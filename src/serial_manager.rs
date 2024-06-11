@@ -1,0 +1,299 @@
+use serialport::{SerialPort, new, DataBits, StopBits, Parity};
+use std::io::ErrorKind;  // 正确引入ErrorKind
+use std::{thread, time::Duration};
+use std::sync::mpsc::Receiver;
+use crate::csv_parser::{BitIndex, Config, Record};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use tokio::runtime::Runtime;
+use crate::common::{Command, Value};
+use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
+
+
+// 串口通信管理器结构体
+struct SerialManager {
+    port: Box<dyn SerialPort>,             // 串口对象
+    command_queue: Arc<Mutex<VecDeque<Command>>>,  // 线程安全的命令队列
+    serial_config: SerialConfig,            // 串口配置
+    recs: Vec<Record>,                      // 记录
+    global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>, // 全局发送器
+}
+
+// 串口配置结构体
+pub struct SerialConfig {
+    pub port_name: String,                    // 串口名称
+    pub baud_rate: u32,                       // 串口波特率
+    pub data_bits: DataBits,                  // 串口数据位设置
+    pub stop_bits: StopBits,                  // 串口停止位设置
+    pub parity: Parity,                       // 串口奇偶校验设置
+}
+
+//串口数据包
+struct DataPacket {
+    #[allow(unused)]
+    addr: u8,  // 地址
+    #[allow(unused)]
+    cmd: u8,   // 命令
+    #[allow(unused)]
+    len: u8,   // 长度
+    #[allow(unused)]
+    status: Vec<u8>, // 状态信息，键为KKS标识符，值为解析出的值
+    #[allow(unused)]
+    crc: u8,   // 校验字节
+}
+
+impl DataPacket {
+    // Define a constructor for DataPacket
+    pub fn new(addr: u8, cmd: u8, len: u8, status: Vec<u8>, crc: u8) -> Self {
+        DataPacket {
+            addr,
+            cmd,
+            len,
+            status,
+            crc
+        }
+    }
+}
+
+impl SerialManager {
+    // 构造函数：初始化串口通信管理器
+    fn new(serial_config: SerialConfig, records:Vec<Record>,global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>) -> Self {
+        let port = open_serial_port_with_retries(&serial_config.port_name, serial_config.baud_rate, serial_config.data_bits, serial_config.stop_bits, serial_config.parity);
+        SerialManager {
+            port,
+            command_queue: Arc::new(Mutex::new(VecDeque::new())),
+            serial_config,
+            recs: records,
+            global_sender,
+        }
+    }
+
+    // 重新连接串口的方法
+    fn reconnect(&mut self) {
+        self.port = open_serial_port_with_retries(&self.serial_config.port_name, self.serial_config.baud_rate, self.serial_config.data_bits, self.serial_config.stop_bits, self.serial_config.parity);
+        eprintln!("串口重新连接成功");
+    }
+
+    // 发送命令到设备的方法
+    async fn send_command(&mut self, command: Command) {
+        //println!("发送命令: {:?}", command.command);
+        if let Err(e) = self.port.write(&command.command) {
+            eprintln!("写入错误: {:?}", e);
+            self.reconnect(); // 发生写入错误时，尝试重新连接
+        }
+    }
+
+    // 从串口接收数据的方法
+    async fn receive_data(&mut self) {
+        let mut buffer = vec![0; 1024];
+        match self.port.read(&mut buffer) {
+            Ok(bytes_read)=>{
+                //println!("接收到数据: {:?}", &buffer[..bytes_read]);
+                //处理数据包
+                let data = parse_data_packet(&buffer[..bytes_read]);
+                match data {
+                    Ok(packet) => {
+                        //处理数据包内的状态信息
+                        let data = parse_status(&packet.status, self.recs.as_slice());
+                        //将数据发送到全局发送器
+                        let sender = self.global_sender.lock().await;
+                        for s in sender.iter() {
+                            if let Err(e) = s.send(data.clone()).await {
+                                eprintln!("发送数据失败: {:?}", e);
+                            }
+                        }
+                    },
+                    Err(e) => eprintln!("解析数据包错误: {:?}", e),
+                }
+            },
+            Err(e) if e.kind() == ErrorKind::TimedOut => eprintln!("读取超时"), // 更新超时处理
+            Err(e) => {
+                eprintln!("读取错误: {:?}", e);
+                self.reconnect(); // 发生读取错误时，尝试重新连接
+            }
+        }
+    }
+}
+
+// 根据指定的配置重试打开串口的方法
+fn open_serial_port_with_retries(port_name: &str, baud_rate: u32, data_bits: DataBits, stop_bits: StopBits, parity: Parity) -> Box<dyn SerialPort> {
+    loop {
+        match new(port_name, baud_rate).data_bits(data_bits).stop_bits(stop_bits).parity(parity).timeout(Duration::from_millis(1000)).open() {
+            Ok(port) => return port,
+            Err(e) => {
+                eprintln!("无法打开串口: {:?}", e);
+                thread::sleep(Duration::from_millis(1000));  // 在重试前暂停一秒
+            }
+        }
+    }
+}
+
+// 启动串口通信线程的函数
+/// rx 用于接收命令
+/// device_states 用于存储设备状态
+/// serial_config 用于配置串口
+/// global_sender 用于存储全局发送器 用于给所有网络客户端发送数据
+/// queries 用于查询命令
+/// config 用于配置
+/// recs 所有点位配置
+// device_states: Arc<RwLock<HashMap<String, Value>>>,
+pub fn start_serial_thread(rx: Receiver<Command>,
+                           global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>,
+                           serial_config: SerialConfig, queries: Command, config: Config, recs : Vec<Record>) -> thread::JoinHandle<()> {
+    let mut manager = SerialManager::new(serial_config, recs, global_sender.clone());
+
+    // thread::spawn(move || {
+    //     loop {
+    //         // 首先尝试从接收器中获取命令并将其加入队列
+    //         while let Ok(cmd) = rx.try_recv() {
+    //             manager.command_queue.lock().unwrap().push_back(cmd);
+    //         }
+    //
+    //         // 在一个单独的作用域中操作命令队列
+    //         {
+    //             // 获取队列的锁，尝试从队列中取出命令
+    //             let mut queue = manager.command_queue.lock().unwrap();
+    //             if let Some(cmd) = queue.pop_front() {
+    //                 drop(queue); // 显式释放锁，避免在调用 send_command 时持有锁
+    //                 manager.send_command(cmd);  // 从队列中取出命令并发送
+    //             } else {
+    //                 drop(queue); // 显式释放锁
+    //                 manager.send_command(queries.clone());  // 如果队列为空，则发送查询命令
+    //             }
+    //         }
+    //
+    //         // 接收数据
+    //         manager.receive_data();  // 接收数据
+    //         thread::sleep(Duration::from_millis(10));  // 每次循环后暂停以避免过载
+    //     }
+    // })
+
+    thread::spawn(move || {
+        let rt = Runtime::new().unwrap(); // 创建一个新的Tokio运行时
+        rt.block_on(async { // 在运行时中执行异步代码块
+            loop {
+                // 处理命令
+                while let Ok(cmd) = rx.try_recv() {
+                    manager.command_queue.lock().unwrap().push_back(cmd);
+                }
+
+                // 处理命令队列
+                {
+                    let mut queue = manager.command_queue.lock().unwrap();
+                    if let Some(cmd) = queue.pop_front() {
+                        drop(queue);
+                        manager.send_command(cmd).await; // 注意这里假设send_command也是异步的
+                    } else {
+                        drop(queue);
+                        manager.send_command(queries.clone()).await; // 发送查询命令也需要是异步的
+                    }
+                }
+
+                // 异步接收数据
+                manager.receive_data().await; // 以异步方式接收数据
+
+                //sleep(Duration::from_millis(10)).await; // 使用异步sleep
+                tokio::time::sleep(Duration::from_millis(10)).await; // 暂停以避免过载
+            }
+        })
+    })
+
+
+}
+
+//累加和校验
+fn verify_checksum(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+
+    let checksum: u8 = data.iter().take(data.len() - 1).sum();
+    let received_checksum = *data.last().unwrap();
+
+    checksum == received_checksum
+}
+
+//解析数据
+fn parse_data_packet(data: &[u8]) -> Result<DataPacket, &'static str> {
+    //累加和校验
+    if !verify_checksum(data) {
+        return Err("Checksum mismatch");
+    }
+
+    // 验证数据包长度是否大于4
+    if data.len() < 4 {
+        return Err("Data packet too short");
+    }
+
+    let addr = data[0];
+    let cmd = data[1];
+    let len = data[2] as usize;  // Len字段值，16进制转十进制
+
+    // 验证从Len字段之后到数据包结尾前（不包括CRC）的字节数是否为Ln+1
+    if (len + 2) != (data.len() - 3) {  // 总长度减去Addr, CMD, Len，再加上1
+        return Err("Data packet length mismatch");
+    }
+
+    let crc = data[data.len() - 1];
+    // 根据Len的解释取出状态数据
+    let status_bytes = data[3..data.len() - 1].to_vec();  // 直接复制状态数据到Vec<u8>
+
+    Ok(DataPacket::new(addr, cmd, len as u8, status_bytes, crc))
+}
+
+//解析状态
+fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
+    let mut results = HashMap::new();
+    for record in records {
+        let byte_index = record.byte_index as usize - 1;  // 确保byte_index是从0开始的索引
+        if byte_index < data.len() {
+            let value = match &record.bit_index {
+                BitIndex::Single(bit) => {
+                    let bit = *bit as usize;
+                    ((data[byte_index] >> bit) & 1) as u32
+                },
+                BitIndex::Range(range) => {
+                    let mut val = 0;
+                    let total_bits = (data.len() * 8) as u32; // 计算数组总共包含的位数，并将结果转换为u32
+                    let (start_bit, end_bit) = (*range.start(), *range.end());
+                    let start_bit_absolute = byte_index * 8 + (start_bit as usize); // 计算绝对的起始位位置
+                    //计算绝对结束位位置
+                    let end_bit_absolute = byte_index * 8 + (end_bit as usize);
+                    //打印一下
+                    if start_bit > end_bit  || end_bit >= total_bits {
+                        panic!("Invalid bit range or start byte"); // 如果范围无效或开始字节不正确，则抛出错误
+                    }
+                    let bits_to_extract = start_bit_absolute as u32..=end_bit_absolute as u32;
+                    for bit_pos in bits_to_extract {
+                        val <<= 1;
+                        let mut byte_index = 0;
+                        if record.lh == 1{
+                            byte_index = bit_pos / 8;
+                        }else {
+                            byte_index = data.len() as u32 - 1 - bit_pos / 8;
+                        }
+
+                        val |= ((data[byte_index as usize] >> (7 - bit_pos % 8)) & 1) as u32;
+                    }
+
+                    val
+                },
+            };
+
+            let value = match record.type_.as_ref() {
+                "uint" => Value::UInt(value),
+                "bool" => Value::Bool(value != 0),
+                "float" => {
+                    // 假设浮点数解析的简化示例
+                    Value::Float((value as u32 as f32) / 100.0)
+                },
+                _ => continue,
+            };
+
+            results.insert(record.kks.clone(), value);
+        }
+    }
+    //print!("{:?}\n", results);
+    results
+}
+
