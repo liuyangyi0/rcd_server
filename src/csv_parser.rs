@@ -7,55 +7,58 @@ use std::ops::RangeInclusive;
 use std::str::FromStr;
 
 // 定义 BitIndex 枚举
+// 定义一个名为 `BitIndex` 的枚举，用于存储单个位索引或者位索引范围
 #[derive(Debug, Deserialize)]
 pub enum BitIndex {
-    Single(u32),
-    Range(RangeInclusive<u32>),
+    Single(u32),                // 单个位索引
+    Range(RangeInclusive<u32>), // 位索引范围
 }
 
-// 为 BitIndex 实现从字符串的转换
-// impl FromStr for BitIndex {
-//     type Err = ParseIntError;
-//
-//     fn from_str(s: &str) -> Result<Self, Self::Err> {
-//         if let Some(dot_pos) = s.find('.') {
-//             let start = s[..dot_pos].parse::<u32>()?;
-//             let end = s[dot_pos + 1..].parse::<u32>()?;
-//             Ok(BitIndex::Range(start..=end))
-//         } else {
-//             s.parse::<u32>().map(BitIndex::Single)
-//         }
-//     }
-// }
-
+// 为 `BitIndex` 实现 `FromStr` 特性，允许从字符串解析
 impl FromStr for BitIndex {
-    type Err = String;  // 使用字符串直接描述错误
+    type Err = String;  // 定义错误类型为字符串，用于描述解析错误
 
+    // 定义字符串解析方法
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // 检查字符串中是否存在'.'，用以区分是单个索引还是索引范围
         if let Some(dot_pos) = s.find('.') {
+            // 解析'.'之前的部分作为起始索引
             let start = s[..dot_pos].parse::<u32>()
-                .map_err(|e| e.to_string())?;
-                //.checked_sub(1)
-                //.ok_or("Index underflow, input should be 1 or greater")?;
+                .map_err(|e| e.to_string())?; // 转换错误信息为字符串
+            // 解析'.'之后的部分作为结束索引
             let end = s[dot_pos + 1..].parse::<u32>()
-                .map_err(|e| e.to_string())?;
-                //.checked_sub(1)
-                //.ok_or("Index underflow, input should be 1 or greater")?;
+                .map_err(|e| e.to_string())?; // 转换错误信息为字符串
+            // 如果成功解析，返回一个表示范围的 `BitIndex`
             Ok(BitIndex::Range(start..=end))
         } else {
+            // 如果没有找到'.'，则视为单个位索引
             let index = s.parse::<u32>()
-                .map_err(|e| e.to_string())?;
-                //.checked_sub(1)
-                //.ok_or("Index underflow, input should be 1 or greater")?;
+                .map_err(|e| e.to_string())?; // 转换错误信息为字符串
+            // 返回一个表示单个位索引的 `BitIndex`
             Ok(BitIndex::Single(index))
         }
     }
 }
 
+
 // 定义一个枚举来表示数据的大小端模式
+#[derive(Debug, Deserialize)]
 enum Endian {
     Big,
     Little,
+}
+
+//为 Endian 实现 FromStr 特性
+impl FromStr for Endian {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "big" => Ok(Endian::Big),
+            "little" => Ok(Endian::Little),
+            _ => Err(format!("Invalid endian value: {}", s)),
+        }
+    }
 }
 
 
@@ -73,6 +76,12 @@ pub struct Record {
     pub max: u32,
     pub min: u32,
     pub lh: u32,
+}
+
+
+pub struct DeviceConfiguration {
+    pub config: Config,
+    pub records: Vec<Record>, // 使用 Vec 来存储多个 Record 实例
 }
 
 // 自定义反序列化函数
@@ -126,4 +135,18 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
         records.push(record);
     }
     Ok((config, records))
+}
+
+//解析多个csv文件
+pub fn parse_csv_files<P: AsRef<Path>>(file_paths: Vec<P>) -> Result<Vec<DeviceConfiguration>, Box<dyn Error>> {
+    let mut configs = Vec::new();
+
+    for file_path in file_paths {
+        let (config, records) = parse_csv(file_path)?;
+        configs.push(DeviceConfiguration {
+            config,
+            records,
+        });
+    }
+    Ok(configs)
 }

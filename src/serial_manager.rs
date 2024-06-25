@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 use crate::common::{Command, Value};
 use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
+use tokio::time::{sleep};
 
 
 // 串口通信管理器结构体
@@ -57,8 +58,8 @@ impl DataPacket {
 
 impl SerialManager {
     // 构造函数：初始化串口通信管理器
-    fn new(serial_config: SerialConfig, records:Vec<Record>,global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>) -> Self {
-        let port = open_serial_port_with_retries(&serial_config.port_name, serial_config.baud_rate, serial_config.data_bits, serial_config.stop_bits, serial_config.parity);
+    async fn new(serial_config: SerialConfig, records:Vec<Record>,global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>) -> Self {
+        let port = open_serial_port_with_retries(&serial_config.port_name, serial_config.baud_rate, serial_config.data_bits, serial_config.stop_bits, serial_config.parity).await;
         SerialManager {
             port,
             command_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -69,8 +70,8 @@ impl SerialManager {
     }
 
     // 重新连接串口的方法
-    fn reconnect(&mut self) {
-        self.port = open_serial_port_with_retries(&self.serial_config.port_name, self.serial_config.baud_rate, self.serial_config.data_bits, self.serial_config.stop_bits, self.serial_config.parity);
+    async fn reconnect(&mut self) {
+        self.port = open_serial_port_with_retries(&self.serial_config.port_name, self.serial_config.baud_rate, self.serial_config.data_bits, self.serial_config.stop_bits, self.serial_config.parity).await;
         eprintln!("串口重新连接成功");
     }
 
@@ -79,7 +80,7 @@ impl SerialManager {
         //println!("发送命令: {:?}", command.command);
         if let Err(e) = self.port.write(&command.command) {
             eprintln!("写入错误: {:?}", e);
-            self.reconnect(); // 发生写入错误时，尝试重新连接
+            self.reconnect().await; // 发生写入错误时，尝试重新连接
         }
     }
 
@@ -109,20 +110,21 @@ impl SerialManager {
             Err(e) if e.kind() == ErrorKind::TimedOut => eprintln!("读取超时"), // 更新超时处理
             Err(e) => {
                 eprintln!("读取错误: {:?}", e);
-                self.reconnect(); // 发生读取错误时，尝试重新连接
+                self.reconnect().await; // 发生读取错误时，尝试重新连接
             }
         }
     }
 }
 
 // 根据指定的配置重试打开串口的方法
-fn open_serial_port_with_retries(port_name: &str, baud_rate: u32, data_bits: DataBits, stop_bits: StopBits, parity: Parity) -> Box<dyn SerialPort> {
+async fn open_serial_port_with_retries(port_name: &str, baud_rate: u32, data_bits: DataBits, stop_bits: StopBits, parity: Parity) -> Box<dyn SerialPort> {
     loop {
-        match new(port_name, baud_rate).data_bits(data_bits).stop_bits(stop_bits).parity(parity).timeout(Duration::from_millis(1000)).open() {
+        match new(port_name, baud_rate).data_bits(data_bits).stop_bits(stop_bits).parity(parity).timeout(Duration::from_millis(200)).open() {
             Ok(port) => return port,
             Err(e) => {
                 eprintln!("无法打开串口: {:?}", e);
-                thread::sleep(Duration::from_millis(1000));  // 在重试前暂停一秒
+                //thread::sleep(Duration::from_millis(1000));  // 在重试前暂停一秒
+                sleep(Duration::from_millis(1000)).await;  // 使用异步sleep
             }
         }
     }
@@ -137,36 +139,10 @@ fn open_serial_port_with_retries(port_name: &str, baud_rate: u32, data_bits: Dat
 /// config 用于配置
 /// recs 所有点位配置
 // device_states: Arc<RwLock<HashMap<String, Value>>>,
-pub fn start_serial_thread(rx: Receiver<Command>,
+pub async fn start_serial_thread(rx: Receiver<Command>,
                            global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>,
                            serial_config: SerialConfig, queries: Command, config: Config, recs : Vec<Record>) -> thread::JoinHandle<()> {
-    let mut manager = SerialManager::new(serial_config, recs, global_sender.clone());
-
-    // thread::spawn(move || {
-    //     loop {
-    //         // 首先尝试从接收器中获取命令并将其加入队列
-    //         while let Ok(cmd) = rx.try_recv() {
-    //             manager.command_queue.lock().unwrap().push_back(cmd);
-    //         }
-    //
-    //         // 在一个单独的作用域中操作命令队列
-    //         {
-    //             // 获取队列的锁，尝试从队列中取出命令
-    //             let mut queue = manager.command_queue.lock().unwrap();
-    //             if let Some(cmd) = queue.pop_front() {
-    //                 drop(queue); // 显式释放锁，避免在调用 send_command 时持有锁
-    //                 manager.send_command(cmd);  // 从队列中取出命令并发送
-    //             } else {
-    //                 drop(queue); // 显式释放锁
-    //                 manager.send_command(queries.clone());  // 如果队列为空，则发送查询命令
-    //             }
-    //         }
-    //
-    //         // 接收数据
-    //         manager.receive_data();  // 接收数据
-    //         thread::sleep(Duration::from_millis(10));  // 每次循环后暂停以避免过载
-    //     }
-    // })
+    let mut manager = SerialManager::new(serial_config, recs, global_sender.clone()).await;
 
     thread::spawn(move || {
         let rt = Runtime::new().unwrap(); // 创建一个新的Tokio运行时
@@ -193,25 +169,26 @@ pub fn start_serial_thread(rx: Receiver<Command>,
                 manager.receive_data().await; // 以异步方式接收数据
 
                 //sleep(Duration::from_millis(10)).await; // 使用异步sleep
-                tokio::time::sleep(Duration::from_millis(10)).await; // 暂停以避免过载
+                tokio::time::sleep(Duration::from_millis(1)).await; // 暂停以避免过载
             }
         })
     })
-
-
 }
 
-//累加和校验
+//累加和校验 超出255会自动回到0
 fn verify_checksum(data: &[u8]) -> bool {
     if data.is_empty() {
         return false;
     }
 
-    let checksum: u8 = data.iter().take(data.len() - 1).sum();
+    let checksum: u8 = data.iter()
+        .take(data.len() - 1)
+        .fold(0u8, |acc, &x| acc.wrapping_add(x));
     let received_checksum = *data.last().unwrap();
 
     checksum == received_checksum
 }
+
 
 //解析数据
 fn parse_data_packet(data: &[u8]) -> Result<DataPacket, &'static str> {
@@ -259,23 +236,47 @@ fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
                     let start_bit_absolute = byte_index * 8 + (start_bit as usize); // 计算绝对的起始位位置
                     //计算绝对结束位位置
                     let end_bit_absolute = byte_index * 8 + (end_bit as usize);
+
+                    let start_bit = *range.start();
+                    let end_bit = *range.end();
+                    let start_byte_index = byte_index as usize + (start_bit / 8) as usize;
+                    let end_byte_index = byte_index as usize + (end_bit / 8) as usize;
+
+
                     //打印一下
                     if start_bit > end_bit  || end_bit >= total_bits {
                         panic!("Invalid bit range or start byte"); // 如果范围无效或开始字节不正确，则抛出错误
                     }
                     let bits_to_extract = start_bit_absolute as u32..=end_bit_absolute as u32;
-                    for bit_pos in bits_to_extract {
-                        val <<= 1;
-                        let mut byte_index = 0;
-                        if record.lh == 1{
-                            byte_index = bit_pos / 8;
-                        }else {
-                            byte_index = data.len() as u32 - 1 - bit_pos / 8;
-                        }
+                    // for bit_pos in bits_to_extract {
+                    //     val <<= 1;
+                    //     let mut byte_index1 = 0;
+                    //     if record.lh == 1{
+                    //         byte_index1 = bit_pos / 8;
+                    //     }else {
+                    //         byte_index1 = data.len() as u32 - 1 - bit_pos / 8;
+                    //     }
+                    //
+                    //     val |= ((data[byte_index1 as usize] >> (7 - bit_pos % 8)) & 1) as u32;
+                    // }
 
-                        val |= ((data[byte_index as usize] >> (7 - bit_pos % 8)) & 1) as u32;
+
+                    let mut combined_data = 0u32;
+                    for i in start_byte_index..=end_byte_index{
+                        let byte = data[i as usize] as u32;
+                            if record.lh == 1{
+                                combined_data = (combined_data << 8) | byte;
+                            }else {
+                                combined_data |= byte << (8 * (i as usize - start_byte_index));
+                            }
                     }
 
+                    // 3. 提取特定位
+                    let bit_offset = (start_bit % 8) as u32;
+                    let num_bits = end_bit - start_bit + 1;
+                    let mask = (1u32 << num_bits) - 1;
+                    let result = (combined_data >> bit_offset) & mask;
+                    val = result;
                     val
                 },
             };

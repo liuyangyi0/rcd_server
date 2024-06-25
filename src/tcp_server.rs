@@ -1,6 +1,6 @@
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc as tokio_mpsc, RwLock, Mutex as TokioMutex};
-use std::sync::{Arc, mpsc, Mutex};
+use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
+use std::sync::{Arc, mpsc};
 use futures::stream::StreamExt;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use std::collections::HashMap;
@@ -82,7 +82,7 @@ pub async fn handle_client(mut framed: Framed<TcpStream, LengthDelimitedCodec>,
             data_to_send = rx.recv() => {
                 // 如果有数据待发送
                 if let Some(data) = data_to_send {
-                    //println!("Preparing to send data: {:?}", data);
+                    println!("Preparing to send data: {:?}", data);
                     // 这里注释的部分是将数据发送到客户端的代码，需要解开注释以实际发送数据
                     let message = MessageType::DeviceStatus(DeviceStatus { id: 1, value: data });
                     // 序列化消息。
