@@ -8,7 +8,7 @@ use std::str::FromStr;
 
 // 定义 BitIndex 枚举
 // 定义一个名为 `BitIndex` 的枚举，用于存储单个位索引或者位索引范围
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub enum BitIndex {
     Single(u32),                // 单个位索引
     Range(RangeInclusive<u32>), // 位索引范围
@@ -64,7 +64,7 @@ impl FromStr for Endian {
 
 
 // 定义 Record 结构体，使用 BitIndex 枚举
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize , Clone)]
 pub struct Record {
     pub kks: String,
     pub type_: String,
@@ -84,6 +84,16 @@ pub struct DeviceConfiguration {
     pub records: Vec<Record>, // 使用 Vec 来存储多个 Record 实例
 }
 
+//DeviceConfiguration new
+impl DeviceConfiguration {
+    pub fn new(config: Config, records: Vec<Record>) -> Self {
+        DeviceConfiguration {
+            config,
+            records,
+        }
+    }
+}
+
 // 自定义反序列化函数
 fn deserialize_bit_index<'de, D>(deserializer: D) -> Result<BitIndex, D::Error>
     where
@@ -95,7 +105,7 @@ fn deserialize_bit_index<'de, D>(deserializer: D) -> Result<BitIndex, D::Error>
 }
 
 // 定义 Config 结构体
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub com: String,
     pub device_id: u8,

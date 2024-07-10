@@ -2,7 +2,7 @@ use serialport::{SerialPort, new, DataBits, StopBits, Parity};
 use std::io::ErrorKind;  // 正确引入ErrorKind
 use std::{thread, time::Duration};
 use std::sync::mpsc::Receiver;
-use crate::csv_parser::{BitIndex, Config, Record};
+use crate::csv_parser::{BitIndex, Config, DeviceConfiguration, Record};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
@@ -174,6 +174,52 @@ pub async fn start_serial_thread(rx: Receiver<Command>,
         })
     })
 }
+
+
+// pub async fn start_serial_thread_1(
+//     rx: Receiver<Command>,
+//     global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>,
+//     serial_config: SerialConfig,
+//     dev_config:DeviceConfiguration
+// ) -> thread::JoinHandle<()> {
+//     let mut manager = SerialManager::new(serial_config, recs, global_sender.clone()).await;
+//
+//     thread::spawn(move || {
+//         let rt = Runtime::new().unwrap(); // 创建一个新的Tokio运行时
+//         let mut query_index = 0; // 添加一个索引来追踪当前应发送的查询命令
+//         rt.block_on(async { // 在运行时中执行异步代码块
+//             loop {
+//                 // 处理命令
+//                 while let Ok(cmd) = rx.try_recv() {
+//                     manager.command_queue.lock().unwrap().push_back(cmd);
+//                 }
+//
+//                 // 处理命令队列
+//                 {
+//                     let mut queue = manager.command_queue.lock().unwrap();
+//                     if let Some(cmd) = queue.pop_front() {
+//                         drop(queue);
+//                         manager.send_command(cmd).await; // 发送命令
+//                     } else {
+//                         drop(queue);
+//                         if !queries.is_empty() {
+//                             let query = queries[query_index % queries.len()].clone(); // 循环使用查询命令
+//                             manager.send_command(query).await; // 发送查询命令
+//                             query_index = (query_index + 1) % queries.len(); // 更新索引，并防止溢出
+//                         }
+//                     }
+//                 }
+//
+//                 // 异步接收数据
+//                 manager.receive_data().await; // 以异步方式接收数据
+//
+//                 // 使用异步sleep
+//                 tokio::time::sleep(Duration::from_millis(1)).await; // 暂停以避免过载
+//             }
+//         })
+//     })
+// }
+
 
 //累加和校验 超出255会自动回到0
 fn verify_checksum(data: &[u8]) -> bool {

@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 
-
-
-
 // 定义设备状态结构体。
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Command {
