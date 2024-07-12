@@ -8,7 +8,8 @@ use regex::Regex; // 引入正则表达式库
 pub fn read_and_process_files(directory: &Path, pattern: &str) -> io::Result<Vec<PathBuf>> {
     let re = Regex::new(pattern).expect("正则表达式无效");
     let mut valid_files = Vec::new();  // 存储符合条件的文件路径
-
+    //打印目录
+    println!("directory: {:?}", directory);
     // 遍历目录中的文件
     let entries = fs::read_dir(directory)?;
     for entry in entries {

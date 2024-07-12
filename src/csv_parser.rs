@@ -78,7 +78,7 @@ pub struct Record {
     pub lh: u32,
 }
 
-
+#[derive(Debug, Deserialize, Clone)]
 pub struct DeviceConfiguration {
     pub config: Config,
     pub records: Vec<Record>, // 使用 Vec 来存储多个 Record 实例
@@ -141,7 +141,9 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
     rdr.records().next();
     let mut records = Vec::new();
     for result in rdr.deserialize() {
-        let record: Record = result?;
+        let mut record: Record = result?;
+        // 拼接前缀到 kks 字段
+        record.kks = format!("{}{}", config.pre, record.kks);
         records.push(record);
     }
     Ok((config, records))

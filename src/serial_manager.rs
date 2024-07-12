@@ -6,9 +6,10 @@ use crate::csv_parser::{BitIndex, Config, DeviceConfiguration, Record};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
-use crate::common::{Command, Value};
+use crate::common::{Command, get_sum, Value};
 use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
 use tokio::time::{sleep};
+use crate::serial_port_config::SerialPortConfig;
 
 
 // 串口通信管理器结构体
@@ -16,8 +17,9 @@ struct SerialManager {
     port: Box<dyn SerialPort>,             // 串口对象
     command_queue: Arc<Mutex<VecDeque<Command>>>,  // 线程安全的命令队列
     serial_config: SerialConfig,            // 串口配置
-    recs: Vec<Record>,                      // 记录
+    serial_config_data:SerialPortConfig, //串口配置数据
     global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>, // 全局发送器
+    index: usize,
 }
 
 // 串口配置结构体
@@ -58,14 +60,15 @@ impl DataPacket {
 
 impl SerialManager {
     // 构造函数：初始化串口通信管理器
-    async fn new(serial_config: SerialConfig, records:Vec<Record>,global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>) -> Self {
+    async fn new(serial_config: SerialConfig, serial_config_data:SerialPortConfig, global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>) -> Self {
         let port = open_serial_port_with_retries(&serial_config.port_name, serial_config.baud_rate, serial_config.data_bits, serial_config.stop_bits, serial_config.parity).await;
         SerialManager {
             port,
             command_queue: Arc::new(Mutex::new(VecDeque::new())),
             serial_config,
-            recs: records,
+            serial_config_data,
             global_sender,
+            index: 0,
         }
     }
 
@@ -95,7 +98,7 @@ impl SerialManager {
                 match data {
                     Ok(packet) => {
                         //处理数据包内的状态信息
-                        let data = parse_status(&packet.status, self.recs.as_slice());
+                        let data = parse_status(&packet.status, self.serial_config_data.commands[self.index].records.as_slice());
                         //将数据发送到全局发送器
                         let sender = self.global_sender.lock().await;
                         for s in sender.iter() {
@@ -139,16 +142,57 @@ async fn open_serial_port_with_retries(port_name: &str, baud_rate: u32, data_bit
 /// config 用于配置
 /// recs 所有点位配置
 // device_states: Arc<RwLock<HashMap<String, Value>>>,
-pub async fn start_serial_thread(rx: Receiver<Command>,
-                           global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>,
-                           serial_config: SerialConfig, queries: Command, config: Config, recs : Vec<Record>) -> thread::JoinHandle<()> {
-    let mut manager = SerialManager::new(serial_config, recs, global_sender.clone()).await;
+// pub async fn start_serial_thread(rx: Receiver<Command>,
+//                            global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>,
+//                            serial_config: SerialConfig, queries: Command, config: Config, recs : Vec<Record>) -> thread::JoinHandle<()> {
+    // let mut manager = SerialManager::new(serial_config, recs, global_sender.clone()).await;
+    //
+    // thread::spawn(move || {
+    //     let rt = Runtime::new().unwrap(); // 创建一个新的Tokio运行时
+    //     rt.block_on(async { // 在运行时中执行异步代码块
+    //         loop {
+    //             // 处理命令
+    //             while let Ok(cmd) = rx.try_recv() {
+    //                 manager.command_queue.lock().unwrap().push_back(cmd);
+    //             }
+    //
+    //             // 处理命令队列
+    //             {
+    //                 let mut queue = manager.command_queue.lock().unwrap();
+    //                 if let Some(cmd) = queue.pop_front() {
+    //                     drop(queue);
+    //                     manager.send_command(cmd).await; // 注意这里假设send_command也是异步的
+    //                 } else {
+    //                     drop(queue);
+    //                     manager.send_command(queries.clone()).await; // 发送查询命令也需要是异步的
+    //                 }
+    //             }
+    //
+    //             // 异步接收数据
+    //             manager.receive_data().await; // 以异步方式接收数据
+    //
+    //             //sleep(Duration::from_millis(10)).await; // 使用异步sleep
+    //             tokio::time::sleep(Duration::from_millis(1)).await; // 暂停以避免过载
+    //         }
+    //     })
+    // })
+// }
+
+
+pub async fn start_serial_thread_1(
+    global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>,
+    serial_config: SerialConfig,
+    serial_config_data:SerialPortConfig,
+    rx: Receiver<Command>,
+) -> thread::JoinHandle<()> {
+    let mut manager = SerialManager::new(serial_config, serial_config_data, global_sender.clone()).await;
 
     thread::spawn(move || {
         let rt = Runtime::new().unwrap(); // 创建一个新的Tokio运行时
+        // let mut query_index = 0; // 添加一个索引来追踪当前应发送的查询命令
         rt.block_on(async { // 在运行时中执行异步代码块
             loop {
-                // 处理命令
+                // 处理命令rx.try_recv()
                 while let Ok(cmd) = rx.try_recv() {
                     manager.command_queue.lock().unwrap().push_back(cmd);
                 }
@@ -158,67 +202,38 @@ pub async fn start_serial_thread(rx: Receiver<Command>,
                     let mut queue = manager.command_queue.lock().unwrap();
                     if let Some(cmd) = queue.pop_front() {
                         drop(queue);
-                        manager.send_command(cmd).await; // 注意这里假设send_command也是异步的
+                        manager.send_command(cmd).await; // 发送命令
                     } else {
                         drop(queue);
-                        manager.send_command(queries.clone()).await; // 发送查询命令也需要是异步的
+                        if !manager.serial_config_data.commands.is_empty() {
+                            let dev_config = &manager.serial_config_data.commands[manager.index];
+                            let mut c = vec![
+                                dev_config.config.device_id.clone(),
+                                0x08,
+                                0x02,
+                                0x30,
+                                0x10,
+                                dev_config.config.data_len.clone(),
+                            ];
+                            c.push(get_sum(&c));
+                            let q = Command { device_id: 1, command: c };
+
+                           // let query = queries[query_index % queries.len()].clone(); // 循环使用查询命令
+                            manager.send_command(q).await; // 发送查询命令
+                            manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
+                        }
                     }
                 }
 
                 // 异步接收数据
                 manager.receive_data().await; // 以异步方式接收数据
 
-                //sleep(Duration::from_millis(10)).await; // 使用异步sleep
+                // 使用异步sleep
                 tokio::time::sleep(Duration::from_millis(1)).await; // 暂停以避免过载
             }
         })
     })
 }
-
-
-// pub async fn start_serial_thread_1(
-//     rx: Receiver<Command>,
-//     global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>,
-//     serial_config: SerialConfig,
-//     dev_config:DeviceConfiguration
-// ) -> thread::JoinHandle<()> {
-//     let mut manager = SerialManager::new(serial_config, recs, global_sender.clone()).await;
-//
-//     thread::spawn(move || {
-//         let rt = Runtime::new().unwrap(); // 创建一个新的Tokio运行时
-//         let mut query_index = 0; // 添加一个索引来追踪当前应发送的查询命令
-//         rt.block_on(async { // 在运行时中执行异步代码块
-//             loop {
-//                 // 处理命令
-//                 while let Ok(cmd) = rx.try_recv() {
-//                     manager.command_queue.lock().unwrap().push_back(cmd);
-//                 }
-//
-//                 // 处理命令队列
-//                 {
-//                     let mut queue = manager.command_queue.lock().unwrap();
-//                     if let Some(cmd) = queue.pop_front() {
-//                         drop(queue);
-//                         manager.send_command(cmd).await; // 发送命令
-//                     } else {
-//                         drop(queue);
-//                         if !queries.is_empty() {
-//                             let query = queries[query_index % queries.len()].clone(); // 循环使用查询命令
-//                             manager.send_command(query).await; // 发送查询命令
-//                             query_index = (query_index + 1) % queries.len(); // 更新索引，并防止溢出
-//                         }
-//                     }
-//                 }
-//
-//                 // 异步接收数据
-//                 manager.receive_data().await; // 以异步方式接收数据
-//
-//                 // 使用异步sleep
-//                 tokio::time::sleep(Duration::from_millis(1)).await; // 暂停以避免过载
-//             }
-//         })
-//     })
-// }
 
 
 //累加和校验 超出255会自动回到0
@@ -340,7 +355,6 @@ fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
             results.insert(record.kks.clone(), value);
         }
     }
-    //print!("{:?}\n", results);
     results
 }
 
