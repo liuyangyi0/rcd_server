@@ -20,6 +20,7 @@ enum MessageType {
 }
 
 
+
 #[derive(Serialize, Deserialize, Debug)]
 struct DeviceStatus {
     id: u64,
@@ -132,6 +133,14 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
                             //把数据发送到串口
                             println!("Received MessageA: {:?}", a.clone());
                             //tx.send(a).unwrap();
+
+                            //发送到串口线程 serial_prots
+                            for (i, serial_prot) in serial_prots.iter().enumerate() {
+                                if a.com == serial_prot.port_number {
+                                    txs[i].send(a.clone()).unwrap();
+                                    println!("serialized: {:?}", a);
+                                }
+                            }
 
                         },
                         MessageType::DeviceStatus(b) => {

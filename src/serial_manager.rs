@@ -2,7 +2,7 @@ use serialport::{SerialPort, new, DataBits, StopBits, Parity};
 use std::io::ErrorKind;  // 正确引入ErrorKind
 use std::{thread, time::Duration};
 use std::sync::mpsc::Receiver;
-use crate::csv_parser::{BitIndex, Config, DeviceConfiguration, Record};
+use crate::csv_parser::{BitIndex, Record};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
@@ -99,6 +99,7 @@ impl SerialManager {
                     Ok(packet) => {
                         //处理数据包内的状态信息
                         let data = parse_status(&packet.status, self.serial_config_data.commands[self.index].records.as_slice());
+                        //println!("解析数据包: {:?}", data);
                         //将数据发送到全局发送器
                         let sender = self.global_sender.lock().await;
                         for s in sender.iter() {
@@ -216,7 +217,7 @@ pub async fn start_serial_thread_1(
                                 dev_config.config.data_len.clone(),
                             ];
                             c.push(get_sum(&c));
-                            let q = Command { device_id: 1, command: c };
+                            let q = Command {com: String::from(""), device_id: 1, command: c };
 
                            // let query = queries[query_index % queries.len()].clone(); // 循环使用查询命令
                             manager.send_command(q).await; // 发送查询命令
