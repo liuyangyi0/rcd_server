@@ -1,10 +1,11 @@
 use serialport::{SerialPort, new, DataBits, StopBits, Parity};
-use std::io::ErrorKind;  // 正确引入ErrorKind
+use std::io::{ErrorKind, Write};  // 正确引入ErrorKind
 use std::{thread, time::Duration};
 use std::sync::mpsc::Receiver;
 use crate::csv_parser::{BitIndex, Record};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
 use crate::common::{Command, get_sum, Value};
 use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
@@ -12,15 +13,13 @@ use tokio::time::{sleep};
 use crate::serial_port_config::SerialPortConfig;
 
 
-// 串口通信管理器结构体
-struct SerialManager {
-    port: Box<dyn SerialPort>,             // 串口对象
-    command_queue: Arc<Mutex<VecDeque<Command>>>,  // 线程安全的命令队列
-    serial_config: SerialConfig,            // 串口配置
-    serial_config_data:SerialPortConfig, //串口配置数据
-    global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>, // 全局发送器
-    index: usize,
+// 定义一个枚举来表示奇数和偶数
+enum NumberType {
+    Odd,
+    Even,
 }
+
+
 
 // 串口配置结构体
 pub struct SerialConfig {
@@ -58,10 +57,39 @@ impl DataPacket {
     }
 }
 
+
+// 串口通信管理器结构体
+struct SerialManager {
+    // port: Box<dyn SerialPort>,             // 串口对象
+    port: Option<Box<dyn SerialPort>>, // 使用Option来允许空值
+    command_queue: Arc<Mutex<VecDeque<Command>>>,  // 线程安全的命令队列
+    serial_config: SerialConfig,            // 串口配置
+    serial_config_data:SerialPortConfig, //串口配置数据
+    global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>, // 全局发送器
+    index: usize,
+}
+
 impl SerialManager {
     // 构造函数：初始化串口通信管理器
-    async fn new(serial_config: SerialConfig, serial_config_data:SerialPortConfig, global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>) -> Self {
-        let port = open_serial_port_with_retries(&serial_config.port_name, serial_config.baud_rate, serial_config.data_bits, serial_config.stop_bits, serial_config.parity).await;
+    pub async fn new(
+        serial_config: SerialConfig,
+        serial_config_data: SerialPortConfig,
+        global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>
+    ) -> Self {
+        let port = match open_serial_port_with_retries(
+            &serial_config.port_name,
+            serial_config.baud_rate,
+            serial_config.data_bits,
+            serial_config.stop_bits,
+            serial_config.parity
+        ).await {
+            Ok(port) => Some(port),
+            Err(e) => {
+                eprintln!("Error opening serial port: {:?}", e);
+                None
+            }
+        };
+
         SerialManager {
             port,
             command_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -72,67 +100,296 @@ impl SerialManager {
         }
     }
 
+
     // 重新连接串口的方法
     async fn reconnect(&mut self) {
-        self.port = open_serial_port_with_retries(&self.serial_config.port_name, self.serial_config.baud_rate, self.serial_config.data_bits, self.serial_config.stop_bits, self.serial_config.parity).await;
+        match  open_serial_port_with_retries(&self.serial_config.port_name, self.serial_config.baud_rate, self.serial_config.data_bits, self.serial_config.stop_bits, self.serial_config.parity).await{
+            Ok(port) => {
+                self.port = Some(port);
+                println!("串口重新连接成功");
+            },
+            Err(e) => {
+                eprintln!("重新连接串口失败: {:?}", e);
+                self.port = None;
+            }
+        }
         eprintln!("串口重新连接成功");
     }
 
+    async fn open_port(&mut self) {
+        let result = open_serial_port_with_retries(
+            &self.serial_config.port_name,
+            self.serial_config.baud_rate,
+            self.serial_config.data_bits,
+            self.serial_config.stop_bits,
+            self.serial_config.parity
+        ).await;
+
+        println!("parity {}", self.serial_config.parity);
+
+        match result {
+            Ok(port) => {
+                self.port = Some(port);
+                println!("串口打开成功");
+            },
+            Err(e) => {
+                eprintln!("打开串口失败: {:?}", e);
+                self.port = None;
+            }
+        }
+    }
+
+
+    async fn close_port(&mut self) {
+        if self.port.is_some() {
+            println!("串口正在关闭...");
+            self.port = None;  // 将 port 设置为 None，强制调用 Drop trait
+        } else {
+            println!("串口已经是关闭状态");
+        }
+    }
+
+
+
     // 发送命令到设备的方法
-    async fn send_command(&mut self, command: Command) {
-        //println!("发送命令: {:?}", command.command);
-        if let Err(e) = self.port.write(&command.command) {
-            eprintln!("写入错误: {:?}", e);
-            self.reconnect().await; // 发生写入错误时，尝试重新连接
+    async fn send_command(&mut self, mut command: Command) {
+        if command.command.len() == 0 {
+            return;
+        }
+
+        let selected_data = vec![command.command[0]];  // 创建一个只包含所选元素的新Vec
+        //移除第一个元素
+        command.command.remove(0);
+
+        // let parity = SerialManager::count_bits(&selected_data);
+        //
+        // match self.port {
+        //     Some(ref mut port)=>{
+        //         match parity{
+        //             NumberType::Odd => {
+        //                     //self.serial_config.parity = Parity::Odd;
+        //                 println!("二进制1的个数 是奇数 设置偶校验");
+        //                 port.set_parity(Parity::Even).expect("TODO: panic message");
+        //                 }
+        //             ,
+        //             NumberType::Even => {
+        //                 //self.serial_config.parity = Parity::Even;
+        //                 println!("二进制1的个数 是偶数 设置奇校验");
+        //                 port.set_parity(Parity::Odd).expect("TODO: panic message");
+        //             },
+        //         }
+        //     },
+        //     _ => {}
+        // }
+
+
+        match self.port{
+            Some(ref mut port) => {
+                port.set_parity(Parity::Mark).expect("TODO: panic message");
+
+
+                if let Err(e) = port.write(&selected_data) {
+                    eprintln!("写入错误: {:?}", e);
+                    //self.reconnect().await; // 发生写入错误时，尝试重新连接
+                }
+
+                if let Err(e) = port.flush() {
+                    eprintln!("flush错误: {:?}", e);
+                    //self.reconnect().await; // 发生写入错误时，尝试重新连接
+                }
+            },
+            None => {
+                eprintln!("串口未打开");
+                self.reconnect().await; // 串口未打开时，尝试重新连接
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        // match self.port {
+        //     Some(ref mut port)=>{
+        //         port.set_parity(Parity::None).expect("TODO: panic message");
+        //     },
+        //     _ => {}
+        // }
+
+
+
+        // match self.port{
+        //     Some(ref mut port) => {
+        //         //循环发送command.command
+        //         for c in command.command.iter(){
+        //             //判断是奇数还是偶数
+        //             let parity = SerialManager::count_bits(&[*c]);
+        //             match parity {
+        //                 NumberType::Odd => {
+        //                     //设置奇校验
+        //                     if let Err(e) = port.set_parity(Parity::Odd) {
+        //                         eprintln!("设置错误: {:?}", e);
+        //                         //self.reconnect().await; // 设置发生错误时，尝试重新连接
+        //                     }
+        //                 },
+        //                 NumberType::Even => {
+        //                     //设置偶校验
+        //                     if let Err(e) = port.set_parity(Parity::Even) {
+        //                         eprintln!("设置错误: {:?}", e);
+        //                         //self.reconnect().await; // 设置发生错误时，尝试重新连接
+        //                     }
+        //                 },
+        //             }
+        //             if let Err(e) = port.write(&[*c]) {
+        //                 eprintln!("写入错误: {:?}", e);
+        //                 //self.reconnect().await; // 发生写入错误时，尝试重新连接
+        //             }
+        //             if let Err(e) = port.flush() {
+        //                 eprintln!("flush错误: {:?}", e);
+        //                 //self.reconnect().await; // 发生写入错误时，尝试重新连接
+        //             }
+        //             tokio::time::sleep(Duration::from_nanos(100000)).await;
+        //         }
+        //     },
+        //     None => {
+        //         eprintln!("串口未打开");
+        //         self.reconnect().await; // 串口未打开时，尝试重新连接
+        //     }
+        // }
+
+
+
+        match self.port{
+            Some(ref mut port) => {
+                port.set_parity(Parity::Space).expect("TODO: panic message");
+                if let Err(e) = port.write(&command.command) {
+                    eprintln!("写入错误: {:?}", e);
+                    self.reconnect().await; // 发生写入错误时，尝试重新连接
+                }
+            },
+            None => {
+                eprintln!("串口未打开");
+                self.reconnect().await; // 串口未打开时，尝试重新连接
+            }
+        }
+
+
+        //暂停一段时间
+        //tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    async fn try_set_parity(&mut self, parity: Parity) {
+        match self.port {
+            Some(ref mut port) => {
+                if let Err(e) = port.set_parity(parity) {
+                    eprintln!("设置错误: {:?}", e);
+                    self.reconnect().await; // 设置发生错误时，尝试重新连接
+                }
+            },
+            None => {
+                eprintln!("串口未打开");
+                self.reconnect().await; // 串口未打开时，尝试重新连接
+            }
+        }
+    }
+
+    async fn set_parity_based_on_number_type(&mut self, parity: NumberType) {
+        match parity {
+            NumberType::Odd => self.try_set_parity(Parity::Odd).await,
+            NumberType::Even => self.try_set_parity(Parity::Even).await,
+        }
+    }
+
+
+    //计算字节1个个数 是奇数还是偶数
+    fn count_bits(data: &[u8]) -> NumberType {
+        // Count the total number of '1' bits in all bytes
+        let total_bits: usize = data.iter()
+            .map(|&byte| byte.count_ones() as usize)
+            .sum();
+        // 根据总数的奇偶性返回枚举值
+        if total_bits % 2 == 0 {
+            NumberType::Even
+        } else {
+            NumberType::Odd
         }
     }
 
     // 从串口接收数据的方法
     async fn receive_data(&mut self) {
         let mut buffer = vec![0; 1024];
-        match self.port.read(&mut buffer) {
-            Ok(bytes_read)=>{
-                //println!("接收到数据: {:?}", &buffer[..bytes_read]);
-                //处理数据包
-                let data = parse_data_packet(&buffer[..bytes_read]);
-                match data {
-                    Ok(packet) => {
-                        //处理数据包内的状态信息
-                        let data = parse_status(&packet.status, self.serial_config_data.commands[self.index].records.as_slice());
-                        //println!("解析数据包: {:?}", data);
-                        //将数据发送到全局发送器
-                        let sender = self.global_sender.lock().await;
-                        for s in sender.iter() {
-                            if let Err(e) = s.send(data.clone()).await {
-                                eprintln!("发送数据失败: {:?}", e);
-                            }
+        match self.port {
+            Some(ref mut port) => {
+                match port.read(&mut buffer) {
+                    Ok(bytes_read) => {
+                        //println!("接收到数据: {:?}", &buffer[..bytes_read]);
+                        //处理数据包
+                        let data = parse_data_packet(&buffer[..bytes_read]);
+                        match data {
+                            Ok(packet) => {
+                                //处理数据包内的状态信息
+                                let data = parse_status(&packet.status, self.serial_config_data.commands[self.index].records.as_slice());
+                                //println!("解析数据包: {:?}", data);
+                                //将数据发送到全局发送器
+                                let sender = self.global_sender.lock().await;
+                                for s in sender.iter() {
+                                    if let Err(e) = s.send(data.clone()).await {
+                                        eprintln!("发送数据失败: {:?}", e);
+                                    }
+                                }
+                            },
+                            Err(e) => eprintln!("解析数据包错误: {:?}", e),
                         }
                     },
-                    Err(e) => eprintln!("解析数据包错误: {:?}", e),
+                    Err(e) if e.kind() == ErrorKind::TimedOut => eprintln!("读取超时"), // 更新超时处理
+                    Err(e) => {
+                        eprintln!("读取错误: {:?}", e);
+                        self.reconnect().await; // 发生读取错误时，尝试重新连接
+                    }
                 }
             },
-            Err(e) if e.kind() == ErrorKind::TimedOut => eprintln!("读取超时"), // 更新超时处理
+            None => {
+                eprintln!("串口未打开");
+                self.reconnect().await; // 串口未打开时，尝试重新连接
+            }
+        }
+
+    }
+}
+
+// 根据指定的配置重试打开串口的方法
+// async fn open_serial_port_with_retries(port_name: &str, baud_rate: u32, data_bits: DataBits, stop_bits: StopBits, parity: Parity) -> Box<dyn SerialPort> {
+//     loop {
+//         match new(port_name, baud_rate).data_bits(data_bits).stop_bits(stop_bits).parity(parity).timeout(Duration::from_millis(200)).open() {
+//             Ok(port) => return port,
+//             Err(e) => {
+//                 eprintln!("无法打开串口: {:?}", e);
+//                 //thread::sleep(Duration::from_millis(1000));  // 在重试前暂停一秒
+//                 sleep(Duration::from_millis(1000)).await;  // 使用异步sleep
+//             }
+//         }
+//     }
+// }
+
+async fn open_serial_port_with_retries(
+    port_name: &str,
+    baud_rate: u32,
+    data_bits: DataBits,
+    stop_bits: StopBits,
+    parity: Parity
+) -> Result<Box<dyn SerialPort>, serialport::Error> {
+    loop {
+        match serialport::new(port_name, baud_rate)
+            .data_bits(data_bits)
+            .stop_bits(stop_bits)
+            .parity(parity)
+            .timeout(Duration::from_secs(1))
+            .open() {
+            Ok(port) => return Ok(port), // 直接返回port，不需要再次包装
             Err(e) => {
-                eprintln!("读取错误: {:?}", e);
-                self.reconnect().await; // 发生读取错误时，尝试重新连接
+                eprintln!("打开串口失败: {:?}", e);
+                tokio::time::sleep(Duration::from_millis(1000)).await;
             }
         }
     }
 }
 
-// 根据指定的配置重试打开串口的方法
-async fn open_serial_port_with_retries(port_name: &str, baud_rate: u32, data_bits: DataBits, stop_bits: StopBits, parity: Parity) -> Box<dyn SerialPort> {
-    loop {
-        match new(port_name, baud_rate).data_bits(data_bits).stop_bits(stop_bits).parity(parity).timeout(Duration::from_millis(200)).open() {
-            Ok(port) => return port,
-            Err(e) => {
-                eprintln!("无法打开串口: {:?}", e);
-                //thread::sleep(Duration::from_millis(1000));  // 在重试前暂停一秒
-                sleep(Duration::from_millis(1000)).await;  // 使用异步sleep
-            }
-        }
-    }
-}
 
 // 启动串口通信线程的函数
 /// rx 用于接收命令
@@ -221,13 +478,14 @@ pub async fn start_serial_thread_1(
 
                            // let query = queries[query_index % queries.len()].clone(); // 循环使用查询命令
                             manager.send_command(q).await; // 发送查询命令
-                            manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
+
                         }
                     }
                 }
-
+                tokio::time::sleep(Duration::from_millis(30)).await;
                 // 异步接收数据
                 manager.receive_data().await; // 以异步方式接收数据
+                manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
 
                 // 使用异步sleep
                 tokio::time::sleep(Duration::from_millis(1)).await; // 暂停以避免过载
