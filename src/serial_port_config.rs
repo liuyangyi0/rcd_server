@@ -1,7 +1,4 @@
-use std::sync::mpsc;
-use std::thread;
 use serde::Deserialize;
-use crate::common::Command;
 use crate::csv_parser::DeviceConfiguration;
 
 

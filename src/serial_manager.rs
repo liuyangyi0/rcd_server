@@ -1,23 +1,21 @@
-use serialport::{SerialPort, new, DataBits, StopBits, Parity};
+use serialport::{SerialPort, DataBits, StopBits, Parity};
 use std::io::{ErrorKind, Write};  // 正确引入ErrorKind
 use std::{thread, time::Duration};
 use std::sync::mpsc::Receiver;
 use crate::csv_parser::{BitIndex, Record};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
 use crate::common::{Command, get_sum, Value};
 use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
-use tokio::time::{sleep};
 use crate::serial_port_config::SerialPortConfig;
 
 
 // 定义一个枚举来表示奇数和偶数
-enum NumberType {
-    Odd,
-    Even,
-}
+// pub enum NumberType {
+//     Odd,
+//     Even,
+// }
 
 
 
@@ -116,38 +114,38 @@ impl SerialManager {
         // eprintln!("串口重新连接成功");
     }
 
-    async fn open_port(&mut self) {
-        let result = open_serial_port_with_retries(
-            &self.serial_config.port_name,
-            self.serial_config.baud_rate,
-            self.serial_config.data_bits,
-            self.serial_config.stop_bits,
-            self.serial_config.parity
-        ).await;
+    // async fn open_port(&mut self) {
+    //     let result = open_serial_port_with_retries(
+    //         &self.serial_config.port_name,
+    //         self.serial_config.baud_rate,
+    //         self.serial_config.data_bits,
+    //         self.serial_config.stop_bits,
+    //         self.serial_config.parity
+    //     ).await;
+    //
+    //     println!("parity {}", self.serial_config.parity);
+    //
+    //     match result {
+    //         Ok(port) => {
+    //             self.port = Some(port);
+    //             println!("串口打开成功");
+    //         },
+    //         Err(e) => {
+    //             eprintln!("打开串口失败: {:?}", e);
+    //             self.port = None;
+    //         }
+    //     }
+    // }
 
-        println!("parity {}", self.serial_config.parity);
 
-        match result {
-            Ok(port) => {
-                self.port = Some(port);
-                println!("串口打开成功");
-            },
-            Err(e) => {
-                eprintln!("打开串口失败: {:?}", e);
-                self.port = None;
-            }
-        }
-    }
-
-
-    async fn close_port(&mut self) {
-        if self.port.is_some() {
-            println!("串口正在关闭...");
-            self.port = None;  // 将 port 设置为 None，强制调用 Drop trait
-        } else {
-            println!("串口已经是关闭状态");
-        }
-    }
+    // async fn close_port(&mut self) {
+    //     if self.port.is_some() {
+    //         println!("串口正在关闭...");
+    //         self.port = None;  // 将 port 设置为 None，强制调用 Drop trait
+    //     } else {
+    //         println!("串口已经是关闭状态");
+    //     }
+    // }
 
 
 
@@ -203,42 +201,42 @@ impl SerialManager {
         //tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    async fn try_set_parity(&mut self, parity: Parity) {
-        match self.port {
-            Some(ref mut port) => {
-                if let Err(e) = port.set_parity(parity) {
-                    eprintln!("设置错误: {:?}", e);
-                    self.reconnect().await; // 设置发生错误时，尝试重新连接
-                }
-            },
-            None => {
-                eprintln!("串口未打开");
-                self.reconnect().await; // 串口未打开时，尝试重新连接
-            }
-        }
-    }
+    // async fn try_set_parity(&mut self, parity: Parity) {
+    //     match self.port {
+    //         Some(ref mut port) => {
+    //             if let Err(e) = port.set_parity(parity) {
+    //                 eprintln!("设置错误: {:?}", e);
+    //                 self.reconnect().await; // 设置发生错误时，尝试重新连接
+    //             }
+    //         },
+    //         None => {
+    //             eprintln!("串口未打开");
+    //             self.reconnect().await; // 串口未打开时，尝试重新连接
+    //         }
+    //     }
+    // }
 
-    async fn set_parity_based_on_number_type(&mut self, parity: NumberType) {
-        match parity {
-            NumberType::Odd => self.try_set_parity(Parity::Odd).await,
-            NumberType::Even => self.try_set_parity(Parity::Even).await,
-        }
-    }
+    // async fn set_parity_based_on_number_type(&mut self, parity: NumberType) {
+    //     match parity {
+    //         NumberType::Odd => self.try_set_parity(Parity::Odd).await,
+    //         NumberType::Even => self.try_set_parity(Parity::Even).await,
+    //     }
+    // }
 
 
     //计算字节1个个数 是奇数还是偶数
-    fn count_bits(data: &[u8]) -> NumberType {
-        // Count the total number of '1' bits in all bytes
-        let total_bits: usize = data.iter()
-            .map(|&byte| byte.count_ones() as usize)
-            .sum();
-        // 根据总数的奇偶性返回枚举值
-        if total_bits % 2 == 0 {
-            NumberType::Even
-        } else {
-            NumberType::Odd
-        }
-    }
+    // fn count_bits(data: &[u8]) -> NumberType {
+    //     // Count the total number of '1' bits in all bytes
+    //     let total_bits: usize = data.iter()
+    //         .map(|&byte| byte.count_ones() as usize)
+    //         .sum();
+    //     // 根据总数的奇偶性返回枚举值
+    //     if total_bits % 2 == 0 {
+    //         NumberType::Even
+    //     } else {
+    //         NumberType::Odd
+    //     }
+    // }
 
     // 从串口接收数据的方法
     async fn receive_data(&mut self) {
@@ -282,20 +280,6 @@ impl SerialManager {
     }
 }
 
-// 根据指定的配置重试打开串口的方法
-// async fn open_serial_port_with_retries(port_name: &str, baud_rate: u32, data_bits: DataBits, stop_bits: StopBits, parity: Parity) -> Box<dyn SerialPort> {
-//     loop {
-//         match new(port_name, baud_rate).data_bits(data_bits).stop_bits(stop_bits).parity(parity).timeout(Duration::from_millis(200)).open() {
-//             Ok(port) => return port,
-//             Err(e) => {
-//                 eprintln!("无法打开串口: {:?}", e);
-//                 //thread::sleep(Duration::from_millis(1000));  // 在重试前暂停一秒
-//                 sleep(Duration::from_millis(1000)).await;  // 使用异步sleep
-//             }
-//         }
-//     }
-// }
-
 async fn open_serial_port_with_retries(
     port_name: &str,
     baud_rate: u32,
@@ -314,8 +298,8 @@ async fn open_serial_port_with_retries(
             Ok(port) => return Ok(port), // 直接返回port，不需要再次包装
             Err(e) => {
                 return Err(e); // 返回最后一次尝试的错误
-                eprintln!("打开串口失败: {:?}", e);
-                tokio::time::sleep(Duration::from_millis(1000)).await;
+                // eprintln!("打开串口失败: {:?}", e);
+                // tokio::time::sleep(Duration::from_millis(1000)).await;
             }
         }
     }
@@ -323,51 +307,6 @@ async fn open_serial_port_with_retries(
 
 
 // 启动串口通信线程的函数
-/// rx 用于接收命令
-/// device_states 用于存储设备状态
-/// serial_config 用于配置串口
-/// global_sender 用于存储全局发送器 用于给所有网络客户端发送数据
-/// queries 用于查询命令
-/// config 用于配置
-/// recs 所有点位配置
-// device_states: Arc<RwLock<HashMap<String, Value>>>,
-// pub async fn start_serial_thread(rx: Receiver<Command>,
-//                            global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>,
-//                            serial_config: SerialConfig, queries: Command, config: Config, recs : Vec<Record>) -> thread::JoinHandle<()> {
-    // let mut manager = SerialManager::new(serial_config, recs, global_sender.clone()).await;
-    //
-    // thread::spawn(move || {
-    //     let rt = Runtime::new().unwrap(); // 创建一个新的Tokio运行时
-    //     rt.block_on(async { // 在运行时中执行异步代码块
-    //         loop {
-    //             // 处理命令
-    //             while let Ok(cmd) = rx.try_recv() {
-    //                 manager.command_queue.lock().unwrap().push_back(cmd);
-    //             }
-    //
-    //             // 处理命令队列
-    //             {
-    //                 let mut queue = manager.command_queue.lock().unwrap();
-    //                 if let Some(cmd) = queue.pop_front() {
-    //                     drop(queue);
-    //                     manager.send_command(cmd).await; // 注意这里假设send_command也是异步的
-    //                 } else {
-    //                     drop(queue);
-    //                     manager.send_command(queries.clone()).await; // 发送查询命令也需要是异步的
-    //                 }
-    //             }
-    //
-    //             // 异步接收数据
-    //             manager.receive_data().await; // 以异步方式接收数据
-    //
-    //             //sleep(Duration::from_millis(10)).await; // 使用异步sleep
-    //             tokio::time::sleep(Duration::from_millis(1)).await; // 暂停以避免过载
-    //         }
-    //     })
-    // })
-// }
-
-
 pub async fn start_serial_thread_1(
     global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>,
     serial_config: SerialConfig,
@@ -481,12 +420,12 @@ fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
                     ((data[byte_index] >> bit) & 1) as u32
                 },
                 BitIndex::Range(range) => {
-                    let mut val = 0;
+                    //let mut val = 0;
                     let total_bits = (data.len() * 8) as u32; // 计算数组总共包含的位数，并将结果转换为u32
-                    let (start_bit, end_bit) = (*range.start(), *range.end());
-                    let start_bit_absolute = byte_index * 8 + (start_bit as usize); // 计算绝对的起始位位置
-                    //计算绝对结束位位置
-                    let end_bit_absolute = byte_index * 8 + (end_bit as usize);
+                    //let (start_bit, end_bit) = (*range.start(), *range.end());
+                    // let start_bit_absolute = byte_index * 8 + (start_bit as usize); // 计算绝对的起始位位置
+                    // //计算绝对结束位位置
+                    // let end_bit_absolute = byte_index * 8 + (end_bit as usize);
 
                     let start_bit = *range.start();
                     let end_bit = *range.end();
@@ -498,20 +437,6 @@ fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
                     if start_bit > end_bit  || end_bit >= total_bits {
                         panic!("Invalid bit range or start byte"); // 如果范围无效或开始字节不正确，则抛出错误
                     }
-                    let bits_to_extract = start_bit_absolute as u32..=end_bit_absolute as u32;
-                    // for bit_pos in bits_to_extract {
-                    //     val <<= 1;
-                    //     let mut byte_index1 = 0;
-                    //     if record.lh == 1{
-                    //         byte_index1 = bit_pos / 8;
-                    //     }else {
-                    //         byte_index1 = data.len() as u32 - 1 - bit_pos / 8;
-                    //     }
-                    //
-                    //     val |= ((data[byte_index1 as usize] >> (7 - bit_pos % 8)) & 1) as u32;
-                    // }
-
-
                     let mut combined_data = 0u32;
                     for i in start_byte_index..=end_byte_index{
                         let byte = data[i as usize] as u32;
@@ -527,8 +452,7 @@ fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
                     let num_bits = end_bit - start_bit + 1;
                     let mask = (1u32 << num_bits) - 1;
                     let result = (combined_data >> bit_offset) & mask;
-                    val = result;
-                    val
+                    result
                 },
             };
 

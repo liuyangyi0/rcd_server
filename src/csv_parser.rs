@@ -85,14 +85,14 @@ pub struct DeviceConfiguration {
 }
 
 //DeviceConfiguration new
-impl DeviceConfiguration {
-    pub fn new(config: Config, records: Vec<Record>) -> Self {
-        DeviceConfiguration {
-            config,
-            records,
-        }
-    }
-}
+// impl DeviceConfiguration {
+//     pub fn new(config: Config, records: Vec<Record>) -> Self {
+//         DeviceConfiguration {
+//             config,
+//             records,
+//         }
+//     }
+// }
 
 // 自定义反序列化函数
 fn deserialize_bit_index<'de, D>(deserializer: D) -> Result<BitIndex, D::Error>
@@ -108,6 +108,7 @@ fn deserialize_bit_index<'de, D>(deserializer: D) -> Result<BitIndex, D::Error>
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub com: String,
+    pub com_index: u8,
     pub device_id: u8,
     pub data_len: u8,
     pub pre: String,
@@ -122,7 +123,7 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
         .from_reader(file);
 
     let mut headers = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..5 {
         if let Some(result) = rdr.records().next() {
             let record = result?;
             headers.push(record.get(1).unwrap_or_default().to_string());
@@ -131,9 +132,10 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
 
     let config = Config {
         com: headers.get(0).cloned().unwrap_or_default(),
-        device_id: headers.get(1).cloned().unwrap_or_default().parse().unwrap_or(0),
-        data_len: headers.get(2).cloned().unwrap_or_default().parse().unwrap_or(0),
-        pre: headers.get(3).cloned().unwrap_or_default(),
+        com_index: headers.get(1).cloned().unwrap_or_default().parse().unwrap_or(0),
+        device_id: headers.get(2).cloned().unwrap_or_default().parse().unwrap_or(0),
+        data_len: headers.get(3).cloned().unwrap_or_default().parse().unwrap_or(0),
+        pre: headers.get(4).cloned().unwrap_or_default(),
     };
 
 
@@ -150,15 +152,15 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
 }
 
 //解析多个csv文件
-pub fn parse_csv_files<P: AsRef<Path>>(file_paths: Vec<P>) -> Result<Vec<DeviceConfiguration>, Box<dyn Error>> {
-    let mut configs = Vec::new();
-
-    for file_path in file_paths {
-        let (config, records) = parse_csv(file_path)?;
-        configs.push(DeviceConfiguration {
-            config,
-            records,
-        });
-    }
-    Ok(configs)
-}
+// pub fn parse_csv_files<P: AsRef<Path>>(file_paths: Vec<P>) -> Result<Vec<DeviceConfiguration>, Box<dyn Error>> {
+//     let mut configs = Vec::new();
+//
+//     for file_path in file_paths {
+//         let (config, records) = parse_csv(file_path)?;
+//         configs.push(DeviceConfiguration {
+//             config,
+//             records,
+//         });
+//     }
+//     Ok(configs)
+// }
