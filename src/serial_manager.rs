@@ -113,7 +113,7 @@ impl SerialManager {
                 self.port = None;
             }
         }
-        eprintln!("串口重新连接成功");
+        // eprintln!("串口重新连接成功");
     }
 
     async fn open_port(&mut self) {
@@ -161,28 +161,6 @@ impl SerialManager {
         //移除第一个元素
         command.command.remove(0);
 
-        // let parity = SerialManager::count_bits(&selected_data);
-        //
-        // match self.port {
-        //     Some(ref mut port)=>{
-        //         match parity{
-        //             NumberType::Odd => {
-        //                     //self.serial_config.parity = Parity::Odd;
-        //                 println!("二进制1的个数 是奇数 设置偶校验");
-        //                 port.set_parity(Parity::Even).expect("TODO: panic message");
-        //                 }
-        //             ,
-        //             NumberType::Even => {
-        //                 //self.serial_config.parity = Parity::Even;
-        //                 println!("二进制1的个数 是偶数 设置奇校验");
-        //                 port.set_parity(Parity::Odd).expect("TODO: panic message");
-        //             },
-        //         }
-        //     },
-        //     _ => {}
-        // }
-
-
         match self.port{
             Some(ref mut port) => {
                 port.set_parity(Parity::Mark).expect("TODO: panic message");
@@ -205,55 +183,6 @@ impl SerialManager {
         }
 
         tokio::time::sleep(Duration::from_millis(2)).await;
-        // match self.port {
-        //     Some(ref mut port)=>{
-        //         port.set_parity(Parity::None).expect("TODO: panic message");
-        //     },
-        //     _ => {}
-        // }
-
-
-
-        // match self.port{
-        //     Some(ref mut port) => {
-        //         //循环发送command.command
-        //         for c in command.command.iter(){
-        //             //判断是奇数还是偶数
-        //             let parity = SerialManager::count_bits(&[*c]);
-        //             match parity {
-        //                 NumberType::Odd => {
-        //                     //设置奇校验
-        //                     if let Err(e) = port.set_parity(Parity::Odd) {
-        //                         eprintln!("设置错误: {:?}", e);
-        //                         //self.reconnect().await; // 设置发生错误时，尝试重新连接
-        //                     }
-        //                 },
-        //                 NumberType::Even => {
-        //                     //设置偶校验
-        //                     if let Err(e) = port.set_parity(Parity::Even) {
-        //                         eprintln!("设置错误: {:?}", e);
-        //                         //self.reconnect().await; // 设置发生错误时，尝试重新连接
-        //                     }
-        //                 },
-        //             }
-        //             if let Err(e) = port.write(&[*c]) {
-        //                 eprintln!("写入错误: {:?}", e);
-        //                 //self.reconnect().await; // 发生写入错误时，尝试重新连接
-        //             }
-        //             if let Err(e) = port.flush() {
-        //                 eprintln!("flush错误: {:?}", e);
-        //                 //self.reconnect().await; // 发生写入错误时，尝试重新连接
-        //             }
-        //             tokio::time::sleep(Duration::from_nanos(100000)).await;
-        //         }
-        //     },
-        //     None => {
-        //         eprintln!("串口未打开");
-        //         self.reconnect().await; // 串口未打开时，尝试重新连接
-        //     }
-        // }
-
-
 
         match self.port{
             Some(ref mut port) => {
@@ -375,6 +304,7 @@ async fn open_serial_port_with_retries(
     parity: Parity
 ) -> Result<Box<dyn SerialPort>, serialport::Error> {
     loop {
+        tokio::time::sleep(Duration::from_millis(1000)).await;
         match serialport::new(port_name, baud_rate)
             .data_bits(data_bits)
             .stop_bits(stop_bits)
@@ -383,6 +313,7 @@ async fn open_serial_port_with_retries(
             .open() {
             Ok(port) => return Ok(port), // 直接返回port，不需要再次包装
             Err(e) => {
+                return Err(e); // 返回最后一次尝试的错误
                 eprintln!("打开串口失败: {:?}", e);
                 tokio::time::sleep(Duration::from_millis(1000)).await;
             }
@@ -610,7 +541,7 @@ fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
                 },
                 _ => continue,
             };
-
+            println!("{:?}", value.clone());
             results.insert(record.kks.clone(), value);
         }
     }
