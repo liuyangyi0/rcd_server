@@ -420,12 +420,8 @@ fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
                     ((data[byte_index] >> bit) & 1) as u32
                 },
                 BitIndex::Range(range) => {
-                    //let mut val = 0;
+
                     let total_bits = (data.len() * 8) as u32; // 计算数组总共包含的位数，并将结果转换为u32
-                    //let (start_bit, end_bit) = (*range.start(), *range.end());
-                    // let start_bit_absolute = byte_index * 8 + (start_bit as usize); // 计算绝对的起始位位置
-                    // //计算绝对结束位位置
-                    // let end_bit_absolute = byte_index * 8 + (end_bit as usize);
 
                     let start_bit = *range.start();
                     let end_bit = *range.end();
