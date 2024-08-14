@@ -81,6 +81,10 @@ pub struct Record {
 #[derive(Debug, Deserialize, Clone)]
 pub struct DeviceConfiguration {
     pub config: Config,
+    //超时次数
+    pub timeout: u32,
+    //当前轮询次数
+    pub current_round: u32,
     pub records: Vec<Record>, // 使用 Vec 来存储多个 Record 实例
 }
 

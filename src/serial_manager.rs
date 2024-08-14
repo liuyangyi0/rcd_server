@@ -245,7 +245,8 @@ impl SerialManager {
             Some(ref mut port) => {
                 match port.read(&mut buffer) {
                     Ok(bytes_read) => {
-                        //println!("接收到数据: {:?}", &buffer[..bytes_read]);
+                        println!("接收到数据: {:?}", &buffer[..bytes_read]);
+                        self.serial_config_data.commands[self.index].timeout = 0;
                         //处理数据包
                         let data = parse_data_packet(&buffer[..bytes_read]);
                         match data {
@@ -264,7 +265,10 @@ impl SerialManager {
                             Err(e) => eprintln!("解析数据包错误: {:?}", e),
                         }
                     },
-                    Err(e) if e.kind() == ErrorKind::TimedOut => eprintln!("读取超时"), // 更新超时处理
+                    Err(e) if e.kind() == ErrorKind::TimedOut => {
+                        self.serial_config_data.commands[self.index].timeout += 1;
+                        eprintln!("读取超时"); // 更新超时处理
+                    }
                     Err(e) => {
                         eprintln!("读取错误: {:?}", e);
                         self.reconnect().await; // 发生读取错误时，尝试重新连接
@@ -293,7 +297,7 @@ async fn open_serial_port_with_retries(
             .data_bits(data_bits)
             .stop_bits(stop_bits)
             .parity(parity)
-            .timeout(Duration::from_secs(1))
+            .timeout(Duration::from_millis(50))
             .open() {
             Ok(port) => return Ok(port), // 直接返回port，不需要再次包装
             Err(e) => {
@@ -333,7 +337,23 @@ pub async fn start_serial_thread_1(
                         manager.send_command(cmd).await; // 发送命令
                     } else {
                         drop(queue);
+
+                        //如果超时次数大于等于3，且当前轮询次数大于10，则切换到下一个设备
                         if !manager.serial_config_data.commands.is_empty() {
+                            if manager.serial_config_data.commands[manager.index].timeout > 3 {
+                                if manager.serial_config_data.commands[manager.index].current_round > 10 {
+                                    manager.serial_config_data.commands[manager.index].current_round = 0;
+                                }else {
+                                    manager.serial_config_data.commands[manager.index].current_round += 1;
+                                    //打印当前轮询次数
+                                    println!("当前轮询次数:{}", manager.serial_config_data.commands[manager.index].current_round);
+                                    manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
+                                    tokio::time::sleep(Duration::from_millis(200)).await; // 暂停以避免过载
+                                    continue;
+                                }
+                            }
+
+
                             let dev_config = &manager.serial_config_data.commands[manager.index];
                             let mut c = vec![
                                 dev_config.config.device_id.clone(),
@@ -461,7 +481,7 @@ fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
                 },
                 _ => continue,
             };
-            println!("{:?}", value.clone());
+            // println!("{:?}", value.clone());
             results.insert(record.kks.clone(), value);
         }
     }
