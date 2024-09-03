@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+
+// 定义枚举类型 RunLocation，表示程序是主还是备用
 #[derive(Deserialize, Debug, Clone)]
 pub enum RunLocation {
     #[serde(rename = "primary")]
@@ -8,6 +10,7 @@ pub enum RunLocation {
     Secondary,
 }
 
+// 定义结构体 Server，包含主备用服务器的IP地址和程序运行位置
 #[derive(Deserialize, Debug, Clone)]
 pub struct Server {
     pub primary_ip: String,

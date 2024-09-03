@@ -10,6 +10,7 @@ use tokio::runtime::Runtime;
 use crate::common::{Command, get_sum, Value};
 use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
 use crate::config;
+use crate::config::RunLocation;
 use crate::serial_port_config::SerialPortConfig;
 use crate::tcp_server::DeviceStatus;
 // 定义一个枚举来表示奇数和偶数
@@ -66,6 +67,7 @@ struct SerialManager {
     serial_config_data:SerialPortConfig, //串口配置数据
     global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>, // 全局发送器
     index: usize,
+    run_on: RunLocation // 程序运行是主还是备用
 }
 
 impl SerialManager {
@@ -73,7 +75,8 @@ impl SerialManager {
     pub async fn new(
         serial_config: SerialConfig,
         serial_config_data: SerialPortConfig,
-        global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>
+        global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
+        run_on: RunLocation,
     ) -> Self {
         let port = match open_serial_port_with_retries(
             &serial_config.port_name,
@@ -96,6 +99,7 @@ impl SerialManager {
             serial_config_data,
             global_sender,
             index: 0,
+            run_on,
         }
     }
 
@@ -185,7 +189,7 @@ impl SerialManager {
             Some(ref mut port) => {
                 match port.read(&mut buffer) {
                     Ok(bytes_read) => {
-                        //println!("接收到数据: {:?}", &buffer[..bytes_read]);
+
                         self.serial_config_data.commands[self.index].timeout = 0;
                         //处理数据包
                         let data = parse_data_packet(&buffer[..bytes_read]);
@@ -390,7 +394,7 @@ pub async fn start_serial_thread_1(
     rx: Receiver<Command>,
     software_config: config::Config
 ) -> thread::JoinHandle<()> {
-    let mut manager = SerialManager::new(serial_config, serial_config_data, global_sender.clone()).await;
+    let mut manager = SerialManager::new(serial_config, serial_config_data, global_sender.clone(),software_config.server.run_on).await;
 
     thread::spawn(move || {
         let rt = Runtime::new().unwrap(); // 创建一个新的Tokio运行时
