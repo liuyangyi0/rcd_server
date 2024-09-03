@@ -2,7 +2,7 @@ use serde::Deserialize;
 
 
 // 定义枚举类型 RunLocation，表示程序是主还是备用
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone,PartialEq)]
 pub enum RunLocation {
     #[serde(rename = "primary")]
     Primary,

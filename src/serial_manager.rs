@@ -241,6 +241,20 @@ impl SerialManager {
                                 eprintln!("发送数据失败: {:?}", e);
                             }
                         }
+
+                        //这里如果cmmads内的所有设备都超时，且是secondary,那么该被动切换为primary
+                        if self.run_on == RunLocation::Secondary {
+                            let mut all_timeout = true;
+                            for dev in self.serial_config_data.commands.iter(){
+                                if dev.timeout < 3{
+                                    all_timeout = false;
+                                    break;
+                                }
+                            }
+                            if all_timeout {
+                                self.run_on = RunLocation::Primary;
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("读取错误: {:?}", e);
@@ -400,53 +414,60 @@ pub async fn start_serial_thread_1(
         let rt = Runtime::new().unwrap(); // 创建一个新的Tokio运行时
         rt.block_on(async { // 在运行时中执行异步代码块
             loop {
-                // 处理命令rx.try_recv()
-                while let Ok(cmd) = rx.try_recv() {
-                    manager.command_queue.lock().unwrap().push_back(cmd);
-                }
+                //如果程序是Primary，则执行 发送命令  如果是Secondary，则不执行
+                match manager.run_on {
+                    RunLocation::Primary => {
+                        // 处理命令rx.try_recv()
+                        while let Ok(cmd) = rx.try_recv() {
+                            manager.command_queue.lock().unwrap().push_back(cmd);
+                        }
 
-                // 处理命令队列
-                {
-                    let mut queue = manager.command_queue.lock().unwrap();
-                    if let Some(cmd) = queue.pop_front() {
-                        drop(queue);
-                        manager.send_command(cmd).await; // 发送命令
-                    } else {
-                        drop(queue);
+                        // 处理命令队列
+                        {
+                            let mut queue = manager.command_queue.lock().unwrap();
+                            if let Some(cmd) = queue.pop_front() {
+                                drop(queue);
+                                manager.send_command(cmd).await; // 发送命令
+                            } else {
+                                drop(queue);
 
-                        //如果超时次数大于等于3，且当前轮询次数大于10，则切换到下一个设备
-                        if !manager.serial_config_data.commands.is_empty() {
-                            if manager.serial_config_data.commands[manager.index].timeout > 3 {
-                                if manager.serial_config_data.commands[manager.index].current_round > 10 {
-                                    manager.serial_config_data.commands[manager.index].current_round = 0;
-                                }else {
-                                    manager.serial_config_data.commands[manager.index].current_round += 1;
-                                    //打印当前轮询次数
-                                    println!("当前轮询次数:{}", manager.serial_config_data.commands[manager.index].current_round);
-                                    manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
-                                    tokio::time::sleep(Duration::from_millis(200)).await; // 暂停以避免过载
-                                    continue;
+                                //如果超时次数大于等于3，且当前轮询次数大于10，则切换到下一个设备
+                                if !manager.serial_config_data.commands.is_empty() {
+                                    if manager.serial_config_data.commands[manager.index].timeout > 3 {
+                                        if manager.serial_config_data.commands[manager.index].current_round > 10 {
+                                            manager.serial_config_data.commands[manager.index].current_round = 0;
+                                        }else {
+                                            manager.serial_config_data.commands[manager.index].current_round += 1;
+                                            //打印当前轮询次数
+                                            //println!("当前轮询次数:{}", manager.serial_config_data.commands[manager.index].current_round);
+                                            manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
+                                            tokio::time::sleep(Duration::from_millis(200)).await; // 暂停以避免过载
+                                            continue;
+                                        }
+                                    }
+
+
+                                    let dev_config = &manager.serial_config_data.commands[manager.index];
+                                    let mut c = vec![
+                                        dev_config.config.device_id.clone(),
+                                        0x08,
+                                        0x02,
+                                        0x30,
+                                        0x10,
+                                        dev_config.config.data_len.clone(),
+                                    ];
+                                    c.push(get_sum(&c));
+                                    let q = Command {com: String::from(""), device_id: 1, command: c };
+
+                                    manager.send_command(q).await; // 发送查询命令
+
                                 }
                             }
-
-
-                            let dev_config = &manager.serial_config_data.commands[manager.index];
-                            let mut c = vec![
-                                dev_config.config.device_id.clone(),
-                                0x08,
-                                0x02,
-                                0x30,
-                                0x10,
-                                dev_config.config.data_len.clone(),
-                            ];
-                            c.push(get_sum(&c));
-                            let q = Command {com: String::from(""), device_id: 1, command: c };
-
-                            manager.send_command(q).await; // 发送查询命令
-
                         }
                     }
+                    RunLocation::Secondary => {}
                 }
+
                 tokio::time::sleep(Duration::from_millis(30)).await;
                 // 异步接收数据
                 manager.receive_data().await; // 以异步方式接收数据
