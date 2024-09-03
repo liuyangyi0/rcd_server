@@ -154,17 +154,3 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
     }
     Ok((config, records))
 }
-
-//解析多个csv文件
-// pub fn parse_csv_files<P: AsRef<Path>>(file_paths: Vec<P>) -> Result<Vec<DeviceConfiguration>, Box<dyn Error>> {
-//     let mut configs = Vec::new();
-//
-//     for file_path in file_paths {
-//         let (config, records) = parse_csv(file_path)?;
-//         configs.push(DeviceConfiguration {
-//             config,
-//             records,
-//         });
-//     }
-//     Ok(configs)
-// }

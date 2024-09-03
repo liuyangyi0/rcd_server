@@ -5,12 +5,13 @@ use std::sync::mpsc::Receiver;
 use crate::csv_parser::{BitIndex, Record};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use serde::Deserialize;
 use tokio::runtime::Runtime;
 use crate::common::{Command, get_sum, Value};
 use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
+use crate::config;
 use crate::serial_port_config::SerialPortConfig;
-
-
+use crate::tcp_server::DeviceStatus;
 // 定义一个枚举来表示奇数和偶数
 // pub enum NumberType {
 //     Odd,
@@ -29,6 +30,7 @@ pub struct SerialConfig {
 }
 
 //串口数据包
+#[derive(Debug, Deserialize, Clone)]
 struct DataPacket {
     #[allow(unused)]
     addr: u8,  // 地址
@@ -58,12 +60,11 @@ impl DataPacket {
 
 // 串口通信管理器结构体
 struct SerialManager {
-    // port: Box<dyn SerialPort>,             // 串口对象
     port: Option<Box<dyn SerialPort>>, // 使用Option来允许空值
     command_queue: Arc<Mutex<VecDeque<Command>>>,  // 线程安全的命令队列
     serial_config: SerialConfig,            // 串口配置
     serial_config_data:SerialPortConfig, //串口配置数据
-    global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>, // 全局发送器
+    global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>, // 全局发送器
     index: usize,
 }
 
@@ -72,7 +73,7 @@ impl SerialManager {
     pub async fn new(
         serial_config: SerialConfig,
         serial_config_data: SerialPortConfig,
-        global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>
+        global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>
     ) -> Self {
         let port = match open_serial_port_with_retries(
             &serial_config.port_name,
@@ -107,46 +108,23 @@ impl SerialManager {
                 println!("串口重新连接成功");
             },
             Err(e) => {
-                eprintln!("重新连接串口失败: {:?}", e);
+                eprintln!("{:?}:重新连接串口失败: {:?}", e, self.serial_config.port_name);
+                let v: Vec<u8> = vec![0; self.serial_config_data.commands[self.index].config.data_len as usize];
+
+                let data = parse_status(&v, self.serial_config_data.commands[self.index].records.as_slice());
+                //println!("解析数据包: {:?}", data);
+                //将数据发送到全局发送器
+                let sender = self.global_sender.lock().await;
+                for s in sender.iter() {
+                    if let Err(e) = s.send(DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: false,device_status: false, value: data.clone()}).await {
+                        eprintln!("发送数据失败: {:?}", e);
+                    }
+                }
                 self.port = None;
             }
         }
         // eprintln!("串口重新连接成功");
     }
-
-    // async fn open_port(&mut self) {
-    //     let result = open_serial_port_with_retries(
-    //         &self.serial_config.port_name,
-    //         self.serial_config.baud_rate,
-    //         self.serial_config.data_bits,
-    //         self.serial_config.stop_bits,
-    //         self.serial_config.parity
-    //     ).await;
-    //
-    //     println!("parity {}", self.serial_config.parity);
-    //
-    //     match result {
-    //         Ok(port) => {
-    //             self.port = Some(port);
-    //             println!("串口打开成功");
-    //         },
-    //         Err(e) => {
-    //             eprintln!("打开串口失败: {:?}", e);
-    //             self.port = None;
-    //         }
-    //     }
-    // }
-
-
-    // async fn close_port(&mut self) {
-    //     if self.port.is_some() {
-    //         println!("串口正在关闭...");
-    //         self.port = None;  // 将 port 设置为 None，强制调用 Drop trait
-    //     } else {
-    //         println!("串口已经是关闭状态");
-    //     }
-    // }
-
 
 
     // 发送命令到设备的方法
@@ -175,7 +153,8 @@ impl SerialManager {
                 }
             },
             None => {
-                eprintln!("串口未打开");
+                //打印未打开串口
+                eprintln!("{:}串口未打开",command.com);
                 self.reconnect().await; // 串口未打开时，尝试重新连接
             }
         }
@@ -191,52 +170,13 @@ impl SerialManager {
                 }
             },
             None => {
-                eprintln!("串口未打开");
+                eprintln!("{:}串口未打开",command.com);
                 self.reconnect().await; // 串口未打开时，尝试重新连接
             }
         }
 
-
-        //暂停一段时间
-        //tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // async fn try_set_parity(&mut self, parity: Parity) {
-    //     match self.port {
-    //         Some(ref mut port) => {
-    //             if let Err(e) = port.set_parity(parity) {
-    //                 eprintln!("设置错误: {:?}", e);
-    //                 self.reconnect().await; // 设置发生错误时，尝试重新连接
-    //             }
-    //         },
-    //         None => {
-    //             eprintln!("串口未打开");
-    //             self.reconnect().await; // 串口未打开时，尝试重新连接
-    //         }
-    //     }
-    // }
-
-    // async fn set_parity_based_on_number_type(&mut self, parity: NumberType) {
-    //     match parity {
-    //         NumberType::Odd => self.try_set_parity(Parity::Odd).await,
-    //         NumberType::Even => self.try_set_parity(Parity::Even).await,
-    //     }
-    // }
-
-
-    //计算字节1个个数 是奇数还是偶数
-    // fn count_bits(data: &[u8]) -> NumberType {
-    //     // Count the total number of '1' bits in all bytes
-    //     let total_bits: usize = data.iter()
-    //         .map(|&byte| byte.count_ones() as usize)
-    //         .sum();
-    //     // 根据总数的奇偶性返回枚举值
-    //     if total_bits % 2 == 0 {
-    //         NumberType::Even
-    //     } else {
-    //         NumberType::Odd
-    //     }
-    // }
 
     // 从串口接收数据的方法
     async fn receive_data(&mut self) {
@@ -245,10 +185,27 @@ impl SerialManager {
             Some(ref mut port) => {
                 match port.read(&mut buffer) {
                     Ok(bytes_read) => {
-                        println!("接收到数据: {:?}", &buffer[..bytes_read]);
+                        //println!("接收到数据: {:?}", &buffer[..bytes_read]);
                         self.serial_config_data.commands[self.index].timeout = 0;
                         //处理数据包
                         let data = parse_data_packet(&buffer[..bytes_read]);
+
+                        match data.clone() {
+                            Ok(d) => {
+                                //根据data.addr 寻找self.serial_config_data.commands 内的config 的device_id
+                                for (i,dev) in self.serial_config_data.commands.iter().enumerate(){
+                                    if dev.config.device_id == d.addr{
+                                        self.index = i;
+                                        break;
+                                    }
+                                }
+
+                            }
+                            Err(_) => {}
+                        }
+
+
+
                         match data {
                             Ok(packet) => {
                                 //处理数据包内的状态信息
@@ -257,7 +214,8 @@ impl SerialManager {
                                 //将数据发送到全局发送器
                                 let sender = self.global_sender.lock().await;
                                 for s in sender.iter() {
-                                    if let Err(e) = s.send(data.clone()).await {
+
+                                    if let Err(e) = s.send(DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: true, value: data.clone()}).await {
                                         eprintln!("发送数据失败: {:?}", e);
                                     }
                                 }
@@ -268,6 +226,17 @@ impl SerialManager {
                     Err(e) if e.kind() == ErrorKind::TimedOut => {
                         self.serial_config_data.commands[self.index].timeout += 1;
                         eprintln!("读取超时"); // 更新超时处理
+                        let v: Vec<u8> = vec![0; self.serial_config_data.commands[self.index].config.data_len as usize];
+
+                        let data = parse_status(&v, self.serial_config_data.commands[self.index].records.as_slice());
+                        //println!("解析数据包: {:?}", data);
+                        //将数据发送到全局发送器
+                        let sender = self.global_sender.lock().await;
+                        for s in sender.iter() {
+                            if let Err(e) = s.send(DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: false, value: data.clone()}).await {
+                                eprintln!("发送数据失败: {:?}", e);
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("读取错误: {:?}", e);
@@ -284,6 +253,7 @@ impl SerialManager {
     }
 }
 
+// 重新连接串口的函数
 async fn open_serial_port_with_retries(
     port_name: &str,
     baud_rate: u32,
@@ -308,82 +278,6 @@ async fn open_serial_port_with_retries(
         }
     }
 }
-
-
-// 启动串口通信线程的函数
-pub async fn start_serial_thread_1(
-    global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>,
-    serial_config: SerialConfig,
-    serial_config_data:SerialPortConfig,
-    rx: Receiver<Command>,
-) -> thread::JoinHandle<()> {
-    let mut manager = SerialManager::new(serial_config, serial_config_data, global_sender.clone()).await;
-
-    thread::spawn(move || {
-        let rt = Runtime::new().unwrap(); // 创建一个新的Tokio运行时
-        // let mut query_index = 0; // 添加一个索引来追踪当前应发送的查询命令
-        rt.block_on(async { // 在运行时中执行异步代码块
-            loop {
-                // 处理命令rx.try_recv()
-                while let Ok(cmd) = rx.try_recv() {
-                    manager.command_queue.lock().unwrap().push_back(cmd);
-                }
-
-                // 处理命令队列
-                {
-                    let mut queue = manager.command_queue.lock().unwrap();
-                    if let Some(cmd) = queue.pop_front() {
-                        drop(queue);
-                        manager.send_command(cmd).await; // 发送命令
-                    } else {
-                        drop(queue);
-
-                        //如果超时次数大于等于3，且当前轮询次数大于10，则切换到下一个设备
-                        if !manager.serial_config_data.commands.is_empty() {
-                            if manager.serial_config_data.commands[manager.index].timeout > 3 {
-                                if manager.serial_config_data.commands[manager.index].current_round > 10 {
-                                    manager.serial_config_data.commands[manager.index].current_round = 0;
-                                }else {
-                                    manager.serial_config_data.commands[manager.index].current_round += 1;
-                                    //打印当前轮询次数
-                                    println!("当前轮询次数:{}", manager.serial_config_data.commands[manager.index].current_round);
-                                    manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
-                                    tokio::time::sleep(Duration::from_millis(200)).await; // 暂停以避免过载
-                                    continue;
-                                }
-                            }
-
-
-                            let dev_config = &manager.serial_config_data.commands[manager.index];
-                            let mut c = vec![
-                                dev_config.config.device_id.clone(),
-                                0x08,
-                                0x02,
-                                0x30,
-                                0x10,
-                                dev_config.config.data_len.clone(),
-                            ];
-                            c.push(get_sum(&c));
-                            let q = Command {com: String::from(""), device_id: 1, command: c };
-
-                           // let query = queries[query_index % queries.len()].clone(); // 循环使用查询命令
-                            manager.send_command(q).await; // 发送查询命令
-
-                        }
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(30)).await;
-                // 异步接收数据
-                manager.receive_data().await; // 以异步方式接收数据
-                manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
-
-                // 使用异步sleep
-                tokio::time::sleep(Duration::from_millis(1)).await; // 暂停以避免过载
-            }
-        })
-    })
-}
-
 
 //累加和校验 超出255会自动回到0
 fn verify_checksum(data: &[u8]) -> bool {
@@ -417,7 +311,7 @@ fn parse_data_packet(data: &[u8]) -> Result<DataPacket, &'static str> {
     let len = data[2] as usize;  // Len字段值，16进制转十进制
 
     // 验证从Len字段之后到数据包结尾前（不包括CRC）的字节数是否为Ln+1
-    if (len + 2) != (data.len() - 3) {  // 总长度减去Addr, CMD, Len，再加上1
+    if (len + 2) != (data.len() - 3) {  // 总长度减去Addr, CMD, Len
         return Err("Data packet length mismatch");
     }
 
@@ -488,3 +382,75 @@ fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
     results
 }
 
+// 启动串口通信线程的函数
+pub async fn start_serial_thread_1(
+    global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
+    serial_config: SerialConfig,
+    serial_config_data:SerialPortConfig,
+    rx: Receiver<Command>,
+    software_config: config::Config
+) -> thread::JoinHandle<()> {
+    let mut manager = SerialManager::new(serial_config, serial_config_data, global_sender.clone()).await;
+
+    thread::spawn(move || {
+        let rt = Runtime::new().unwrap(); // 创建一个新的Tokio运行时
+        rt.block_on(async { // 在运行时中执行异步代码块
+            loop {
+                // 处理命令rx.try_recv()
+                while let Ok(cmd) = rx.try_recv() {
+                    manager.command_queue.lock().unwrap().push_back(cmd);
+                }
+
+                // 处理命令队列
+                {
+                    let mut queue = manager.command_queue.lock().unwrap();
+                    if let Some(cmd) = queue.pop_front() {
+                        drop(queue);
+                        manager.send_command(cmd).await; // 发送命令
+                    } else {
+                        drop(queue);
+
+                        //如果超时次数大于等于3，且当前轮询次数大于10，则切换到下一个设备
+                        if !manager.serial_config_data.commands.is_empty() {
+                            if manager.serial_config_data.commands[manager.index].timeout > 3 {
+                                if manager.serial_config_data.commands[manager.index].current_round > 10 {
+                                    manager.serial_config_data.commands[manager.index].current_round = 0;
+                                }else {
+                                    manager.serial_config_data.commands[manager.index].current_round += 1;
+                                    //打印当前轮询次数
+                                    println!("当前轮询次数:{}", manager.serial_config_data.commands[manager.index].current_round);
+                                    manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
+                                    tokio::time::sleep(Duration::from_millis(200)).await; // 暂停以避免过载
+                                    continue;
+                                }
+                            }
+
+
+                            let dev_config = &manager.serial_config_data.commands[manager.index];
+                            let mut c = vec![
+                                dev_config.config.device_id.clone(),
+                                0x08,
+                                0x02,
+                                0x30,
+                                0x10,
+                                dev_config.config.data_len.clone(),
+                            ];
+                            c.push(get_sum(&c));
+                            let q = Command {com: String::from(""), device_id: 1, command: c };
+
+                            manager.send_command(q).await; // 发送查询命令
+
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                // 异步接收数据
+                manager.receive_data().await; // 以异步方式接收数据
+                manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
+
+                // 使用异步sleep
+                tokio::time::sleep(Duration::from_millis(1)).await; // 暂停以避免过载
+            }
+        })
+    })
+}

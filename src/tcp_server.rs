@@ -14,7 +14,7 @@ use crate::serial_port_config::SerialPortConfig;
 
 
 #[derive(Serialize, Deserialize, Debug)]
-enum MessageType {
+pub enum MessageType {
     Command(Command),
     DeviceStatus(DeviceStatus),
 }
@@ -22,13 +22,15 @@ enum MessageType {
 
 
 #[derive(Serialize, Deserialize, Debug)]
-struct DeviceStatus {
-    id: u64,
-    value: HashMap<String, Value>,
+pub struct DeviceStatus {
+    pub id: u64,
+    pub com_status: bool,
+    pub device_status: bool,
+    pub value: HashMap<String, Value>,
 }
 
 pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>,
-                             global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>,
+                             global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
                              serial_ports:Vec<SerialPortConfig>,
                              txs: Vec<mpsc::Sender<Command>>,
 ) -> io::Result<()> {
@@ -90,9 +92,9 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
             data_to_send = rx.recv() => {
                 // 如果有数据待发送
                 if let Some(data) = data_to_send {
-                    println!("Preparing to send data: {:?}", data);
+                    println!("Preparing to send data: {:?}", data.device_status);
                     // 这里注释的部分是将数据发送到客户端的代码，需要解开注释以实际发送数据
-                    let message = MessageType::DeviceStatus(DeviceStatus { id: 1, value: data });
+                    let message = MessageType::DeviceStatus(data);
                     // 序列化消息。
                     let serialized = bincode::serialize(&message).expect("Failed to serialize message");
                     // 发送序列化后的消息。
@@ -112,7 +114,7 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
 
 pub async fn run_tcp_server_1(serial_ports:Vec<SerialPortConfig>,
                               txs: Vec<mpsc::Sender<Command>>,
-                              global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<HashMap<String, Value>>>>>>,) -> io::Result<()> {
+                              global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,) -> io::Result<()> {
     // 绑定一个TCP监听器到本地的8080端口
     let listener = TcpListener::bind("127.0.0.1:11002").await?;
 
