@@ -284,7 +284,7 @@ impl SerialManager {
                         }
 
                         //如果串口读取超时次数大于100次，且是primary,则切换到secondary
-                        if self.time_out_count > 100 && self.current_run == RunLocation::Secondary && self.run_on == RunLocation::Secondary {
+                        if self.time_out_count > 20 && self.current_run == RunLocation::Secondary && self.run_on == RunLocation::Secondary {
                             self.current_run = RunLocation::Primary;
                         }
 
