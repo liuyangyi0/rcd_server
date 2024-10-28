@@ -258,7 +258,7 @@ impl SerialManager {
 
                                 //如果解析失败次数大于100次，且是primary,则切换到secondary
                                 if self.parse_fail_count > 100 && self.current_run == RunLocation::Primary && self.run_on == RunLocation::Secondary {
-                                    self.run_on = RunLocation::Secondary;
+                                    self.current_run = RunLocation::Secondary;
                                 }
                                 eprintln!("解析数据包错误: {:?} 解析错误次数: {:?}", e,self.parse_fail_count)
                             },
