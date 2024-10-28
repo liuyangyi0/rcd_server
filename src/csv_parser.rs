@@ -86,6 +86,8 @@ pub struct DeviceConfiguration {
     //当前轮询次数
     pub current_round: u32,
     pub records: Vec<Record>, // 使用 Vec 来存储多个 Record 实例
+    //解析失败次数
+    pub parse_fail_count: u32,
 }
 
 //DeviceConfiguration new
