@@ -453,7 +453,7 @@ pub async fn start_serial_thread_1(
         rt.block_on(async { // 在运行时中执行异步代码块
             loop {
                 //如果程序是Primary，则执行 发送命令  如果是Secondary，则不执行
-                match manager.run_on {
+                match manager.current_run {
                     RunLocation::Primary => {
                         // 处理命令rx.try_recv()
                         while let Ok(cmd) = rx.try_recv() {
