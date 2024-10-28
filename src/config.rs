@@ -15,7 +15,9 @@ pub enum RunLocation {
 pub struct Server {
     pub primary_ip: String,
     pub secondary_ip: String,
-    pub run_on: RunLocation,
+    pub run_on: RunLocation, //程序是主还是备用
+    //程序当前是主还是备用
+    pub current_run: RunLocation,
 }
 
 #[derive(Deserialize, Debug, Clone)]

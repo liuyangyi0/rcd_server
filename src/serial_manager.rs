@@ -194,18 +194,20 @@ impl SerialManager {
                         //处理数据包
                         let data = parse_data_packet(&buffer[..bytes_read]);
 
-                        match data.clone() {
-                            Ok(d) => {
-                                //根据data.addr 寻找self.serial_config_data.commands 内的config 的device_id
-                                for (i,dev) in self.serial_config_data.commands.iter().enumerate(){
-                                    if dev.config.device_id == d.addr{
-                                        self.index = i;
-                                        break;
+
+                        if self.run_on == RunLocation::Secondary {
+                            match data.clone() {
+                                Ok(d) => {
+                                    //根据data.addr 寻找self.serial_config_data.commands 内的config 的device_id
+                                    for (i, dev) in self.serial_config_data.commands.iter().enumerate() {
+                                        if dev.config.device_id == d.addr {
+                                            self.index = i;
+                                            break;
+                                        }
                                     }
                                 }
-
+                                Err(_) => {}
                             }
-                            Err(_) => {}
                         }
 
 
@@ -224,7 +226,9 @@ impl SerialManager {
                                     }
                                 }
                             },
-                            Err(e) => eprintln!("解析数据包错误: {:?}", e),
+                            Err(e) => {
+                                eprintln!("解析数据包错误: {:?}", e)
+                            },
                         }
                     },
                     Err(e) if e.kind() == ErrorKind::TimedOut => {
@@ -285,7 +289,7 @@ async fn open_serial_port_with_retries(
             .data_bits(data_bits)
             .stop_bits(stop_bits)
             .parity(parity)
-            .timeout(Duration::from_millis(50))
+            .timeout(Duration::from_millis(100))
             .open() {
             Ok(port) => return Ok(port), // 直接返回port，不需要再次包装
             Err(e) => {
@@ -441,7 +445,7 @@ pub async fn start_serial_thread_1(
                                             //打印当前轮询次数
                                             //println!("当前轮询次数:{}", manager.serial_config_data.commands[manager.index].current_round);
                                             manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
-                                            tokio::time::sleep(Duration::from_millis(200)).await; // 暂停以避免过载
+                                            tokio::time::sleep(Duration::from_millis(10)).await; // 暂停以避免过载
                                             continue;
                                         }
                                     }
@@ -468,7 +472,7 @@ pub async fn start_serial_thread_1(
                     RunLocation::Secondary => {}
                 }
 
-                tokio::time::sleep(Duration::from_millis(30)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
                 // 异步接收数据
                 manager.receive_data().await; // 以异步方式接收数据
                 manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
