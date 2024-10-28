@@ -67,7 +67,11 @@ struct SerialManager {
     serial_config_data:SerialPortConfig, //串口配置数据
     global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>, // 全局发送器
     index: usize,
-    run_on: RunLocation // 程序运行是主还是备用
+    run_on: RunLocation, // 程序运行是主还是备用
+    //程序当前是主还是备用
+    current_run: RunLocation,
+    //整个串口读取超时次数
+    time_out_number: u32,
 }
 
 impl SerialManager {
@@ -77,6 +81,7 @@ impl SerialManager {
         serial_config_data: SerialPortConfig,
         global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
         run_on: RunLocation,
+        current_run: RunLocation
     ) -> Self {
         let port = match open_serial_port_with_retries(
             &serial_config.port_name,
@@ -100,6 +105,8 @@ impl SerialManager {
             global_sender,
             index: 0,
             run_on,
+            current_run,
+            time_out_number: 0,
         }
     }
 
@@ -191,15 +198,16 @@ impl SerialManager {
                     Ok(bytes_read) => {
                         println!("读取数据: {:?}", &buffer[..bytes_read]);
                         self.serial_config_data.commands[self.index].timeout = 0;
+                        self.time_out_number = 0;
                         //如果是secondary,则移除前7位的数据
-                        if self.run_on == RunLocation::Secondary {
+                        if self.current_run == RunLocation::Secondary {
                             buffer = buffer[7..].to_vec();
                         }
 
                         //处理数据包
                         let data = parse_data_packet(&buffer[..bytes_read]);
 
-                        if self.run_on == RunLocation::Secondary {
+                        if self.current_run == RunLocation::Secondary {
                             match data.clone() {
                                 Ok(d) => {
                                     //根据data.addr 寻找self.serial_config_data.commands 内的config 的device_id
@@ -221,6 +229,8 @@ impl SerialManager {
 
                         match data {
                             Ok(packet) => {
+                                //解析成功 次数清零
+                                self.serial_config_data.commands[self.index].parse_fail_count  = 0;
                                 //处理数据包内的状态信息
                                 let data = parse_status(&packet.status, self.serial_config_data.commands[self.index].records.as_slice());
                                 // println!("解析数据包: {:?}", data);
@@ -234,12 +244,23 @@ impl SerialManager {
                                 }
                             },
                             Err(e) => {
+                                //解析失败 次数加1
+                                self.serial_config_data.commands[self.index].parse_fail_count += 1;
+
+                                //如果解析失败次数大于100次，且是primary,则切换到secondary
+                                if self.serial_config_data.commands[self.index].parse_fail_count > 100 && self.current_run == RunLocation::Primary && self.run_on == RunLocation::Secondary {
+                                    self.run_on = RunLocation::Secondary;
+                                }
                                 eprintln!("解析数据包错误: {:?}", e)
                             },
                         }
                     },
                     Err(e) if e.kind() == ErrorKind::TimedOut => {
+                        //对应的设备超时次数加1
                         self.serial_config_data.commands[self.index].timeout += 1;
+                        //串口读取超时次数加1
+                        self.time_out_number += 1;
+
                         eprintln!("读取超时"); // 更新超时处理
                         let v: Vec<u8> = vec![0; self.serial_config_data.commands[self.index].config.data_len as usize];
 
@@ -253,19 +274,24 @@ impl SerialManager {
                             }
                         }
 
-                        //这里如果cmmads内的所有设备都超时，且是secondary,那么该被动切换为primary
-                        if self.run_on == RunLocation::Secondary {
-                            let mut all_timeout = true;
-                            for dev in self.serial_config_data.commands.iter(){
-                                if dev.timeout < 3{
-                                    all_timeout = false;
-                                    break;
-                                }
-                            }
-                            if all_timeout {
-                                self.run_on = RunLocation::Primary;
-                            }
+                        //如果串口读取超时次数大于100次，且是primary,则切换到secondary
+                        if self.time_out_number > 100 && self.current_run == RunLocation::Secondary && self.run_on == RunLocation::Secondary {
+                            self.run_on = RunLocation::Primary;
                         }
+
+                        //这里如果cmmads内的所有设备都超时，且是secondary,那么该被动切换为primary
+                        // if self.current_run == RunLocation::Secondary {
+                        //     let mut all_timeout = true;
+                        //     for dev in self.serial_config_data.commands.iter(){
+                        //         if dev.timeout < 3{
+                        //             all_timeout = false;
+                        //             break;
+                        //         }
+                        //     }
+                        //     if all_timeout {
+                        //         self.run_on = RunLocation::Primary;
+                        //     }
+                        // }
                     }
                     Err(e) => {
                         eprintln!("读取错误: {:?}", e);
@@ -419,7 +445,7 @@ pub async fn start_serial_thread_1(
     rx: Receiver<Command>,
     software_config: config::Config
 ) -> thread::JoinHandle<()> {
-    let mut manager = SerialManager::new(serial_config, serial_config_data, global_sender.clone(),software_config.server.run_on).await;
+    let mut manager = SerialManager::new(serial_config, serial_config_data, global_sender.clone(),software_config.server.run_on,software_config.server.current_run).await;
 
     thread::spawn(move || {
         let rt = Runtime::new().unwrap(); // 创建一个新的Tokio运行时

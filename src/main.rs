@@ -89,6 +89,7 @@ async fn init(global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceSta
                                 timeout:0,
                                 current_round:0,
                                 records: recs.clone(),
+                                parse_fail_count:0,
                             };
                             serial_port_config.commands.push(device_configuration);
                             found = true;
@@ -103,6 +104,7 @@ async fn init(global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceSta
                             timeout:0,
                             current_round:0,
                             records: recs.clone(),
+                            parse_fail_count:0,
                         };
                         new_config.commands.push(device_configuration);
                         serial_port_configs.push(new_config);
