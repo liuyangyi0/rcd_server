@@ -216,8 +216,6 @@ impl SerialManager {
                         if self.current_run == RunLocation::Secondary {
                             match data.clone() {
                                 Ok(d) => {
-                                    //解析成功 次数清零
-                                    self.parse_fail_count = 0;
 
                                     //根据data.addr 寻找self.serial_config_data.commands 内的config 的device_id
                                     for (i, dev) in self.serial_config_data.commands.iter().enumerate() {
@@ -240,6 +238,8 @@ impl SerialManager {
                             Ok(packet) => {
                                 //解析成功 次数清零
                                 self.serial_config_data.commands[self.index].parse_fail_count  = 0;
+                                //解析成功 次数清零
+                                self.parse_fail_count = 0;
                                 //处理数据包内的状态信息
                                 let data = parse_status(&packet.status, self.serial_config_data.commands[self.index].records.as_slice());
                                 // println!("解析数据包: {:?}", data);
