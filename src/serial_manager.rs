@@ -205,7 +205,9 @@ impl SerialManager {
                         //如果是secondary,则移除前7位的数据
                         if self.current_run == RunLocation::Secondary {
                             buffer = buffer[7..].to_vec();
-                            bytes_read -= 7;
+                            if bytes_read > 7 {
+                                bytes_read -= 7;
+                            }
                         }
 
                         //处理数据包
