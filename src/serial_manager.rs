@@ -194,7 +194,6 @@ impl SerialManager {
                         //处理数据包
                         let data = parse_data_packet(&buffer[..bytes_read]);
 
-
                         if self.run_on == RunLocation::Secondary {
                             match data.clone() {
                                 Ok(d) => {
@@ -206,7 +205,10 @@ impl SerialManager {
                                         }
                                     }
                                 }
-                                Err(_) => {}
+                                Err(_) => {
+                                    //解析失败的数据是
+                                    println!("解析失败的数据是: {:?}", buffer);
+                                }
                             }
                         }
 
