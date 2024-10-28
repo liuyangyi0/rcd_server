@@ -189,7 +189,7 @@ impl SerialManager {
             Some(ref mut port) => {
                 match port.read(&mut buffer) {
                     Ok(bytes_read) => {
-
+                        println!("读取数据: {:?}", &buffer[..bytes_read]);
                         self.serial_config_data.commands[self.index].timeout = 0;
                         //处理数据包
                         let data = parse_data_packet(&buffer[..bytes_read]);
@@ -218,7 +218,7 @@ impl SerialManager {
                             Ok(packet) => {
                                 //处理数据包内的状态信息
                                 let data = parse_status(&packet.status, self.serial_config_data.commands[self.index].records.as_slice());
-                                //println!("解析数据包: {:?}", data);
+                                // println!("解析数据包: {:?}", data);
                                 //将数据发送到全局发送器
                                 let sender = self.global_sender.lock().await;
                                 for s in sender.iter() {
@@ -291,7 +291,7 @@ async fn open_serial_port_with_retries(
             .data_bits(data_bits)
             .stop_bits(stop_bits)
             .parity(parity)
-            .timeout(Duration::from_millis(100))
+            .timeout(Duration::from_millis(300))
             .open() {
             Ok(port) => return Ok(port), // 直接返回port，不需要再次包装
             Err(e) => {
