@@ -71,7 +71,9 @@ struct SerialManager {
     //程序当前是主还是备用
     current_run: RunLocation,
     //整个串口读取超时次数
-    time_out_number: u32,
+    time_out_count: u32,
+    //串口解析失败次数
+    parse_fail_count: u32,
 }
 
 impl SerialManager {
@@ -106,7 +108,8 @@ impl SerialManager {
             index: 0,
             run_on,
             current_run,
-            time_out_number: 0,
+            time_out_count: 0,
+            parse_fail_count: 0,
         }
     }
 
@@ -198,7 +201,7 @@ impl SerialManager {
                     Ok(mut bytes_read) => {
                         println!("读取数据: {:?}", &buffer[..bytes_read]);
                         self.serial_config_data.commands[self.index].timeout = 0;
-                        self.time_out_number = 0;
+                        self.time_out_count = 0;
                         //如果是secondary,则移除前7位的数据
                         if self.current_run == RunLocation::Secondary {
                             buffer = buffer[7..].to_vec();
@@ -211,6 +214,9 @@ impl SerialManager {
                         if self.current_run == RunLocation::Secondary {
                             match data.clone() {
                                 Ok(d) => {
+                                    //解析成功 次数清零
+                                    self.parse_fail_count = 0;
+
                                     //根据data.addr 寻找self.serial_config_data.commands 内的config 的device_id
                                     for (i, dev) in self.serial_config_data.commands.iter().enumerate() {
                                         if dev.config.device_id == d.addr {
@@ -247,12 +253,14 @@ impl SerialManager {
                             Err(e) => {
                                 //解析失败 次数加1
                                 self.serial_config_data.commands[self.index].parse_fail_count += 1;
+                                //串口解析失败次数加1
+                                self.parse_fail_count += 1;
 
                                 //如果解析失败次数大于100次，且是primary,则切换到secondary
-                                if self.serial_config_data.commands[self.index].parse_fail_count > 100 && self.current_run == RunLocation::Primary && self.run_on == RunLocation::Secondary {
+                                if self.parse_fail_count > 100 && self.current_run == RunLocation::Primary && self.run_on == RunLocation::Secondary {
                                     self.run_on = RunLocation::Secondary;
                                 }
-                                eprintln!("解析数据包错误: {:?}", e)
+                                eprintln!("解析数据包错误: {:?} 解析错误次数: {:?}", e,self.parse_fail_count)
                             },
                         }
                     },
@@ -260,9 +268,9 @@ impl SerialManager {
                         //对应的设备超时次数加1
                         self.serial_config_data.commands[self.index].timeout += 1;
                         //串口读取超时次数加1
-                        self.time_out_number += 1;
+                        self.time_out_count += 1;
 
-                        eprintln!("读取超时 超时次数{:}",self.time_out_number); // 更新超时处理
+                        eprintln!("读取超时 超时次数{:}",self.time_out_count); // 更新超时处理
                         let v: Vec<u8> = vec![0; self.serial_config_data.commands[self.index].config.data_len as usize];
 
                         let data = parse_status(&v, self.serial_config_data.commands[self.index].records.as_slice());
@@ -276,7 +284,7 @@ impl SerialManager {
                         }
 
                         //如果串口读取超时次数大于100次，且是primary,则切换到secondary
-                        if self.time_out_number > 100 && self.current_run == RunLocation::Secondary && self.run_on == RunLocation::Secondary {
+                        if self.time_out_count > 100 && self.current_run == RunLocation::Secondary && self.run_on == RunLocation::Secondary {
                             self.current_run = RunLocation::Primary;
                         }
 
