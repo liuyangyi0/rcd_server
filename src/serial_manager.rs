@@ -262,7 +262,7 @@ impl SerialManager {
                         //串口读取超时次数加1
                         self.time_out_number += 1;
 
-                        eprintln!("读取超时"); // 更新超时处理
+                        eprintln!("读取超时 超时次数{:}",self.time_out_number); // 更新超时处理
                         let v: Vec<u8> = vec![0; self.serial_config_data.commands[self.index].config.data_len as usize];
 
                         let data = parse_status(&v, self.serial_config_data.commands[self.index].records.as_slice());
@@ -277,7 +277,7 @@ impl SerialManager {
 
                         //如果串口读取超时次数大于100次，且是primary,则切换到secondary
                         if self.time_out_number > 100 && self.current_run == RunLocation::Secondary && self.run_on == RunLocation::Secondary {
-                            self.run_on = RunLocation::Primary;
+                            self.current_run = RunLocation::Primary;
                         }
 
                         //这里如果cmmads内的所有设备都超时，且是secondary,那么该被动切换为primary

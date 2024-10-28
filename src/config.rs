@@ -45,7 +45,8 @@ pub fn init_config() -> Result<Config, Box<dyn std::error::Error>> {
     let exe_path = std::env::current_exe()?;
     let exe_dir = exe_path.parent().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "无法获取可执行文件目录"))?;
     let config_path = exe_dir.join("config/config.toml"); // 指定到配置文件的正确路径
-
+    //打印路径
+    println!("config_path: {:?}", config_path);
     let config_str = std::fs::read_to_string(config_path)?;
     let config: Config = toml::from_str(&config_str)?;
 
