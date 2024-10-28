@@ -195,13 +195,14 @@ impl SerialManager {
         match self.port {
             Some(ref mut port) => {
                 match port.read(&mut buffer) {
-                    Ok(bytes_read) => {
+                    Ok(mut bytes_read) => {
                         println!("读取数据: {:?}", &buffer[..bytes_read]);
                         self.serial_config_data.commands[self.index].timeout = 0;
                         self.time_out_number = 0;
                         //如果是secondary,则移除前7位的数据
                         if self.current_run == RunLocation::Secondary {
                             buffer = buffer[7..].to_vec();
+                            bytes_read -= 7;
                         }
 
                         //处理数据包
