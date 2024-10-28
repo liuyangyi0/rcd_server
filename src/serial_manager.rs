@@ -191,6 +191,11 @@ impl SerialManager {
                     Ok(bytes_read) => {
                         println!("读取数据: {:?}", &buffer[..bytes_read]);
                         self.serial_config_data.commands[self.index].timeout = 0;
+                        //如果是secondary,则移除前7位的数据
+                        if self.run_on == RunLocation::Secondary {
+                            buffer = buffer[7..].to_vec();
+                        }
+
                         //处理数据包
                         let data = parse_data_packet(&buffer[..bytes_read]);
 
