@@ -9,19 +9,22 @@ use bytes::Bytes;
 use futures::SinkExt;
 use serde::{Deserialize, Serialize};
 use tracing::error;
-use crate::common::{Command, Value};
+use crate::common::{SendData, Value};
 use crate::serial_port_config::SerialPortConfig;
 
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum MessageType {
-    Command(Command),
+    Command(SendData),
     DeviceStatus(DeviceStatus),
 }
 
 
+pub enum CommandType {
+    SendData,
+}
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DeviceStatus {
     pub id: u64,
     pub com_status: bool,
@@ -32,7 +35,7 @@ pub struct DeviceStatus {
 pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>,
                              global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
                              serial_ports:Vec<SerialPortConfig>,
-                             txs: Vec<mpsc::Sender<Command>>,
+                             txs: Vec<mpsc::Sender<SendData>>,
 ) -> io::Result<()> {
     println!("handle_client");
     // 创建一个Tokio异步消息通道，缓冲区大小为32 tx_serial 用于向客户端发送数据，rx 用于接收其他任务发送的数据 串口数据从tx_serial发送到rx
@@ -113,10 +116,10 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
 }
 
 pub async fn run_tcp_server_1(serial_ports:Vec<SerialPortConfig>,
-                              txs: Vec<mpsc::Sender<Command>>,
+                              txs: Vec<mpsc::Sender<SendData>>,
                               global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,) -> io::Result<()> {
     // 绑定一个TCP监听器到本地的8080端口
-    let listener = TcpListener::bind("127.0.0.1:11002").await?;
+    let listener = TcpListener::bind("0.0.0.0:11002").await?;
 
     // 无限循环，用于不断接受连接请求
     loop {

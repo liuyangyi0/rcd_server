@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 // 定义设备状态结构体。
 #[derive(Serialize, Deserialize, Debug)]
-pub struct Command {
+pub struct SendData {
     pub com: String,
     pub device_id: u32,
     pub command: Vec<u8>,
@@ -11,14 +11,20 @@ pub struct Command {
 
 
 
-impl Clone for Command {
+impl Clone for SendData {
     fn clone(&self) -> Self {
-        Command {
+        SendData {
             com: self.com.clone(),
             device_id: self.device_id,
             command: self.command.clone(),
         }
     }
+}
+
+pub struct ChangeParsingScheme {
+    pub com: String,
+    pub device_id: u32,
+    pub command: Vec<u8>,
 }
 
 

@@ -1,5 +1,42 @@
 use serde::Deserialize;
 
+extern crate serialport;
+
+use serialport::DataBits;
+use serialport::StopBits;
+use serialport::Parity;
+
+
+// 为 DataBits 定义远程类型
+#[derive(Deserialize)]
+#[serde(remote = "DataBits")]
+pub enum DataBitsDef {
+    Five,
+    Six,
+    Seven,
+    Eight,
+}
+
+// 为 Parity 定义远程类型
+#[derive(Deserialize)]
+#[serde(remote = "Parity")]
+pub enum ParityDef {
+    None,
+    Odd,
+    Even,
+    Mark,
+    Space,
+}
+
+// 为 StopBits 定义远程类型
+#[derive(Deserialize)]
+#[serde(remote = "StopBits")]
+pub enum StopBitsDef {
+    One,
+    Two,
+}
+
+
 
 // 定义枚举类型 RunLocation，表示程序是主还是备用
 #[derive(Deserialize, Debug, Clone,PartialEq)]
@@ -23,15 +60,18 @@ pub struct Server {
 #[derive(Deserialize, Debug, Clone)]
 pub struct Serial {
     pub baud_rate: u32,
-    pub data_bits: u32,
-    pub parity: String,
-    pub stop_bits: u32,
+    #[serde(with = "DataBitsDef")]
+    pub data_bits: DataBits,
+    #[serde(with = "ParityDef")]
+    pub parity: Parity,
+    #[serde(with = "StopBitsDef")]
+    pub stop_bits: StopBits,
     pub flow_control: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Settings {
-    pub timeout: u32,
+    pub timeout: u64,
 }
 
 #[derive(Deserialize, Debug, Clone)]

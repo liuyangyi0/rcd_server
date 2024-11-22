@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use serde::Deserialize;
 use tokio::runtime::Runtime;
-use crate::common::{Command, get_sum, Value};
+use crate::common::{SendData, get_sum, Value};
 use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
 use crate::config;
 use crate::config::RunLocation;
@@ -62,7 +62,7 @@ impl DataPacket {
 // 串口通信管理器结构体
 struct SerialManager {
     port: Option<Box<dyn SerialPort>>, // 使用Option来允许空值
-    command_queue: Arc<Mutex<VecDeque<Command>>>,  // 线程安全的命令队列
+    command_queue: Arc<Mutex<VecDeque<SendData>>>,  // 线程安全的命令队列
     serial_config: SerialConfig,            // 串口配置
     serial_config_data:SerialPortConfig, //串口配置数据
     global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>, // 全局发送器
@@ -126,14 +126,7 @@ impl SerialManager {
                 let v: Vec<u8> = vec![0; self.serial_config_data.commands[self.index].config.data_len as usize];
 
                 let data = parse_status(&v, self.serial_config_data.commands[self.index].records.as_slice());
-                //println!("解析数据包: {:?}", data);
-                //将数据发送到全局发送器
-                let sender = self.global_sender.lock().await;
-                for s in sender.iter() {
-                    if let Err(e) = s.send(DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: false,device_status: false, value: data.clone()}).await {
-                        eprintln!("发送数据失败: {:?}", e);
-                    }
-                }
+                send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: false,device_status: false, value: data.clone()}).await;
                 self.port = None;
             }
         }
@@ -142,7 +135,7 @@ impl SerialManager {
 
 
     // 发送命令到设备的方法
-    async fn send_command(&mut self, mut command: Command) {
+    async fn send_command(&mut self, mut command: SendData) {
         if command.command.len() == 0 {
             return;
         }
@@ -154,7 +147,6 @@ impl SerialManager {
         match self.port{
             Some(ref mut port) => {
                 port.set_parity(Parity::Mark).expect("TODO: panic message");
-
 
                 if let Err(e) = port.write(&selected_data) {
                     eprintln!("写入错误: {:?}", e);
@@ -197,41 +189,61 @@ impl SerialManager {
         let mut buffer = vec![0; 1024];
         match self.port {
             Some(ref mut port) => {
+
+
                 match port.read(&mut buffer) {
                     Ok(mut bytes_read) => {
-                        println!("读取数据: {:?}", &buffer[..bytes_read]);
-                        self.serial_config_data.commands[self.index].timeout = 0;
+                        println!("读取数据: {:?} 数据长度{:?}", &buffer[..bytes_read], bytes_read);
+                        self.serial_config_data.commands[self.index].timeout_count = 0;
                         self.time_out_count = 0;
-                        //如果是secondary,则移除前7位的数据
+                        // //如果是secondary,则移除 00 之前的数据
                         if self.current_run == RunLocation::Secondary {
-                            buffer = buffer[7..].to_vec();
-                            if bytes_read > 7 {
-                                bytes_read -= 7;
+                            if let Some(index) = find_double_zero(&buffer[..bytes_read]) {
+                                // 提取 '00 00' 之前的数据
+                                let before_00_data = &buffer[..index];
+
+                                // 验证长度是否为7
+                                if before_00_data.len() == 7 {
+                                    // 验证累加和校验
+                                    if verify_checksum(before_00_data) {
+                                        // 取第一个字节
+                                        let first_byte = before_00_data[0];
+                                        //first_byte  16进制转10进制
+
+                                        // 对第一个字节进行处理，这里您可以根据需求添加相应的逻辑
+                                        println!("提取的第一个字节: {:?}", first_byte);
+
+                                        for (i, dev) in self.serial_config_data.commands.iter().enumerate() {
+                                            if dev.config.device_id == first_byte {
+                                                self.index = i;
+                                                break;
+                                            }
+                                        }
+
+                                        // TODO: 根据您的需求处理第一个字节
+                                    } else {
+                                        eprintln!("累加和校验失败");
+                                        return;
+                                    }
+                                } else {
+                                    eprintln!("数据长度错误，期望长度为7，实际长度为{}", before_00_data.len());
+                                    return;
+                                }
+
+
+                                buffer = buffer[index..].to_vec();  // 移除 '00 00' 之前的数据
+                                bytes_read = bytes_read - index;
+                                if bytes_read >= 4 {
+                                    let len = buffer[2] as usize + 5;
+                                    bytes_read = len;
+                                }
+
+                                print!("移除后的数据: {:?} 数据长度{:?}", &buffer[..bytes_read], bytes_read);
                             }
                         }
 
                         //处理数据包
                         let data = parse_data_packet(&buffer[..bytes_read]);
-
-                        if self.current_run == RunLocation::Secondary {
-                            match data.clone() {
-                                Ok(d) => {
-
-                                    //根据data.addr 寻找self.serial_config_data.commands 内的config 的device_id
-                                    for (i, dev) in self.serial_config_data.commands.iter().enumerate() {
-                                        if dev.config.device_id == d.addr {
-                                            self.index = i;
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(_) => {
-                                    //解析失败的数据是
-                                    println!("解析失败的数据是: {:?}", buffer);
-                                }
-                            }
-                        }
-
 
 
                         match data {
@@ -242,15 +254,7 @@ impl SerialManager {
                                 self.parse_fail_count = 0;
                                 //处理数据包内的状态信息
                                 let data = parse_status(&packet.status, self.serial_config_data.commands[self.index].records.as_slice());
-                                // println!("解析数据包: {:?}", data);
-                                //将数据发送到全局发送器
-                                let sender = self.global_sender.lock().await;
-                                for s in sender.iter() {
-
-                                    if let Err(e) = s.send(DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: true, value: data.clone()}).await {
-                                        eprintln!("发送数据失败: {:?}", e);
-                                    }
-                                }
+                                send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: true, value: data.clone()}).await;
                             },
                             Err(e) => {
                                 //解析失败 次数加1
@@ -262,13 +266,14 @@ impl SerialManager {
                                 if self.parse_fail_count > 100 && self.current_run == RunLocation::Primary && self.run_on == RunLocation::Secondary {
                                     self.current_run = RunLocation::Secondary;
                                 }
+
                                 eprintln!("解析数据包错误: {:?} 解析错误次数: {:?}", e,self.parse_fail_count)
                             },
                         }
                     },
                     Err(e) if e.kind() == ErrorKind::TimedOut => {
                         //对应的设备超时次数加1
-                        self.serial_config_data.commands[self.index].timeout += 1;
+                        self.serial_config_data.commands[self.index].timeout_count += 1;
                         //串口读取超时次数加1
                         self.time_out_count += 1;
 
@@ -276,33 +281,13 @@ impl SerialManager {
                         let v: Vec<u8> = vec![0; self.serial_config_data.commands[self.index].config.data_len as usize];
 
                         let data = parse_status(&v, self.serial_config_data.commands[self.index].records.as_slice());
-                        //println!("解析数据包: {:?}", data);
-                        //将数据发送到全局发送器
-                        let sender = self.global_sender.lock().await;
-                        for s in sender.iter() {
-                            if let Err(e) = s.send(DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: false, value: data.clone()}).await {
-                                eprintln!("发送数据失败: {:?}", e);
-                            }
-                        }
+
+                        send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: false, value: data.clone()}).await;
 
                         //如果串口读取超时次数大于100次，且是primary,则切换到secondary
                         if self.time_out_count > 20 && self.current_run == RunLocation::Secondary && self.run_on == RunLocation::Secondary {
                             self.current_run = RunLocation::Primary;
                         }
-
-                        //这里如果cmmads内的所有设备都超时，且是secondary,那么该被动切换为primary
-                        // if self.current_run == RunLocation::Secondary {
-                        //     let mut all_timeout = true;
-                        //     for dev in self.serial_config_data.commands.iter(){
-                        //         if dev.timeout < 3{
-                        //             all_timeout = false;
-                        //             break;
-                        //         }
-                        //     }
-                        //     if all_timeout {
-                        //         self.run_on = RunLocation::Primary;
-                        //     }
-                        // }
                     }
                     Err(e) => {
                         eprintln!("读取错误: {:?}", e);
@@ -362,10 +347,7 @@ fn verify_checksum(data: &[u8]) -> bool {
 
 //解析数据
 fn parse_data_packet(data: &[u8]) -> Result<DataPacket, &'static str> {
-    //累加和校验
-    if !verify_checksum(data) {
-        return Err("Checksum mismatch");
-    }
+
 
     // 验证数据包长度是否大于4
     if data.len() < 4 {
@@ -379,6 +361,11 @@ fn parse_data_packet(data: &[u8]) -> Result<DataPacket, &'static str> {
     // 验证从Len字段之后到数据包结尾前（不包括CRC）的字节数是否为Ln+1
     if (len + 2) != (data.len() - 3) {  // 总长度减去Addr, CMD, Len
         return Err("Data packet length mismatch");
+    }
+
+    //累加和校验
+    if !verify_checksum(data) {
+        return Err("Checksum mismatch");
     }
 
     let crc = data[data.len() - 1];
@@ -453,7 +440,7 @@ pub async fn start_serial_thread_1(
     global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
     serial_config: SerialConfig,
     serial_config_data:SerialPortConfig,
-    rx: Receiver<Command>,
+    rx: Receiver<SendData>,
     software_config: config::Config
 ) -> thread::JoinHandle<()> {
     let mut manager = SerialManager::new(serial_config, serial_config_data, global_sender.clone(),software_config.server.run_on,software_config.server.current_run).await;
@@ -481,7 +468,7 @@ pub async fn start_serial_thread_1(
 
                                 //如果超时次数大于等于3，且当前轮询次数大于10，则切换到下一个设备
                                 if !manager.serial_config_data.commands.is_empty() {
-                                    if manager.serial_config_data.commands[manager.index].timeout > 3 {
+                                    if manager.serial_config_data.commands[manager.index].timeout_count > 3 {
                                         if manager.serial_config_data.commands[manager.index].current_round > 10 {
                                             manager.serial_config_data.commands[manager.index].current_round = 0;
                                         }else {
@@ -505,7 +492,7 @@ pub async fn start_serial_thread_1(
                                         dev_config.config.data_len.clone(),
                                     ];
                                     c.push(get_sum(&c));
-                                    let q = Command {com: String::from(""), device_id: 1, command: c };
+                                    let q = SendData {com: String::from(""), device_id: 1, command: c };
 
                                     manager.send_command(q).await; // 发送查询命令
 
@@ -516,14 +503,42 @@ pub async fn start_serial_thread_1(
                     RunLocation::Secondary => {}
                 }
 
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                //tokio::time::sleep(Duration::from_millis(10)).await;
                 // 异步接收数据
                 manager.receive_data().await; // 以异步方式接收数据
                 manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
 
                 // 使用异步sleep
-                tokio::time::sleep(Duration::from_millis(1)).await; // 暂停以避免过载
+                //tokio::time::sleep(Duration::from_millis(1)).await; // 暂停以避免过载
             }
         })
     })
+}
+
+
+fn find_double_zero(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(2).position(|window| window == [0, 0])
+}
+
+
+
+// 发送数据到所有发送器
+pub async fn send_to_all_senders(
+    global_sender: &Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
+    data: DeviceStatus,
+) {
+    let mut sender = global_sender.lock().await;
+    let mut indices_to_remove = Vec::new();
+
+    for (i, s) in sender.iter().enumerate() {
+        if let Err(e) = s.send(data.clone()).await {
+            eprintln!("发送数据失败，移除发送器: {:?}", e);
+            indices_to_remove.push(i);
+        }
+    }
+
+    // 逆序移除发送器，防止索引混乱
+    for &i in indices_to_remove.iter().rev() {
+        sender.remove(i);
+    }
 }

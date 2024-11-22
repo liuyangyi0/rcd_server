@@ -10,6 +10,9 @@ pub struct SerialPortConfig {
     pub port_number: String,      // 串口号
     pub commands: Vec<DeviceConfiguration>,    // 设备配置
     //pub rx_channel: mpsc::Receiver<Command>,   // 发送数据到串口的通道
+    //串口通讯状态
+    pub status: bool,
+
 }
 
 
@@ -22,6 +25,7 @@ impl SerialPortConfig {
         SerialPortConfig {
             port_number,
             commands,
+            status: true,
             //rx_channel: rx,
         }
     }
@@ -30,6 +34,7 @@ impl SerialPortConfig {
         SerialPortConfig {
             port_number: self.port_number.clone(),
             commands: self.commands.clone(),
+            status: self.status,
         }
     }
 }
