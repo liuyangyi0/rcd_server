@@ -126,7 +126,10 @@ impl SerialManager {
                 let v: Vec<u8> = vec![0; self.serial_config_data.commands[self.index].config.data_len as usize];
 
                 let data = parse_status(&v, self.serial_config_data.commands[self.index].records.as_slice());
-                send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: false,device_status: false, value: data.clone()}).await;
+                if self.serial_config_data.commands[self.index].check_data(v.clone()){
+                    send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: false,device_status: false, value: data.clone()}).await;
+                }
+                //send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: false,device_status: false, value: data.clone()}).await;
                 self.port = None;
             }
         }
@@ -193,7 +196,7 @@ impl SerialManager {
 
                 match port.read(&mut buffer) {
                     Ok(mut bytes_read) => {
-                        println!("读取数据: {:?} 数据长度{:?}", &buffer[..bytes_read], bytes_read);
+                        //println!("读取数据: {:?} 数据长度{:?}", &buffer[..bytes_read], bytes_read);
                         self.serial_config_data.commands[self.index].timeout_count = 0;
                         self.time_out_count = 0;
                         // //如果是secondary,则移除 00 之前的数据
@@ -211,7 +214,7 @@ impl SerialManager {
                                         //first_byte  16进制转10进制
 
                                         // 对第一个字节进行处理，这里您可以根据需求添加相应的逻辑
-                                        println!("提取的第一个字节: {:?}", first_byte);
+                                        //println!("提取的第一个字节: {:?}", first_byte);
 
                                         for (i, dev) in self.serial_config_data.commands.iter().enumerate() {
                                             if dev.config.device_id == first_byte {
@@ -222,11 +225,11 @@ impl SerialManager {
 
                                         // TODO: 根据您的需求处理第一个字节
                                     } else {
-                                        eprintln!("累加和校验失败");
+                                        //eprintln!("累加和校验失败");
                                         return;
                                     }
                                 } else {
-                                    eprintln!("数据长度错误，期望长度为7，实际长度为{}", before_00_data.len());
+                                    //eprintln!("数据长度错误，期望长度为7，实际长度为{}", before_00_data.len());
                                     return;
                                 }
 
@@ -238,7 +241,7 @@ impl SerialManager {
                                     bytes_read = len;
                                 }
 
-                                print!("移除后的数据: {:?} 数据长度{:?}", &buffer[..bytes_read], bytes_read);
+                                //print!("移除后的数据: {:?} 数据长度{:?}", &buffer[..bytes_read], bytes_read);
                             }
                         }
 
@@ -254,7 +257,11 @@ impl SerialManager {
                                 self.parse_fail_count = 0;
                                 //处理数据包内的状态信息
                                 let data = parse_status(&packet.status, self.serial_config_data.commands[self.index].records.as_slice());
-                                send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: true, value: data.clone()}).await;
+                                if self.serial_config_data.commands[self.index].check_data(packet.status.clone()){
+                                    send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: true, value: data.clone()}).await;
+                                }
+
+                                //send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: true, value: data.clone()}).await;
                             },
                             Err(e) => {
                                 //解析失败 次数加1
@@ -267,7 +274,7 @@ impl SerialManager {
                                     self.current_run = RunLocation::Secondary;
                                 }
 
-                                eprintln!("解析数据包错误: {:?} 解析错误次数: {:?}", e,self.parse_fail_count)
+                                //eprintln!("解析数据包错误: {:?} 解析错误次数: {:?}", e,self.parse_fail_count)
                             },
                         }
                     },
@@ -277,12 +284,14 @@ impl SerialManager {
                         //串口读取超时次数加1
                         self.time_out_count += 1;
 
-                        eprintln!("读取超时 超时次数{:}",self.time_out_count); // 更新超时处理
+                        //eprintln!("读取超时 超时次数{:}",self.time_out_count); // 更新超时处理
                         let v: Vec<u8> = vec![0; self.serial_config_data.commands[self.index].config.data_len as usize];
-
                         let data = parse_status(&v, self.serial_config_data.commands[self.index].records.as_slice());
+                        if self.serial_config_data.commands[self.index].check_data(v.clone()){
+                            send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: false, value: data.clone()}).await;
+                        }
 
-                        send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: false, value: data.clone()}).await;
+                        //send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: false, value: data.clone()}).await;
 
                         //如果串口读取超时次数大于100次，且是primary,则切换到secondary
                         if self.time_out_count > 20 && self.current_run == RunLocation::Secondary && self.run_on == RunLocation::Secondary {
@@ -313,12 +322,12 @@ async fn open_serial_port_with_retries(
     parity: Parity
 ) -> Result<Box<dyn SerialPort>, serialport::Error> {
     loop {
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        tokio::time::sleep(Duration::from_millis(2000)).await;
         match serialport::new(port_name, baud_rate)
             .data_bits(data_bits)
             .stop_bits(stop_bits)
             .parity(parity)
-            .timeout(Duration::from_millis(300))
+            .timeout(Duration::from_millis(400))
             .open() {
             Ok(port) => return Ok(port), // 直接返回port，不需要再次包装
             Err(e) => {
@@ -500,10 +509,25 @@ pub async fn start_serial_thread_1(
                             }
                         }
                     }
-                    RunLocation::Secondary => {}
+                    RunLocation::Secondary => {
+                        while let Ok(cmd) = rx.try_recv() {
+                            manager.command_queue.lock().unwrap().push_back(cmd);
+                        }
+
+                        {
+                            let mut queue = manager.command_queue.lock().unwrap();
+                            if let Some(cmd) = queue.pop_front() {
+                                drop(queue);
+                                manager.send_command(cmd).await; // 发送命令
+                            } else {
+                                drop(queue);
+                            }
+                        }
+
+                    }
                 }
 
-                //tokio::time::sleep(Duration::from_millis(10)).await;
+                //tokio::time::sleep(Duration::from_millis(200)).await;
                 // 异步接收数据
                 manager.receive_data().await; // 以异步方式接收数据
                 manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出

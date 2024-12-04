@@ -5,9 +5,11 @@ use futures::stream::StreamExt;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use std::collections::HashMap;
 use std::io;
+use std::time::Duration;
 use bytes::Bytes;
 use futures::SinkExt;
 use serde::{Deserialize, Serialize};
+use tokio::time::timeout;
 use tracing::error;
 use crate::common::{SendData, Value};
 use crate::serial_port_config::SerialPortConfig;
@@ -95,16 +97,20 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
             data_to_send = rx.recv() => {
                 // 如果有数据待发送
                 if let Some(data) = data_to_send {
-                    println!("Preparing to send data: {:?}", data.device_status);
+                    println!("Preparing to send data: {:?}", data);
                     // 这里注释的部分是将数据发送到客户端的代码，需要解开注释以实际发送数据
                     let message = MessageType::DeviceStatus(data);
                     // 序列化消息。
                     let serialized = bincode::serialize(&message).expect("Failed to serialize message");
                     // 发送序列化后的消息。
-                    if let Err(e) = framed.send(Bytes::from(serialized)).await {
-                        // 若发送失败，则记录错误并结束循环。
-                        error!("Failed to send message: {:?}", e);
-                        return Err(e);
+                    // if let Err(e) = framed.send(Bytes::from(serialized)).await {
+                    //     // 若发送失败，则记录错误并结束循环。
+                    //     error!("Failed to send message: {:?}", e);
+                    //     return Err(e);
+                    // }
+                    if let Err(e) = timeout(Duration::from_secs(1), framed.send(Bytes::from(serialized))).await {
+                        error!("发送消息超时: {:?}", e);
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "发送消息超时"));
                     }
                 }
             }

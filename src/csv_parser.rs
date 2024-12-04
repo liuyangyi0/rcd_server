@@ -90,7 +90,43 @@ pub struct DeviceConfiguration {
     pub parse_fail_count: u32,
     //站点是否通讯
     pub site_status: bool,
+    //记录上次数据
+    pub last_data: Vec<u8>,
+    //相同次数
+    pub same_count: u32,
 }
+
+impl DeviceConfiguration {
+    // 检查数据是否符合条件的方法
+    pub fn check_data(&mut self, data: Vec<u8>) -> bool {
+        // 如果新数据和上次数据相同
+        if data == self.last_data {
+            // 增加相同次数计数器
+            self.same_count += 1;
+            // 如果相同次数大于等于 10，清零并返回 true
+            if self.same_count == 10{
+                return true;
+            }
+
+            if self.same_count == 20{
+                return true;
+            }
+
+            if self.same_count >= 20000 {
+                self.same_count = 0;
+                true
+            } else {
+                false
+            }
+        } else {
+            // 如果数据不同，重置相同次数计数器，并更新 last_data
+            self.same_count = 0;
+            self.last_data = data.clone();
+            true
+        }
+    }
+}
+
 
 //DeviceConfiguration new
 // impl DeviceConfiguration {
