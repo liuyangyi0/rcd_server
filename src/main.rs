@@ -12,7 +12,7 @@ use std::io::ErrorKind;
 use std::sync::{Arc, mpsc};
 use tokio::io::Result;               // 引入IO结果类型。
 // use bincode;
-use crate::common::{SendData};
+use crate::common::{Command, SendData};
 use crate::csv_parser::DeviceConfiguration;
 use crate::file_processor::read_and_process_files;
 use crate::serial_manager::{SerialConfig, start_serial_thread_1};
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
 
 ///Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>> 表示一个线程安全的、可以异步访问的动态数组，数组中的每个元素都是一个可以发送 DeviceStatus 类型消息的发送者
 async fn init(global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>, software_config: config::Config)
-    ->  io::Result<(Vec<SerialPortConfig>, Vec<mpsc::Sender<SendData>>)> {
+    ->  io::Result<(Vec<SerialPortConfig>, Vec<mpsc::Sender<Command>>)> {
     let exe_path = env::current_exe()?; // 获取可执行文件路径
     let exe_dir = exe_path.parent().ok_or_else(|| io::Error::new(ErrorKind::NotFound, "无法获取可执行文件目录"))?; // 获取可执行文件目录
     let binding = exe_dir.join("config");
@@ -75,7 +75,7 @@ async fn init(global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceSta
         println!("文件: {:?}", file);
     }    //files 遍历
     let mut serial_port_configs: Vec<SerialPortConfig> = vec![];
-    let mut txs: Vec<mpsc::Sender<SendData>> = vec![];
+    let mut txs: Vec<mpsc::Sender<Command>> = vec![];
 
     for file in files {
         match csv_parser::parse_csv(file) {

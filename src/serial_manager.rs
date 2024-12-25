@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use serde::Deserialize;
 use tokio::runtime::Runtime;
-use crate::common::{SendData, get_sum, Value};
+use crate::common::{SendData, get_sum, Value, Command, CommandType};
 use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
 use crate::config;
 use crate::config::RunLocation;
@@ -74,6 +74,8 @@ struct SerialManager {
     time_out_count: u32,
     //串口解析失败次数
     parse_fail_count: u32,
+    //串口是否使用
+    
 }
 
 impl SerialManager {
@@ -163,7 +165,7 @@ impl SerialManager {
             },
             None => {
                 //打印未打开串口
-                eprintln!("{:}串口未打开",command.com);
+                //eprintln!("{:}串口未打开",command.com);
                 self.reconnect().await; // 串口未打开时，尝试重新连接
             }
         }
@@ -179,7 +181,7 @@ impl SerialManager {
                 }
             },
             None => {
-                eprintln!("{:}串口未打开",command.com);
+                //eprintln!("{:}串口未打开",command.com);
                 self.reconnect().await; // 串口未打开时，尝试重新连接
             }
         }
@@ -449,7 +451,7 @@ pub async fn start_serial_thread_1(
     global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
     serial_config: SerialConfig,
     serial_config_data:SerialPortConfig,
-    rx: Receiver<SendData>,
+    rx: Receiver<Command>,
     software_config: config::Config
 ) -> thread::JoinHandle<()> {
     let mut manager = SerialManager::new(serial_config, serial_config_data, global_sender.clone(),software_config.server.run_on,software_config.server.current_run).await;
@@ -458,13 +460,26 @@ pub async fn start_serial_thread_1(
         let rt = Runtime::new().unwrap(); // 创建一个新的Tokio运行时
         rt.block_on(async { // 在运行时中执行异步代码块
             loop {
+
+                while let Ok(cmd) = rx.try_recv() {
+                    match cmd.command {
+                        CommandType::SendData(data) => {
+                            manager.command_queue.lock().unwrap().push_back(data);
+                        },
+                        CommandType::PortStatus(status) => {
+                            send_to_all_senders(&global_sender, DeviceStatus { id: 0, com_status: status.device_status, device_status: false, value: HashMap::new()}).await;
+                        },
+                        CommandType::DeviceSetting(setting) => {
+                            //println!("设置设备: {:?}", setting);
+                        },
+                    }
+                    //manager.command_queue.lock().unwrap().push_back(cmd);
+                }
+
                 //如果程序是Primary，则执行 发送命令  如果是Secondary，则不执行
                 match manager.current_run {
                     RunLocation::Primary => {
                         // 处理命令rx.try_recv()
-                        while let Ok(cmd) = rx.try_recv() {
-                            manager.command_queue.lock().unwrap().push_back(cmd);
-                        }
 
                         // 处理命令队列
                         {
@@ -501,7 +516,7 @@ pub async fn start_serial_thread_1(
                                         dev_config.config.data_len.clone(),
                                     ];
                                     c.push(get_sum(&c));
-                                    let q = SendData {com: String::from(""), device_id: 1, command: c };
+                                    let q = SendData {device_id: 1, command: c };
 
                                     manager.send_command(q).await; // 发送查询命令
 
@@ -510,10 +525,9 @@ pub async fn start_serial_thread_1(
                         }
                     }
                     RunLocation::Secondary => {
-                        while let Ok(cmd) = rx.try_recv() {
-                            manager.command_queue.lock().unwrap().push_back(cmd);
-                        }
-
+                        // while let Ok(cmd) = rx.try_recv() {
+                        //     manager.command_queue.lock().unwrap().push_back(cmd);
+                        // }
                         {
                             let mut queue = manager.command_queue.lock().unwrap();
                             if let Some(cmd) = queue.pop_front() {

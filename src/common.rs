@@ -1,38 +1,44 @@
 use serde::{Deserialize, Serialize};
 use crate::tcp_server::DeviceStatus;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MessageType {
     //Command(SendData),
-    Command(CommandType),
+    Command(Command),
     DeviceStatus(DeviceStatus),
 }
 
 
-#[derive(Serialize, Deserialize, Debug)]
+// 顶层结构体，包含 `com` 字段和命令枚举
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Command {
+    pub com: String,
+    pub command: CommandType,
+}
+
+// 枚举，包含不同的命令类型
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum CommandType {
     SendData(SendData),
     PortStatus(PortStatus),
-    DeviceStatus(DeviceSetting),
+    DeviceSetting(DeviceSetting),
 }
 
-// 定义设备状态结构体。
+// 各个命令类型的具体结构体，不再包含 `com` 字段
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SendData {
-    pub com: String,
     pub device_id: u32,
     pub command: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PortStatus {
-    pub com: String,
     pub device_status: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DeviceSetting {
-    pub id: u64,
+    pub device_id: u32,
     pub device_status: bool,
 }
 
@@ -41,7 +47,6 @@ pub struct DeviceSetting {
 impl Clone for SendData {
     fn clone(&self) -> Self {
         SendData {
-            com: self.com.clone(),
             device_id: self.device_id,
             command: self.command.clone(),
         }
