@@ -3,8 +3,8 @@ use crate::tcp_server::DeviceStatus;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum MessageType {
-    Command(SendData),
-    //Command(CommandType),
+    //Command(SendData),
+    Command(CommandType),
     DeviceStatus(DeviceStatus),
 }
 
