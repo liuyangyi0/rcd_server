@@ -263,7 +263,7 @@ impl SerialManager {
 
                                 //send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: true, value: data.clone()}).await;
                             },
-                            Err(e) => {
+                            Err(_e) => {
                                 //解析失败 次数加1
                                 self.serial_config_data.commands[self.index].parse_fail_count += 1;
                                 //串口解析失败次数加1
@@ -274,7 +274,7 @@ impl SerialManager {
                                     self.current_run = RunLocation::Secondary;
                                 }
 
-                                //eprintln!("解析数据包错误: {:?} 解析错误次数: {:?}", e,self.parse_fail_count)
+                                //eprintln!("解析数据包错误: {:?} 解析错误次数: {:?}", _e,self.parse_fail_count)
                             },
                         }
                     },
@@ -527,13 +527,13 @@ pub async fn start_serial_thread_1(
                     }
                 }
 
-                //tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
                 // 异步接收数据
                 manager.receive_data().await; // 以异步方式接收数据
                 manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
 
                 // 使用异步sleep
-                //tokio::time::sleep(Duration::from_millis(1)).await; // 暂停以避免过载
+                tokio::time::sleep(Duration::from_millis(1)).await; // 暂停以避免过载
             }
         })
     })

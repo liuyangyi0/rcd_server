@@ -1,5 +1,20 @@
 use serde::{Deserialize, Serialize};
+use crate::tcp_server::DeviceStatus;
 
+#[derive(Serialize, Deserialize, Debug)]
+pub enum MessageType {
+    Command(SendData),
+    //Command(CommandType),
+    DeviceStatus(DeviceStatus),
+}
+
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum CommandType {
+    SendData(SendData),
+    PortStatus(PortStatus),
+    DeviceStatus(DeviceSetting),
+}
 
 // 定义设备状态结构体。
 #[derive(Serialize, Deserialize, Debug)]
@@ -7,6 +22,18 @@ pub struct SendData {
     pub com: String,
     pub device_id: u32,
     pub command: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PortStatus {
+    pub com: String,
+    pub device_status: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct DeviceSetting {
+    pub id: u64,
+    pub device_status: bool,
 }
 
 
@@ -21,11 +48,11 @@ impl Clone for SendData {
     }
 }
 
-pub struct ChangeParsingScheme {
-    pub com: String,
-    pub device_id: u32,
-    pub command: Vec<u8>,
-}
+// pub struct ChangeParsingScheme {
+//     pub com: String,
+//     pub device_id: u32,
+//     pub command: Vec<u8>,
+// }
 
 
 

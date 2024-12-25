@@ -11,20 +11,15 @@ use futures::SinkExt;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 use tracing::error;
-use crate::common::{SendData, Value};
+use crate::common::{MessageType, SendData, Value};
 use crate::serial_port_config::SerialPortConfig;
 
 
-#[derive(Serialize, Deserialize, Debug)]
-pub enum MessageType {
-    Command(SendData),
-    DeviceStatus(DeviceStatus),
-}
 
 
-pub enum CommandType {
-    SendData,
-}
+
+
+
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DeviceStatus {
@@ -109,7 +104,7 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
                     //     return Err(e);
                     // }
                     if let Err(e) = timeout(Duration::from_secs(1), framed.send(Bytes::from(serialized))).await {
-                        error!("发送消息超时: {:?}", e);
+                        //error!("发送消息超时: {:?}", e);
                         return Err(io::Error::new(io::ErrorKind::TimedOut, "发送消息超时"));
                     }
                 }

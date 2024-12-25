@@ -103,16 +103,7 @@ impl DeviceConfiguration {
         if data == self.last_data {
             // 增加相同次数计数器
             self.same_count += 1;
-            // 如果相同次数大于等于 10，清零并返回 true
-            if self.same_count == 10{
-                return true;
-            }
-
-            if self.same_count == 20{
-                return true;
-            }
-
-            if self.same_count >= 20000 {
+            if self.same_count >= 10 {
                 self.same_count = 0;
                 true
             } else {
