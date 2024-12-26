@@ -10,8 +10,7 @@ use bytes::Bytes;
 use futures::SinkExt;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
-use tracing::error;
-use crate::common::{Command, MessageType, SendData, Value};
+use crate::common::{Command, MessageType, Value};
 use crate::serial_port_config::SerialPortConfig;
 
 
@@ -24,9 +23,11 @@ use crate::serial_port_config::SerialPortConfig;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DeviceStatus {
     pub id: u64,
+    pub com : String,
     pub com_status: bool,
     pub device_status: bool,
     pub value: HashMap<String, Value>,
+    pub raw_data: Vec<u8>, // 原始数据
 }
 
 pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>,

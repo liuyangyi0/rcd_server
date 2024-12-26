@@ -38,7 +38,7 @@ pub struct PortStatus {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DeviceSetting {
-    pub device_id: u32,
+    pub device_id: u8,
     pub device_status: bool,
 }
 

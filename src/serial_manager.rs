@@ -75,7 +75,7 @@ struct SerialManager {
     //串口解析失败次数
     parse_fail_count: u32,
     //串口是否使用
-    
+    //serial_struct: bool,
 }
 
 impl SerialManager {
@@ -112,6 +112,7 @@ impl SerialManager {
             current_run,
             time_out_count: 0,
             parse_fail_count: 0,
+            //serial_struct: true,
         }
     }
 
@@ -129,7 +130,14 @@ impl SerialManager {
 
                 let data = parse_status(&v, self.serial_config_data.commands[self.index].records.as_slice());
                 if self.serial_config_data.commands[self.index].check_data(v.clone()){
-                    send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: false,device_status: false, value: data.clone()}).await;
+                    let data = DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64,
+                        com: self.serial_config_data.port_number.clone(),
+                        com_status: false,
+                        device_status: false,
+                        value: data.clone(),
+                        raw_data: v};
+                    
+                    send_to_all_senders(&self.global_sender, data).await;
                 }
                 //send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: false,device_status: false, value: data.clone()}).await;
                 self.port = None;
@@ -260,7 +268,14 @@ impl SerialManager {
                                 //处理数据包内的状态信息
                                 let data = parse_status(&packet.status, self.serial_config_data.commands[self.index].records.as_slice());
                                 if self.serial_config_data.commands[self.index].check_data(packet.status.clone()){
-                                    send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: true, value: data.clone()}).await;
+                                    
+                                    let data = DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, 
+                                        com: self.serial_config_data.port_number.clone(), 
+                                        com_status: true,
+                                        device_status: true, 
+                                        value: data.clone(), 
+                                        raw_data: buffer[..bytes_read].to_vec()};
+                                    send_to_all_senders(&self.global_sender, data).await;
                                 }
 
                                 //send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: true, value: data.clone()}).await;
@@ -290,7 +305,14 @@ impl SerialManager {
                         let v: Vec<u8> = vec![0; self.serial_config_data.commands[self.index].config.data_len as usize];
                         let data = parse_status(&v, self.serial_config_data.commands[self.index].records.as_slice());
                         if self.serial_config_data.commands[self.index].check_data(v.clone()){
-                            send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: false, value: data.clone()}).await;
+                            let data = DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64,
+                                com: self.serial_config_data.port_number.clone(),
+                                com_status: true,
+                                device_status: false,
+                                value: data.clone(),
+                                raw_data: v};
+                            
+                            send_to_all_senders(&self.global_sender, data).await;
                         }
 
                         //send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: false, value: data.clone()}).await;
@@ -467,13 +489,23 @@ pub async fn start_serial_thread_1(
                             manager.command_queue.lock().unwrap().push_back(data);
                         },
                         CommandType::PortStatus(status) => {
-                            send_to_all_senders(&global_sender, DeviceStatus { id: 0, com_status: status.device_status, device_status: false, value: HashMap::new()}).await;
+                            manager.serial_config_data.status = status.device_status;
                         },
                         CommandType::DeviceSetting(setting) => {
-                            //println!("设置设备: {:?}", setting);
+                            for dev in &mut manager.serial_config_data.commands {
+                                if dev.config.device_id == setting.device_id {
+                                    dev.is_read = setting.device_status;
+                                }
+                            }
                         },
                     }
                     //manager.command_queue.lock().unwrap().push_back(cmd);
+                }
+
+                //如果设置为false，则等待
+                if !manager.serial_config_data.status {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
                 }
 
                 //如果程序是Primary，则执行 发送命令  如果是Secondary，则不执行
@@ -507,6 +539,7 @@ pub async fn start_serial_thread_1(
 
 
                                     let dev_config = &manager.serial_config_data.commands[manager.index];
+
                                     let mut c = vec![
                                         dev_config.config.device_id.clone(),
                                         0x08,
@@ -544,7 +577,25 @@ pub async fn start_serial_thread_1(
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 // 异步接收数据
                 manager.receive_data().await; // 以异步方式接收数据
-                manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
+                
+                
+                // manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
+                // if manager.serial_config_data.commands[manager.index].is_read {
+                //     
+                // }
+
+                let total_commands = manager.serial_config_data.commands.len();
+                for _ in 0..total_commands {
+                    // 更新索引，并防止溢出
+                    manager.index = (manager.index + 1) % manager.serial_config_data.commands.len();
+                    // 获取当前命令
+                    let current_command = &manager.serial_config_data.commands[manager.index];
+                    // 检查是否为读取命令
+                    if current_command.is_read {
+                        // 满足条件，跳出循环
+                        break;
+                    }
+                }
 
                 // 使用异步sleep
                 tokio::time::sleep(Duration::from_millis(1)).await; // 暂停以避免过载

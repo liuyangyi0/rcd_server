@@ -94,6 +94,9 @@ pub struct DeviceConfiguration {
     pub last_data: Vec<u8>,
     //相同次数
     pub same_count: u32,
+    
+    //是否读取配置
+    pub is_read: bool,
 }
 
 impl DeviceConfiguration {

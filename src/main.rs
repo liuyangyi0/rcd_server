@@ -12,7 +12,7 @@ use std::io::ErrorKind;
 use std::sync::{Arc, mpsc};
 use tokio::io::Result;               // 引入IO结果类型。
 // use bincode;
-use crate::common::{Command, SendData};
+use crate::common::{Command};
 use crate::csv_parser::DeviceConfiguration;
 use crate::file_processor::read_and_process_files;
 use crate::serial_manager::{SerialConfig, start_serial_thread_1};
@@ -93,6 +93,7 @@ async fn init(global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceSta
                                 site_status: true,
                                 last_data: vec![0],
                                 same_count:0,
+                                is_read: true,
                             };
                             serial_port_config.commands.push(device_configuration);
                             found = true;
@@ -111,6 +112,7 @@ async fn init(global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceSta
                             site_status: true,
                             last_data: vec![0],
                             same_count:0,
+                            is_read: true,
                         };
                         new_config.commands.push(device_configuration);
                         serial_port_configs.push(new_config);
