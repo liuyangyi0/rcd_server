@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures::SinkExt;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
-use crate::common::{Command, MessageType, Value};
+use crate::common::{Command, MessageType, SystemState, Value};
 use crate::serial_port_config::SerialPortConfig;
 
 
@@ -34,6 +34,7 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
                              global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
                              serial_ports:Vec<SerialPortConfig>,
                              txs: Vec<mpsc::Sender<Command>>,
+                             system_state: SystemState
 ) -> io::Result<()> {
     println!("handle_client");
     // 创建一个Tokio异步消息通道，缓冲区大小为32 tx_serial 用于向客户端发送数据，rx 用于接收其他任务发送的数据 串口数据从tx_serial发送到rx
@@ -71,6 +72,19 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
                         MessageType::DeviceStatus(b) => {
                             println!("Received MessageB: {:?}", b);
                         },
+                        MessageType::QueryAllStatus => {
+                            // 查询所有设备状态
+                            let msg = MessageType::AllStatus(system_state.get_state().await);
+
+                            let serialized = bincode::serialize(&msg).expect("Failed to serialize message");
+                            if let Err(_e) = timeout(Duration::from_secs(1), framed.send(Bytes::from(serialized))).await {
+                                return Err(io::Error::new(io::ErrorKind::TimedOut, "发送消息超时"));
+                            }
+                        }
+                        MessageType::AllStatus(c) => {
+                            // 查询所有设备状态
+                            println!("Received MessageC: {:?}", c);
+                        }
                     }
                 }
                 // 如果接收消息时出错或流结束（None），则处理客户端断开连接的情况
@@ -99,11 +113,6 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
                     // 序列化消息。
                     let serialized = bincode::serialize(&message).expect("Failed to serialize message");
                     // 发送序列化后的消息。
-                    // if let Err(e) = framed.send(Bytes::from(serialized)).await {
-                    //     // 若发送失败，则记录错误并结束循环。
-                    //     error!("Failed to send message: {:?}", e);
-                    //     return Err(e);
-                    // }
                     if let Err(_e) = timeout(Duration::from_secs(1), framed.send(Bytes::from(serialized))).await {
                         //error!("发送消息超时: {:?}", e);
                         return Err(io::Error::new(io::ErrorKind::TimedOut, "发送消息超时"));
@@ -119,7 +128,9 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
 
 pub async fn run_tcp_server_1(serial_ports:Vec<SerialPortConfig>,
                               txs: Vec<mpsc::Sender<Command>>,
-                              global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,) -> io::Result<()> {
+                              global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
+                              system_state: SystemState
+                              ) -> io::Result<()> {
     // 绑定一个TCP监听器到本地的8080端口
     let listener = TcpListener::bind("0.0.0.0:11002").await?;
 
@@ -136,7 +147,7 @@ pub async fn run_tcp_server_1(serial_ports:Vec<SerialPortConfig>,
                 // 将TCP流包装成帧，使用`LengthDelimitedCodec`解码器处理数据帧
                 let framed = Framed::new(stream, LengthDelimitedCodec::new());
                 // 异步启动一个新的任务来处理客户端，传递处理好的帧和克隆的状态
-                tokio::spawn(handle_client_1(framed, global_sender_clone, serial_ports.clone(), txs.clone()));
+                tokio::spawn(handle_client_1(framed, global_sender_clone, serial_ports.clone(), txs.clone(),system_state.clone()));
             },
             // 如果接受连接失败，则输出错误信息
             Err(e) => {

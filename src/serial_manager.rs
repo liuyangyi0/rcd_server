@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use serde::Deserialize;
 use tokio::runtime::Runtime;
-use crate::common::{SendData, get_sum, Value, Command, CommandType};
+use crate::common::{SendData, get_sum, Value, Command, CommandType, SystemState};
 use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
 use crate::config;
 use crate::config::RunLocation;
@@ -74,8 +74,6 @@ struct SerialManager {
     time_out_count: u32,
     //串口解析失败次数
     parse_fail_count: u32,
-    //串口是否使用
-    //serial_struct: bool,
 }
 
 impl SerialManager {
@@ -136,7 +134,7 @@ impl SerialManager {
                         device_status: false,
                         value: data.clone(),
                         raw_data: v};
-                    
+
                     send_to_all_senders(&self.global_sender, data).await;
                 }
                 //send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: false,device_status: false, value: data.clone()}).await;
@@ -268,12 +266,12 @@ impl SerialManager {
                                 //处理数据包内的状态信息
                                 let data = parse_status(&packet.status, self.serial_config_data.commands[self.index].records.as_slice());
                                 if self.serial_config_data.commands[self.index].check_data(packet.status.clone()){
-                                    
-                                    let data = DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, 
-                                        com: self.serial_config_data.port_number.clone(), 
+
+                                    let data = DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64,
+                                        com: self.serial_config_data.port_number.clone(),
                                         com_status: true,
-                                        device_status: true, 
-                                        value: data.clone(), 
+                                        device_status: true,
+                                        value: data.clone(),
                                         raw_data: buffer[..bytes_read].to_vec()};
                                     send_to_all_senders(&self.global_sender, data).await;
                                 }
@@ -311,7 +309,7 @@ impl SerialManager {
                                 device_status: false,
                                 value: data.clone(),
                                 raw_data: v};
-                            
+
                             send_to_all_senders(&self.global_sender, data).await;
                         }
 
@@ -469,12 +467,19 @@ fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
 }
 
 // 启动串口通信线程的函数
+//global_sender: 全局发送器
+//serial_config: 串口配置
+//serial_config_data: 串口配置数据
+//rx: 接收器
+//software_config: 软件配置
+//system_state: 系统状态
 pub async fn start_serial_thread_1(
     global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
     serial_config: SerialConfig,
     serial_config_data:SerialPortConfig,
     rx: Receiver<Command>,
-    software_config: config::Config
+    software_config: config::Config,
+    system_state: SystemState
 ) -> thread::JoinHandle<()> {
     let mut manager = SerialManager::new(serial_config, serial_config_data, global_sender.clone(),software_config.server.run_on,software_config.server.current_run).await;
 
@@ -490,11 +495,38 @@ pub async fn start_serial_thread_1(
                         },
                         CommandType::PortStatus(status) => {
                             manager.serial_config_data.status = status.device_status;
+                            match system_state
+                                .set_port_status(&manager.serial_config_data.port_number, status.device_status)
+                                .await
+                            {
+                                Ok(_) => {
+                                    // 成功处理
+                                },
+                                Err(e) => {
+                                    eprintln!("设置端口状态失败: {}", e);
+                                    // 进行适当的错误处理，例如重试、记录日志或优雅退出
+                                }
+                            }
+
+
                         },
                         CommandType::DeviceSetting(setting) => {
                             for dev in &mut manager.serial_config_data.commands {
                                 if dev.config.device_id == setting.device_id {
                                     dev.is_read = setting.device_status;
+                                }
+                            }
+                            //设置 system_state
+                            match system_state
+                                .set_device_status(&manager.serial_config_data.port_number, setting.device_id, setting.device_status)
+                                .await
+                            {
+                                Ok(_) => {
+                                    // 成功处理
+                                },
+                                Err(e) => {
+                                    eprintln!("设置设备状态失败: {}", e);
+                                    // 进行适当的错误处理，例如重试、记录日志或优雅退出
                                 }
                             }
                         },
@@ -577,11 +609,11 @@ pub async fn start_serial_thread_1(
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 // 异步接收数据
                 manager.receive_data().await; // 以异步方式接收数据
-                
-                
+
+
                 // manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
                 // if manager.serial_config_data.commands[manager.index].is_read {
-                //     
+                //
                 // }
 
                 let total_commands = manager.serial_config_data.commands.len();
