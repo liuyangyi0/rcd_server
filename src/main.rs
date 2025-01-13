@@ -21,6 +21,7 @@ use crate::serial_port_config::SerialPortConfig;
 use crate::tcp_server::{run_tcp_server_1, DeviceStatus}; // 引入串口管理模块。
 
 use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
+use bounded_vec_deque::BoundedVecDeque;
 
 
 
@@ -36,12 +37,14 @@ async fn main() -> Result<()> {
     
     // 创建系统状态列表
     let system_state = SystemState::new();
+
+    let system_record = Arc::new(TokioMutex::new(BoundedVecDeque::<String>::new(20000)));
     
     // 初始化 串口配置和发送器列表
-    match init(global_sender.clone(), software_config, system_state.clone()).await {
+    match init(global_sender.clone(), software_config, system_state.clone(),system_record.clone()).await {
         Ok((configs, txs)) => {
             // 启动 TCP 服务器
-            match run_tcp_server_1(configs, txs, global_sender.clone(), system_state.clone()).await {
+            match run_tcp_server_1(configs, txs, global_sender.clone(), system_state.clone(), system_record).await {
                 Ok(_) => println!("Server terminated successfully."),
                 Err(e) => eprintln!("Server failed with error: {}", e),
             }
@@ -55,7 +58,7 @@ async fn main() -> Result<()> {
 }
 
 ///Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>> 表示一个线程安全的、可以异步访问的动态数组，数组中的每个元素都是一个可以发送 DeviceStatus 类型消息的发送者
-async fn init(global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>, software_config: config::Config, system_state: SystemState)
+async fn init(global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>, software_config: config::Config, system_state: SystemState, system_record: Arc<TokioMutex<BoundedVecDeque<String>>>)
     ->  io::Result<(Vec<SerialPortConfig>, Vec<mpsc::Sender<Command>>)> {
     let exe_path = env::current_exe()?; // 获取可执行文件路径
     let exe_dir = exe_path.parent().ok_or_else(|| io::Error::new(ErrorKind::NotFound, "无法获取可执行文件目录"))?; // 获取可执行文件目录
@@ -151,7 +154,7 @@ async fn init(global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceSta
         }
         system_state.add_port(state).await;
         
-        start_serial_thread_1(global_sender.clone(), serial_config,serial_port_config.clone(),rx, software_config.clone(), system_state.clone()).await;
+        start_serial_thread_1(global_sender.clone(), serial_config,serial_port_config.clone(),rx, software_config.clone(), system_state.clone(), system_record.clone()).await;
     }
 
     Ok((serial_port_configs,txs))

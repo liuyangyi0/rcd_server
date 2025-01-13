@@ -6,23 +6,21 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use std::collections::HashMap;
 use std::io;
 use std::time::Duration;
+use bounded_vec_deque::BoundedVecDeque;
 use bytes::Bytes;
 use futures::SinkExt;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 use crate::common::{Command, MessageType, SystemState, Value};
 use crate::serial_port_config::SerialPortConfig;
-
-
-
-
-
+use chrono::prelude::*;
 
 
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DeviceStatus {
-    pub id: u64,
+    pub id: u64, 
+    pub device_id: u8,
     pub com : String,
     pub com_status: bool,
     pub device_status: bool,
@@ -34,7 +32,8 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
                              global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
                              serial_ports:Vec<SerialPortConfig>,
                              txs: Vec<mpsc::Sender<Command>>,
-                             system_state: SystemState
+                             system_state: SystemState,
+                             system_record: Arc<TokioMutex<BoundedVecDeque<String>>>
 ) -> io::Result<()> {
     println!("handle_client");
     // 创建一个Tokio异步消息通道，缓冲区大小为32 tx_serial 用于向客户端发送数据，rx 用于接收其他任务发送的数据 串口数据从tx_serial发送到rx
@@ -59,11 +58,27 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
                             //把数据发送到串口
                             println!("Received MessageA: {:?}", a.clone());
                             //tx.send(a).unwrap();
+                            
+                            //时间戳
+                            let local: DateTime<Local> = Local::now();
+                            
+                            //记录到系统日志
+                            let mut record = system_record.lock().await;
+                            record.push_back(format!("时间{:?} 串口{:?} 数据{:?}", local.format("%Y-%m-%d %H:%M:%S"), a.com, a.command));
 
                             //发送到串口线程 serial_prots
                             for (i, serial_prot) in serial_ports.iter().enumerate() {
                                 if a.com == serial_prot.port_number {
-                                    txs[i].send(a.clone()).unwrap();
+                                    // txs[i].send(a.clone()).unwrap();
+                                    match txs[i].send(a.clone()) {
+                                        Ok(_) => {
+                                            println!("Message sent successfully to serial port thread");
+                                        },
+                                        Err(e) => {
+                                            eprintln!("Failed to send message: {:?}", e);
+                                            // 此时可以根据需要进行进一步处理，比如记录日志，或者跳过。
+                                        }
+                                    }
                                     println!("serialized: {:?}", a);
                                 }
                             }
@@ -75,6 +90,7 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
                         MessageType::QueryAllStatus => {
                             // 查询所有设备状态
                             let msg = MessageType::AllStatus(system_state.get_state().await);
+                            println!("Sending MessageC: {:?}", msg);
 
                             let serialized = bincode::serialize(&msg).expect("Failed to serialize message");
                             if let Err(_e) = timeout(Duration::from_secs(1), framed.send(Bytes::from(serialized))).await {
@@ -84,6 +100,26 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
                         MessageType::AllStatus(c) => {
                             // 查询所有设备状态
                             println!("Received MessageC: {:?}", c);
+                        }
+                        MessageType::QueryRecord => {
+                            // 查询所有设备状态
+                            //记录到系统日志
+                            let mut record = system_record.lock().await;
+                            let mut records = vec![];
+                            for r in record.iter() {
+                                records.push(r.clone());
+                            }
+
+                            let msg = MessageType::AllRecord(records);
+
+                            let serialized = bincode::serialize(&msg).expect("Failed to serialize message");
+                            if let Err(_e) = timeout(Duration::from_secs(1), framed.send(Bytes::from(serialized))).await {
+                                return Err(io::Error::new(io::ErrorKind::TimedOut, "发送消息超时"));
+                            }
+                        }
+                        MessageType::AllRecord(d) => {
+                            // 查询所有设备状态
+                            println!("Received MessageD: {:?}", d);
                         }
                     }
                 }
@@ -129,7 +165,8 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
 pub async fn run_tcp_server_1(serial_ports:Vec<SerialPortConfig>,
                               txs: Vec<mpsc::Sender<Command>>,
                               global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
-                              system_state: SystemState
+                              system_state: SystemState,
+                              system_record: Arc<TokioMutex<BoundedVecDeque<String>>>
                               ) -> io::Result<()> {
     // 绑定一个TCP监听器到本地的8080端口
     let listener = TcpListener::bind("0.0.0.0:11002").await?;
@@ -147,7 +184,7 @@ pub async fn run_tcp_server_1(serial_ports:Vec<SerialPortConfig>,
                 // 将TCP流包装成帧，使用`LengthDelimitedCodec`解码器处理数据帧
                 let framed = Framed::new(stream, LengthDelimitedCodec::new());
                 // 异步启动一个新的任务来处理客户端，传递处理好的帧和克隆的状态
-                tokio::spawn(handle_client_1(framed, global_sender_clone, serial_ports.clone(), txs.clone(),system_state.clone()));
+                tokio::spawn(handle_client_1(framed, global_sender_clone, serial_ports.clone(), txs.clone(),system_state.clone(), system_record.clone()));
             },
             // 如果接受连接失败，则输出错误信息
             Err(e) => {

@@ -5,6 +5,8 @@ use std::sync::mpsc::Receiver;
 use crate::csv_parser::{BitIndex, Record};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use bounded_vec_deque::BoundedVecDeque;
+use chrono::{DateTime, Local};
 use serde::Deserialize;
 use tokio::runtime::Runtime;
 use crate::common::{SendData, get_sum, Value, Command, CommandType, SystemState};
@@ -74,6 +76,7 @@ struct SerialManager {
     time_out_count: u32,
     //串口解析失败次数
     parse_fail_count: u32,
+    system_record: Arc<TokioMutex<BoundedVecDeque<String>>>
 }
 
 impl SerialManager {
@@ -83,7 +86,8 @@ impl SerialManager {
         serial_config_data: SerialPortConfig,
         global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
         run_on: RunLocation,
-        current_run: RunLocation
+        current_run: RunLocation,
+        system_record: Arc<TokioMutex<BoundedVecDeque<String>>>
     ) -> Self {
         let port = match open_serial_port_with_retries(
             &serial_config.port_name,
@@ -110,6 +114,7 @@ impl SerialManager {
             current_run,
             time_out_count: 0,
             parse_fail_count: 0,
+            system_record
             //serial_struct: true,
         }
     }
@@ -129,6 +134,7 @@ impl SerialManager {
                 let data = parse_status(&v, self.serial_config_data.commands[self.index].records.as_slice());
                 if self.serial_config_data.commands[self.index].check_data(v.clone()){
                     let data = DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64,
+                        device_id: self.serial_config_data.commands[self.index].config.device_id,
                         com: self.serial_config_data.port_number.clone(),
                         com_status: false,
                         device_status: false,
@@ -231,7 +237,6 @@ impl SerialManager {
                                             }
                                         }
 
-                                        // TODO: 根据您的需求处理第一个字节
                                     } else {
                                         //eprintln!("累加和校验失败");
                                         return;
@@ -268,6 +273,7 @@ impl SerialManager {
                                 if self.serial_config_data.commands[self.index].check_data(packet.status.clone()){
 
                                     let data = DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64,
+                                        device_id: self.serial_config_data.commands[self.index].config.device_id,
                                         com: self.serial_config_data.port_number.clone(),
                                         com_status: true,
                                         device_status: true,
@@ -304,6 +310,7 @@ impl SerialManager {
                         let data = parse_status(&v, self.serial_config_data.commands[self.index].records.as_slice());
                         if self.serial_config_data.commands[self.index].check_data(v.clone()){
                             let data = DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64,
+                                device_id: self.serial_config_data.commands[self.index].config.device_id,
                                 com: self.serial_config_data.port_number.clone(),
                                 com_status: true,
                                 device_status: false,
@@ -322,11 +329,33 @@ impl SerialManager {
                     }
                     Err(e) => {
                         eprintln!("读取错误: {:?}", e);
+
+                        //时间戳
+                        {
+                            let local: DateTime<Local> = Local::now();
+                            let mut record = self.system_record.lock().await;
+                            record.push_back(format!(
+                                "时间{:?} 读取错误",
+                                local.format("%Y-%m-%d %H:%M:%S")
+                            ));
+                            // 这里 record 的生命周期在此花括号结束后就被释放
+                        }
                         self.reconnect().await; // 发生读取错误时，尝试重新连接
                     }
                 }
             },
             None => {
+                //时间戳
+                {
+                    let local: DateTime<Local> = Local::now();
+                    let mut record = self.system_record.lock().await;
+                    record.push_back(format!(
+                        "时间{:?} 串口未打开",
+                        local.format("%Y-%m-%d %H:%M:%S")
+                    ));
+                    // 这里 record 的生命周期在此花括号结束后就被释放
+                }
+
                 eprintln!("串口未打开");
                 self.reconnect().await; // 串口未打开时，尝试重新连接
             }
@@ -479,9 +508,10 @@ pub async fn start_serial_thread_1(
     serial_config_data:SerialPortConfig,
     rx: Receiver<Command>,
     software_config: config::Config,
-    system_state: SystemState
+    system_state: SystemState,
+    system_record: Arc<TokioMutex<BoundedVecDeque<String>>>
 ) -> thread::JoinHandle<()> {
-    let mut manager = SerialManager::new(serial_config, serial_config_data, global_sender.clone(),software_config.server.run_on,software_config.server.current_run).await;
+    let mut manager = SerialManager::new(serial_config, serial_config_data, global_sender.clone(),software_config.server.run_on,software_config.server.current_run, system_record).await;
 
     thread::spawn(move || {
         let rt = Runtime::new().unwrap(); // 创建一个新的Tokio运行时
@@ -571,20 +601,24 @@ pub async fn start_serial_thread_1(
 
 
                                     let dev_config = &manager.serial_config_data.commands[manager.index];
+                                    if dev_config.is_read {
+                                        let mut c = vec![
+                                            dev_config.config.device_id.clone(),
+                                            0x08,
+                                            0x02,
+                                            0x30,
+                                            0x10,
+                                            dev_config.config.data_len.clone(),
+                                        ];
+                                        c.push(get_sum(&c));
+                                        let q = SendData {device_id: 1, command: c };
 
-                                    let mut c = vec![
-                                        dev_config.config.device_id.clone(),
-                                        0x08,
-                                        0x02,
-                                        0x30,
-                                        0x10,
-                                        dev_config.config.data_len.clone(),
-                                    ];
-                                    c.push(get_sum(&c));
-                                    let q = SendData {device_id: 1, command: c };
-
-                                    manager.send_command(q).await; // 发送查询命令
-
+                                        manager.send_command(q).await; // 发送查询命令
+                                    }else {
+                                        tokio::time::sleep(Duration::from_millis(20)).await;
+                                        continue;
+                                    }
+                                    
                                 }
                             }
                         }
@@ -611,23 +645,23 @@ pub async fn start_serial_thread_1(
                 manager.receive_data().await; // 以异步方式接收数据
 
 
-                // manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
+                manager.index = (manager.index + 1) % manager.serial_config_data.commands.len(); // 更新索引，并防止溢出
                 // if manager.serial_config_data.commands[manager.index].is_read {
                 //
                 // }
 
-                let total_commands = manager.serial_config_data.commands.len();
-                for _ in 0..total_commands {
-                    // 更新索引，并防止溢出
-                    manager.index = (manager.index + 1) % manager.serial_config_data.commands.len();
-                    // 获取当前命令
-                    let current_command = &manager.serial_config_data.commands[manager.index];
-                    // 检查是否为读取命令
-                    if current_command.is_read {
-                        // 满足条件，跳出循环
-                        break;
-                    }
-                }
+                // let total_commands = manager.serial_config_data.commands.len();
+                // for _ in 0..total_commands {
+                //     // 更新索引，并防止溢出
+                //     manager.index = (manager.index + 1) % manager.serial_config_data.commands.len();
+                //     // 获取当前命令
+                //     let current_command = &manager.serial_config_data.commands[manager.index];
+                //     // 检查是否为读取命令
+                //     if current_command.is_read {
+                //         // 满足条件，跳出循环
+                //         break;
+                //     }
+                // }
 
                 // 使用异步sleep
                 tokio::time::sleep(Duration::from_millis(1)).await; // 暂停以避免过载

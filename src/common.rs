@@ -12,6 +12,8 @@ pub enum MessageType {
     DeviceStatus(DeviceStatus),
     QueryAllStatus,
     AllStatus(Vec<PortRuntimeState>),
+    QueryRecord,
+    AllRecord(Vec<String>),
 }
 
 
