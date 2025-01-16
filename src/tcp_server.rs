@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::SinkExt;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
-use crate::common::{Command, MessageType, SystemState, Value};
+use crate::common::{Command, CommandType, MessageType, SystemState, Value};
 use crate::serial_port_config::SerialPortConfig;
 use chrono::prelude::*;
 
@@ -64,7 +64,15 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
                             
                             //记录到系统日志
                             let mut record = system_record.lock().await;
-                            record.push_back(format!("时间{:?} 串口{:?} 数据{:?}", local.format("%Y-%m-%d %H:%M:%S"), a.com, a.command));
+                            
+                            
+                            match a.command.clone() {
+                                CommandType::SendData(data) => {
+                                    record.push_back(format!("时间{} 串口{} 数据{}", local.format("%Y-%m-%d %H:%M:%S"), a.com, data.command_as_string()));
+                                },
+                                _ => {}
+                            }
+
 
                             //发送到串口线程 serial_prots
                             for (i, serial_prot) in serial_ports.iter().enumerate() {
@@ -72,7 +80,7 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
                                     // txs[i].send(a.clone()).unwrap();
                                     match txs[i].send(a.clone()) {
                                         Ok(_) => {
-                                            println!("Message sent successfully to serial port thread");
+                                            // println!("Message sent successfully to serial port thread");
                                         },
                                         Err(e) => {
                                             eprintln!("Failed to send message: {:?}", e);

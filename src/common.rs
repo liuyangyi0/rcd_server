@@ -39,6 +39,15 @@ pub struct SendData {
     pub command: Vec<u8>,
 }
 
+impl SendData {
+    /// 将 `command` 转换为十六进制字符串
+    pub fn command_as_string(&self) -> String {
+        self.command.iter()
+            .map(|byte| format!("{:02X}", byte)) // 使用大写十六进制，如果需要小写可用 {:02x}
+            .collect()
+    }
+}
+
 // 串口状态结构体
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PortStatus {

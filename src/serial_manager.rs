@@ -335,7 +335,8 @@ impl SerialManager {
                             let local: DateTime<Local> = Local::now();
                             let mut record = self.system_record.lock().await;
                             record.push_back(format!(
-                                "时间{:?} 读取错误",
+                                "串口{}时间{} 读取错误",
+                                self.serial_config.port_name,
                                 local.format("%Y-%m-%d %H:%M:%S")
                             ));
                             // 这里 record 的生命周期在此花括号结束后就被释放
@@ -350,9 +351,11 @@ impl SerialManager {
                     let local: DateTime<Local> = Local::now();
                     let mut record = self.system_record.lock().await;
                     record.push_back(format!(
-                        "时间{:?} 串口未打开",
+                        "串口{}时间{} 串口未打开",
+                        self.serial_config.port_name,
                         local.format("%Y-%m-%d %H:%M:%S")
                     ));
+
                     // 这里 record 的生命周期在此花括号结束后就被释放
                 }
 
