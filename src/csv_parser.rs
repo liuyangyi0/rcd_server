@@ -146,6 +146,7 @@ fn deserialize_bit_index<'de, D>(deserializer: D) -> Result<BitIndex, D::Error>
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub com: String,
+    pub baud_rate : u32,
     pub com_index: u8,
     pub device_id: u8,
     pub data_len: u8,
@@ -161,7 +162,7 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
         .from_reader(file);
 
     let mut headers = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..6 {
         if let Some(result) = rdr.records().next() {
             let record = result?;
             headers.push(record.get(1).unwrap_or_default().to_string());
@@ -170,10 +171,11 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
 
     let config = Config {
         com: headers.get(0).cloned().unwrap_or_default(),
-        com_index: headers.get(1).cloned().unwrap_or_default().parse().unwrap_or(0),
-        device_id: headers.get(2).cloned().unwrap_or_default().parse().unwrap_or(0),
-        data_len: headers.get(3).cloned().unwrap_or_default().parse().unwrap_or(0),
-        pre: headers.get(4).cloned().unwrap_or_default(),
+        baud_rate: headers.get(1).cloned().unwrap_or_default().parse().unwrap_or(0),
+        com_index: headers.get(2).cloned().unwrap_or_default().parse().unwrap_or(0),
+        device_id: headers.get(3).cloned().unwrap_or_default().parse().unwrap_or(0),
+        data_len: headers.get(4).cloned().unwrap_or_default().parse().unwrap_or(0),
+        pre: headers.get(5).cloned().unwrap_or_default(),
     };
 
 
