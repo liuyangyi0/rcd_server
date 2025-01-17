@@ -147,6 +147,7 @@ fn deserialize_bit_index<'de, D>(deserializer: D) -> Result<BitIndex, D::Error>
 pub struct Config {
     pub com: String,
     pub baud_rate : u32,
+    pub is_special: bool,                     // 是否为特殊串口
     pub com_index: u8,
     pub device_id: u8,
     pub data_len: u8,
@@ -162,7 +163,7 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
         .from_reader(file);
 
     let mut headers = Vec::new();
-    for _ in 0..6 {
+    for _ in 0..7 {
         if let Some(result) = rdr.records().next() {
             let record = result?;
             headers.push(record.get(1).unwrap_or_default().to_string());
@@ -172,10 +173,18 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
     let config = Config {
         com: headers.get(0).cloned().unwrap_or_default(),
         baud_rate: headers.get(1).cloned().unwrap_or_default().parse().unwrap_or(0),
-        com_index: headers.get(2).cloned().unwrap_or_default().parse().unwrap_or(0),
-        device_id: headers.get(3).cloned().unwrap_or_default().parse().unwrap_or(0),
-        data_len: headers.get(4).cloned().unwrap_or_default().parse().unwrap_or(0),
-        pre: headers.get(5).cloned().unwrap_or_default(),
+        // 这里将第 2 号下标对应的字符串，解析成 bool
+        // 如果解析失败（非 "true"/"false"），则默认 false
+        is_special: headers
+            .get(2)
+            .cloned()
+            .unwrap_or_default()
+            .parse::<bool>()
+            .unwrap_or(false),
+        com_index: headers.get(3).cloned().unwrap_or_default().parse().unwrap_or(0),
+        device_id: headers.get(4).cloned().unwrap_or_default().parse().unwrap_or(0),
+        data_len: headers.get(5).cloned().unwrap_or_default().parse().unwrap_or(0),
+        pre: headers.get(6).cloned().unwrap_or_default(),
     };
 
 

@@ -157,6 +157,27 @@ impl SerialManager {
             return;
         }
 
+        match self.port{
+            Some(ref mut port) => {
+                if self.serial_config_data.is_special {
+                    match port.write(&command.command) {  
+                        Ok(_) => {
+                            return ;
+                        },
+                        Err(e) => {
+                            eprintln!("写入错误: {:?}", e);
+                            self.reconnect().await; // 发生写入错误时，尝试重新连接
+                        }
+                    }
+                }
+            },
+            None => {
+                //打印未打开串口
+                //eprintln!("{:}串口未打开",command.com);
+                self.reconnect().await; // 串口未打开时，尝试重新连接
+            }
+        }
+
         let selected_data = vec![command.command[0]];  // 创建一个只包含所选元素的新Vec
         //移除第一个元素
         command.command.remove(0);
@@ -164,7 +185,6 @@ impl SerialManager {
         match self.port{
             Some(ref mut port) => {
                 port.set_parity(Parity::Mark).expect("TODO: panic message");
-
                 if let Err(e) = port.write(&selected_data) {
                     eprintln!("写入错误: {:?}", e);
                     //self.reconnect().await; // 发生写入错误时，尝试重新连接

@@ -111,7 +111,7 @@ async fn init(global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceSta
                     }
                     // 如果没有找到相同的串口配置，创建新的配置
                     if !found {
-                        let mut  new_config = SerialPortConfig::new(conf.com.clone(),conf.baud_rate, vec![]);
+                        let mut  new_config = SerialPortConfig::new(conf.com.clone(),conf.baud_rate, conf.is_special, vec![]);
                         let device_configuration = DeviceConfiguration {
                             config: conf.clone(),
                             timeout_count:0,
