@@ -32,6 +32,19 @@ pub struct SerialConfig {
     pub parity: Parity,                       // 串口奇偶校验设置
 }
 
+impl SerialConfig {
+    // 构造函数
+    pub fn new(port_name: String, baud_rate: u32, data_bits: DataBits, stop_bits: StopBits, parity: Parity) -> Self {
+        SerialConfig {
+            port_name,
+            baud_rate,
+            data_bits,
+            stop_bits,
+            parity
+        }
+    }
+}
+
 //串口数据包
 #[derive(Debug, Deserialize, Clone)]
 struct DataPacket {

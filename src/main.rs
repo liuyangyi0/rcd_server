@@ -80,9 +80,9 @@ async fn init(global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceSta
     }
 
     //打印文件列表
-    for file in files.iter() {
-        println!("文件: {:?}", file);
-    }    //files 遍历
+    // for file in files.iter() {
+    //     println!("文件: {:?}", file);
+    // }    //files 遍历
     let mut serial_port_configs: Vec<SerialPortConfig> = vec![];
     let mut txs: Vec<mpsc::Sender<Command>> = vec![];
 
@@ -93,17 +93,7 @@ async fn init(global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceSta
                     // 判断是否有重复的串口配置
                     for serial_port_config in serial_port_configs.iter_mut() {
                         if serial_port_config.port_number == conf.com {
-                            let device_configuration = DeviceConfiguration {
-                                config: conf.clone(),
-                                timeout_count:0,
-                                current_round:0,
-                                records: recs.clone(),
-                                parse_fail_count:0,
-                                site_status: true,
-                                last_data: vec![0],
-                                same_count:0,
-                                is_read: true,
-                            };
+                            let device_configuration = DeviceConfiguration::new(conf.clone(), recs.clone());
                             serial_port_config.commands.push(device_configuration);
                             found = true;
                             break;
@@ -112,17 +102,7 @@ async fn init(global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceSta
                     // 如果没有找到相同的串口配置，创建新的配置
                     if !found {
                         let mut  new_config = SerialPortConfig::new(conf.com.clone(),conf.baud_rate, conf.is_special, vec![]);
-                        let device_configuration = DeviceConfiguration {
-                            config: conf.clone(),
-                            timeout_count:0,
-                            current_round:0,
-                            records: recs.clone(),
-                            parse_fail_count:0,
-                            site_status: true,
-                            last_data: vec![0],
-                            same_count:0,
-                            is_read: true,
-                        };
+                        let device_configuration = DeviceConfiguration::new(conf.clone(), recs.clone());
                         new_config.commands.push(device_configuration);
                         serial_port_configs.push(new_config);
                     }
@@ -133,13 +113,10 @@ async fn init(global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceSta
 
     // 循环 serial_port_configs 创建串口读取线程
     for (_, serial_port_config) in serial_port_configs.iter_mut().enumerate() {
-        let serial_config = SerialConfig{
-            port_name: serial_port_config.port_number.clone(),
-            baud_rate: serial_port_config.baud_rate,
-            data_bits: software_config.serial.data_bits,
-            stop_bits: software_config.serial.stop_bits,
-            parity: software_config.serial.parity,
-        };
+
+        let serial_config = SerialConfig::new(serial_port_config.port_number.clone(), serial_port_config.baud_rate,
+                                              software_config.serial.data_bits, software_config.serial.stop_bits, software_config.serial.parity);
+
         let (tx, rx) = mpsc::channel();
         txs.push(tx);
         

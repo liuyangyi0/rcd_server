@@ -100,6 +100,21 @@ pub struct DeviceConfiguration {
 }
 
 impl DeviceConfiguration {
+    
+    pub fn  new(config: Config, records: Vec<Record>) -> Self {
+        DeviceConfiguration {
+            config,
+            timeout_count: 0,
+            current_round: 0,
+            records,
+            parse_fail_count: 0,
+            site_status: true,
+            last_data: vec![0],
+            same_count: 0,
+            is_read: true,
+        }
+    }
+    
     // 检查数据是否符合条件的方法
     pub fn check_data(&mut self, data: Vec<u8>) -> bool {
         // 如果新数据和上次数据相同
