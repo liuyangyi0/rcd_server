@@ -31,13 +31,10 @@ use bounded_vec_deque::BoundedVecDeque;
 async fn main() -> Result<()> {
     // 创建全局发送器列表 当有新的客户端连接时，将其本地发送器注册到全局发送器列表中
     let global_sender = Arc::new(TokioMutex::new(Vec::new()));
-
     // 初始化配置
     let software_config = config::init_config().unwrap();
-    
     // 创建系统状态列表
     let system_state = SystemState::new();
-
     let system_record = Arc::new(TokioMutex::new(BoundedVecDeque::<String>::new(20000)));
     
     // 初始化 串口配置和发送器列表
