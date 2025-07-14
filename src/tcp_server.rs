@@ -14,6 +14,73 @@ use tokio::time::timeout;
 use crate::common::{Command, CommandType, MessageType, SystemState, Value};
 use crate::serial_port_config::SerialPortConfig;
 use chrono::prelude::*;
+use std::fmt::Write;
+use crate::common::CommandType::SendData;
+use bytes::BytesMut;
+
+/// 解析失败时的错误类型
+
+#[derive(Debug)]
+pub enum ParseError {
+    /// 条目中缺少等号，例如 "foo" 或 "foo=bar=baz"
+    MissingEq(String),
+    /// 键为空，例如 "=bar"
+    EmptyKey(String),
+    /// 值为空，例如 "foo="
+    EmptyValue(String),
+    /// 键重复
+    DuplicateKey(String),
+    /// 不是合法 UTF-8
+    InvalidUtf8,          // ← 一定要有这行
+}
+
+
+/// 将形如 "a=1;b=2;c=3" 的字符串解析成 HashMap
+pub fn parse_kv_line(buf: &BytesMut) -> Result<HashMap<String, String>, ParseError> {
+    // 1) 先尝试把整段缓冲区按 UTF-8 解释
+    let line = std::str::from_utf8(buf).map_err(|_| ParseError::InvalidUtf8)?;
+
+    let mut map = HashMap::new();
+
+    // 2) 与之前相同的逐项解析
+    for raw in line.split(';').filter(|s| !s.is_empty()) {
+        let mut parts = raw.splitn(2, '=');
+
+        let key = parts.next().unwrap();
+        let value_opt = parts.next();
+
+        // 缺少 '='
+        let value = value_opt.ok_or_else(|| ParseError::MissingEq(raw.to_string()))?;
+
+        if key.is_empty() {
+            return Err(ParseError::EmptyKey(raw.to_string()));
+        }
+        if value.is_empty() {
+            return Err(ParseError::EmptyValue(raw.to_string()));
+        }
+        if map.contains_key(key) {
+            return Err(ParseError::DuplicateKey(key.to_string()));
+        }
+
+        map.insert(key.to_owned(), value.to_owned());
+    }
+
+    Ok(map)
+}
+
+
+fn hex_str_to_bytes(hex_str: &str) -> Result<Vec<u8>, String> {
+    if hex_str.len() % 2 != 0 {
+        return Err("Hex字符串的长度不是偶数".to_string());
+    }
+    (0..hex_str.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex_str[i..i + 2], 16)
+                .map_err(|e| e.to_string())
+        })
+        .collect()
+}
 
 
 
@@ -52,84 +119,140 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
             message = framed.next() => match message {
                 // 如果成功接收到消息，输出消息内容
                 Some(Ok(msg)) => {
-                    let message: MessageType = bincode::deserialize(&msg).unwrap();
-                    match message {
-                        MessageType::Command(a) => {
-                            //把数据发送到串口
-                            println!("Received MessageA: {:?}", a.clone());
-                            //tx.send(a).unwrap();
-                            
-                            //时间戳
-                            let local: DateTime<Local> = Local::now();
-                            
-                            //记录到系统日志
-                            let mut record = system_record.lock().await;
-                            
-                            
-                            match a.command.clone() {
-                                CommandType::SendData(data) => {
-                                    record.push_back(format!("时间{} 串口{} 数据{}", local.format("%Y-%m-%d %H:%M:%S"), a.com, data.command_as_string()));
-                                },
-                                _ => {}
-                            }
+                    //let message: MessageType = bincode::deserialize(&msg).unwrap();
+                    match bincode::deserialize::<MessageType>(&msg){
+                        Ok(message) => {
+                            match message {
+                                MessageType::Command(a) => {
+                                    //把数据发送到串口
+                                    println!("Received MessageA: {:?}", a.clone());
+                                    //tx.send(a).unwrap();
+
+                                    //时间戳
+                                    let local: DateTime<Local> = Local::now();
+
+                                    //记录到系统日志
+                                    let mut record = system_record.lock().await;
 
 
-                            //发送到串口线程 serial_prots
-                            for (i, serial_prot) in serial_ports.iter().enumerate() {
-                                if a.com == serial_prot.port_number {
-                                    // txs[i].send(a.clone()).unwrap();
-                                    match txs[i].send(a.clone()) {
-                                        Ok(_) => {
-                                            // println!("Message sent successfully to serial port thread");
+                                    match a.command.clone() {
+                                        CommandType::SendData(data) => {
+                                            record.push_back(format!("时间{} 串口{} 数据{}", local.format("%Y-%m-%d %H:%M:%S"), a.com, data.command_as_string()));
                                         },
-                                        Err(e) => {
-                                            eprintln!("Failed to send message: {:?}", e);
-                                            // 此时可以根据需要进行进一步处理，比如记录日志，或者跳过。
+                                        _ => {}
+                                    }
+
+
+                                    //发送到串口线程 serial_prots
+                                    for (i, serial_prot) in serial_ports.iter().enumerate() {
+                                        if a.com == serial_prot.port_number {
+                                            // txs[i].send(a.clone()).unwrap();
+                                            match txs[i].send(a.clone()) {
+                                                Ok(_) => {
+                                                    // println!("Message sent successfully to serial port thread");
+                                                },
+                                                Err(e) => {
+                                                    eprintln!("Failed to send message: {:?}", e);
+                                                    // 此时可以根据需要进行进一步处理，比如记录日志，或者跳过。
+                                                }
+                                            }
+                                            println!("serialized: {:?}", a);
                                         }
                                     }
-                                    println!("serialized: {:?}", a);
+
+                                },
+                                MessageType::DeviceStatus(b) => {
+                                    println!("Received MessageB: {:?}", b);
+                                },
+                                MessageType::QueryAllStatus => {
+                                    // 查询所有设备状态
+                                    let msg = MessageType::AllStatus(system_state.get_state().await);
+                                    println!("Sending MessageC: {:?}", msg);
+
+                                    let serialized = bincode::serialize(&msg).expect("Failed to serialize message");
+                                    if let Err(_e) = timeout(Duration::from_secs(1), framed.send(Bytes::from(serialized))).await {
+                                        return Err(io::Error::new(io::ErrorKind::TimedOut, "发送消息超时"));
+                                    }
+                                }
+                                MessageType::AllStatus(c) => {
+                                    // 查询所有设备状态
+                                    println!("Received MessageC: {:?}", c);
+                                }
+                                MessageType::QueryRecord => {
+                                    // 查询所有设备状态
+                                    //记录到系统日志
+                                    let mut record = system_record.lock().await;
+                                    let mut records = vec![];
+                                    for r in record.iter() {
+                                        records.push(r.clone());
+                                    }
+
+                                    let msg = MessageType::AllRecord(records);
+
+                                    let serialized = bincode::serialize(&msg).expect("Failed to serialize message");
+                                    if let Err(_e) = timeout(Duration::from_secs(1), framed.send(Bytes::from(serialized))).await {
+                                        return Err(io::Error::new(io::ErrorKind::TimedOut, "发送消息超时"));
+                                    }
+                                }
+                                MessageType::AllRecord(d) => {
+                                    // 查询所有设备状态
+                                    println!("Received MessageD: {:?}", d);
                                 }
                             }
-
                         },
-                        MessageType::DeviceStatus(b) => {
-                            println!("Received MessageB: {:?}", b);
-                        },
-                        MessageType::QueryAllStatus => {
-                            // 查询所有设备状态
-                            let msg = MessageType::AllStatus(system_state.get_state().await);
-                            println!("Sending MessageC: {:?}", msg);
+                        Err(e) => {
+                            //struct SendData {
+                            //     pub device_id: u32,
+                            //     pub command: Vec<u8>,
+                            // }  创建一个 SendData 结构体
 
-                            let serialized = bincode::serialize(&msg).expect("Failed to serialize message");
-                            if let Err(_e) = timeout(Duration::from_secs(1), framed.send(Bytes::from(serialized))).await {
-                                return Err(io::Error::new(io::ErrorKind::TimedOut, "发送消息超时"));
+                            match parse_kv_line(&msg) {
+                                Ok(map) => {
+                                    // ① 同时遍历键和值（最常用）
+                                    for (key, value) in &map {
+                                        let mut bytes = match hex_str_to_bytes(&value) {
+                                            Ok(bytes) => bytes,
+                                            Err(e) => {
+                                                eprintln!("Hex字符串转换失败: {}", e);
+                                                continue; // 跳过当前循环，继续处理下一个键值对
+                                            }
+                                        };
+                                        let send_data = crate::common::SendData{
+                                            device_id: 0, // 这里可以根据实际情况设置设备ID
+                                            command: bytes, // 将接收到的消息转换为 Vec<u8>
+                                        };
+                                            // 然后用它来构造 Command
+                                        let a = Command {
+                                            com: key.clone(),
+                                            command: CommandType::SendData(send_data),
+                                        };
+                                        
+                                        
+                                        //发送到串口线程 serial_prots
+                                        for (i, serial_prot) in serial_ports.iter().enumerate() {
+                                            if a.com.clone() == serial_prot.port_number {
+                                                // txs[i].send(a.clone()).unwrap();
+                                                match txs[i].send(a.clone()) {
+                                                    Ok(_) => {
+                                                        // println!("Message sent successfully to serial port thread");
+                                                    },
+                                                    Err(e) => {
+                                                        eprintln!("Failed to send message: {:?}", e);
+                                                        // 此时可以根据需要进行进一步处理，比如记录日志，或者跳过。
+                                                    }
+                                                }
+                                                println!("serialized: {:?}", a);
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => eprintln!("解析失败: {e:?}"),
                             }
-                        }
-                        MessageType::AllStatus(c) => {
-                            // 查询所有设备状态
-                            println!("Received MessageC: {:?}", c);
-                        }
-                        MessageType::QueryRecord => {
-                            // 查询所有设备状态
-                            //记录到系统日志
-                            let mut record = system_record.lock().await;
-                            let mut records = vec![];
-                            for r in record.iter() {
-                                records.push(r.clone());
-                            }
-
-                            let msg = MessageType::AllRecord(records);
-
-                            let serialized = bincode::serialize(&msg).expect("Failed to serialize message");
-                            if let Err(_e) = timeout(Duration::from_secs(1), framed.send(Bytes::from(serialized))).await {
-                                return Err(io::Error::new(io::ErrorKind::TimedOut, "发送消息超时"));
-                            }
-                        }
-                        MessageType::AllRecord(d) => {
-                            // 查询所有设备状态
-                            println!("Received MessageD: {:?}", d);
                         }
                     }
+
+
+
                 }
                 // 如果接收消息时出错或流结束（None），则处理客户端断开连接的情况
                 Some(Err(e)) => {
@@ -153,14 +276,22 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
                 if let Some(data) = data_to_send {
                     println!("Preparing to send data: {:?}", data);
                     // 这里注释的部分是将数据发送到客户端的代码，需要解开注释以实际发送数据
-                    let message = MessageType::DeviceStatus(data);
+                    //let message = MessageType::DeviceStatus(data);
                     // 序列化消息。
-                    let serialized = bincode::serialize(&message).expect("Failed to serialize message");
-                    // 发送序列化后的消息。
-                    if let Err(_e) = timeout(Duration::from_secs(1), framed.send(Bytes::from(serialized))).await {
+                    //let serialized = bincode::serialize(&message).expect("Failed to serialize message");
+
+                        // ① 打平成字符串
+                    let plain = build_status_line(&data);
+                    if let Err(_e) = timeout(Duration::from_secs(1), framed.send(Bytes::from(plain.clone()))).await {
                         //error!("发送消息超时: {:?}", e);
                         return Err(io::Error::new(io::ErrorKind::TimedOut, "发送消息超时"));
                     }
+
+                    // 发送序列化后的消息。
+                    // if let Err(_e) = timeout(Duration::from_secs(1), framed.send(Bytes::from(serialized))).await {
+                    //     //error!("发送消息超时: {:?}", e);
+                    //     return Err(io::Error::new(io::ErrorKind::TimedOut, "发送消息超时"));
+                    // }
                 }
             }
         }
@@ -168,6 +299,37 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
 
     // 正常退出循环后返回Ok，表示函数执行成功
     Ok(())
+}
+
+fn build_status_line(ds: &DeviceStatus) -> String {
+    // com_status / device_status 先缓存，避免反复借用
+    let com_ok   = ds.com_status;
+    let dev_ok   = ds.device_status;
+
+    let mut s = String::new();
+
+    for (k, v) in &ds.value {
+        // 1) 普通数据
+        write!(&mut s, "{}={};", k, value_to_str(v)).unwrap();
+        // 2) com_status / device_status
+        write!(&mut s, "{}_com_status={};", k, com_ok).unwrap();
+        write!(&mut s, "{}_device_status={};", k, dev_ok).unwrap();
+    }
+
+    // 去掉最后一个分号
+    if s.ends_with(';') {
+        s.pop();
+    }
+    s
+}
+
+/// 把 `serde_json::Value` 转成适合人看的字符串
+fn value_to_str(v: &Value) -> String {
+    match v {
+        Value::Float(f)      => f.to_string(),
+        Value::Bool(b)   => b.to_string(),
+        Value::UInt(n) => n.to_string(),
+    }
 }
 
 pub async fn run_tcp_server_1(serial_ports:Vec<SerialPortConfig>,
