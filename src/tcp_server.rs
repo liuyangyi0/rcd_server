@@ -15,8 +15,8 @@ use crate::common::{Command, CommandType, MessageType, SystemState, Value};
 use crate::serial_port_config::SerialPortConfig;
 use chrono::prelude::*;
 use std::fmt::Write;
-use crate::common::CommandType::SendData;
 use bytes::BytesMut;
+use tokio::io::AsyncWriteExt;
 
 /// 解析失败时的错误类型
 
@@ -181,7 +181,7 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
                                 MessageType::QueryRecord => {
                                     // 查询所有设备状态
                                     //记录到系统日志
-                                    let mut record = system_record.lock().await;
+                                    let record = system_record.lock().await;
                                     let mut records = vec![];
                                     for r in record.iter() {
                                         records.push(r.clone());
@@ -200,7 +200,7 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
                                 }
                             }
                         },
-                        Err(e) => {
+                        Err(_e) => {
                             //struct SendData {
                             //     pub device_id: u32,
                             //     pub command: Vec<u8>,
@@ -210,7 +210,7 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
                                 Ok(map) => {
                                     // ① 同时遍历键和值（最常用）
                                     for (key, value) in &map {
-                                        let mut bytes = match hex_str_to_bytes(&value) {
+                                        let bytes = match hex_str_to_bytes(&value) {
                                             Ok(bytes) => bytes,
                                             Err(e) => {
                                                 eprintln!("Hex字符串转换失败: {}", e);
@@ -310,17 +310,19 @@ fn build_status_line(ds: &DeviceStatus) -> String {
 
     for (k, v) in &ds.value {
         // 1) 普通数据
-        write!(&mut s, "{}={};", k, value_to_str(v)).unwrap();
+        write!(&mut s, "{}={}\n", k, value_to_str(v)).unwrap();
         // 2) com_status / device_status
-        write!(&mut s, "{}_com_status={};", k, com_ok).unwrap();
-        write!(&mut s, "{}_device_status={};", k, dev_ok).unwrap();
+        write!(&mut s, "{}_com_status={}\n", k, com_ok).unwrap();
+        write!(&mut s, "{}_device_status={}\n", k, dev_ok).unwrap();
     }
 
     // 去掉最后一个分号
-    if s.ends_with(';') {
-        s.pop();
-    }
-    s
+    // if s.ends_with(';') {
+    //     s.pop();
+    // }
+    s.chars()
+        .filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace())
+        .collect()
 }
 
 /// 把 `serde_json::Value` 转成适合人看的字符串
@@ -363,3 +365,87 @@ pub async fn run_tcp_server_1(serial_ports:Vec<SerialPortConfig>,
         }
     }
 }
+
+
+
+pub async fn run_tcp_server_2(serial_ports: Vec<SerialPortConfig>,
+                              txs: Vec<mpsc::Sender<Command>>,
+                              global_sender_plain: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
+                              system_state: SystemState,
+                              system_record: Arc<TokioMutex<BoundedVecDeque<String>>>
+) -> io::Result<()> {
+    // 绑定一个新的TCP监听器到本地的11003端口（你可以修改端口）
+    let listener = TcpListener::bind("0.0.0.0:11003").await?;
+
+    // 无限循环，用于不断接受连接请求
+    loop {
+        // 克隆全局发送器，以便在多个任务中安全使用
+        let global_sender_plain_clone = global_sender_plain.clone();
+
+        // 异步接受一个连接请求
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                // 不使用Framed，直接用TcpStream
+                tokio::spawn(handle_client_2(stream, global_sender_plain_clone, serial_ports.clone(), txs.clone(), system_state.clone(), system_record.clone()));
+            },
+            Err(e) => {
+                eprintln!("Failed to accept connection on plain server: {:?}", e);
+            }
+        }
+    }
+}
+
+
+pub async fn handle_client_2(mut stream: TcpStream,
+                             global_sender_plain: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
+                             _serial_ports: Vec<SerialPortConfig>,  // 未使用，但保持参数一致
+                             _txs: Vec<mpsc::Sender<Command>>,      // 未使用
+                             _system_state: SystemState,            // 未使用
+                             _system_record: Arc<TokioMutex<BoundedVecDeque<String>>>  // 未使用
+) -> io::Result<()> {
+    println!("handle_client_2 (plain server)");
+
+    // 创建一个Tokio异步消息通道，缓冲区大小为32
+    let (tx_serial, mut rx) = tokio_mpsc::channel(32);
+    let local_tx_arc = Arc::new(tx_serial);
+
+    // 获取全局发送器的锁，并将当前客户端的发送器添加到全局列表中
+    {
+        let mut sender = global_sender_plain.lock().await;
+        sender.push(local_tx_arc.clone());
+    }
+
+    // 无限循环，只处理待发送的数据（不接收客户端消息）
+    loop {
+        // 从其他任务或处理逻辑接收到要发送的数据
+        if let Some(data) = rx.recv().await {
+            println!("Preparing to send data (plain): {:?}", data);
+
+            // 构建plain字符串（与原有相同）
+            let plain = build_status_line(&data);
+
+            // 直接发送纯字符串，不带帧头
+            if let Err(e) = timeout(Duration::from_secs(1), stream.write_all(plain.as_bytes())).await {
+                eprintln!("发送消息超时 (plain): {:?}", e);
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "发送消息超时"));
+            }
+
+            // 可选：flush确保发送
+            if let Err(e) = stream.flush().await {
+                eprintln!("Flush failed (plain): {:?}", e);
+                break;
+            }
+        } else {
+            // rx关闭，连接结束
+            println!("Connection closed by server (plain).");
+            break;
+        }
+    }
+
+    // 移除发送器
+    let mut sender = global_sender_plain.lock().await;
+    sender.retain(|x| !Arc::ptr_eq(x, &local_tx_arc));
+
+    Ok(())
+}
+

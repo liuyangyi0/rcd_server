@@ -81,6 +81,7 @@ struct SerialManager {
     serial_config: SerialConfig,            // 串口配置
     serial_config_data:SerialPortConfig, //串口配置数据
     global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>, // 全局发送器
+    global_sender_plain: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
     index: usize,
     run_on: RunLocation, // 程序运行是主还是备用
     //程序当前是主还是备用
@@ -98,6 +99,7 @@ impl SerialManager {
         serial_config: SerialConfig,
         serial_config_data: SerialPortConfig,
         global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
+        global_sender_plain: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
         run_on: RunLocation,
         current_run: RunLocation,
         system_record: Arc<TokioMutex<BoundedVecDeque<String>>>
@@ -122,6 +124,7 @@ impl SerialManager {
             serial_config,
             serial_config_data,
             global_sender,
+            global_sender_plain,
             index: 0,
             run_on,
             current_run,
@@ -154,7 +157,7 @@ impl SerialManager {
                         value: data.clone(),
                         raw_data: v};
 
-                    send_to_all_senders(&self.global_sender, data).await;
+                    send_to_all_senders(&self.global_sender,&self.global_sender_plain, data).await;
                 }
                 //send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: false,device_status: false, value: data.clone()}).await;
                 self.port = None;
@@ -312,7 +315,7 @@ impl SerialManager {
                                         device_status: true,
                                         value: data.clone(),
                                         raw_data: buffer[..bytes_read].to_vec()};
-                                    send_to_all_senders(&self.global_sender, data).await;
+                                    send_to_all_senders(&self.global_sender, &self.global_sender,data).await;
                                 }
 
                                 //send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: true, value: data.clone()}).await;
@@ -350,7 +353,7 @@ impl SerialManager {
                                 value: data.clone(),
                                 raw_data: v};
 
-                            send_to_all_senders(&self.global_sender, data).await;
+                            send_to_all_senders(&self.global_sender, &self.global_sender, data).await;
                         }
 
                         //send_to_all_senders(&self.global_sender, DeviceStatus { id: self.serial_config_data.commands[self.index].config.com_index as i64 as u64, com_status: true,device_status: false, value: data.clone()}).await;
@@ -540,6 +543,7 @@ fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
 //system_state: 系统状态
 pub async fn start_serial_thread_1(
     global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
+    global_sender_plain: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
     serial_config: SerialConfig,
     serial_config_data:SerialPortConfig,
     rx: Receiver<Command>,
@@ -547,7 +551,7 @@ pub async fn start_serial_thread_1(
     system_state: SystemState,
     system_record: Arc<TokioMutex<BoundedVecDeque<String>>>
 ) -> thread::JoinHandle<()> {
-    let mut manager = SerialManager::new(serial_config, serial_config_data, global_sender.clone(),software_config.server.run_on,software_config.server.current_run, system_record).await;
+    let mut manager = SerialManager::new(serial_config, serial_config_data, global_sender.clone(), global_sender_plain.clone(), software_config.server.run_on,software_config.server.current_run, system_record).await;
 
     thread::spawn(move || {
         let rt = Runtime::new().unwrap(); // 创建一个新的Tokio运行时
@@ -716,6 +720,7 @@ fn find_double_zero(buffer: &[u8]) -> Option<usize> {
 // 发送数据到所有发送器
 pub async fn send_to_all_senders(
     global_sender: &Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
+    global_sender_plain: &Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
     data: DeviceStatus,
 ) {
     let mut sender = global_sender.lock().await;
@@ -732,4 +737,18 @@ pub async fn send_to_all_senders(
     for &i in indices_to_remove.iter().rev() {
         sender.remove(i);
     }
+
+    // 发送到新global_sender_plain（不带帧头客户端）
+    let mut sender_plain = global_sender_plain.lock().await;
+    let mut indices_to_remove_plain = Vec::new();
+    for (i, s) in sender_plain.iter().enumerate() {
+        if let Err(e) = s.send(data.clone()).await {
+            eprintln!("发送数据失败，移除发送器 (plain): {:?}", e);
+            indices_to_remove_plain.push(i);
+        }
+    }
+    for &i in indices_to_remove_plain.iter().rev() {
+        sender_plain.remove(i);
+    }
+
 }
