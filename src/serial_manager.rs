@@ -11,6 +11,7 @@ use serde::Deserialize;
 use tokio::runtime::Runtime;
 use crate::common::{SendData, get_sum, Value, Command, CommandType, SystemState};
 use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
+use tokio::time::timeout;
 use crate::config;
 use crate::config::RunLocation;
 use crate::serial_port_config::SerialPortConfig;
@@ -557,7 +558,7 @@ pub async fn start_serial_thread_1(
         let rt = Runtime::new().unwrap(); // 创建一个新的Tokio运行时
         rt.block_on(async { // 在运行时中执行异步代码块
             loop {
-
+              
                 while let Ok(cmd) = rx.try_recv() {
                     match cmd.command {
                         CommandType::SendData(data) => {
@@ -718,37 +719,97 @@ fn find_double_zero(buffer: &[u8]) -> Option<usize> {
 
 
 // 发送数据到所有发送器
+// pub async fn send_to_all_senders(
+//     global_sender: &Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
+//     global_sender_plain: &Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
+//     data: DeviceStatus,
+// ) {
+//     let mut sender = global_sender.lock().await;
+//     let mut indices_to_remove = Vec::new();
+//
+//     for (i, s) in sender.iter().enumerate() {
+//         if let Err(e) = s.send(data.clone()).await {
+//             eprintln!("发送数据失败，移除发送器: {:?}", e);
+//             indices_to_remove.push(i);
+//         }
+//     }
+//
+//     // 逆序移除发送器，防止索引混乱
+//     for &i in indices_to_remove.iter().rev() {
+//         sender.remove(i);
+//     }
+//
+//     // 发送到新global_sender_plain（不带帧头客户端）
+//     let mut sender_plain = global_sender_plain.lock().await;
+//     let mut indices_to_remove_plain = Vec::new();
+//     for (i, s) in sender_plain.iter().enumerate() {
+//         if let Err(e) = s.send(data.clone()).await {
+//             eprintln!("发送数据失败，移除发送器 (plain): {:?}", e);
+//             indices_to_remove_plain.push(i);
+//         }
+//     }
+//     for &i in indices_to_remove_plain.iter().rev() {
+//         sender_plain.remove(i);
+//     }
+//
+// }
+
+
+// 发送数据到所有发送器
 pub async fn send_to_all_senders(
     global_sender: &Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
     global_sender_plain: &Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
     data: DeviceStatus,
 ) {
-    let mut sender = global_sender.lock().await;
-    let mut indices_to_remove = Vec::new();
+    // 处理 global_sender
+    let senders = {
+        let guard = global_sender.lock().await;
+        guard.iter().cloned().collect::<Vec<_>>()
+    };
 
-    for (i, s) in sender.iter().enumerate() {
-        if let Err(e) = s.send(data.clone()).await {
-            eprintln!("发送数据失败，移除发送器: {:?}", e);
-            indices_to_remove.push(i);
+    let mut failed = Vec::new();
+    for s in senders {
+        match timeout(Duration::from_millis(500), s.send(data.clone())).await {
+            Ok(Ok(_)) => {}, // 发送成功
+            Ok(Err(e)) => {
+                eprintln!("发送数据失败: {:?}", e); // 接收端已关闭
+                failed.push(s);
+            }
+            Err(_) => {
+                eprintln!("发送数据超时，客户端可能缓慢"); // 缓冲区满或其他超时，视为失败
+                failed.push(s);
+            }
         }
     }
 
-    // 逆序移除发送器，防止索引混乱
-    for &i in indices_to_remove.iter().rev() {
-        sender.remove(i);
+    if !failed.is_empty() {
+        let mut guard = global_sender.lock().await;
+        guard.retain(|existing| !failed.iter().any(|f| Arc::ptr_eq(f, existing)));
     }
 
-    // 发送到新global_sender_plain（不带帧头客户端）
-    let mut sender_plain = global_sender_plain.lock().await;
-    let mut indices_to_remove_plain = Vec::new();
-    for (i, s) in sender_plain.iter().enumerate() {
-        if let Err(e) = s.send(data.clone()).await {
-            eprintln!("发送数据失败，移除发送器 (plain): {:?}", e);
-            indices_to_remove_plain.push(i);
+    // 处理 global_sender_plain
+    let senders_plain = {
+        let guard = global_sender_plain.lock().await;
+        guard.iter().cloned().collect::<Vec<_>>()
+    };
+
+    let mut failed_plain = Vec::new();
+    for s in senders_plain {
+        match timeout(Duration::from_millis(500), s.send(data.clone())).await {
+            Ok(Ok(_)) => {}, // 发送成功
+            Ok(Err(e)) => {
+                eprintln!("发送数据失败 (plain): {:?}", e); // 接收端已关闭
+                failed_plain.push(s);
+            }
+            Err(_) => {
+                eprintln!("发送数据超时 (plain)，客户端可能缓慢"); // 缓冲区满或其他超时，视为失败
+                failed_plain.push(s);
+            }
         }
     }
-    for &i in indices_to_remove_plain.iter().rev() {
-        sender_plain.remove(i);
-    }
 
+    if !failed_plain.is_empty() {
+        let mut guard = global_sender_plain.lock().await;
+        guard.retain(|existing| !failed_plain.iter().any(|f| Arc::ptr_eq(f, existing)));
+    }
 }

@@ -301,6 +301,9 @@ pub async fn handle_client_1(mut framed: Framed<TcpStream, LengthDelimitedCodec>
     Ok(())
 }
 
+
+
+
 fn build_status_line(ds: &DeviceStatus) -> String {
     // com_status / device_status 先缓存，避免反复借用
     let com_ok   = ds.com_status;
@@ -312,8 +315,8 @@ fn build_status_line(ds: &DeviceStatus) -> String {
         // 1) 普通数据
         write!(&mut s, "{}={}\n", k, value_to_str(v)).unwrap();
         // 2) com_status / device_status
-        write!(&mut s, "{}_com_status={}\n", k, com_ok).unwrap();
-        write!(&mut s, "{}_device_status={}\n", k, dev_ok).unwrap();
+        write!(&mut s, "{}_com_status={}\n", k, bool_to_int(com_ok).to_string()).unwrap();
+        write!(&mut s, "{}_device_status={}\n", k, bool_to_int(dev_ok).to_string()).unwrap();
     }
 
     // 去掉最后一个分号
@@ -325,11 +328,16 @@ fn build_status_line(ds: &DeviceStatus) -> String {
         .collect()
 }
 
+#[inline]
+fn bool_to_int(b: bool) -> u8 {
+    if b { 1 } else { 0 }
+}
+
 /// 把 `serde_json::Value` 转成适合人看的字符串
 fn value_to_str(v: &Value) -> String {
     match v {
         Value::Float(f)      => f.to_string(),
-        Value::Bool(b)   => b.to_string(),
+        Value::Bool(b)  => bool_to_int(*b).to_string(),
         Value::UInt(n) => n.to_string(),
     }
 }
