@@ -15,6 +15,14 @@ use crate::common::{Command, CommandType, MessageType, SystemState, Value};
 use crate::serial_port_config::SerialPortConfig;
 use chrono::prelude::*;
 
+// ========== OPC UA 所需的新增导入 ==========
+use opcua::server::address_space::Variable;
+use opcua::server::diagnostics::NamespaceMetadata;
+use opcua::server::node_manager::memory::{simple_node_manager, SimpleNodeManager};
+use opcua::server::{ServerBuilder, ServerEndpoint, ServerUserToken, SubscriptionCache, ANONYMOUS_USER_TOKEN_ID};
+use opcua::types::{BuildInfo, DataTypeId, DataValue, DateTime as UaDateTime, NodeId, UAString, Variant};
+use log::warn;
+use env_logger;
 
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -200,4 +208,394 @@ pub async fn run_tcp_server_1(serial_ports:Vec<SerialPortConfig>,
             }
         }
     }
+}
+
+
+
+#[derive(Clone, Copy, Debug)]
+pub enum ExpectedType {
+    UInt32,
+    Bool,
+    Float32,
+    Float64,
+}
+
+// 你可以把字符串或你自己的类型映射到 ExpectedType
+fn expected_type_from_str(s: &str) -> ExpectedType {
+    match s.to_ascii_lowercase().as_str() {
+        "u32" | "uint32" | "uint" => ExpectedType::UInt32,
+        "bool" | "boolean"        => ExpectedType::Bool,
+        "f32" | "float"           => ExpectedType::Float32,
+        "f64" | "double"          => ExpectedType::Float64,
+        _ => ExpectedType::Float32, // 实在未知时用 Float32（你当前 Value::Float 是 f32）
+    }
+}
+
+
+// 由期望类型给出 OPC UA 节点的数据类型 NodeId 与一个合规的初始值
+fn dt_and_init(expected: ExpectedType) -> (NodeId, Variant) {
+    match expected {
+        ExpectedType::UInt32 => (NodeId::from(DataTypeId::UInt32), Variant::UInt32(0)),
+        ExpectedType::Bool   => (NodeId::from(DataTypeId::Boolean), Variant::Boolean(false)),
+        ExpectedType::Float32=> (NodeId::from(DataTypeId::Float),   Variant::Float(0.0)),
+        ExpectedType::Float64=> (NodeId::from(DataTypeId::Double),  Variant::Double(0.0)),
+    }
+}
+
+
+/// 运行 OPC UA 服务器，将串口数据发布为独立变量节点。
+///
+/// 每个节点的命名规则为 `<串口号>_<设备ID>_<kks>`，如 `COM3_1_Value`。
+/// 当串口线程发送 DeviceStatus 时，会根据其中的 `value` 字典更新对应节点的实际数值。
+// pub async fn run_opcua_server(
+//     serial_ports: Vec<SerialPortConfig>,
+//     global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
+//     _system_state: SystemState,
+//     _system_record: Arc<TokioMutex<BoundedVecDeque<String>>>,
+// ) -> io::Result<()> {
+//     // 初始化日志（多次调用也安全）
+//     let _ = env_logger::try_init();
+//
+//     let host = "0.0.0.0";
+//     let port: u16 = 4840;
+//     let base = format!("opc.tcp://{}:{}/", host, port);
+//
+//     // 创建 OPC UA 服务器，设置产品信息和节点管理器
+//     let (server, handle) = ServerBuilder::new()
+//         .host(host)                           // 监听地址
+//         .port(port)                           // 监听端口
+//         .discovery_urls(vec![base.clone()])   // 至少一个 discovery url
+//         // 配置一个匿名登录的 Endpoint（无加密）
+//         .add_endpoint(
+//             "none",
+//             ServerEndpoint::new_none("/", &[ANONYMOUS_USER_TOKEN_ID.to_string()]),
+//         )
+//         .default_endpoint("none")
+//
+//
+//
+//
+//         .build_info(BuildInfo {
+//             product_uri: "urn:SerialServer".into(),
+//             manufacturer_name: "Rust Serial OPC UA Server".into(),
+//             product_name: "Serial OPC UA Server".into(),
+//             software_version: "0.1.0".into(),
+//             build_number: "1".into(),
+//             build_date: UaDateTime::now(),
+//         })
+//         .create_sample_keypair(true)  // 会在 pki 目录下生成示例密钥/证书
+//         .pki_dir("./pki")
+//
+//         .with_node_manager(simple_node_manager(
+//             NamespaceMetadata {
+//                 namespace_uri: "urn:SerialServer".to_owned(),
+//                 ..Default::default()
+//             },
+//             "simple",
+//         ))
+//         .trust_client_certs(true)
+//         .diagnostics_enabled(true)
+//         .build()
+//         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to build OPC UA server: {e}")))?;
+//
+//     // 获取内存节点管理器和订阅缓存
+//     let node_manager: Arc<SimpleNodeManager> = handle
+//         .node_managers()
+//         .get_of_type::<SimpleNodeManager>()
+//         .expect("Failed to get simple node manager");
+//     let subscriptions: Arc<SubscriptionCache> = handle.subscriptions().clone();
+//
+//     // 获取自定义命名空间索引
+//     let ns = handle
+//         .get_namespace_index("urn:SerialServer")
+//         .expect("Custom namespace not registered");
+//
+//     // 创建 Devices 文件夹，并为每个串口设备的每个 kks 建立变量节点
+//     let devices_folder_id = NodeId::new(ns, "Devices");
+//     {
+//         let mut address_space = node_manager.address_space().write();
+//         // 添加 Devices 文件夹到 Objects 文件夹下
+//         address_space.add_folder(
+//             &devices_folder_id,
+//             "Devices",
+//             "Devices",
+//             &NodeId::objects_folder_id(),
+//         );
+//
+//         // 创建变量集合
+//         let mut variables = Vec::new();
+//         for port in &serial_ports {
+//             for cfg in &port.commands {
+//                 for record in &cfg.records {
+//                     // 节点名形如 "COM3_1_Value"
+//                     let browse_name = format!("{}_{}_{}", port.port_number, cfg.config.device_id, record.kks);
+//                     let node_id = NodeId::new(ns, browse_name.clone());
+//                     // 依据 record.type_ 显式指定 DataType，并给一个合规初始值
+//                     let expected = expected_type_from_str(&record.type_);
+//                     let (dt, init) = dt_and_init(expected);
+//
+//                     variables.push(Variable::new_data_value(
+//                         &node_id,
+//                         &browse_name,  // BrowseName
+//                         &browse_name,  // DisplayName
+//                         dt,            // DataType: NodeId::from(DataTypeId::XXX)
+//                         Some(-1),      // value_rank: -1 表示标量
+//                         None,          // 非数组
+//                         init,          // 初始值：与 DataType 匹配
+//                     ));
+//
+//                 }
+//             }
+//         }
+//         if !variables.is_empty() {
+//             address_space.add_variables(variables, &devices_folder_id);
+//         }
+//     }
+//
+//     // 创建本地通道接收串口数据，并注册到全局发送器列表
+//     let (tx_opcua, mut rx_opcua) = tokio_mpsc::channel::<DeviceStatus>(32);
+//     let local_tx_arc = Arc::new(tx_opcua);
+//     {
+//         let mut senders = global_sender.lock().await;
+//         senders.push(local_tx_arc.clone());
+//     }
+//
+//     // 异步任务：循环接收串口线程发送的 DeviceStatus，更新对应变量节点的实际值
+//     let nm = node_manager.clone();
+//     let subs = subscriptions.clone();
+//     let ns_index = ns;
+//     tokio::spawn(async move {
+//         while let Some(status) = rx_opcua.recv().await {
+//             // 针对每个 kks 更新一个变量节点
+//             for (kks, val) in &status.value {
+//                 // 构造节点名，例如 "COM3_1_Value"
+//                 let browse_name = format!("{}_{}_{}", status.com, status.device_id, kks);
+//                 let node_id = NodeId::new(ns_index, browse_name.clone());
+//
+//                 // 根据 Value 类型创建 DataValue，使用 Variant
+//                 let variant = match val {
+//                     Value::UInt(n) => Variant::UInt32(*n),
+//                     Value::Bool(b) => Variant::Boolean(*b),
+//                     Value::Float(f) => Variant::Float(*f as f32), // 假设 Float 是 f64，转为 f32 或用 Double 如果是 f64
+//                 };
+//                 let data_value = DataValue::new_now(variant);
+//
+//                 // 更新 OPC UA 服务器中的变量值
+//                 if let Err(e) = nm.set_values(
+//                     &subs,
+//                     [(&node_id, None, data_value)].into_iter(),
+//                 ) {
+//                     warn!("Failed to set OPC UA variable value for {}: {:?}", browse_name, e);
+//                 }
+//             }
+//         }
+//     });
+//
+//     // Ctrl+C 处理：收到中断信号后取消服务器运行
+//     {
+//         let handle_c = handle.clone();
+//         tokio::spawn(async move {
+//             if let Err(e) = tokio::signal::ctrl_c().await {
+//                 warn!("Failed to register CTRL-C handler: {e}");
+//                 return;
+//             }
+//             handle_c.cancel();
+//         });
+//     }
+//
+//     // 运行 OPC UA 服务器（阻塞直到退出）
+//     server
+//         .run()
+//         .await
+//         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("OPC UA server error: {e}")))
+// }
+
+
+
+
+
+// ====== 你的函数：带证书/安全端点的完整版本（已标注改动点） ======
+pub async fn run_opcua_server(
+    serial_ports: Vec<SerialPortConfig>,
+    global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>,
+    _system_state: SystemState,
+    _system_record: Arc<TokioMutex<BoundedVecDeque<String>>>,
+) -> io::Result<()> {
+    // 初始化日志（多次调用也安全）
+    let _ = env_logger::try_init();
+
+    let host = "0.0.0.0";
+    let port: u16 = 4840;
+    let base = format!("opc.tcp://{}:{}/", host, port);
+
+    // 创建 OPC UA 服务器，设置产品信息和节点管理器
+    let (server, handle) = ServerBuilder::new()
+        .host(host)                           // 监听地址
+        .port(port)                           // 监听端口
+        .discovery_urls(vec![base.clone()])   // 至少一个 discovery url
+        // [改动] —— 建议设置应用标识（很多客户端会校验） ——
+        .application_name("Serial OPC UA Server")
+        .application_uri("urn:SerialServer:rcd_server")
+        // [改动] —— 指定 PKI 目录与证书策略 ——
+        // 会在 ./pki/own/... 等目录下生成/读取证书与私钥
+        .pki_dir("./pki")
+        .create_sample_keypair(true)  // 若缺失则自动生成样例密钥/证书（便于调试）
+        // 生产环境建议改为你自己的证书路径，并注释掉上面一行：
+        // .certificate_path("./pki/own/certs/server.der")         // DER 格式证书
+        // .private_key_path("./pki/own/private/server_key.pem")   // PEM 格式私钥
+
+
+        // === 改成：===
+        .add_user_token("user1", ServerUserToken::user_pass("user1", "pwd")) // 仅注册需要凭据的令牌
+
+        // 无安全端点：允许匿名
+        .add_endpoint(
+            "none",
+            ServerEndpoint::new_none("/", &[ANONYMOUS_USER_TOKEN_ID.to_string()]),
+        )
+
+        // 安全端点：允许匿名 + 用户名口令（或你也可以只允许 "user1"） //aes256_signenc  basic256sha256_signenc
+        .add_endpoint(
+            "basic256sha256_signenc",
+            ServerEndpoint::new_basic256sha256_sign_encrypt(
+                "/",
+                &[
+                    ANONYMOUS_USER_TOKEN_ID.to_string(), // 允许匿名登录（通道仍加密）
+                    "user1".to_string(),                 // 允许用户名口令
+                ],
+            ),
+        )
+
+        // [改动] —— 将安全端点设为默认 //aes256_signenc  basic256sha256_signenc
+        .default_endpoint("basic256sha256_signenc")
+
+        .build_info(BuildInfo {
+            product_uri: "urn:SerialServer".into(),
+            manufacturer_name: "Rust Serial OPC UA Server".into(),
+            product_name: "Serial OPC UA Server".into(),
+            software_version: "0.1.0".into(),
+            build_number: "1".into(),
+            build_date: UaDateTime::now(),
+        })
+        .with_node_manager(simple_node_manager(
+            NamespaceMetadata {
+                namespace_uri: "urn:SerialServer".to_owned(),
+                ..Default::default()
+            },
+            "simple",
+        ))
+        // 测试期可设为 true：自动信任首次连接的客户端证书
+        // 生产建议设为 false，并手动维护 pki/trusted/certs
+        .trust_client_certs(true)
+        .diagnostics_enabled(true)
+        .build()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to build OPC UA server: {e}")))?;
+
+    // 获取内存节点管理器和订阅缓存
+    let node_manager: Arc<SimpleNodeManager> = handle
+        .node_managers()
+        .get_of_type::<SimpleNodeManager>()
+        .expect("Failed to get simple node manager");
+    let subscriptions: Arc<SubscriptionCache> = handle.subscriptions().clone();
+
+    // 获取自定义命名空间索引
+    let ns = handle
+        .get_namespace_index("urn:SerialServer")
+        .expect("Custom namespace not registered");
+
+    // 创建 Devices 文件夹，并为每个串口设备的每个 kks 建立变量节点
+    let devices_folder_id = NodeId::new(ns, "Devices");
+    {
+        let mut address_space = node_manager.address_space().write();
+        // 添加 Devices 文件夹到 Objects 文件夹下
+        address_space.add_folder(
+            &devices_folder_id,
+            "Devices",
+            "Devices",
+            &NodeId::objects_folder_id(),
+        );
+
+        // 创建变量集合
+        let mut variables = Vec::new();
+        for port in &serial_ports {
+            for cfg in &port.commands {
+                for record in &cfg.records {
+                    // 节点名形如 "COM3_1_Value"
+                    let browse_name = format!("{}_{}_{}", port.port_number, cfg.config.device_id, record.kks);
+                    let node_id = NodeId::new(ns, browse_name.clone());
+
+                    // [改动] —— 显式指定 DataType，避免 Variant::Empty 导致的推断失败 panic
+                    let expected = expected_type_from_str(&record.type_);
+                    let (dt, init) = dt_and_init(expected);
+
+                    variables.push(Variable::new_data_value(
+                        &node_id,
+                        &browse_name,  // BrowseName
+                        &browse_name,  // DisplayName
+                        dt,            // DataType
+                        Some(-1),      // 标量
+                        None,          // 非数组
+                        init,          // 初始值
+                    ));
+                }
+            }
+        }
+        if !variables.is_empty() {
+            address_space.add_variables(variables, &devices_folder_id);
+        }
+    }
+
+    // 创建本地通道接收串口数据，并注册到全局发送器列表
+    let (tx_opcua, mut rx_opcua) = tokio_mpsc::channel::<DeviceStatus>(32);
+    let local_tx_arc = Arc::new(tx_opcua);
+    {
+        let mut senders = global_sender.lock().await;
+        senders.push(local_tx_arc.clone());
+    }
+
+    // 异步任务：循环接收串口线程发送的 DeviceStatus，更新对应变量节点的实际值
+    let nm = node_manager.clone();
+    let subs = subscriptions.clone();
+    let ns_index = ns;
+    tokio::spawn(async move {
+        while let Some(status) = rx_opcua.recv().await {
+            // 针对每个 kks 更新一个变量节点
+            for (kks, val) in &status.value {
+                // 构造节点名，例如 "COM3_1_Value"
+                let browse_name = format!("{}_{}_{}", status.com, status.device_id, kks);
+                let node_id = NodeId::new(ns_index, browse_name.clone());
+
+                // 根据 Value 类型创建 DataValue，类型需与建点时一致
+                let variant = match val {
+                    Value::UInt(n) => Variant::UInt32(*n),
+                    Value::Bool(b) => Variant::Boolean(*b),
+                    Value::Float(f)=> Variant::Float(*f), // 若你的 Float 是 f64，请改用 Variant::Double(*f)
+                };
+                let data_value = DataValue::new_now(variant);
+
+                // 更新 OPC UA 服务器中的变量值
+                if let Err(e) = nm.set_values(&subs, [(&node_id, None, data_value)].into_iter()) {
+                    warn!("Failed to set OPC UA variable value for {}: {:?}", browse_name, e);
+                }
+            }
+        }
+    });
+
+    // Ctrl+C 处理：收到中断信号后取消服务器运行
+    {
+        let handle_c = handle.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                warn!("Failed to register CTRL-C handler: {e}");
+                return;
+            }
+            handle_c.cancel();
+        });
+    }
+
+    // 运行 OPC UA 服务器（阻塞直到退出）
+    server
+        .run()
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("OPC UA server error: {e}")))
 }

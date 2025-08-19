@@ -21,3 +21,6 @@ regex = "1.10.4"
 toml = "0.8.19"
 bounded-vec-deque = "0.1.1"
 chrono = "0.4"
+async-opcua = { version = "0.16", features = ["server"] }
+log = "0.4"
+env_logger = "0.10"

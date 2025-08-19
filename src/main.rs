@@ -24,6 +24,9 @@ use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
 use bounded_vec_deque::BoundedVecDeque;
 
 
+// 导入 OPC UA 服务器入口和 DeviceStatus 类型
+use crate::tcp_server::{run_opcua_server};
+
 
 
 // 程序主函数，设置并启动TCP服务器和串口读取线程。
@@ -41,9 +44,13 @@ async fn main() -> Result<()> {
     match init(global_sender.clone(), software_config, system_state.clone(),system_record.clone()).await {
         Ok((configs, txs)) => {
             // 启动 TCP 服务器
-            match run_tcp_server_1(configs, txs, global_sender.clone(), system_state.clone(), system_record).await {
-                Ok(_) => println!("Server terminated successfully."),
-                Err(e) => eprintln!("Server failed with error: {}", e),
+            // match run_tcp_server_1(configs, txs, global_sender.clone(), system_state.clone(), system_record).await {
+            //     Ok(_) => println!("Server terminated successfully."),
+            //     Err(e) => eprintln!("Server failed with error: {}", e),
+            // }
+            match run_opcua_server(configs, global_sender.clone(), system_state.clone(), system_record).await {
+                Ok(_) => println!("OPC UA server terminated successfully."),
+                Err(e) => eprintln!("OPC UA server failed with error: {}", e),
             }
         },
         Err(e) => {
