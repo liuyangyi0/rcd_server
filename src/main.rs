@@ -48,9 +48,9 @@ async fn main() -> Result<()> {
             //     Ok(_) => println!("Server terminated successfully."),
             //     Err(e) => eprintln!("Server failed with error: {}", e),
             // }
-            match run_opcua_server(configs, global_sender.clone(), system_state.clone(), system_record).await {
-                Ok(_) => println!("OPC UA server terminated successfully."),
-                Err(e) => eprintln!("OPC UA server failed with error: {}", e),
+            match run_opcua_server(configs, global_sender.clone(), system_state.clone(), system_record.clone(), txs).await {  // 新增：在此传入 txs
+                Ok(_) => println!("OPC UA server terminated successfully."),
+                Err(e) => eprintln!("OPC UA server failed with error: {}", e),
             }
         },
         Err(e) => {
