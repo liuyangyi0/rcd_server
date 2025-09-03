@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::SinkExt;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
-use crate::common::{Command, CommandType, MessageType, SendData, SystemState, Value};
+use crate::common::{get_sum, Command, CommandType, MessageType, SendData, SystemState, Value};
 use crate::serial_port_config::SerialPortConfig;
 use chrono::prelude::*;
 
@@ -276,6 +276,9 @@ fn modbus_crc16_special(data: &[u8]) -> (u8, u8) {
 
 
 
+
+
+
 /// 运行 OPC UA 服务器，将串口数据发布为独立变量节点。
 ///
 /// 每个节点的命名规则为 `<串口号>_<设备ID>_<kks>`，如 `COM3_1_Value`。
@@ -503,9 +506,10 @@ pub async fn run_opcua_server(
                                             if bytes.len() < 2 {
                                                 warn!("收到的十六进制长度过短（至少需要2字节，含设备地址）: {}", v);
                                             } else {
-                                                let (low, high) = modbus_crc16_special(&bytes[1..]);
-                                                bytes.push(low);
-                                                bytes.push(high);
+                                                // let (low, high) = modbus_crc16_special(&bytes[1..]);
+                                                // bytes.push(low);
+                                                // bytes.push(high);
+                                                bytes.push(get_sum(&bytes));
 
                                                 // device_id 用首字节
                                                 let device_id = bytes[0] as u32;
