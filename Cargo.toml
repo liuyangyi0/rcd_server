@@ -7,16 +7,12 @@ edition = "2021"
 tokio = { version = "1.37.0", features = ["full"] }
 tokio-util = { version = "0.7.11", features = ["codec"] }
 bytes = "1.6.0"
-tracing = "0.1.40"
-tracing-subscriber = "0.3.18"
 serde = { version = "1.0.202", features = ["derive"] }
 bincode = "1.3.3"
 futures = "0.3.30"
 csv = "1.1"
 #serialport = "4.4.0"
 serialport = { git = "https://github.com/YgorSouza/serialport-rs.git", branch = "parity-mark-space"}
-once_cell = "1.19.0"
-serde_json = "1.0.117"
 regex = "1.10.4"
 toml = "0.8.19"
 bounded-vec-deque = "0.1.1"

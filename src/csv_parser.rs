@@ -1,175 +1,140 @@
-use csv::{ReaderBuilder};
-use serde::Deserialize;
+﻿//! CSV 配置文件解析模块。
+//!
+//! 每个 CSV 文件描述一个设备的通信参数与数据点定义。
+//! 文件前 7 行为设备配置头，之后为数据记录表。
+
 use std::error::Error;
 use std::fs::File;
-use std::path::Path;
 use std::ops::RangeInclusive;
+use std::path::Path;
 use std::str::FromStr;
 
-// 定义 BitIndex 枚举
-// 定义一个名为 `BitIndex` 的枚举，用于存储单个位索引或者位索引范围
+use csv::ReaderBuilder;
+use serde::Deserialize;
+
+// ============================================================
+//  位索引类型
+// ============================================================
+
+/// 数据字节中的位定位方式：单个位 或 连续位范围。
 #[derive(Debug, Deserialize, Clone)]
 pub enum BitIndex {
-    Single(u32),                // 单个位索引
-    Range(RangeInclusive<u32>), // 位索引范围
+    /// 单个位（如第 3 位）。
+    Single(u32),
+    /// 连续位范围（如第 0..7 位）。
+    Range(RangeInclusive<u32>),
 }
 
-// 为 `BitIndex` 实现 `FromStr` 特性，允许从字符串解析
 impl FromStr for BitIndex {
-    type Err = String;  // 定义错误类型为字符串，用于描述解析错误
+    type Err = String;
 
-    // 定义字符串解析方法
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // 检查字符串中是否存在'.'，用以区分是单个索引还是索引范围
         if let Some(dot_pos) = s.find('.') {
-            // 解析'.'之前的部分作为起始索引
-            let start = s[..dot_pos].parse::<u32>()
-                .map_err(|e| e.to_string())?; // 转换错误信息为字符串
-            // 解析'.'之后的部分作为结束索引
-            let end = s[dot_pos + 1..].parse::<u32>()
-                .map_err(|e| e.to_string())?; // 转换错误信息为字符串
-            // 如果成功解析，返回一个表示范围的 `BitIndex`
+            let start = s[..dot_pos].parse::<u32>().map_err(|e| e.to_string())?;
+            let end = s[dot_pos + 1..].parse::<u32>().map_err(|e| e.to_string())?;
             Ok(BitIndex::Range(start..=end))
         } else {
-            // 如果没有找到'.'，则视为单个位索引
-            let index = s.parse::<u32>()
-                .map_err(|e| e.to_string())?; // 转换错误信息为字符串
-            // 返回一个表示单个位索引的 `BitIndex`
+            let index = s.parse::<u32>().map_err(|e| e.to_string())?;
             Ok(BitIndex::Single(index))
         }
     }
 }
 
-
-// 定义一个枚举来表示数据的大小端模式
-#[derive(Debug, Deserialize)]
-enum Endian {
-    Big,
-    Little,
+/// serde 自定义反序列化：将字符串解析为 [`BitIndex`]。
+fn deserialize_bit_index<'de, D>(deserializer: D) -> Result<BitIndex, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    s.parse().map_err(serde::de::Error::custom)
 }
 
-//为 Endian 实现 FromStr 特性
-impl FromStr for Endian {
-    type Err = String;
+// ============================================================
+//  数据记录
+// ============================================================
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "big" => Ok(Endian::Big),
-            "little" => Ok(Endian::Little),
-            _ => Err(format!("Invalid endian value: {}", s)),
-        }
-    }
-}
-
-
-
-// 定义 Record 结构体，使用 BitIndex 枚举
-#[derive(Debug, Deserialize , Clone)]
+/// CSV 中一行数据点描述。
+#[derive(Debug, Deserialize, Clone)]
 pub struct Record {
+    /// KKS 标识符（已拼接前缀）。
     pub kks: String,
+    /// 值类型字符串（`"uint"` / `"bool"` / `"float"`）。
     pub type_: String,
-    pub f_type: String,
+    /// 功能类型（预留字段）。
+    #[serde(rename = "f_type")]
+    pub _f_type: String,
+    /// 数据在响应帧中的字节偏移（1-based）。
     pub byte_index: u32,
+    /// 位偏移。
     #[serde(deserialize_with = "deserialize_bit_index")]
     pub bit_index: BitIndex,
-    pub def: u32,
-    pub max: u32,
-    pub min: u32,
-    pub lh: u32,
+    /// 默认值（预留）。
+    #[serde(rename = "def")]
+    pub _def: u32,
+    /// 最大值（预留）。
+    #[serde(rename = "max")]
+    pub _max: u32,
+    /// 最小值（预留）。
+    #[serde(rename = "min")]
+    pub _min: u32,
+    /// 字节序标记（`1` = 大端，`0` = 小端）。
+    #[serde(rename = "lh")]
+    pub byte_order: u32,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct DeviceConfiguration {
-    pub config: Config,
-    //超时次数
-    pub timeout_count: u32,
-    //当前轮询次数
-    pub current_round: u32,
-    pub records: Vec<Record>, // 使用 Vec 来存储多个 Record 实例
-    //解析失败次数
-    pub parse_fail_count: u32,
-    //站点是否通讯
-    pub site_status: bool,
-    //记录上次数据
-    pub last_data: Vec<u8>,
-    //相同次数
-    pub same_count: u32,
-    
-    //是否读取配置
-    pub is_read: bool,
-}
+// ============================================================
+//  设备配置头
+// ============================================================
 
-impl DeviceConfiguration {
-    
-    pub fn  new(config: Config, records: Vec<Record>) -> Self {
-        DeviceConfiguration {
-            config,
-            timeout_count: 0,
-            current_round: 0,
-            records,
-            parse_fail_count: 0,
-            site_status: true,
-            last_data: vec![0],
-            same_count: 0,
-            is_read: true,
-        }
-    }
-    
-    // 检查数据是否符合条件的方法
-    pub fn check_data(&mut self, data: Vec<u8>) -> bool {
-        // 如果新数据和上次数据相同
-        if data == self.last_data {
-            // 增加相同次数计数器
-            self.same_count += 1;
-            if self.same_count >= 10 {
-                self.same_count = 0;
-                true
-            } else {
-                false
-            }
-        } else {
-            // 如果数据不同，重置相同次数计数器，并更新 last_data
-            self.same_count = 0;
-            self.last_data = data.clone();
-            true
-        }
-    }
-}
-
-
-//DeviceConfiguration new
-// impl DeviceConfiguration {
-//     pub fn new(config: Config, records: Vec<Record>) -> Self {
-//         DeviceConfiguration {
-//             config,
-//             records,
-//         }
-//     }
-// }
-
-// 自定义反序列化函数
-fn deserialize_bit_index<'de, D>(deserializer: D) -> Result<BitIndex, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-    let s = String::deserialize(deserializer)?;
-    s.parse().map_err(Error::custom)
-}
-
-// 定义 Config 结构体
+/// CSV 文件前 7 行中提取的设备通信配置。
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
+    /// 串口号，如 `"COM3"`。
     pub com: String,
-    pub baud_rate : u32,
-    pub is_special: bool,                     // 是否为特殊串口
+    /// 波特率。
+    pub baud_rate: u32,
+    /// 是否为特殊串口（Mark/Space 奇偶校验模式）。
+    pub is_special: bool,
+    /// 串口索引编号。
     pub com_index: u8,
+    /// 设备站地址。
     pub device_id: u8,
+    /// 期望数据长度。
     pub data_len: u8,
-    pub pre: String,
+    /// KKS 前缀。
+    pub kks_prefix: String,
 }
 
-// 函数 parse_csv，用于解析 CSV 文件
+// ============================================================
+//  设备运行时状态
+// ============================================================
+
+/// 设备静态配置：通信参数 + 数据点定义（从 CSV 解析，运行期不可变）。
+#[derive(Debug, Clone)]
+pub struct DeviceConfig {
+    /// 通信配置。
+    pub config: Config,
+    /// 数据点定义列表。
+    pub records: Vec<Record>,
+}
+
+impl DeviceConfig {
+    /// 创建新的设备配置实例。
+    pub fn new(config: Config, records: Vec<Record>) -> Self {
+        Self { config, records }
+    }
+}
+
+// ============================================================
+//  CSV 解析入口
+// ============================================================
+
+/// 解析一个设备 CSV 文件，返回 `(设备配置, 数据点列表)`。
+///
+/// 文件格式：
+/// - 第 1~7 行：配置项（第 2 列为值）。
+/// - 第 8 行：表头分隔行（跳过）。
+/// - 第 9 行起：数据记录。
 pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), Box<dyn Error>> {
     let file = File::open(file_path)?;
     let mut rdr = ReaderBuilder::new()
@@ -177,7 +142,8 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
         .has_headers(false)
         .from_reader(file);
 
-    let mut headers = Vec::new();
+    // 读取前 7 行配置头
+    let mut headers = Vec::with_capacity(7);
     for _ in 0..7 {
         if let Some(result) = rdr.records().next() {
             let record = result?;
@@ -187,30 +153,24 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
 
     let config = Config {
         com: headers.get(0).cloned().unwrap_or_default(),
-        baud_rate: headers.get(1).cloned().unwrap_or_default().parse().unwrap_or(0),
-        // 这里将第 2 号下标对应的字符串，解析成 bool
-        // 如果解析失败（非 "true"/"false"），则默认 false
-        is_special: headers
-            .get(2)
-            .cloned()
-            .unwrap_or_default()
-            .parse::<bool>()
-            .unwrap_or(false),
-        com_index: headers.get(3).cloned().unwrap_or_default().parse().unwrap_or(0),
-        device_id: headers.get(4).cloned().unwrap_or_default().parse().unwrap_or(0),
-        data_len: headers.get(5).cloned().unwrap_or_default().parse().unwrap_or(0),
-        pre: headers.get(6).cloned().unwrap_or_default(),
+        baud_rate: headers.get(1).and_then(|s| s.parse().ok()).unwrap_or(0),
+        is_special: headers.get(2).and_then(|s| s.parse().ok()).unwrap_or(false),
+        com_index: headers.get(3).and_then(|s| s.parse().ok()).unwrap_or(0),
+        device_id: headers.get(4).and_then(|s| s.parse().ok()).unwrap_or(0),
+        data_len: headers.get(5).and_then(|s| s.parse().ok()).unwrap_or(0),
+        kks_prefix: headers.get(6).cloned().unwrap_or_default(),
     };
 
-
-    // 跳过配置后的行
+    // 跳过表头分隔行
     rdr.records().next();
+
+    // 读取数据记录并拼接 KKS 前缀
     let mut records = Vec::new();
     for result in rdr.deserialize() {
         let mut record: Record = result?;
-        // 拼接前缀到 kks 字段
-        record.kks = format!("{}{}", config.pre, record.kks);
+        record.kks = format!("{}{}", config.kks_prefix, record.kks);
         records.push(record);
     }
+
     Ok((config, records))
 }

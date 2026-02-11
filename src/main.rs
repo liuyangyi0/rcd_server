@@ -1,143 +1,158 @@
-mod csv_parser;
-mod serial_manager;
-mod common;
-mod tcp_server;
-mod file_processor;
-mod serial_port_config;
+﻿//! RCD Server  串口采集 OPC UA 网关。
+//!
+//! 主要流程：
+//! 1. 加载 `config/config.toml` 全局配置。
+//! 2. 扫描 `config/rcd*.csv` 文件，解析设备通信参数与数据点定义。
+//! 3. 为每个串口启动独立的通信线程（轮询采集 + 命令下发）。
+//! 4. 启动 OPC UA 服务器，将采集数据发布为变量节点。
+
+mod broadcast;
 mod config;
+mod csv_parser;
+mod file_scanner;
+mod model;
+mod protocol;
+mod serial;
+mod server;
 
-// use serialport::{self, DataBits, Parity, StopBits};  // 引入serial port库，用于串口通信。
-use std::{env, io, vec};
 use std::collections::HashMap;
-use std::io::ErrorKind;
+use std::io;
 use std::sync::{Arc, mpsc};
-use tokio::io::Result;               // 引入IO结果类型。
-// use bincode;
-use crate::common::{Command, PortRuntimeState, SystemState};
-use crate::csv_parser::DeviceConfiguration;
-use crate::file_processor::read_and_process_files;
-use crate::serial_manager::{SerialConfig, start_serial_thread_1};
-use crate::serial_port_config::SerialPortConfig;
-use crate::tcp_server::{run_tcp_server_1, DeviceStatus}; // 引入串口管理模块。
 
-use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
 use bounded_vec_deque::BoundedVecDeque;
+use tokio::sync::Mutex as TokioMutex;
 
+use crate::broadcast::Broadcaster;
+use crate::model::{Command, SystemState};
+use crate::csv_parser::DeviceConfig;
+use crate::serial::manager::SerialConfig;
+use crate::serial::worker::spawn_serial_worker;
+use crate::serial::port_config::SerialPortConfig;
+use crate::server::opcua::run_opcua_server;
+use log::{info, warn, error};
 
-// 导入 OPC UA 服务器入口和 DeviceStatus 类型
-use crate::tcp_server::{run_opcua_server};
+// ============================================================
+//  程序入口
+// ============================================================
 
-
-
-// 程序主函数，设置并启动TCP服务器和串口读取线程。
 #[tokio::main]
-async fn main() -> Result<()> {
-    // 创建全局发送器列表 当有新的客户端连接时，将其本地发送器注册到全局发送器列表中
-    let global_sender = Arc::new(TokioMutex::new(Vec::new()));
-    // 初始化配置
-    let software_config = config::init_config().unwrap();
-    // 创建系统状态列表
+async fn main() -> tokio::io::Result<()> {
+    env_logger::init();
+
+    // 全局广播器：串口数据会广播到所有订阅者（OPC UA / TCP 客户端）
+    let broadcaster = Broadcaster::new();
+
+    // 加载配置
+    let software_config = config::init_config().expect("加载配置文件失败");
+
+    // 系统状态 & 操作记录
     let system_state = SystemState::new();
     let system_record = Arc::new(TokioMutex::new(BoundedVecDeque::<String>::new(20000)));
-    
-    // 初始化 串口配置和发送器列表
-    match init(global_sender.clone(), software_config, system_state.clone(),system_record.clone()).await {
+
+    // 初始化串口并启动通信线程
+    match init_serial_ports(
+        broadcaster.clone(),
+        &software_config,
+        system_state.clone(),
+        system_record.clone(),
+    ).await {
         Ok((configs, txs)) => {
-            // 启动 TCP 服务器
-            // match run_tcp_server_1(configs, txs, global_sender.clone(), system_state.clone(), system_record).await {
-            //     Ok(_) => println!("Server terminated successfully."),
-            //     Err(e) => eprintln!("Server failed with error: {}", e),
-            // }
-            match run_opcua_server(configs, global_sender.clone(), system_state.clone(), system_record.clone(), txs).await {  // 新增：在此传入 txs
-                Ok(_) => println!("OPC UA server terminated successfully."),
-                Err(e) => eprintln!("OPC UA server failed with error: {}", e),
+            // 启动 OPC UA 服务器（阻塞直到退出）
+            match run_opcua_server(configs, broadcaster, system_state, system_record, txs).await {
+                Ok(_) => info!("OPC UA 服务器已正常退出"),
+                Err(e) => error!("OPC UA 服务器运行失败: {}", e),
             }
-        },
+        }
         Err(e) => {
-            eprintln!("初始化失败: {}", e);
+            error!("初始化失败: {}", e);
         }
     }
 
     Ok(())
 }
 
-///Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>> 表示一个线程安全的、可以异步访问的动态数组，数组中的每个元素都是一个可以发送 DeviceStatus 类型消息的发送者
-async fn init(global_sender: Arc<TokioMutex<Vec<Arc<tokio_mpsc::Sender<DeviceStatus>>>>>, software_config: config::Config, system_state: SystemState, system_record: Arc<TokioMutex<BoundedVecDeque<String>>>)
-    ->  io::Result<(Vec<SerialPortConfig>, Vec<mpsc::Sender<Command>>)> {
-    let exe_path = env::current_exe()?; // 获取可执行文件路径
-    let exe_dir = exe_path.parent().ok_or_else(|| io::Error::new(ErrorKind::NotFound, "无法获取可执行文件目录"))?; // 获取可执行文件目录
-    let binding = exe_dir.join("config");
-    let path = binding.as_path();
+// ============================================================
+//  初始化
+// ============================================================
 
-    // 定义文件名模式，这里以 .txt 结尾的文件
-    let pattern = r"^rcd.*\.csv$";
+/// 扫描 CSV 配置文件、聚合串口设备、启动通信线程。
+///
+/// 返回 `(串口配置列表, 命令发送器列表)` 供服务器使用。
+async fn init_serial_ports(
+    broadcaster: Broadcaster,
+    software_config: &config::Config,
+    system_state: SystemState,
+    system_record: Arc<TokioMutex<BoundedVecDeque<String>>>,
+) -> io::Result<(Vec<SerialPortConfig>, Vec<mpsc::Sender<Command>>)> {
 
-    let mut files: Vec<std::path::PathBuf> = vec![];
+    // 1. 扫描 CSV 并按串口号聚合
+    let serial_port_configs = load_and_group_csv_configs()?;
 
-    match read_and_process_files(path, pattern) {
-        Ok(f) => {
-            files = f;
-        }
-        Err(e) => {
-            eprintln!("读取文件时出错: {}", e);
-        }
+    if serial_port_configs.is_empty() {
+        warn!("未找到任何有效的设备配置文件");
+    } else {
+        info!(
+            "已加载 {} 个串口, 共 {} 个设备",
+            serial_port_configs.len(),
+            serial_port_configs.iter().map(|c| c.devices.len()).sum::<usize>(),
+        );
     }
 
-    //打印文件列表
-    // for file in files.iter() {
-    //     println!("文件: {:?}", file);
-    // }    //files 遍历
-    let mut serial_port_configs: Vec<SerialPortConfig> = vec![];
-    let mut txs: Vec<mpsc::Sender<Command>> = vec![];
+    // 2. 为每个串口启动通信线程
+    let mut txs = Vec::with_capacity(serial_port_configs.len());
 
-    for file in files {
-        match csv_parser::parse_csv(file) {
-            Ok((conf, recs)) => {
-                    let mut found = false;
-                    // 判断是否有重复的串口配置
-                    for serial_port_config in serial_port_configs.iter_mut() {
-                        if serial_port_config.port_number == conf.com {
-                            let device_configuration = DeviceConfiguration::new(conf.clone(), recs.clone());
-                            serial_port_config.commands.push(device_configuration);
-                            found = true;
-                            break;
-                        }
-                    }
-                    // 如果没有找到相同的串口配置，创建新的配置
-                    if !found {
-                        let mut  new_config = SerialPortConfig::new(conf.com.clone(),conf.baud_rate, conf.is_special, vec![]);
-                        let device_configuration = DeviceConfiguration::new(conf.clone(), recs.clone());
-                        new_config.commands.push(device_configuration);
-                        serial_port_configs.push(new_config);
-                    }
-            }
-            Err(e) => println!("读取csv: {}", e),
-        }
-    }
-
-    // 循环 serial_port_configs 创建串口读取线程
-    for (_, serial_port_config) in serial_port_configs.iter_mut().enumerate() {
-
-        let serial_config = SerialConfig::new(serial_port_config.port_number.clone(), serial_port_config.baud_rate,
-                                              software_config.serial.data_bits, software_config.serial.stop_bits, software_config.serial.parity);
-
+    for port_config in &serial_port_configs {
         let (tx, rx) = mpsc::channel();
         txs.push(tx);
-        
-        // 创建串口状态 串口状态默认为打开 返回给客户端
-        let mut state = PortRuntimeState{
-            port_number: serial_port_config.port_number.clone(),
-            status: true,
-            device_status: HashMap::new(),
-        };
-        for device in serial_port_config.commands.iter() {
-            state.device_status.insert(device.config.device_id, true);
-        }
-        system_state.add_port(state).await;
-        
-        start_serial_thread_1(global_sender.clone(), serial_config,serial_port_config.clone(),rx, software_config.clone(), system_state.clone(), system_record.clone()).await;
+
+        system_state.add_port(port_config.to_runtime_state()).await;
+
+        spawn_serial_worker(
+            broadcaster.clone(),
+            SerialConfig::new(
+                port_config.port_number.clone(),
+                port_config.baud_rate,
+                software_config.serial.data_bits,
+                software_config.serial.stop_bits,
+                software_config.serial.parity,
+            ),
+            port_config.clone(),
+            rx,
+            software_config.clone(),
+            system_state.clone(),
+            system_record.clone(),
+        );
     }
 
-    Ok((serial_port_configs,txs))
+    Ok((serial_port_configs, txs))
 }
 
+/// 从 config 目录加载所有 `rcd*.csv` 文件并按串口号聚合。
+fn load_and_group_csv_configs() -> io::Result<Vec<SerialPortConfig>> {
+    let config_dir = config::config_dir()
+        .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
+
+    let csv_files = file_scanner::read_and_process_files(&config_dir, r"^rcd.*\.csv$")
+        .unwrap_or_else(|e| {
+            warn!("读取配置文件目录失败: {}", e);
+            Vec::new()
+        });
+
+    let mut configs: HashMap<String, SerialPortConfig> = HashMap::new();
+
+    for file in &csv_files {
+        match csv_parser::parse_csv(file) {
+            Ok((conf, recs)) => {
+                let device = DeviceConfig::new(conf.clone(), recs);
+                configs
+                    .entry(conf.com.clone())
+                    .or_insert_with(|| SerialPortConfig::from_csv_config(&conf))
+                    .devices
+                    .push(device);
+            }
+            Err(e) => warn!("解析 CSV {:?} 失败: {}", file, e),
+        }
+    }
+
+    Ok(configs.into_values().collect())
+}
