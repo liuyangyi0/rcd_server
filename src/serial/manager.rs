@@ -290,7 +290,12 @@ impl SerialManager {
             }
         }
 
-        std::thread::sleep(Duration::from_millis(2));
+        // 等待地址字节在物理线路上完全发出后再切换校验位
+        // 1字节 = (1起始 + 8数据 + 1校验 + 1停止) = 11位
+        // 延时 = 11 / baud_rate (秒) + 安全余量，最少5ms
+        let byte_time_us = (11_000_000u64) / (self.serial_config.baud_rate as u64);
+        let delay_ms = ((byte_time_us / 1000) + 3).max(5);
+        std::thread::sleep(Duration::from_millis(delay_ms));
 
         // 发送数据部分（Space 奇偶校验）
         match self.port {
