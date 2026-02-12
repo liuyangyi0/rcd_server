@@ -245,6 +245,7 @@ impl SerialManager {
         if command.command.is_empty() {
             return;
         }
+        println!("串口 {} 发送数据: {}", self.serial_config.port_name, format_hex(&command.command));
 
         // 特殊串口：直接写入全部数据
         if self.port_config.is_special {
@@ -282,7 +283,7 @@ impl SerialManager {
                     self.restore_parity();
                     return;
                 }
-                let _ = port.flush();
+                 let _ = port.flush();
             }
             None => {
                 self.reconnect();
@@ -291,7 +292,7 @@ impl SerialManager {
         }
 
         // 等待地址字节在物理线路上完全发出后再切换校验位
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(2));
 
         // 发送数据部分（Space 奇偶校验）
         match self.port {
@@ -316,14 +317,17 @@ impl SerialManager {
             }
         }
 
+        // 等待数据在物理线路上完全发出后再恢复校验位
+        std::thread::sleep(Duration::from_millis(2));
+
         // 恢复原始校验位，供后续 receive_data 使用
-        self.restore_parity();
+        //self.restore_parity();
     }
 
     /// 将串口校验位恢复为配置文件中指定的原始值。
     fn restore_parity(&mut self) {
         if let Some(ref mut port) = self.port {
-            if let Err(e) = port.set_parity(self.serial_config.parity) {
+            if let Err(e) = port.set_parity(Parity::None) {
                 error!("恢复校验位失败: {:?}", e);
             }
         }
