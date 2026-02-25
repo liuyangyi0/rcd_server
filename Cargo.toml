@@ -12,7 +12,8 @@ bincode = "1.3.3"
 futures = "0.3.30"
 csv = "1.1"
 #serialport = "4.4.0"
-serialport = { git = "https://github.com/YgorSouza/serialport-rs.git", branch = "parity-mark-space"}
+#serialport = { git = "https://github.com/YgorSouza/serialport-rs.git", branch = "parity-mark-space"}
+serialport = { path = "serialport-rs" }
 regex = "1.10.4"
 toml = "0.8.19"
 bounded-vec-deque = "0.1.1"

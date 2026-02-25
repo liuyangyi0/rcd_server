@@ -1490,7 +1490,6 @@ dependencies = [
 [[package]]
 name = "serialport"
 version = "4.3.1-alpha.0"
-source = "git+https://github.com/YgorSouza/serialport-rs.git?branch=parity-mark-space#0937208e895fa4f47addd0862360a8503104f268"
 dependencies = [
  "bitflags 2.5.0",
  "cfg-if",
