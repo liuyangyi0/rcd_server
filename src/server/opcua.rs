@@ -12,6 +12,7 @@ use log::{info, warn};
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::broadcast::Broadcaster;
+use crate::calc_engine::engine::CalcEngine;
 use crate::model::{Command, CommandType, SendData, SystemState, Value, get_sum};
 use crate::protocol::hex_str_to_bytes;
 use crate::serial::port_config::SerialPortConfig;
@@ -81,6 +82,7 @@ pub async fn run_opcua_server(
     _system_state: SystemState,
     _system_record: Arc<TokioMutex<BoundedVecDeque<String>>>,
     txs: Vec<mpsc::Sender<Command>>,
+    calc_engine: Arc<CalcEngine>,
 ) -> io::Result<()> {
     let host = "0.0.0.0";
     let port: u16 = 4840;
@@ -138,7 +140,7 @@ pub async fn run_opcua_server(
         .expect("自定义命名空间未注册");
 
     // ---- 创建 OPC UA 节点（变量 + Method）----
-    let opcua_nodes = create_opcua_nodes(&node_manager, ns, &serial_ports);
+    let opcua_nodes = create_opcua_nodes(&node_manager, ns, &serial_ports, &calc_engine);
     let send_node_ids = opcua_nodes.send_node_ids;
     let kks_node_map = Arc::new(opcua_nodes.kks_node_map);
 
@@ -152,10 +154,15 @@ pub async fn run_opcua_server(
     let nm_update = node_manager.clone();
     let subs_update = subscriptions.clone();
     let kks_map = kks_node_map.clone();
+    let calc = calc_engine.clone();
     tokio::spawn(async move {
+        // 全局变量累加器：跨设备 / 跨串口持续积累最新值，
+        // 使公式可引用来自不同设备的变量。
+        let mut global_vars: HashMap<String, f64> = HashMap::new();
+
         while let Some(status) = rx_opcua.recv().await {
-            // 批量收集本次广播的所有变量更新
-            let updates: Vec<_> = status.value.iter().filter_map(|(kks, val)| {
+            // ---- 1. 更新设备 OPC UA 节点（原有逻辑）----
+            let mut updates: Vec<_> = status.value.iter().filter_map(|(kks, val)| {
                 let browse_name = format!("{}_{}_{}", status.com, status.device_id, kks);
                 let node_id = kks_map.get(&browse_name)?;
                 let variant = match val {
@@ -166,8 +173,30 @@ pub async fn run_opcua_server(
                 Some((node_id, None, DataValue::new_now(variant)))
             }).collect();
 
+            // ---- 2. 计算引擎：累积变量并执行公式 ----
+            if !calc.is_empty() {
+                // 将本次广播的变量合并到全局累加器
+                for (kks, val) in &status.value {
+                    global_vars.insert(kks.clone(), val.to_f64());
+                }
+
+                // 执行所有公式（变量缺失 / 除零等自动回退默认值）
+                let calc_results = calc.run_cycle(&global_vars);
+
+                for (kks_calc, val) in &calc_results {
+                    if let Some(node_id) = kks_map.get(kks_calc) {
+                        let variant = match val {
+                            Value::UInt(n)  => Variant::UInt32(*n),
+                            Value::Bool(b)  => Variant::Boolean(*b),
+                            Value::Float(f) => Variant::Float(*f),
+                        };
+                        updates.push((node_id, None, DataValue::new_now(variant)));
+                    }
+                }
+            }
+
+            // ---- 3. 批量写入所有变量（设备 + 计算），只获取一次写锁 ----
             if !updates.is_empty() {
-                // 一次性写入所有变量，只获取一次写锁
                 if let Err(e) = nm_update.set_values(&subs_update, updates.into_iter()) {
                     warn!("批量更新 OPC UA 变量失败: {:?}", e);
                 }
@@ -228,11 +257,12 @@ struct OpcuaNodes {
     kks_node_map: HashMap<String, NodeId>,
 }
 
-/// 在地址空间中创建所有设备变量节点和写命令节点。
+/// 在地址空间中创建所有设备变量节点、写命令节点和计算引擎衍生变量节点。
 fn create_opcua_nodes(
     node_manager: &Arc<SimpleNodeManager>,
     ns: u16,
     serial_ports: &[SerialPortConfig],
+    calc_engine: &CalcEngine,
 ) -> OpcuaNodes {
     let devices_folder_id = NodeId::new(ns, "Devices");
     let mut send_node_ids: Vec<(String, NodeId)> = Vec::new();
@@ -267,6 +297,17 @@ fn create_opcua_nodes(
             Variant::String(UAString::from("")),
         ));
         send_node_ids.push((port.port_number.clone(), send_node_id));
+    }
+
+    // ---- 计算引擎衍生变量节点 ----
+    for (kks_calc, data_type) in calc_engine.output_definitions() {
+        let node_id = NodeId::new(ns, kks_calc.to_string());
+        let expected = expected_type_from_str(data_type);
+        let (dt, init) = datatype_and_initial(expected);
+        variables.push(Variable::new_data_value(
+            &node_id, kks_calc, kks_calc, dt, Some(-1), None, init,
+        ));
+        kks_node_map.insert(kks_calc.to_string(), node_id);
     }
 
     if !variables.is_empty() {

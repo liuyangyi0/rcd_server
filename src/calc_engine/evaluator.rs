@@ -1,27 +1,58 @@
 //! AST 求值器。
 //!
 //! 对解析后的表达式 AST 进行求值，所有中间计算使用 `f64`。
-//! 内置除零保护、NaN/Infinity 检测、变量缺失回退等安全机制。
+//! 采用 Fail-Fast 策略：变量缺失或除零时立即短路返回错误，
+//! 由上层（engine）统一决定日志与默认值回退。
 
 use std::collections::HashMap;
+use std::fmt;
 
 use super::parser::{BinOp, Expr, UnaryOp};
 
+// ============================================================
+//  错误类型
+// ============================================================
+
+/// 求值过程中可能出现的错误。
+#[derive(Debug)]
+pub enum EvalError {
+    /// 表达式引用的变量在当前上下文中不存在（丢包 / 未采集到）。
+    MissingVariable(String),
+    /// 除法或取模运算的除数为零。
+    DivisionByZero,
+}
+
+impl fmt::Display for EvalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EvalError::MissingVariable(name) => write!(f, "变量 '{}' 缺失", name),
+            EvalError::DivisionByZero => write!(f, "除以零"),
+        }
+    }
+}
+
+// ============================================================
+//  求值入口
+// ============================================================
+
 /// 对表达式 AST 求值。
 ///
-/// - `variables`：当前全局变量存储。
-/// - `default_value`：当变量缺失时使用的回退值。
+/// - `variables`：当前全局变量存储（基础采集值 + 已计算的衍生值）。
 ///
-/// 返回 `f64` 结果，调用方负责后续的 NaN/clamp/类型转换。
-pub fn evaluate(expr: &Expr, variables: &HashMap<String, f64>, default_value: f64) -> f64 {
+/// 任何一个变量缺失或出现除零，立即短路返回 `Err`，
+/// 不会将默认值代入中间计算，避免产生无意义的派生结果。
+pub fn evaluate(expr: &Expr, variables: &HashMap<String, f64>) -> Result<f64, EvalError> {
     match expr {
-        Expr::Literal(n) => *n,
+        Expr::Literal(n) => Ok(*n),
 
-        Expr::Variable(name) => *variables.get(name.as_str()).unwrap_or(&default_value),
+        Expr::Variable(name) => variables
+            .get(name.as_str())
+            .copied()
+            .ok_or_else(|| EvalError::MissingVariable(name.clone())),
 
         Expr::Unary { op, operand } => {
-            let val = evaluate(operand, variables, default_value);
-            match op {
+            let val = evaluate(operand, variables)?;
+            Ok(match op {
                 UnaryOp::Neg => -val,
                 UnaryOp::Not => {
                     if val == 0.0 {
@@ -34,109 +65,113 @@ pub fn evaluate(expr: &Expr, variables: &HashMap<String, f64>, default_value: f6
                     let i = val as i64;
                     (!i) as f64
                 }
-            }
+            })
         }
 
         Expr::Binary { op, left, right } => {
-            let l = evaluate(left, variables, default_value);
-            let r = evaluate(right, variables, default_value);
+            let l = evaluate(left, variables)?;
+            let r = evaluate(right, variables)?;
             eval_binary(*op, l, r)
         }
     }
 }
 
+// ============================================================
+//  二元运算
+// ============================================================
+
 /// 二元运算求值，包含完整的安全防护。
-fn eval_binary(op: BinOp, l: f64, r: f64) -> f64 {
+fn eval_binary(op: BinOp, l: f64, r: f64) -> Result<f64, EvalError> {
     match op {
         // ---- 算术 ----
-        BinOp::Add => l + r,
-        BinOp::Sub => l - r,
-        BinOp::Mul => l * r,
+        BinOp::Add => Ok(l + r),
+        BinOp::Sub => Ok(l - r),
+        BinOp::Mul => Ok(l * r),
         BinOp::Div => {
             if r == 0.0 {
-                f64::NAN // 由调用方统一处理 NaN → default_value
+                Err(EvalError::DivisionByZero)
             } else {
-                l / r
+                Ok(l / r)
             }
         }
         BinOp::Mod => {
             if r == 0.0 {
-                f64::NAN
+                Err(EvalError::DivisionByZero)
             } else {
-                l % r
+                Ok(l % r)
             }
         }
 
         // ---- 位运算（转 i64 操作再转回 f64）----
-        BinOp::BitAnd => ((l as i64) & (r as i64)) as f64,
-        BinOp::BitOr => ((l as i64) | (r as i64)) as f64,
-        BinOp::BitXor => ((l as i64) ^ (r as i64)) as f64,
+        BinOp::BitAnd => Ok(((l as i64) & (r as i64)) as f64),
+        BinOp::BitOr => Ok(((l as i64) | (r as i64)) as f64),
+        BinOp::BitXor => Ok(((l as i64) ^ (r as i64)) as f64),
         BinOp::ShiftLeft => {
             let shift = (r as u32).min(63); // 防止移位过大 panic
-            ((l as i64) << shift) as f64
+            Ok(((l as i64) << shift) as f64)
         }
         BinOp::ShiftRight => {
             let shift = (r as u32).min(63);
-            ((l as i64) >> shift) as f64
+            Ok(((l as i64) >> shift) as f64)
         }
 
         // ---- 逻辑（非零为 true）----
         BinOp::And => {
             if l != 0.0 && r != 0.0 {
-                1.0
+                Ok(1.0)
             } else {
-                0.0
+                Ok(0.0)
             }
         }
         BinOp::Or => {
             if l != 0.0 || r != 0.0 {
-                1.0
+                Ok(1.0)
             } else {
-                0.0
+                Ok(0.0)
             }
         }
 
         // ---- 比较 ----
         BinOp::Eq => {
             if (l - r).abs() < f64::EPSILON {
-                1.0
+                Ok(1.0)
             } else {
-                0.0
+                Ok(0.0)
             }
         }
         BinOp::NotEq => {
             if (l - r).abs() >= f64::EPSILON {
-                1.0
+                Ok(1.0)
             } else {
-                0.0
+                Ok(0.0)
             }
         }
         BinOp::Lt => {
             if l < r {
-                1.0
+                Ok(1.0)
             } else {
-                0.0
+                Ok(0.0)
             }
         }
         BinOp::Gt => {
             if l > r {
-                1.0
+                Ok(1.0)
             } else {
-                0.0
+                Ok(0.0)
             }
         }
         BinOp::LtEq => {
             if l <= r {
-                1.0
+                Ok(1.0)
             } else {
-                0.0
+                Ok(0.0)
             }
         }
         BinOp::GtEq => {
             if l >= r {
-                1.0
+                Ok(1.0)
             } else {
-                0.0
+                Ok(0.0)
             }
         }
     }
@@ -152,11 +187,11 @@ mod tests {
     use crate::calc_engine::parser::parse;
     use crate::calc_engine::tokenizer::tokenize;
 
-    /// 辅助：解析并求值表达式。
+    /// 辅助：解析并求值表达式（期望成功）。
     fn eval(input: &str, vars: &HashMap<String, f64>) -> f64 {
         let tokens = tokenize(input).unwrap();
         let ast = parse(tokens).unwrap();
-        evaluate(&ast, vars, 0.0)
+        evaluate(&ast, vars).unwrap()
     }
 
     fn vars(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
@@ -190,18 +225,22 @@ mod tests {
         assert_eq!(eval("10 % 3", &HashMap::new()), 1.0);
     }
 
-    // ---- 除零保护 ----
+    // ---- 除零短路 ----
 
     #[test]
-    fn eval_div_by_zero() {
-        let result = eval("10 / 0", &HashMap::new());
-        assert!(result.is_nan());
+    fn eval_div_by_zero_returns_error() {
+        let tokens = tokenize("10 / 0").unwrap();
+        let ast = parse(tokens).unwrap();
+        let result = evaluate(&ast, &HashMap::new());
+        assert!(matches!(result, Err(EvalError::DivisionByZero)));
     }
 
     #[test]
-    fn eval_mod_by_zero() {
-        let result = eval("10 % 0", &HashMap::new());
-        assert!(result.is_nan());
+    fn eval_mod_by_zero_returns_error() {
+        let tokens = tokenize("10 % 0").unwrap();
+        let ast = parse(tokens).unwrap();
+        let result = evaluate(&ast, &HashMap::new());
+        assert!(matches!(result, Err(EvalError::DivisionByZero)));
     }
 
     // ---- 变量 ----
@@ -213,11 +252,20 @@ mod tests {
     }
 
     #[test]
-    fn eval_missing_variable_uses_default() {
+    fn eval_missing_variable_returns_error() {
         let tokens = tokenize("missing_var + 1").unwrap();
         let ast = parse(tokens).unwrap();
-        let result = evaluate(&ast, &HashMap::new(), 42.0);
-        assert_eq!(result, 43.0); // default=42.0 + 1
+        let result = evaluate(&ast, &HashMap::new());
+        assert!(matches!(result, Err(EvalError::MissingVariable(ref name)) if name == "missing_var"));
+    }
+
+    #[test]
+    fn eval_missing_variable_short_circuits() {
+        // 即使公式后半部分合法，只要有一个变量缺失就立即报错
+        let tokens = tokenize("missing_var + 10").unwrap();
+        let ast = parse(tokens).unwrap();
+        let result = evaluate(&ast, &HashMap::new());
+        assert!(result.is_err());
     }
 
     // ---- 一元运算 ----
