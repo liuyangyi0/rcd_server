@@ -9,7 +9,7 @@ use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use bounded_vec_deque::BoundedVecDeque;
-use log::error;
+use log::{error, warn};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
@@ -69,18 +69,20 @@ pub fn spawn_serial_worker(
                 continue;
             }
 
-            // 根据主/备角色决定行为
-            match manager.current_run {
+            // 根据主/备角色决定行为，返回是否已发送命令（需要接收响应）
+            let should_receive = match manager.current_run {
                 RunLocation::Primary => {
-                    run_primary_cycle(&mut manager);
+                    run_primary_cycle(&mut manager)
                 }
                 RunLocation::Secondary => {
-                    run_secondary_cycle(&mut manager);
+                    run_secondary_cycle(&mut manager)
                 }
-            }
+            };
 
-            // 接收并解析响应（内部循环读取直到帧完整或超时）
-            manager.receive_data();
+            // 仅在实际发送了命令（或备机监听模式）时才接收数据
+            if should_receive {
+                manager.receive_data();
+            }
 
             // 主机模式：轮询下一个设备；备机模式：index 由 extract_frame 从转发头解析
             if manager.current_run == RunLocation::Primary {
@@ -100,7 +102,10 @@ fn process_incoming_commands(
     while let Ok(cmd) = rx.try_recv() {
         match cmd.command {
             CommandType::SendData(data) => {
-                manager.command_queue.lock().unwrap().push_back(data);
+                manager.command_queue.lock().unwrap_or_else(|e| {
+                    warn!("命令队列锁中毒，恢复: {}", e);
+                    e.into_inner()
+                }).push_back(data);
             }
             CommandType::PortStatus(status) => {
                 manager.port_config.status = status.device_status;
@@ -131,17 +136,22 @@ fn process_incoming_commands(
 }
 
 /// 主机模式的一次轮询周期。
-fn run_primary_cycle(manager: &mut SerialManager) {
-    let mut queue = manager.command_queue.lock().unwrap();
+///
+/// 返回 `true` 表示已发送命令，需要接收响应；`false` 表示跳过本轮，不需要接收。
+fn run_primary_cycle(manager: &mut SerialManager) -> bool {
+    let mut queue = manager.command_queue.lock().unwrap_or_else(|e| {
+        warn!("命令队列锁中毒，恢复: {}", e);
+        e.into_inner()
+    });
     if let Some(cmd) = queue.pop_front() {
         drop(queue);
         manager.send_command(cmd);
-        return;
+        return true;
     }
     drop(queue);
 
     if manager.port_config.devices.is_empty() {
-        return;
+        return false;
     }
 
     let idx = manager.index;
@@ -154,13 +164,13 @@ fn run_primary_cycle(manager: &mut SerialManager) {
             manager.device_states[idx].current_round += 1;
             manager.index = (manager.index + 1) % manager.port_config.devices.len();
             std::thread::sleep(Duration::from_millis(10));
-            return;
+            return false;
         }
     }
 
     if !manager.device_states[idx].is_enabled {
         std::thread::sleep(Duration::from_millis(20));
-        return;
+        return false;
     }
 
     // 构造轮询查询命令
@@ -176,13 +186,21 @@ fn run_primary_cycle(manager: &mut SerialManager) {
     frame.push(get_sum(&frame));
 
     manager.send_command(SendData { device_id: 1, command: frame });
+    true
 }
 
 /// 备机模式的一次轮询周期。
-fn run_secondary_cycle(manager: &mut SerialManager) {
-    let mut queue = manager.command_queue.lock().unwrap();
+///
+/// 返回 `true` 表示备机始终需要监听数据（主机转发帧）。
+fn run_secondary_cycle(manager: &mut SerialManager) -> bool {
+    let mut queue = manager.command_queue.lock().unwrap_or_else(|e| {
+        warn!("命令队列锁中毒，恢复: {}", e);
+        e.into_inner()
+    });
     if let Some(cmd) = queue.pop_front() {
         drop(queue);
         manager.send_command(cmd);
     }
+    // 备机始终需要监听转发数据
+    true
 }

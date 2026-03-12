@@ -245,7 +245,7 @@ impl SerialManager {
         if command.command.is_empty() {
             return;
         }
-        println!("串口 {} 发送数据: {}", self.serial_config.port_name, format_hex(&command.command));
+        info!("串口 {} 发送数据: {}", self.serial_config.port_name, format_hex(&command.command));
 
         // 特殊串口：直接写入全部数据
         if self.port_config.is_special {
@@ -321,7 +321,7 @@ impl SerialManager {
         std::thread::sleep(Duration::from_millis(2));
 
         // 恢复原始校验位，供后续 receive_data 使用
-        //self.restore_parity();
+        self.restore_parity();
     }
 
     /// 将串口校验位恢复为配置文件中指定的原始值。
@@ -397,7 +397,7 @@ impl SerialManager {
 
         // ---- 提取有效数据切片 ----
         let frame = self.extract_frame(total);
-        println!("串口 {} 原始数据: {}", self.serial_config.port_name, format_hex(&frame));
+        info!("串口 {} 原始数据: {}", self.serial_config.port_name, format_hex(&frame));
 
         // ---- 解析数据帧 ----
         match protocol::parse_data_packet(&frame) {
@@ -407,7 +407,7 @@ impl SerialManager {
 
                 let dev = &self.port_config.devices[self.index];
                 let parsed = protocol::parse_status(&packet.status, &dev.records);
-                println!("串口 {} 解析数据: {:?}", self.serial_config.port_name, parsed);
+                info!("串口 {} 解析数据: {:?}", self.serial_config.port_name, parsed);
                 if self.device_states[self.index].should_broadcast(&packet.status) {
                     let status = DeviceStatus {
                         id: dev.config.com_index as u64,
@@ -489,7 +489,7 @@ impl SerialManager {
         self.time_out_count += 1;
 
         let dev = &self.port_config.devices[self.index];
-        println!("串口 {} 设备 {} 读取超时 (连续{}次)",
+        warn!("串口 {} 设备 {} 读取超时 (连续{}次)",
             self.serial_config.port_name,
             dev.config.device_id,
             self.device_states[self.index].timeout_count,

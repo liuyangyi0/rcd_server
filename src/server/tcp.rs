@@ -71,9 +71,15 @@ pub async fn handle_tcp_client(
             data = rx_local.recv() => {
                 if let Some(status) = data {
                     let msg = MessageType::DeviceStatus(status);
-                    let serialized = bincode::serialize(&msg).expect("序列化失败");
-                    if timeout(Duration::from_secs(1), framed.send(Bytes::from(serialized))).await.is_err() {
-                        return Err(io::Error::new(io::ErrorKind::TimedOut, "发送消息超时"));
+                    match bincode::serialize(&msg) {
+                        Ok(serialized) => {
+                            if timeout(Duration::from_secs(1), framed.send(Bytes::from(serialized))).await.is_err() {
+                                return Err(io::Error::new(io::ErrorKind::TimedOut, "发送消息超时"));
+                            }
+                        }
+                        Err(e) => {
+                            error!("序列化 DeviceStatus 失败: {:?}", e);
+                        }
                     }
                 }
             }
@@ -111,6 +117,7 @@ async fn handle_client_message(
                     if let Err(e) = txs[i].send(cmd.clone()) {
                         error!("转发命令到串口线程失败: {:?}", e);
                     }
+                    break;
                 }
             }
         }
@@ -135,7 +142,13 @@ async fn send_framed(
     framed: &mut Framed<TcpStream, LengthDelimitedCodec>,
     msg: &MessageType,
 ) -> io::Result<()> {
-    let serialized = bincode::serialize(msg).expect("序列化失败");
+    let serialized = match bincode::serialize(msg) {
+        Ok(data) => data,
+        Err(e) => {
+            error!("序列化消息失败: {:?}", e);
+            return Ok(());
+        }
+    };
     if timeout(Duration::from_secs(1), framed.send(Bytes::from(serialized)))
         .await
         .is_err()

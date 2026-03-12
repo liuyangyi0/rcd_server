@@ -1,0 +1,50 @@
+# ============================================================
+#  计算规则配置文件  calc.toml
+# ============================================================
+#
+#  每条 [[rules]] 定义一个衍生计算变量，自动发布到 OPC UA。
+#
+#  字段说明：
+#    kks_calc      - 输出变量名（OPC UA BrowseName，全局唯一）
+#    data_type     - 输出类型："uint" / "bool" / "float"
+#    expression    - 计算公式，变量名需与 CSV 中 KKS 名称一致
+#    max_limit     - 结果上限，超出则钳制（可选，默认无上限）
+#    min_limit     - 结果下限，低于则钳制（可选，默认无下限）
+#    default_value - 公式异常时的回退值（可选，默认 0.0）
+#
+#  支持的运算符：
+#    算术:   +  -  *  /  %
+#    逻辑:   &&  ||  !
+#    位运算: &  |  ^  ~  <<  >>
+#    比较:   ==  !=  >  <  >=  <=
+#    括号:   ( )
+#
+
+# ---- 示例 1: 单位换算 (mSv/h -> uSv/h) ----
+# [[rules]]
+# kks_calc      = "rate_usv"
+# data_type     = "float"
+# expression    = "rate_msv * 1000"
+# max_limit     = 999999.0
+# min_limit     = 0.0
+# default_value = 0.0
+
+# ---- 示例 2: 逻辑组合告警 ----
+# [[rules]]
+# kks_calc      = "alarm_combined"
+# data_type     = "bool"
+# expression    = "(status_A == 1) && (status_B == 0)"
+# default_value = 0.0
+
+# ---- 示例 3: 位运算提取状态位 ----
+# [[rules]]
+# kks_calc      = "flag_bit3"
+# data_type     = "bool"
+# expression    = "(register_val >> 3) & 1"
+# default_value = 0.0
+
+# ---- 示例 4: 多变量求和 ----
+# [[rules]]
+# kks_calc      = "total_power"
+# data_type     = "uint"
+# expression    = "power_A + power_B + power_C"

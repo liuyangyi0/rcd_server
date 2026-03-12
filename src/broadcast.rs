@@ -44,15 +44,21 @@ impl Broadcaster {
 
     /// 将数据广播给所有订阅者，自动移除已关闭的通道。
     ///
-    /// 先快照 senders 并释放锁，再逐个发送，
-    /// 避免某个消费者阻塞时锁住整个广播器。
+    /// 使用 `try_send` 进行非阻塞发送，避免某个消费者缓冲区满时
+    /// 阻塞整个串口线程（串口线程通过 `block_on` 调用此方法）。
     pub async fn broadcast(&self, data: DeviceStatus) {
         let senders: Vec<_> = self.senders.lock().await.clone();
 
         let mut failed = Vec::new();
         for s in &senders {
-            if s.send(data.clone()).await.is_err() {
-                failed.push(s.clone());
+            match s.try_send(data.clone()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!("订阅者缓冲区已满，丢弃本次数据");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    failed.push(s.clone());
+                }
             }
         }
 

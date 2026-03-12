@@ -399,7 +399,9 @@ fn forward_hex_command(
     com: &str,
     tx: &mpsc::Sender<Command>,
 ) -> Result<String, String> {
-    let mut bytes = hex_str_to_bytes(hex_str).map_err(|e| format!("十六进制解析失败: {}", e))?;
+    // 移除空格，支持 "0A 1B FF" 格式
+    let cleaned: String = hex_str.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let mut bytes = hex_str_to_bytes(&cleaned).map_err(|e| format!("十六进制解析失败: {}", e))?;
     if bytes.len() < 2 {
         return Err("十六进制长度过短（至少需 2 字节）".to_string());
     }
