@@ -1,0 +1,534 @@
+//! 计算引擎运行器。
+//!
+//! 负责：
+//! 1. 启动期编译：将 TOML 配置中的表达式字符串预编译为 AST。
+//! 2. DAG 拓扑排序：若公式 A 引用了公式 B 的输出，确保 B 先于 A 求值。
+//! 3. 运行期求值：按拓扑顺序依次求值，Fail-Fast 短路 + 默认值回退。
+//! 4. 后处理：NaN/Infinity 安全检查、上下限 Clamping、数据类型强转。
+
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use log::{error, info, warn};
+
+use super::config::CalcRule;
+use super::evaluator::{evaluate, EvalError};
+use super::parser::{extract_variables, parse, Expr};
+use super::tokenizer::tokenize;
+use crate::model::Value;
+
+// ============================================================
+//  编译后的规则
+// ============================================================
+
+/// 预编译的计算规则：包含 AST 和提取的变量列表。
+struct CompiledRule {
+    /// 输出变量名（OPC UA BrowseName）。
+    kks_calc: String,
+    /// 输出数据类型标识：`"uint"` / `"bool"` / `"float"`。
+    data_type: String,
+    /// 原始表达式字符串（用于日志）。
+    expression: String,
+    /// 预编译的 AST。
+    ast: Expr,
+    /// 表达式引用的变量名列表（去重、排序）。
+    variables: Vec<String>,
+    /// 结果上限。
+    max_limit: f64,
+    /// 结果下限。
+    min_limit: f64,
+    /// 异常时的回退默认值。
+    default_value: f64,
+}
+
+// ============================================================
+//  计算引擎
+// ============================================================
+
+/// 计算引擎：持有预编译、拓扑排序后的规则列表。
+///
+/// 构造后不可变，线程安全（可用 `Arc` 共享）。
+pub struct CalcEngine {
+    /// 按拓扑顺序排列的编译后规则。
+    rules: Vec<CompiledRule>,
+}
+
+impl CalcEngine {
+    /// 从配置规则列表构建引擎。
+    ///
+    /// 1. 逐条编译表达式（tokenize → parse → extract_variables）。
+    /// 2. 编译失败的规则会记录错误日志并跳过。
+    /// 3. 对成功编译的规则进行 DAG 拓扑排序。
+    /// 4. 若存在循环依赖，记录错误日志并返回 `Err`。
+    pub fn new(config_rules: Vec<CalcRule>) -> Result<Self, String> {
+        if config_rules.is_empty() {
+            return Ok(CalcEngine { rules: Vec::new() });
+        }
+
+        // ---- 编译阶段 ----
+        let mut compiled = Vec::with_capacity(config_rules.len());
+
+        for rule in config_rules {
+            match Self::compile_rule(&rule) {
+                Ok(cr) => {
+                    info!(
+                        "[CalcEngine] 编译成功: {} = \"{}\" (依赖: {:?})",
+                        cr.kks_calc, cr.expression, cr.variables
+                    );
+                    compiled.push(cr);
+                }
+                Err(e) => {
+                    error!(
+                        "[CalcEngine] 编译失败，跳过规则 '{}': {}",
+                        rule.kks_calc, e
+                    );
+                }
+            }
+        }
+
+        if compiled.is_empty() {
+            info!("[CalcEngine] 无有效规则，引擎为空");
+            return Ok(CalcEngine { rules: Vec::new() });
+        }
+
+        // ---- 拓扑排序 ----
+        let sorted = Self::topological_sort(compiled)?;
+
+        info!(
+            "[CalcEngine] 引擎初始化完成，共 {} 条规则，求值顺序: [{}]",
+            sorted.len(),
+            sorted
+                .iter()
+                .map(|r| r.kks_calc.as_str())
+                .collect::<Vec<_>>()
+                .join(" → ")
+        );
+
+        Ok(CalcEngine { rules: sorted })
+    }
+
+    /// 返回所有规则的输出变量名。
+    pub fn output_names(&self) -> Vec<&str> {
+        self.rules.iter().map(|r| r.kks_calc.as_str()).collect()
+    }
+
+    /// 返回所有规则需要的基础变量名（排除引擎自身产出的变量）。
+    pub fn required_base_variables(&self) -> Vec<String> {
+        let outputs: HashSet<&str> = self.rules.iter().map(|r| r.kks_calc.as_str()).collect();
+        let mut base_vars: Vec<String> = self
+            .rules
+            .iter()
+            .flat_map(|r| r.variables.iter())
+            .filter(|v| !outputs.contains(v.as_str()))
+            .cloned()
+            .collect();
+        base_vars.sort();
+        base_vars.dedup();
+        base_vars
+    }
+
+    /// 返回所有规则的 `(kks_calc, data_type)` 对。
+    ///
+    /// 供 OPC UA 节点创建时确定变量类型。
+    pub fn output_definitions(&self) -> Vec<(&str, &str)> {
+        self.rules
+            .iter()
+            .map(|r| (r.kks_calc.as_str(), r.data_type.as_str()))
+            .collect()
+    }
+
+    /// 是否为空引擎（无规则）。
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    // ============================================================
+    //  核心求值
+    // ============================================================
+
+    /// 执行一轮完整的公式求值。
+    ///
+    /// - `base_variables`：本轮从串口采集到的全部基础 KKS 值。
+    /// - 返回值：每条规则的计算结果 `(kks_calc, Value)`。
+    ///
+    /// 对每条规则：
+    /// 1. 调用 `evaluate`，若变量缺失或除零则 Fail-Fast 短路。
+    /// 2. 捕获错误后记录 `warn!` 日志，输出 `default_value`。
+    /// 3. 对合法结果进行 NaN/Infinity 检测。
+    /// 4. 执行 `[min_limit, max_limit]` 区间钳制。
+    /// 5. 按 `data_type` 转换为 `Value::UInt` / `Value::Bool` / `Value::Float`。
+    /// 6. 将结果写入变量表，供下游公式引用。
+    pub fn run_cycle(&self, base_variables: &HashMap<String, f64>) -> Vec<(String, Value)> {
+        let mut variables = base_variables.clone();
+        let mut results = Vec::with_capacity(self.rules.len());
+
+        for rule in &self.rules {
+            // ---- 求值 ----
+            let raw_value = match evaluate(&rule.ast, &variables) {
+                Ok(val) => val,
+                Err(e) => {
+                    match &e {
+                        EvalError::MissingVariable(var) => {
+                            warn!(
+                                "[CalcEngine] 公式 '{}' (\"{}\") 求值失败: 变量 '{}' 缺失，输出默认值 {}",
+                                rule.kks_calc, rule.expression, var, rule.default_value
+                            );
+                        }
+                        EvalError::DivisionByZero => {
+                            warn!(
+                                "[CalcEngine] 公式 '{}' (\"{}\") 求值失败: 除以零，输出默认值 {}",
+                                rule.kks_calc, rule.expression, rule.default_value
+                            );
+                        }
+                    }
+                    rule.default_value
+                }
+            };
+
+            // ---- NaN / Infinity 安全网 ----
+            let safe_value = if raw_value.is_nan() || raw_value.is_infinite() {
+                warn!(
+                    "[CalcEngine] 公式 '{}' 产生非法浮点值 ({})，输出默认值 {}",
+                    rule.kks_calc, raw_value, rule.default_value
+                );
+                rule.default_value
+            } else {
+                raw_value
+            };
+
+            // ---- 上下限钳制 ----
+            let clamped = safe_value.clamp(rule.min_limit, rule.max_limit);
+
+            // ---- 类型转换 ----
+            let typed_value = match rule.data_type.as_str() {
+                "uint" => Value::UInt(clamped.max(0.0) as u32),
+                "bool" => Value::Bool(clamped != 0.0),
+                _ => Value::Float(clamped as f32), // "float" 及其他
+            };
+
+            // ---- 写回变量表，供下游公式引用 ----
+            variables.insert(rule.kks_calc.clone(), clamped);
+
+            results.push((rule.kks_calc.clone(), typed_value));
+        }
+
+        results
+    }
+
+    // ============================================================
+    //  内部方法
+    // ============================================================
+
+    /// 编译单条规则：tokenize → parse → extract_variables。
+    fn compile_rule(rule: &CalcRule) -> Result<CompiledRule, String> {
+        let tokens = tokenize(&rule.expression)?;
+        let ast = parse(tokens)?;
+        let variables = extract_variables(&ast);
+
+        Ok(CompiledRule {
+            kks_calc: rule.kks_calc.clone(),
+            data_type: rule.data_type.clone(),
+            expression: rule.expression.clone(),
+            ast,
+            variables,
+            max_limit: rule.max_limit,
+            min_limit: rule.min_limit,
+            default_value: rule.default_value,
+        })
+    }
+
+    /// DAG 拓扑排序（Kahn 算法）。
+    ///
+    /// 保证依赖的规则优先求值。若检测到循环依赖则返回错误。
+    fn topological_sort(rules: Vec<CompiledRule>) -> Result<Vec<CompiledRule>, String> {
+        let n = rules.len();
+
+        // 构建名称 → 索引映射
+        let name_to_idx: HashMap<&str, usize> = rules
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.kks_calc.as_str(), i))
+            .collect();
+
+        // 构建邻接表和入度
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut in_degree: Vec<usize> = vec![0; n];
+
+        for (i, rule) in rules.iter().enumerate() {
+            for var in &rule.variables {
+                if let Some(&dep_idx) = name_to_idx.get(var.as_str()) {
+                    // rule[i] 依赖 rule[dep_idx]，dep_idx 必须先算
+                    adj[dep_idx].push(i);
+                    in_degree[i] += 1;
+                }
+            }
+        }
+
+        // Kahn BFS
+        let mut queue: VecDeque<usize> = VecDeque::new();
+        for i in 0..n {
+            if in_degree[i] == 0 {
+                queue.push_back(i);
+            }
+        }
+
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        while let Some(idx) = queue.pop_front() {
+            order.push(idx);
+            for &next in &adj[idx] {
+                in_degree[next] -= 1;
+                if in_degree[next] == 0 {
+                    queue.push_back(next);
+                }
+            }
+        }
+
+        if order.len() != n {
+            // 找出参与循环的规则名
+            let in_cycle: Vec<&str> = (0..n)
+                .filter(|i| in_degree[*i] > 0)
+                .map(|i| rules[i].kks_calc.as_str())
+                .collect();
+            return Err(format!(
+                "检测到循环依赖，涉及规则: [{}]",
+                in_cycle.join(", ")
+            ));
+        }
+
+        // 按拓扑序重排
+        let mut rules_opt: Vec<Option<CompiledRule>> =
+            rules.into_iter().map(Some).collect();
+        let sorted: Vec<CompiledRule> = order
+            .into_iter()
+            .map(|i| rules_opt[i].take().unwrap())
+            .collect();
+
+        Ok(sorted)
+    }
+}
+
+// ============================================================
+//  单元测试
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::calc_engine::config::CalcRule;
+
+    fn make_rule(kks: &str, dtype: &str, expr: &str, default: f64) -> CalcRule {
+        CalcRule {
+            kks_calc: kks.to_string(),
+            data_type: dtype.to_string(),
+            expression: expr.to_string(),
+            max_limit: f64::MAX,
+            min_limit: f64::MIN,
+            default_value: default,
+        }
+    }
+
+    fn vars(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    // ---- 基础求值 ----
+
+    #[test]
+    fn engine_simple_eval() {
+        let rules = vec![make_rule("rate_usv", "float", "rate_msv * 1000", 0.0)];
+        let engine = CalcEngine::new(rules).unwrap();
+
+        let results = engine.run_cycle(&vars(&[("rate_msv", 0.5)]));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "rate_usv");
+        assert_eq!(results[0].1, Value::Float(500.0));
+    }
+
+    // ---- 变量缺失 → 默认值 ----
+
+    #[test]
+    fn engine_missing_variable_uses_default() {
+        let rules = vec![make_rule("output", "float", "sensor_a + 10", -99.0)];
+        let engine = CalcEngine::new(rules).unwrap();
+
+        // sensor_a 不在 base_variables 中
+        let results = engine.run_cycle(&HashMap::new());
+        assert_eq!(results[0].1, Value::Float(-99.0));
+    }
+
+    // ---- 除以零 → 默认值 ----
+
+    #[test]
+    fn engine_div_by_zero_uses_default() {
+        let rules = vec![make_rule("output", "float", "10 / 0", -1.0)];
+        let engine = CalcEngine::new(rules).unwrap();
+
+        let results = engine.run_cycle(&HashMap::new());
+        assert_eq!(results[0].1, Value::Float(-1.0));
+    }
+
+    // ---- Clamping ----
+
+    #[test]
+    fn engine_clamp_max() {
+        let mut rule = make_rule("output", "float", "a", 0.0);
+        rule.max_limit = 100.0;
+        rule.min_limit = 0.0;
+        let engine = CalcEngine::new(vec![rule]).unwrap();
+
+        let results = engine.run_cycle(&vars(&[("a", 999.0)]));
+        assert_eq!(results[0].1, Value::Float(100.0));
+    }
+
+    #[test]
+    fn engine_clamp_min() {
+        let mut rule = make_rule("output", "float", "a", 0.0);
+        rule.max_limit = 100.0;
+        rule.min_limit = 0.0;
+        let engine = CalcEngine::new(vec![rule]).unwrap();
+
+        let results = engine.run_cycle(&vars(&[("a", -50.0)]));
+        assert_eq!(results[0].1, Value::Float(0.0));
+    }
+
+    // ---- 类型转换 ----
+
+    #[test]
+    fn engine_type_uint() {
+        let rules = vec![make_rule("output", "uint", "a", 0.0)];
+        let engine = CalcEngine::new(rules).unwrap();
+
+        let results = engine.run_cycle(&vars(&[("a", 42.7)]));
+        assert_eq!(results[0].1, Value::UInt(42));
+    }
+
+    #[test]
+    fn engine_type_bool_true() {
+        let rules = vec![make_rule("output", "bool", "a", 0.0)];
+        let engine = CalcEngine::new(rules).unwrap();
+
+        let results = engine.run_cycle(&vars(&[("a", 1.0)]));
+        assert_eq!(results[0].1, Value::Bool(true));
+    }
+
+    #[test]
+    fn engine_type_bool_false() {
+        let rules = vec![make_rule("output", "bool", "a", 0.0)];
+        let engine = CalcEngine::new(rules).unwrap();
+
+        let results = engine.run_cycle(&vars(&[("a", 0.0)]));
+        assert_eq!(results[0].1, Value::Bool(false));
+    }
+
+    // ---- DAG 拓扑排序 ----
+
+    #[test]
+    fn engine_dag_dependency_order() {
+        // B = a * 2
+        // A = B + 10  （A 依赖 B）
+        let rules = vec![
+            make_rule("A", "float", "B + 10", 0.0),
+            make_rule("B", "float", "a * 2", 0.0),
+        ];
+        let engine = CalcEngine::new(rules).unwrap();
+
+        // 拓扑排序后 B 应在 A 前面
+        assert_eq!(engine.rules[0].kks_calc, "B");
+        assert_eq!(engine.rules[1].kks_calc, "A");
+
+        let results = engine.run_cycle(&vars(&[("a", 5.0)]));
+        // B = 5 * 2 = 10, A = 10 + 10 = 20
+        assert_eq!(results.len(), 2);
+        let result_map: HashMap<&str, &Value> =
+            results.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        assert_eq!(result_map["B"], &Value::Float(10.0));
+        assert_eq!(result_map["A"], &Value::Float(20.0));
+    }
+
+    #[test]
+    fn engine_dag_three_level() {
+        // C = base * 3
+        // B = C + 1
+        // A = B * 2
+        let rules = vec![
+            make_rule("A", "float", "B * 2", 0.0),
+            make_rule("B", "float", "C + 1", 0.0),
+            make_rule("C", "float", "base * 3", 0.0),
+        ];
+        let engine = CalcEngine::new(rules).unwrap();
+
+        // 排序后应该是 C → B → A
+        assert_eq!(engine.rules[0].kks_calc, "C");
+        assert_eq!(engine.rules[1].kks_calc, "B");
+        assert_eq!(engine.rules[2].kks_calc, "A");
+
+        let results = engine.run_cycle(&vars(&[("base", 2.0)]));
+        let result_map: HashMap<&str, &Value> =
+            results.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        // C = 2*3 = 6, B = 6+1 = 7, A = 7*2 = 14
+        assert_eq!(result_map["C"], &Value::Float(6.0));
+        assert_eq!(result_map["B"], &Value::Float(7.0));
+        assert_eq!(result_map["A"], &Value::Float(14.0));
+    }
+
+    #[test]
+    fn engine_dag_cycle_detection() {
+        // A = B + 1, B = A + 1 → 循环
+        let rules = vec![
+            make_rule("A", "float", "B + 1", 0.0),
+            make_rule("B", "float", "A + 1", 0.0),
+        ];
+        let result = CalcEngine::new(rules);
+        assert!(result.is_err());
+        assert!(result.err().unwrap().contains("循环依赖"));
+    }
+
+    // ---- 编译失败跳过 ----
+
+    #[test]
+    fn engine_skip_bad_expression() {
+        let rules = vec![
+            make_rule("good", "float", "a + 1", 0.0),
+            make_rule("bad", "float", "a = b", 0.0), // 非法表达式
+        ];
+        let engine = CalcEngine::new(rules).unwrap();
+        assert_eq!(engine.rules.len(), 1);
+        assert_eq!(engine.rules[0].kks_calc, "good");
+    }
+
+    // ---- 空引擎 ----
+
+    #[test]
+    fn engine_empty() {
+        let engine = CalcEngine::new(vec![]).unwrap();
+        assert!(engine.is_empty());
+        assert!(engine.run_cycle(&HashMap::new()).is_empty());
+    }
+
+    // ---- 辅助方法 ----
+
+    #[test]
+    fn engine_output_names() {
+        let rules = vec![
+            make_rule("x", "float", "a + 1", 0.0),
+            make_rule("y", "uint", "b + 2", 0.0),
+        ];
+        let engine = CalcEngine::new(rules).unwrap();
+        let names = engine.output_names();
+        assert!(names.contains(&"x"));
+        assert!(names.contains(&"y"));
+    }
+
+    #[test]
+    fn engine_required_base_variables() {
+        let rules = vec![
+            make_rule("B", "float", "a * 2", 0.0),
+            make_rule("A", "float", "B + c", 0.0),
+        ];
+        let engine = CalcEngine::new(rules).unwrap();
+        let base = engine.required_base_variables();
+        // a 和 c 是基础变量，B 是引擎自身产出的
+        assert!(base.contains(&"a".to_string()));
+        assert!(base.contains(&"c".to_string()));
+        assert!(!base.contains(&"B".to_string()));
+    }
+}
