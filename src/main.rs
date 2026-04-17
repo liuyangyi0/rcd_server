@@ -52,14 +52,14 @@ async fn main() -> tokio::io::Result<()> {
     let system_state = SystemState::new();
     let system_record = Arc::new(TokioMutex::new(BoundedVecDeque::<String>::new(20000)));
 
-    // 加载计算引擎
+    // 加载计算引擎：配置异常时降级为空引擎，不终止服务
     let calc_engine = {
         let config_dir = config::config_dir().expect("获取配置目录失败");
         let calc_path = config_dir.join("calc.toml");
         let calc_config = load_calc_config(&calc_path)
             .unwrap_or_else(|e| {
-                error!("[CalcEngine] 加载计算规则失败: {}", e);
-                panic!("CalcEngine 初始化失败: {}", e);
+                error!("[CalcEngine] 加载计算规则失败: {}，以空规则启动", e);
+                crate::calc_engine::config::CalcConfig { rules: Vec::new() }
             });
 
         if calc_config.rules.is_empty() {
@@ -75,8 +75,8 @@ async fn main() -> tokio::io::Result<()> {
                     Arc::new(engine)
                 }
                 Err(e) => {
-                    error!("[CalcEngine] 构建引擎失败: {}", e);
-                    panic!("CalcEngine 初始化失败: {}", e);
+                    error!("[CalcEngine] 构建引擎失败: {}，以空引擎启动", e);
+                    Arc::new(CalcEngine::new(vec![]).unwrap())
                 }
             }
         }

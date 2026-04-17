@@ -56,9 +56,10 @@ impl CalcEngine {
     /// 从配置规则列表构建引擎。
     ///
     /// 1. 逐条编译表达式（tokenize → parse → extract_variables）。
-    /// 2. 编译失败的规则会记录错误日志并跳过。
+    /// 2. 编译失败（含自引用）的规则会记录错误日志并跳过。
     /// 3. 对成功编译的规则进行 DAG 拓扑排序。
-    /// 4. 若存在循环依赖，记录错误日志并返回 `Err`。
+    /// 4. 参与循环依赖或依赖循环节点的规则会被跳过（warn 日志），其余规则正常加载。
+    /// 5. 始终返回 `Ok`；`Err` 签名保留以备未来其他失败场景使用。
     pub fn new(config_rules: Vec<CalcRule>) -> Result<Self, String> {
         if config_rules.is_empty() {
             return Ok(CalcEngine { rules: Vec::new() });
@@ -219,10 +220,19 @@ impl CalcEngine {
     // ============================================================
 
     /// 编译单条规则：tokenize → parse → extract_variables。
+    ///
+    /// 同时检测自引用（kks_calc 出现在自身表达式的变量列表里）。
     fn compile_rule(rule: &CalcRule) -> Result<CompiledRule, String> {
         let tokens = tokenize(&rule.expression)?;
         let ast = parse(tokens)?;
         let variables = extract_variables(&ast);
+
+        if variables.iter().any(|v| v == &rule.kks_calc) {
+            return Err(format!(
+                "公式自引用: {} 的表达式 \"{}\" 中引用了自身",
+                rule.kks_calc, rule.expression
+            ));
+        }
 
         Ok(CompiledRule {
             kks_calc: rule.kks_calc.clone(),
@@ -238,7 +248,8 @@ impl CalcEngine {
 
     /// DAG 拓扑排序（Kahn 算法）。
     ///
-    /// 保证依赖的规则优先求值。若检测到循环依赖则返回错误。
+    /// 保证依赖的规则优先求值。若检测到循环依赖，参与循环或依赖循环节点的
+    /// 规则会被跳过并记录 warn 日志，其余规则正常返回（服务器不会崩溃）。
     fn topological_sort(rules: Vec<CompiledRule>) -> Result<Vec<CompiledRule>, String> {
         let n = rules.len();
 
@@ -283,18 +294,17 @@ impl CalcEngine {
         }
 
         if order.len() != n {
-            // 找出参与循环的规则名
-            let in_cycle: Vec<&str> = (0..n)
+            let skipped: Vec<&str> = (0..n)
                 .filter(|i| in_degree[*i] > 0)
                 .map(|i| rules[i].kks_calc.as_str())
                 .collect();
-            return Err(format!(
-                "检测到循环依赖，涉及规则: [{}]",
-                in_cycle.join(", ")
-            ));
+            warn!(
+                "[CalcEngine] 检测到循环依赖或依赖循环节点，以下规则被跳过: [{}]",
+                skipped.join(", ")
+            );
         }
 
-        // 按拓扑序重排
+        // 只取 order 中的规则，剩余的（参与循环 / 依赖循环）丢弃
         let mut rules_opt: Vec<Option<CompiledRule>> =
             rules.into_iter().map(Some).collect();
         let sorted: Vec<CompiledRule> = order
@@ -472,14 +482,58 @@ mod tests {
 
     #[test]
     fn engine_dag_cycle_detection() {
-        // A = B + 1, B = A + 1 → 循环
+        // A = B + 1, B = A + 1 → 循环，两条规则都应被跳过，引擎为空
         let rules = vec![
             make_rule("A", "float", "B + 1", 0.0),
             make_rule("B", "float", "A + 1", 0.0),
         ];
-        let result = CalcEngine::new(rules);
-        assert!(result.is_err());
-        assert!(result.err().unwrap().contains("循环依赖"));
+        let engine = CalcEngine::new(rules).expect("循环依赖不应导致构建失败");
+        assert!(engine.is_empty(), "循环中的所有规则都应被跳过");
+    }
+
+    #[test]
+    fn engine_self_reference_skipped() {
+        // C = B + C 属于自引用，应在编译阶段被跳过
+        let rules = vec![
+            make_rule("C", "uint", "B + C", 0.0),
+            make_rule("X", "float", "sensor + 1", 0.0),
+        ];
+        let engine = CalcEngine::new(rules).unwrap();
+        let names: Vec<&str> = engine.output_names();
+        assert!(!names.contains(&"C"), "自引用规则 C 应被跳过");
+        assert!(names.contains(&"X"), "正常规则 X 应保留");
+    }
+
+    #[test]
+    fn engine_cycle_preserves_other_rules() {
+        // B ↔ C 构成循环，A = x + 1 独立，应只保留 A
+        let rules = vec![
+            make_rule("A", "float", "x + 1", 0.0),
+            make_rule("B", "float", "C + 1", 0.0),
+            make_rule("C", "float", "B + 1", 0.0),
+        ];
+        let engine = CalcEngine::new(rules).unwrap();
+        let names: Vec<&str> = engine.output_names();
+        assert_eq!(names, vec!["A"], "循环规则应被跳过，独立规则保留");
+
+        let results = engine.run_cycle(&vars(&[("x", 10.0)]));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, Value::Float(11.0));
+    }
+
+    #[test]
+    fn engine_user_crash_scenario() {
+        // 用户提供的原始崩溃场景：C 自引用 + B↔C 循环 + A/D 依赖循环节点
+        // 期望：不 panic，CalcEngine::new 返回 Ok
+        let rules = vec![
+            make_rule("C", "uint", "B+C", 0.0),
+            make_rule("D", "uint", "B+C", 0.0),
+            make_rule("A", "uint", "B+C", 0.0),
+            make_rule("B", "uint", "C+D", 0.0),
+        ];
+        let engine = CalcEngine::new(rules).expect("用户配置不应导致崩溃");
+        // 所有规则要么自引用(C)要么参与/依赖循环(A B D)，引擎应为空
+        assert!(engine.is_empty());
     }
 
     // ---- 编译失败跳过 ----
