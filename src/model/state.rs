@@ -1,10 +1,9 @@
 //! 运行时状态类型。
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 
 /// 单个串口的运行时状态快照。
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -19,7 +18,9 @@ pub struct PortRuntimeState {
 
 /// 系统全局状态——管理所有串口及其设备状态。
 ///
-/// 内部使用 `Arc<Mutex<..>>` 保证线程安全，可安全克隆后跨任务共享。
+/// 操作均为短小的列表查找与字段赋值，使用 `std::sync::Mutex` 即可；
+/// 同时避免在阻塞线程（串口 worker）和异步任务（OPC UA / TCP）之间
+/// 通过 `block_on` 桥接 `tokio::sync::Mutex`。
 #[derive(Debug, Clone)]
 pub struct SystemState {
     inner: Arc<Mutex<Vec<PortRuntimeState>>>,
@@ -34,13 +35,13 @@ impl SystemState {
     }
 
     /// 添加一个串口的运行时状态。
-    pub async fn add_port(&self, port: PortRuntimeState) {
-        self.inner.lock().await.push(port);
+    pub fn add_port(&self, port: PortRuntimeState) {
+        self.lock().push(port);
     }
 
     /// 设置指定串口的在线状态。
-    pub async fn set_port_status(&self, port_number: &str, status: bool) -> Result<(), String> {
-        let mut ports = self.inner.lock().await;
+    pub fn set_port_status(&self, port_number: &str, status: bool) -> Result<(), String> {
+        let mut ports = self.lock();
         match ports.iter_mut().find(|p| p.port_number == port_number) {
             Some(port) => {
                 port.status = status;
@@ -51,13 +52,13 @@ impl SystemState {
     }
 
     /// 修改指定串口下某个设备的在线状态。
-    pub async fn set_device_status(
+    pub fn set_device_status(
         &self,
         port_number: &str,
         device_id: u8,
         status: bool,
     ) -> Result<(), String> {
-        let mut ports = self.inner.lock().await;
+        let mut ports = self.lock();
         match ports.iter_mut().find(|p| p.port_number == port_number) {
             Some(port) => match port.device_status.get_mut(&device_id) {
                 Some(ds) => {
@@ -71,7 +72,20 @@ impl SystemState {
     }
 
     /// 获取当前系统状态的完整快照。
-    pub async fn get_state(&self) -> Vec<PortRuntimeState> {
-        self.inner.lock().await.clone()
+    pub fn get_state(&self) -> Vec<PortRuntimeState> {
+        self.lock().clone()
+    }
+
+    /// 内部 lock helper：遇到锁中毒时恢复 inner 值，避免级联 panic。
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<PortRuntimeState>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Default for SystemState {
+    fn default() -> Self {
+        Self::new()
     }
 }

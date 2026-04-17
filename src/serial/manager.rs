@@ -15,8 +15,6 @@ use chrono::{DateTime, Local};
 use bounded_vec_deque::BoundedVecDeque;
 use log::{info, warn, error};
 use serialport::{DataBits, Parity, SerialPort, StopBits};
-use tokio::runtime::Handle;
-use tokio::sync::Mutex as TokioMutex;
 
 use crate::broadcast::Broadcaster;
 use crate::config::RunLocation;
@@ -116,9 +114,7 @@ pub(crate) struct SerialManager {
     pub(crate) time_out_count: u32,
     /// 整个串口连续解析失败次数。
     pub(crate) parse_fail_count: u32,
-    pub(crate) system_record: Arc<TokioMutex<BoundedVecDeque<String>>>,
-    /// 主运行时句柄，用于在阻塞线程中执行异步操作。
-    pub(crate) handle: Handle,
+    pub(crate) system_record: Arc<Mutex<BoundedVecDeque<String>>>,
     /// 复用的读取缓冲区，避免每次 receive_data 堆分配。
     read_buf: Vec<u8>,
     /// 上次重连尝试的时间，用于冷却控制。
@@ -127,16 +123,13 @@ pub(crate) struct SerialManager {
 
 impl SerialManager {
     /// 创建管理器并尝试打开串口。
-    ///
-    /// 必须在持有 tokio `Handle` 的上下文中调用（如 `spawn_blocking` 内部）。
     pub(crate) fn new(
         serial_config: SerialConfig,
         port_config: SerialPortConfig,
         broadcaster: Broadcaster,
         run_on: RunLocation,
         current_run: RunLocation,
-        system_record: Arc<TokioMutex<BoundedVecDeque<String>>>,
-        handle: Handle,
+        system_record: Arc<Mutex<BoundedVecDeque<String>>>,
     ) -> Self {
         // 首次启动等待设备就绪
         std::thread::sleep(Duration::from_millis(2000));
@@ -168,7 +161,6 @@ impl SerialManager {
             time_out_count: 0,
             parse_fail_count: 0,
             system_record,
-            handle,
             read_buf: vec![0u8; 1024],
             last_reconnect: Instant::now(),
         }
@@ -222,14 +214,17 @@ impl SerialManager {
                 value: parsed,
                 raw_data: zero_data,
             };
-            self.handle.block_on(self.broadcaster.broadcast(status));
+            self.broadcaster.broadcast(status);
         }
     }
 
     /// 记录一条系统日志。
     pub(crate) fn log_record(&self, msg: String) {
         let local: DateTime<Local> = Local::now();
-        let mut record = self.handle.block_on(self.system_record.lock());
+        let mut record = self.system_record.lock().unwrap_or_else(|e| {
+            warn!("system_record 锁中毒，恢复: {}", e);
+            e.into_inner()
+        });
         record.push_back(format!(
             "串口 {} 时间 {} {}",
             self.serial_config.port_name,
@@ -418,7 +413,7 @@ impl SerialManager {
                         value: parsed,
                         raw_data: frame,
                     };
-                    self.handle.block_on(self.broadcaster.broadcast(status));
+                    self.broadcaster.broadcast(status);
                 }
             }
             Err(_) => {

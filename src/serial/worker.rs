@@ -6,14 +6,12 @@
 //! 运行同步串口 I/O，通过 `Handle` 桥接异步操作。
 
 use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bounded_vec_deque::BoundedVecDeque;
 use log::{error, warn};
-use tokio::runtime::Handle;
-use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
-use std::sync::Arc;
 
 use crate::broadcast::Broadcaster;
 use crate::config;
@@ -38,10 +36,8 @@ pub fn spawn_serial_worker(
     rx: Receiver<Command>,
     software_config: config::Config,
     system_state: SystemState,
-    system_record: Arc<TokioMutex<BoundedVecDeque<String>>>,
+    system_record: Arc<Mutex<BoundedVecDeque<String>>>,
 ) -> JoinHandle<()> {
-    let handle = Handle::current();
-
     tokio::task::spawn_blocking(move || {
         let mut manager = SerialManager::new(
             serial_config,
@@ -50,7 +46,6 @@ pub fn spawn_serial_worker(
             software_config.server.run_on,
             software_config.server.current_run,
             system_record,
-            handle,
         );
 
         loop {
@@ -109,8 +104,9 @@ fn process_incoming_commands(
             }
             CommandType::PortStatus(status) => {
                 manager.port_config.status = status.device_status;
-                if let Err(e) = manager.handle.block_on(
-                    system_state.set_port_status(&manager.port_config.port_number, status.device_status)
+                if let Err(e) = system_state.set_port_status(
+                    &manager.port_config.port_number,
+                    status.device_status,
                 ) {
                     error!("设置端口状态失败: {}", e);
                 }
@@ -121,12 +117,10 @@ fn process_incoming_commands(
                         manager.device_states[i].is_enabled = setting.device_status;
                     }
                 }
-                if let Err(e) = manager.handle.block_on(
-                    system_state.set_device_status(
-                        &manager.port_config.port_number,
-                        setting.device_id,
-                        setting.device_status,
-                    )
+                if let Err(e) = system_state.set_device_status(
+                    &manager.port_config.port_number,
+                    setting.device_id,
+                    setting.device_status,
                 ) {
                     error!("设置设备状态失败: {}", e);
                 }

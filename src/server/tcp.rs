@@ -3,7 +3,7 @@
 //! 基于 bincode 长度分帧协议的 TCP 接口，将串口采集到的设备数据推送给客户端。
 
 use std::io;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use bounded_vec_deque::BoundedVecDeque;
@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use log::{info, warn, error};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
+use tokio::sync::broadcast;
 use tokio::time::timeout;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
@@ -30,14 +30,12 @@ pub async fn handle_tcp_client(
     serial_ports: Vec<SerialPortConfig>,
     txs: Vec<mpsc::Sender<Command>>,
     system_state: SystemState,
-    system_record: Arc<TokioMutex<BoundedVecDeque<String>>>,
+    system_record: Arc<Mutex<BoundedVecDeque<String>>>,
 ) -> io::Result<()> {
     info!("新客户端已连接");
 
-    // 创建本连接专用通道并注册到广播器
-    let (tx_local, mut rx_local) = tokio_mpsc::channel(32);
-    let local_tx_arc = Arc::new(tx_local);
-    broadcaster.register(local_tx_arc.clone()).await;
+    // 订阅广播；Receiver drop 时自动注销
+    let mut rx_local = broadcaster.subscribe();
 
     loop {
         tokio::select! {
@@ -57,19 +55,17 @@ pub async fn handle_tcp_client(
                     ).await?;
                 }
                 Some(Err(e)) => {
-                    broadcaster.unregister(&local_tx_arc).await;
                     error!("接收客户端数据出错: {}", e);
                     break;
                 }
                 None => {
-                    broadcaster.unregister(&local_tx_arc).await;
                     info!("客户端断开连接");
                     break;
                 }
             },
             // ---- 推送串口数据给客户端 ----
-            data = rx_local.recv() => {
-                if let Some(status) = data {
+            data = rx_local.recv() => match data {
+                Ok(status) => {
                     let msg = MessageType::DeviceStatus(status);
                     match bincode::serialize(&msg) {
                         Ok(serialized) => {
@@ -81,6 +77,13 @@ pub async fn handle_tcp_client(
                             error!("序列化 DeviceStatus 失败: {:?}", e);
                         }
                     }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("TCP 客户端广播订阅落后 {} 条，已丢帧", n);
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    info!("广播通道关闭");
+                    break;
                 }
             }
         }
@@ -96,14 +99,16 @@ async fn handle_client_message(
     serial_ports: &[SerialPortConfig],
     txs: &[mpsc::Sender<Command>],
     system_state: &SystemState,
-    system_record: &Arc<TokioMutex<BoundedVecDeque<String>>>,
+    system_record: &Arc<Mutex<BoundedVecDeque<String>>>,
 ) -> io::Result<()> {
     match message {
         MessageType::Command(cmd) => {
             // 记录日志
             if let CommandType::SendData(ref data) = cmd.command {
                 let local = chrono::Local::now();
-                let mut record = system_record.lock().await;
+                let mut record = system_record
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 record.push_back(format!(
                     "时间 {} 串口 {} 数据 {}",
                     local.format("%Y-%m-%d %H:%M:%S"),
@@ -122,12 +127,16 @@ async fn handle_client_message(
             }
         }
         MessageType::QueryAllStatus => {
-            let msg = MessageType::AllStatus(system_state.get_state().await);
+            let msg = MessageType::AllStatus(system_state.get_state());
             send_framed(framed, &msg).await?;
         }
         MessageType::QueryRecord => {
-            let record = system_record.lock().await;
-            let records: Vec<String> = record.iter().cloned().collect();
+            let records: Vec<String> = {
+                let record = system_record
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                record.iter().cloned().collect()
+            };
             let msg = MessageType::AllRecord(records);
             send_framed(framed, &msg).await?;
         }
@@ -165,7 +174,7 @@ pub async fn run_tcp_server(
     txs: Vec<mpsc::Sender<Command>>,
     broadcaster: Broadcaster,
     system_state: SystemState,
-    system_record: Arc<TokioMutex<BoundedVecDeque<String>>>,
+    system_record: Arc<Mutex<BoundedVecDeque<String>>>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind("0.0.0.0:11002").await?;
 

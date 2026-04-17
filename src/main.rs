@@ -18,10 +18,9 @@ mod server;
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 use bounded_vec_deque::BoundedVecDeque;
-use tokio::sync::Mutex as TokioMutex;
 
 use crate::broadcast::Broadcaster;
 use crate::model::{Command, SystemState};
@@ -50,7 +49,7 @@ async fn main() -> tokio::io::Result<()> {
 
     // 系统状态 & 操作记录
     let system_state = SystemState::new();
-    let system_record = Arc::new(TokioMutex::new(BoundedVecDeque::<String>::new(20000)));
+    let system_record = Arc::new(Mutex::new(BoundedVecDeque::<String>::new(20000)));
 
     // 加载计算引擎：配置异常时降级为空引擎，不终止服务
     let calc_engine = {
@@ -136,7 +135,7 @@ async fn init_serial_ports(
     broadcaster: Broadcaster,
     software_config: &config::Config,
     system_state: SystemState,
-    system_record: Arc<TokioMutex<BoundedVecDeque<String>>>,
+    system_record: Arc<Mutex<BoundedVecDeque<String>>>,
 ) -> io::Result<(Vec<SerialPortConfig>, Vec<mpsc::Sender<Command>>)> {
 
     // 1. 扫描 CSV 并按串口号聚合
@@ -159,7 +158,7 @@ async fn init_serial_ports(
         let (tx, rx) = mpsc::channel();
         txs.push(tx);
 
-        system_state.add_port(port_config.to_runtime_state()).await;
+        system_state.add_port(port_config.to_runtime_state());
 
         spawn_serial_worker(
             broadcaster.clone(),

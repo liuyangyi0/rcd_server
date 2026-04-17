@@ -4,12 +4,11 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use bounded_vec_deque::BoundedVecDeque;
 use log::{info, warn};
-use tokio::sync::Mutex as TokioMutex;
 
 use crate::broadcast::Broadcaster;
 use crate::calc_engine::engine::CalcEngine;
@@ -80,7 +79,7 @@ pub async fn run_opcua_server(
     serial_ports: Vec<SerialPortConfig>,
     broadcaster: Broadcaster,
     _system_state: SystemState,
-    _system_record: Arc<TokioMutex<BoundedVecDeque<String>>>,
+    _system_record: Arc<Mutex<BoundedVecDeque<String>>>,
     txs: Vec<mpsc::Sender<Command>>,
     calc_engine: Arc<CalcEngine>,
 ) -> io::Result<()> {
@@ -148,7 +147,7 @@ pub async fn run_opcua_server(
     register_send_methods(&node_manager, ns, &serial_ports, &txs);
 
     // ---- 注册本地通道接收串口数据 ----
-    let mut rx_opcua = broadcaster.subscribe(32).await;
+    let mut rx_opcua = broadcaster.subscribe();
 
     // ---- 任务 1: 串口数据 -> OPC UA 节点更新 ----
     let nm_update = node_manager.clone();
@@ -160,7 +159,16 @@ pub async fn run_opcua_server(
         // 使公式可引用来自不同设备的变量。
         let mut global_vars: HashMap<String, f64> = HashMap::new();
 
-        while let Some(status) = rx_opcua.recv().await {
+        loop {
+            let status = match rx_opcua.recv().await {
+                Ok(s) => s,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("[OPC UA] 广播订阅落后 {} 条，已丢帧", n);
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+
             // ---- 1. 更新设备 OPC UA 节点（原有逻辑）----
             let mut updates: Vec<_> = status.value.iter().filter_map(|(kks, val)| {
                 let browse_name = format!("{}_{}_{}", status.com, status.device_id, kks);
@@ -422,7 +430,7 @@ async fn poll_and_forward_commands(
     send_node_ids: &[(String, NodeId)],
     serial_ports: &[SerialPortConfig],
     txs: &[mpsc::Sender<Command>],
-    system_record: &Arc<TokioMutex<BoundedVecDeque<String>>>,
+    system_record: &Arc<Mutex<BoundedVecDeque<String>>>,
 ) -> Vec<NodeId> {
     let mut to_clear = Vec::new();
     let address_space = nm.address_space().read();
@@ -454,7 +462,9 @@ async fn poll_and_forward_commands(
                         Ok(msg) => {
                             info!("{}", msg);
                             let local = chrono::Local::now();
-                            let mut record = system_record.lock().await;
+                            let mut record = system_record
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
                             record.push_back(format!(
                                 "时间: {} 串口: {} 数据: {}",
                                 local.format("%Y-%m-%d %H:%M:%S"),
