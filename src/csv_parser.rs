@@ -3,17 +3,49 @@
 //! 每个 CSV 文件描述一个设备的通信参数与数据点定义。
 //! 文件前 7 行为设备配置头，之后为数据记录表。
 
-use std::error::Error;
 use std::fs::File;
 use std::ops::RangeInclusive;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use csv::ReaderBuilder;
 use serde::Deserialize;
+use thiserror::Error;
+
+// ============================================================
+//  错误类型
+// ============================================================
+
+/// CSV 解析过程中的结构化错误。
+#[derive(Debug, Error)]
+pub enum CsvParseError {
+    #[error("打开 CSV 文件失败: {path:?}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("读取 CSV 记录失败: {0}")]
+    Csv(#[from] csv::Error),
+
+    #[error("CSV 头缺少必填字段 '{field}' (第 {row} 行第 2 列)")]
+    MissingHeader { field: &'static str, row: usize },
+
+    #[error("CSV 头字段 '{field}' 解析失败 (值=\"{value}\"): {reason}")]
+    BadHeaderValue {
+        field: &'static str,
+        value: String,
+        reason: String,
+    },
+}
 
 /// 解析 CSV 头区域的必填数值字段；缺失或不合法时返回带字段名的错误。
-fn parse_required<T: FromStr>(headers: &[String], idx: usize, field: &str) -> Result<T, String>
+fn parse_required<T: FromStr>(
+    headers: &[String],
+    idx: usize,
+    field: &'static str,
+) -> Result<T, CsvParseError>
 where
     T::Err: std::fmt::Display,
 {
@@ -21,9 +53,12 @@ where
         .get(idx)
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("CSV 头缺少必填字段 '{}' (第 {} 行第 2 列)", field, idx + 1))?;
-    raw.parse::<T>()
-        .map_err(|e| format!("CSV 头字段 '{}' 解析失败 (值=\"{}\"): {}", field, raw, e))
+        .ok_or(CsvParseError::MissingHeader { field, row: idx + 1 })?;
+    raw.parse::<T>().map_err(|e| CsvParseError::BadHeaderValue {
+        field,
+        value: raw.to_string(),
+        reason: e.to_string(),
+    })
 }
 
 // ============================================================
@@ -149,8 +184,12 @@ impl DeviceConfig {
 /// - 第 1~7 行：配置项（第 2 列为值）。
 /// - 第 8 行：表头分隔行（跳过）。
 /// - 第 9 行起：数据记录。
-pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), Box<dyn Error>> {
-    let file = File::open(file_path)?;
+pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), CsvParseError> {
+    let path_ref = file_path.as_ref();
+    let file = File::open(path_ref).map_err(|e| CsvParseError::Io {
+        path: path_ref.to_path_buf(),
+        source: e,
+    })?;
     let mut rdr = ReaderBuilder::new()
         .delimiter(b',')
         .has_headers(false)
@@ -170,7 +209,7 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
         .get(0)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| "CSV 头缺少必填字段 'com' (第 1 行第 2 列)".to_string())?;
+        .ok_or(CsvParseError::MissingHeader { field: "com", row: 1 })?;
 
     let config = Config {
         com,

@@ -1344,6 +1344,7 @@ dependencies = [
  "regex",
  "serde",
  "serialport",
+ "thiserror 1.0.61",
  "tokio",
  "tokio-util",
  "toml",
