@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::broadcast::Broadcaster;
 use crate::calc_engine::engine::CalcEngine;
+use crate::calc_engine::runner::CalcRunner;
 use crate::model::{Command, CommandType, SendData, SystemState, Value, get_sum};
 use crate::protocol::hex_str_to_bytes;
 use crate::serial::port_config::SerialPortConfig;
@@ -64,6 +65,15 @@ fn datatype_and_initial(expected: ExpectedType) -> (NodeId, Variant) {
         ExpectedType::Bool    => (NodeId::from(DataTypeId::Boolean), Variant::Boolean(false)),
         ExpectedType::Float32 => (NodeId::from(DataTypeId::Float),   Variant::Float(0.0)),
         ExpectedType::Float64 => (NodeId::from(DataTypeId::Double),  Variant::Double(0.0)),
+    }
+}
+
+/// 将 `model::Value` 映射为 OPC UA `Variant`。
+fn value_to_variant(v: &Value) -> Variant {
+    match v {
+        Value::UInt(n)  => Variant::UInt32(*n),
+        Value::Bool(b)  => Variant::Boolean(*b),
+        Value::Float(f) => Variant::Float(*f),
     }
 }
 
@@ -155,13 +165,9 @@ pub async fn run_opcua_server(
     let nm_update = node_manager.clone();
     let subs_update = subscriptions.clone();
     let kks_map = kks_node_map.clone();
-    let calc = calc_engine.clone();
+    let mut calc_runner = CalcRunner::new(calc_engine.clone());
     let cancel_update = cancel.clone();
     let task_update = tokio::spawn(async move {
-        // 全局变量累加器：跨设备 / 跨串口持续积累最新值，
-        // 使公式可引用来自不同设备的变量。
-        let mut global_vars: HashMap<String, f64> = HashMap::new();
-
         loop {
             let status = tokio::select! {
                 biased;
@@ -176,37 +182,17 @@ pub async fn run_opcua_server(
                 }
             };
 
-            // ---- 1. 更新设备 OPC UA 节点（原有逻辑）----
+            // ---- 1. 更新设备 OPC UA 节点 ----
             let mut updates: Vec<_> = status.value.iter().filter_map(|(kks, val)| {
                 let browse_name = format!("{}_{}_{}", status.com, status.device_id, kks);
                 let node_id = kks_map.get(&browse_name)?;
-                let variant = match val {
-                    Value::UInt(n)  => Variant::UInt32(*n),
-                    Value::Bool(b)  => Variant::Boolean(*b),
-                    Value::Float(f) => Variant::Float(*f),
-                };
-                Some((node_id, None, DataValue::new_now(variant)))
+                Some((node_id, None, DataValue::new_now(value_to_variant(val))))
             }).collect();
 
-            // ---- 2. 计算引擎：累积变量并执行公式 ----
-            if !calc.is_empty() {
-                // 将本次广播的变量合并到全局累加器
-                for (kks, val) in &status.value {
-                    global_vars.insert(kks.clone(), val.to_f64());
-                }
-
-                // 执行所有公式（变量缺失 / 除零等自动回退默认值）
-                let calc_results = calc.run_cycle(&global_vars);
-
-                for (kks_calc, val) in &calc_results {
-                    if let Some(node_id) = kks_map.get(kks_calc) {
-                        let variant = match val {
-                            Value::UInt(n)  => Variant::UInt32(*n),
-                            Value::Bool(b)  => Variant::Boolean(*b),
-                            Value::Float(f) => Variant::Float(*f),
-                        };
-                        updates.push((node_id, None, DataValue::new_now(variant)));
-                    }
+            // ---- 2. 计算引擎：CalcRunner 累积变量并执行公式 ----
+            for (kks_calc, val) in calc_runner.on_update(&status) {
+                if let Some(node_id) = kks_map.get(&kks_calc) {
+                    updates.push((node_id, None, DataValue::new_now(value_to_variant(&val))));
                 }
             }
 
