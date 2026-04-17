@@ -1,0 +1,51 @@
+# 示例规则集（用于验证 nesting-check 工具）
+
+# ---- 深链条：total → sum → mid → base ----
+[[rules]]
+kks_calc      = "total"
+data_type     = "float"
+expression    = "sum * 1.2 + overhead"
+
+[[rules]]
+kks_calc      = "sum"
+data_type     = "float"
+expression    = "mid + tail"
+
+[[rules]]
+kks_calc      = "mid"
+data_type     = "float"
+expression    = "raw_a + raw_b"
+
+# ---- 循环 + 自引用 ----
+[[rules]]
+kks_calc      = "C"
+data_type     = "uint"
+expression    = "B + C"
+
+[[rules]]
+kks_calc      = "B"
+data_type     = "uint"
+expression    = "C + D"
+
+[[rules]]
+kks_calc      = "D"
+data_type     = "uint"
+expression    = "raw_x + raw_y"
+
+# ---- 正常规则：依赖多基础变量 ----
+[[rules]]
+kks_calc      = "alarm_combined"
+data_type     = "bool"
+expression    = "(status_A == 1) && (status_B == 0)"
+default_value = 0.0
+
+# ---- 单位换算（仅 1 个调用者、表达式简单 → 可内联建议）----
+[[rules]]
+kks_calc      = "rate_usv"
+data_type     = "float"
+expression    = "rate_msv * 1000"
+
+[[rules]]
+kks_calc      = "alarm_rate"
+data_type     = "bool"
+expression    = "rate_usv > 100"
