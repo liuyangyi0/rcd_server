@@ -12,6 +12,20 @@ use std::str::FromStr;
 use csv::ReaderBuilder;
 use serde::Deserialize;
 
+/// 解析 CSV 头区域的必填数值字段；缺失或不合法时返回带字段名的错误。
+fn parse_required<T: FromStr>(headers: &[String], idx: usize, field: &str) -> Result<T, String>
+where
+    T::Err: std::fmt::Display,
+{
+    let raw = headers
+        .get(idx)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("CSV 头缺少必填字段 '{}' (第 {} 行第 2 列)", field, idx + 1))?;
+    raw.parse::<T>()
+        .map_err(|e| format!("CSV 头字段 '{}' 解析失败 (值=\"{}\"): {}", field, raw, e))
+}
+
 // ============================================================
 //  位索引类型
 // ============================================================
@@ -151,13 +165,20 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
         }
     }
 
+    // 必填字段缺失/不可解析时立即报错，避免默认 0 在 serialport::new() 里晚崩
+    let com = headers
+        .get(0)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "CSV 头缺少必填字段 'com' (第 1 行第 2 列)".to_string())?;
+
     let config = Config {
-        com: headers.get(0).cloned().unwrap_or_default(),
-        baud_rate: headers.get(1).and_then(|s| s.parse().ok()).unwrap_or(0),
-        is_special: headers.get(2).and_then(|s| s.parse().ok()).unwrap_or(false),
-        com_index: headers.get(3).and_then(|s| s.parse().ok()).unwrap_or(0),
-        device_id: headers.get(4).and_then(|s| s.parse().ok()).unwrap_or(0),
-        data_len: headers.get(5).and_then(|s| s.parse().ok()).unwrap_or(0),
+        com,
+        baud_rate: parse_required(&headers, 1, "baud_rate")?,
+        is_special: headers.get(2).and_then(|s| s.trim().parse().ok()).unwrap_or(false),
+        com_index: parse_required(&headers, 3, "com_index")?,
+        device_id: parse_required(&headers, 4, "device_id")?,
+        data_len: parse_required(&headers, 5, "data_len")?,
         kks_prefix: headers.get(6).cloned().unwrap_or_default(),
     };
 

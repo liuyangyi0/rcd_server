@@ -201,7 +201,15 @@ impl CalcEngine {
 
             // ---- 类型转换 ----
             let typed_value = match rule.data_type.as_str() {
-                "uint" => Value::UInt(clamped.max(0.0) as u32),
+                "uint" => {
+                    if clamped > u32::MAX as f64 {
+                        warn!(
+                            "[CalcEngine] 公式 '{}' 结果 {} 超出 u32::MAX，饱和到 {}",
+                            rule.kks_calc, clamped, u32::MAX
+                        );
+                    }
+                    Value::UInt(clamped.max(0.0) as u32)
+                }
                 "bool" => Value::Bool(clamped != 0.0),
                 _ => Value::Float(clamped as f32), // "float" 及其他
             };

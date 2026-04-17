@@ -103,13 +103,25 @@ pub fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
     let mut results = HashMap::new();
 
     for record in records {
-        let byte_index = record.byte_index as usize - 1; // 转为 0-based
+        // byte_index 为 1-based，0 视为非法，避免 0 - 1 下溢
+        let byte_index = match record.byte_index.checked_sub(1) {
+            Some(v) => v as usize,
+            None => {
+                warn!("记录 '{}' 的 byte_index 为 0 (1-based)，跳过该数据点", record.kks);
+                continue;
+            }
+        };
         if byte_index >= data.len() {
             continue;
         }
 
         let raw_value = match &record.bit_index {
             BitIndex::Single(bit) => {
+                // u8 移位宽度必须 < 8，否则 debug 下 panic、release 下行为未定
+                if *bit >= 8 {
+                    warn!("记录 '{}' 的 bit_index={} 超出 u8 范围 (0..=7)，跳过", record.kks, bit);
+                    continue;
+                }
                 ((data[byte_index] >> (*bit as usize)) & 1) as u32
             }
             BitIndex::Range(range) => {
@@ -318,6 +330,32 @@ mod tests {
         ];
         let result = parse_status(&data, &records);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_status_byte_index_zero_skipped() {
+        // byte_index=0 1-based 不合法，不应导致 panic
+        let data = [0xFF];
+        let records = vec![
+            make_record("bad", "bool", 0, BitIndex::Single(0), 0),
+            make_record("ok", "bool", 1, BitIndex::Single(0), 0),
+        ];
+        let result = parse_status(&data, &records);
+        assert!(result.get("bad").is_none());
+        assert_eq!(result.get("ok"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn parse_status_single_bit_out_of_range_skipped() {
+        // bit=8 超出 u8 范围，必须跳过而非 panic
+        let data = [0xFF];
+        let records = vec![
+            make_record("bad", "bool", 1, BitIndex::Single(8), 0),
+            make_record("ok", "bool", 1, BitIndex::Single(3), 0),
+        ];
+        let result = parse_status(&data, &records);
+        assert!(result.get("bad").is_none());
+        assert_eq!(result.get("ok"), Some(&Value::Bool(true)));
     }
 
     #[test]
