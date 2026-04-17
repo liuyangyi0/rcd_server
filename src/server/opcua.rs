@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use bounded_vec_deque::BoundedVecDeque;
 use log::{info, warn};
+use tokio_util::sync::CancellationToken;
 
 use crate::broadcast::Broadcaster;
 use crate::calc_engine::engine::CalcEngine;
@@ -82,6 +83,7 @@ pub async fn run_opcua_server(
     _system_record: Arc<Mutex<BoundedVecDeque<String>>>,
     txs: Vec<mpsc::Sender<Command>>,
     calc_engine: Arc<CalcEngine>,
+    cancel: CancellationToken,
 ) -> io::Result<()> {
     let host = "0.0.0.0";
     let port: u16 = 4840;
@@ -154,19 +156,24 @@ pub async fn run_opcua_server(
     let subs_update = subscriptions.clone();
     let kks_map = kks_node_map.clone();
     let calc = calc_engine.clone();
-    tokio::spawn(async move {
+    let cancel_update = cancel.clone();
+    let task_update = tokio::spawn(async move {
         // 全局变量累加器：跨设备 / 跨串口持续积累最新值，
         // 使公式可引用来自不同设备的变量。
         let mut global_vars: HashMap<String, f64> = HashMap::new();
 
         loop {
-            let status = match rx_opcua.recv().await {
-                Ok(s) => s,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    warn!("[OPC UA] 广播订阅落后 {} 条，已丢帧", n);
-                    continue;
+            let status = tokio::select! {
+                biased;
+                _ = cancel_update.cancelled() => break,
+                res = rx_opcua.recv() => match res {
+                    Ok(s) => s,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("[OPC UA] 广播订阅落后 {} 条，已丢帧", n);
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
 
             // ---- 1. 更新设备 OPC UA 节点（原有逻辑）----
@@ -218,9 +225,16 @@ pub async fn run_opcua_server(
     let txs_clone = txs.clone();
     let serial_ports_clone = serial_ports.clone();
     let system_record_clone = _system_record.clone();
+    let cancel_poll = cancel.clone();
 
-    tokio::spawn(async move {
+    let task_poll = tokio::spawn(async move {
         loop {
+            tokio::select! {
+                biased;
+                _ = cancel_poll.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            }
+
             let to_clear = poll_and_forward_commands(
                 &nm_send, &send_node_ids, &serial_ports_clone,
                 &txs_clone, &system_record_clone,
@@ -234,27 +248,30 @@ pub async fn run_opcua_server(
                     warn!("清零写命令节点失败: {:?}", e);
                 }
             }
-
-            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     });
 
-    // ---- Ctrl+C 优雅退出 ----
+    // 外部取消信号 → OPC UA 服务器自身取消（Ctrl+C 已在 main 注册）
     {
         let handle_c = handle.clone();
+        let cancel_bridge = cancel.clone();
         tokio::spawn(async move {
-            if let Err(e) = tokio::signal::ctrl_c().await {
-                warn!("注册 Ctrl+C 处理器失败: {e}");
-                return;
-            }
+            cancel_bridge.cancelled().await;
             handle_c.cancel();
         });
     }
 
-    server
+    let result = server
         .run()
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("OPC UA 服务器错误: {e}")))
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("OPC UA 服务器错误: {e}")));
+
+    // 服务器退出后，确保取消信号触发 + 等待子任务收尾
+    cancel.cancel();
+    let _ = task_update.await;
+    let _ = task_poll.await;
+
+    result
 }
 
 /// 初始化后的 OPC UA 节点信息。

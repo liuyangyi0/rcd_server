@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bounded_vec_deque::BoundedVecDeque;
-use log::{error, warn};
+use log::{error, info, warn};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::broadcast::Broadcaster;
 use crate::config;
@@ -37,8 +38,10 @@ pub fn spawn_serial_worker(
     software_config: config::Config,
     system_state: SystemState,
     system_record: Arc<Mutex<BoundedVecDeque<String>>>,
+    cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
+        let port_name = serial_config.port_name.clone();
         let mut manager = SerialManager::new(
             serial_config,
             port_config,
@@ -49,6 +52,11 @@ pub fn spawn_serial_worker(
         );
 
         loop {
+            if cancel.is_cancelled() {
+                info!("串口 {} worker 收到取消信号，退出", port_name);
+                return;
+            }
+
             // 处理来自上层的命令
             process_incoming_commands(&mut manager, &rx, &system_state);
 

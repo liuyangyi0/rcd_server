@@ -19,8 +19,11 @@ mod server;
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use bounded_vec_deque::BoundedVecDeque;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::broadcast::Broadcaster;
 use crate::model::{Command, SystemState};
@@ -40,6 +43,20 @@ use log::{info, warn, error};
 #[tokio::main]
 async fn main() -> tokio::io::Result<()> {
     env_logger::init();
+
+    // 全局取消信号：Ctrl+C / 服务器异常退出时通知所有子任务
+    let cancel = CancellationToken::new();
+    {
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_err() {
+                warn!("注册 Ctrl+C 处理器失败");
+                return;
+            }
+            info!("收到 Ctrl+C，开始优雅退出");
+            c.cancel();
+        });
+    }
 
     // 全局广播器：串口数据会广播到所有订阅者（OPC UA / TCP 客户端）
     let broadcaster = Broadcaster::new();
@@ -87,9 +104,10 @@ async fn main() -> tokio::io::Result<()> {
         &software_config,
         system_state.clone(),
         system_record.clone(),
+        cancel.clone(),
     ).await {
-        Ok((configs, txs)) => {
-            // 校验计算引擎的基础变量是否在 CSV 数据点中定义（需求 4.1 依赖存在性分析）
+        Ok((configs, txs, worker_handles)) => {
+            // 校验计算引擎的基础变量是否在 CSV 数据点中定义
             if !calc_engine.is_empty() {
                 let all_kks: std::collections::HashSet<String> = configs.iter()
                     .flat_map(|port| port.devices.iter())
@@ -110,18 +128,45 @@ async fn main() -> tokio::io::Result<()> {
                 }
             }
 
-            // 启动 OPC UA 服务器（阻塞直到退出）
-            match run_opcua_server(configs, broadcaster, system_state, system_record, txs, calc_engine).await {
+            // 启动 OPC UA 服务器（阻塞直到退出或收到取消信号）
+            match run_opcua_server(
+                configs, broadcaster, system_state, system_record, txs,
+                calc_engine, cancel.clone(),
+            ).await {
                 Ok(_) => info!("OPC UA 服务器已正常退出"),
                 Err(e) => error!("OPC UA 服务器运行失败: {}", e),
             }
+
+            // 服务器退出后，确保取消信号已触发（可能是内部异常而非 Ctrl+C）
+            cancel.cancel();
+
+            // 等待串口 worker 结束，带 3 秒超时
+            shutdown_workers(worker_handles).await;
         }
         Err(e) => {
             error!("初始化失败: {}", e);
+            cancel.cancel();
         }
     }
 
     Ok(())
+}
+
+/// 等待所有串口 worker 自然结束，超时后放弃（tokio runtime drop 会清理）。
+async fn shutdown_workers(handles: Vec<JoinHandle<()>>) {
+    if handles.is_empty() {
+        return;
+    }
+    info!("等待 {} 个串口线程退出…", handles.len());
+    let join_all = async {
+        for h in handles {
+            let _ = h.await;
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(3), join_all).await {
+        Ok(_) => info!("串口线程全部退出完毕"),
+        Err(_) => warn!("串口线程 3s 内未退出，跳过等待"),
+    }
 }
 
 // ============================================================
@@ -136,7 +181,8 @@ async fn init_serial_ports(
     software_config: &config::Config,
     system_state: SystemState,
     system_record: Arc<Mutex<BoundedVecDeque<String>>>,
-) -> io::Result<(Vec<SerialPortConfig>, Vec<mpsc::Sender<Command>>)> {
+    cancel: CancellationToken,
+) -> io::Result<(Vec<SerialPortConfig>, Vec<mpsc::Sender<Command>>, Vec<JoinHandle<()>>)> {
 
     // 1. 扫描 CSV 并按串口号聚合
     let serial_port_configs = load_and_group_csv_configs()?;
@@ -153,6 +199,7 @@ async fn init_serial_ports(
 
     // 2. 为每个串口启动通信线程
     let mut txs = Vec::with_capacity(serial_port_configs.len());
+    let mut handles = Vec::with_capacity(serial_port_configs.len());
 
     for port_config in &serial_port_configs {
         let (tx, rx) = mpsc::channel();
@@ -160,7 +207,7 @@ async fn init_serial_ports(
 
         system_state.add_port(port_config.to_runtime_state());
 
-        spawn_serial_worker(
+        let handle = spawn_serial_worker(
             broadcaster.clone(),
             SerialConfig::new(
                 port_config.port_number.clone(),
@@ -174,10 +221,12 @@ async fn init_serial_ports(
             software_config.clone(),
             system_state.clone(),
             system_record.clone(),
+            cancel.clone(),
         );
+        handles.push(handle);
     }
 
-    Ok((serial_port_configs, txs))
+    Ok((serial_port_configs, txs, handles))
 }
 
 /// 从 config 目录加载所有 `rcd*.csv` 文件并按串口号聚合。
