@@ -22,3 +22,6 @@ async-opcua = { version = "0.16", features = ["server"] }
 log = "0.4"
 env_logger = "0.10"
 thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"

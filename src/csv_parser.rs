@@ -234,3 +234,67 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
 
     Ok((config, records))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// 写入一个临时 CSV 文件并返回路径；测试结束由 tempdir drop 自动清理。
+    fn write_tmp(content: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let path = dir.path().join("test.csv");
+        let mut f = File::create(&path).expect("创建临时文件");
+        f.write_all(content.as_bytes()).expect("写入内容");
+        (dir, path)
+    }
+
+    const VALID_HEADERS: &str = "\
+com,COM3,
+baud_rate,9600,
+is_special,false,
+com_index,1,
+device_id,2,
+data_len,8,
+kks_prefix,PX_,
+kks,type_,f_type,byte_index,bit_index,def,max,min,lh
+";
+
+    #[test]
+    fn parse_valid_file_headers_only() {
+        let (_d, p) = write_tmp(VALID_HEADERS);
+        let (cfg, recs) = parse_csv(&p).unwrap();
+        assert_eq!(cfg.com, "COM3");
+        assert_eq!(cfg.baud_rate, 9600);
+        assert!(!cfg.is_special);
+        assert_eq!(cfg.device_id, 2);
+        assert_eq!(cfg.data_len, 8);
+        assert_eq!(cfg.kks_prefix, "PX_");
+        assert!(recs.is_empty());
+    }
+
+    #[test]
+    fn missing_com_returns_missing_header() {
+        let content = VALID_HEADERS.replacen("com,COM3,", "com,,", 1);
+        let (_d, p) = write_tmp(&content);
+        let err = parse_csv(&p).unwrap_err();
+        assert!(matches!(err, CsvParseError::MissingHeader { field: "com", .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn bad_baud_rate_returns_bad_header_value() {
+        let content = VALID_HEADERS.replacen("baud_rate,9600,", "baud_rate,abc,", 1);
+        let (_d, p) = write_tmp(&content);
+        let err = parse_csv(&p).unwrap_err();
+        assert!(
+            matches!(err, CsvParseError::BadHeaderValue { field: "baud_rate", .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn nonexistent_file_returns_io_error() {
+        let err = parse_csv(Path::new("./_does_not_exist_xyz.csv")).unwrap_err();
+        assert!(matches!(err, CsvParseError::Io { .. }), "got {err:?}");
+    }
+}

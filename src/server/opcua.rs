@@ -2,6 +2,13 @@
 //!
 //! 将串口采集到的设备数据发布为 OPC UA 变量节点，支持客户端写命令下发。
 
+/// OPC UA 默认监听地址。
+pub const OPCUA_BIND_HOST: &str = "0.0.0.0";
+/// OPC UA 默认监听端口。
+pub const OPCUA_BIND_PORT: u16 = 4840;
+/// 写命令节点轮询间隔。
+pub const SEND_NODE_POLL_INTERVAL_MS: u64 = 200;
+
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex, mpsc};
@@ -95,8 +102,8 @@ pub async fn run_opcua_server(
     calc_engine: Arc<CalcEngine>,
     cancel: CancellationToken,
 ) -> io::Result<()> {
-    let host = "0.0.0.0";
-    let port: u16 = 4840;
+    let host = OPCUA_BIND_HOST;
+    let port: u16 = OPCUA_BIND_PORT;
     let base = format!("opc.tcp://{}:{}/", host, port);
 
     // ---- 构建 OPC UA 服务器 ----
@@ -218,7 +225,7 @@ pub async fn run_opcua_server(
             tokio::select! {
                 biased;
                 _ = cancel_poll.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(SEND_NODE_POLL_INTERVAL_MS)) => {}
             }
 
             let to_clear = poll_and_forward_commands(
