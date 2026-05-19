@@ -11,7 +11,7 @@ pub const SEND_NODE_POLL_INTERVAL_MS: u64 = 200;
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use bounded_vec_deque::BoundedVecDeque;
@@ -19,9 +19,10 @@ use log::{info, warn};
 use tokio_util::sync::CancellationToken;
 
 use crate::broadcast::Broadcaster;
+use crate::calc_engine::config::{normalize_data_type, CalcDataType};
 use crate::calc_engine::engine::CalcEngine;
 use crate::calc_engine::runner::CalcRunner;
-use crate::model::{Command, CommandType, SendData, SystemState, Value, get_sum};
+use crate::model::{get_sum, Command, CommandType, SendData, SystemState, Value};
 use crate::protocol::hex_str_to_bytes;
 use crate::serial::port_config::SerialPortConfig;
 
@@ -31,14 +32,13 @@ use opcua::server::address_space::{
     EventNotifier, MethodBuilder, NodeType, ObjectBuilder, Variable,
 };
 use opcua::server::diagnostics::NamespaceMetadata;
-use opcua::server::node_manager::memory::{SimpleNodeManager, simple_node_manager};
+use opcua::server::node_manager::memory::{simple_node_manager, SimpleNodeManager};
 use opcua::server::{
-    ServerBuilder, ServerEndpoint, ServerUserToken, SubscriptionCache,
-    ANONYMOUS_USER_TOKEN_ID,
+    ServerBuilder, ServerEndpoint, ServerUserToken, SubscriptionCache, ANONYMOUS_USER_TOKEN_ID,
 };
 use opcua::types::{
-    BuildInfo, DataEncoding, DataTypeId, DataValue, DateTime as UaDateTime,
-    NodeId, NumericRange, ObjectId, StatusCode, TimestampsToReturn, UAString, Variant,
+    BuildInfo, DataEncoding, DataTypeId, DataValue, DateTime as UaDateTime, NodeId, NumericRange,
+    ObjectId, StatusCode, TimestampsToReturn, UAString, Variant,
 };
 
 // ============================================================
@@ -56,31 +56,32 @@ enum ExpectedType {
 
 /// 从类型字符串映射到 [`ExpectedType`]。
 fn expected_type_from_str(s: &str) -> ExpectedType {
-    match s.to_ascii_lowercase().as_str() {
-        "u32" | "uint32" | "uint" => ExpectedType::UInt32,
-        "bool" | "boolean"        => ExpectedType::Bool,
-        "f32" | "float"           => ExpectedType::Float32,
-        "f64" | "double"          => ExpectedType::Float64,
-        _                         => ExpectedType::Float32,
+    match normalize_data_type(s) {
+        Some(CalcDataType::UInt) => ExpectedType::UInt32,
+        Some(CalcDataType::Bool) => ExpectedType::Bool,
+        Some(CalcDataType::Float) => ExpectedType::Float32,
+        Some(CalcDataType::Double) => ExpectedType::Float64,
+        None => ExpectedType::Float32,
     }
 }
 
 /// 根据期望类型返回 OPC UA 数据类型 NodeId 与初始值。
 fn datatype_and_initial(expected: ExpectedType) -> (NodeId, Variant) {
     match expected {
-        ExpectedType::UInt32  => (NodeId::from(DataTypeId::UInt32),  Variant::UInt32(0)),
-        ExpectedType::Bool    => (NodeId::from(DataTypeId::Boolean), Variant::Boolean(false)),
-        ExpectedType::Float32 => (NodeId::from(DataTypeId::Float),   Variant::Float(0.0)),
-        ExpectedType::Float64 => (NodeId::from(DataTypeId::Double),  Variant::Double(0.0)),
+        ExpectedType::UInt32 => (NodeId::from(DataTypeId::UInt32), Variant::UInt32(0)),
+        ExpectedType::Bool => (NodeId::from(DataTypeId::Boolean), Variant::Boolean(false)),
+        ExpectedType::Float32 => (NodeId::from(DataTypeId::Float), Variant::Float(0.0)),
+        ExpectedType::Float64 => (NodeId::from(DataTypeId::Double), Variant::Double(0.0)),
     }
 }
 
 /// 将 `model::Value` 映射为 OPC UA `Variant`。
 fn value_to_variant(v: &Value) -> Variant {
     match v {
-        Value::UInt(n)  => Variant::UInt32(*n),
-        Value::Bool(b)  => Variant::Boolean(*b),
+        Value::UInt(n) => Variant::UInt32(*n),
+        Value::Bool(b) => Variant::Boolean(*b),
         Value::Float(f) => Variant::Float(*f),
+        Value::Double(f) => Variant::Double(*f),
     }
 }
 
@@ -90,9 +91,12 @@ fn value_to_variant(v: &Value) -> Variant {
 
 /// 运行 OPC UA 服务器，将串口数据发布为独立变量节点。
 ///
-/// 节点命名：`<串口号>_<设备ID>_<kks>`。
-/// 每个串口额外创建一个可写的 `<串口号>_Send` 字符串节点，
-/// 客户端可通过写入十六进制字符串向设备下发命令。
+/// 节点命名约定：
+/// - 设备数据节点（只读）：纯 KKS 名，如 `9CYE91GH201_READY`。
+///   要求 KKS 在所有串口/设备间全局唯一（在 CSV 的 `kks_prefix` 中保证）。
+/// - 计算衍生节点（只读）：纯 `kks_calc`，如 `91UGM91110_Fire`。
+/// - 写命令节点（可写）：`<串口号>_Send`，如 `ttyAP0_Send`，
+///   客户端可通过写入十六进制字符串向设备下发命令。
 pub async fn run_opcua_server(
     serial_ports: Vec<SerialPortConfig>,
     broadcaster: Broadcaster,
@@ -146,7 +150,9 @@ pub async fn run_opcua_server(
         .trust_client_certs(true)
         .diagnostics_enabled(true)
         .build()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("构建 OPC UA 服务器失败: {e}")))?;
+        .map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("构建 OPC UA 服务器失败: {e}"))
+        })?;
 
     let node_manager: Arc<SimpleNodeManager> = handle
         .node_managers()
@@ -189,12 +195,15 @@ pub async fn run_opcua_server(
                 }
             };
 
-            // ---- 1. 更新设备 OPC UA 节点 ----
-            let mut updates: Vec<_> = status.value.iter().filter_map(|(kks, val)| {
-                let browse_name = format!("{}_{}_{}", status.com, status.device_id, kks);
-                let node_id = kks_map.get(&browse_name)?;
-                Some((node_id, None, DataValue::new_now(value_to_variant(val))))
-            }).collect();
+            // ---- 1. 更新设备 OPC UA 节点（按纯 KKS 查询）----
+            let mut updates: Vec<_> = status
+                .value
+                .iter()
+                .filter_map(|(kks, val)| {
+                    let node_id = kks_map.get(kks.as_str())?;
+                    Some((node_id, None, DataValue::new_now(value_to_variant(val))))
+                })
+                .collect();
 
             // ---- 2. 计算引擎：CalcRunner 累积变量并执行公式 ----
             for (kks_calc, val) in calc_runner.on_update(&status) {
@@ -229,9 +238,13 @@ pub async fn run_opcua_server(
             }
 
             let to_clear = poll_and_forward_commands(
-                &nm_send, &send_node_ids, &serial_ports_clone,
-                &txs_clone, &system_record_clone,
-            ).await;
+                &nm_send,
+                &send_node_ids,
+                &serial_ports_clone,
+                &txs_clone,
+                &system_record_clone,
+            )
+            .await;
 
             // 清零已处理的写命令节点
             for id in to_clear {
@@ -275,6 +288,35 @@ struct OpcuaNodes {
     kks_node_map: HashMap<String, NodeId>,
 }
 
+/// 计算所有 OPC UA 节点的 browse_name（纯逻辑，便于单元测试）。
+///
+/// 返回 `(data_browse_names, send_pairs)`：
+/// - `data_browse_names`：所有只读节点（设备数据 + 计算衍生），均为纯 KKS 名。
+/// - `send_pairs`：每个串口的写命令节点 `(port_number, "<port>_Send")`。
+#[cfg(test)]
+fn plan_browse_names(
+    serial_ports: &[SerialPortConfig],
+    calc_engine: &CalcEngine,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut data_names = Vec::new();
+    let mut send_pairs = Vec::new();
+    for port in serial_ports {
+        for cfg in &port.devices {
+            for record in &cfg.records {
+                data_names.push(record.kks.clone());
+            }
+        }
+        send_pairs.push((
+            port.port_number.clone(),
+            format!("{}_Send", port.port_number),
+        ));
+    }
+    for (kks_calc, _) in calc_engine.output_definitions() {
+        data_names.push(kks_calc.to_string());
+    }
+    (data_names, send_pairs)
+}
+
 /// 在地址空间中创建所有设备变量节点、写命令节点和计算引擎衍生变量节点。
 fn create_opcua_nodes(
     node_manager: &Arc<SimpleNodeManager>,
@@ -287,20 +329,31 @@ fn create_opcua_nodes(
     let mut kks_node_map = HashMap::new();
 
     let mut address_space = node_manager.address_space().write();
-    address_space.add_folder(&devices_folder_id, "Devices", "Devices", &NodeId::objects_folder_id());
+    address_space.add_folder(
+        &devices_folder_id,
+        "Devices",
+        "Devices",
+        &NodeId::objects_folder_id(),
+    );
 
     let mut variables = Vec::new();
 
     for port in serial_ports {
-        // 数据变量节点
+        // 数据变量节点：使用纯 KKS 作为 browse_name（要求 KKS 全局唯一）
         for cfg in &port.devices {
             for record in &cfg.records {
-                let browse_name = format!("{}_{}_{}", port.port_number, cfg.config.device_id, record.kks);
+                let browse_name = record.kks.clone();
                 let node_id = NodeId::new(ns, browse_name.clone());
                 let expected = expected_type_from_str(&record.type_);
                 let (dt, init) = datatype_and_initial(expected);
                 variables.push(Variable::new_data_value(
-                    &node_id, &browse_name, &browse_name, dt, Some(-1), None, init,
+                    &node_id,
+                    &browse_name,
+                    &browse_name,
+                    dt,
+                    Some(-1),
+                    None,
+                    init,
                 ));
                 kks_node_map.insert(browse_name, node_id);
             }
@@ -310,8 +363,12 @@ fn create_opcua_nodes(
         let send_name = format!("{}_Send", port.port_number);
         let send_node_id = NodeId::new(ns, send_name.clone());
         variables.push(Variable::new_data_value(
-            &send_node_id, &send_name, &send_name,
-            NodeId::from(DataTypeId::String), Some(-1), None,
+            &send_node_id,
+            &send_name,
+            &send_name,
+            NodeId::from(DataTypeId::String),
+            Some(-1),
+            None,
             Variant::String(UAString::from("")),
         ));
         send_node_ids.push((port.port_number.clone(), send_node_id));
@@ -323,7 +380,13 @@ fn create_opcua_nodes(
         let expected = expected_type_from_str(data_type);
         let (dt, init) = datatype_and_initial(expected);
         variables.push(Variable::new_data_value(
-            &node_id, kks_calc, kks_calc, dt, Some(-1), None, init,
+            &node_id,
+            kks_calc,
+            kks_calc,
+            dt,
+            Some(-1),
+            None,
+            init,
         ));
         kks_node_map.insert(kks_calc.to_string(), node_id);
     }
@@ -342,7 +405,10 @@ fn create_opcua_nodes(
         }
     }
 
-    OpcuaNodes { send_node_ids, kks_node_map }
+    OpcuaNodes {
+        send_node_ids,
+        kks_node_map,
+    }
 }
 
 /// 为每个串口创建 `SendCommand` Method 节点，客户端可通过 OPC UA Call 服务直接调用。
@@ -391,23 +457,25 @@ fn register_send_methods(
         let com = port.port_number.clone();
         let tx = txs[idx].clone();
 
-        node_manager.inner().add_method_callback(fn_node_id, move |args| {
-            let Some(Variant::String(ref hex_ua)) = args.first() else {
-                return Err(StatusCode::BadTypeMismatch);
-            };
-            let hex_str = hex_ua.as_ref().trim();
-            if hex_str.is_empty() {
-                return Err(StatusCode::BadInvalidArgument);
-            }
-
-            match forward_hex_command(hex_str, &com, &tx) {
-                Ok(msg) => Ok(vec![Variant::String(UAString::from(msg))]),
-                Err(msg) => {
-                    warn!("Method 调用失败: {}", msg);
-                    Ok(vec![Variant::String(UAString::from(msg))])
+        node_manager
+            .inner()
+            .add_method_callback(fn_node_id, move |args| {
+                let Some(Variant::String(ref hex_ua)) = args.first() else {
+                    return Err(StatusCode::BadTypeMismatch);
+                };
+                let hex_str = hex_ua.as_ref().trim();
+                if hex_str.is_empty() {
+                    return Err(StatusCode::BadInvalidArgument);
                 }
-            }
-        });
+
+                match forward_hex_command(hex_str, &com, &tx) {
+                    Ok(msg) => Ok(vec![Variant::String(UAString::from(msg))]),
+                    Err(msg) => {
+                        warn!("Method 调用失败: {}", msg);
+                        Ok(vec![Variant::String(UAString::from(msg))])
+                    }
+                }
+            });
     }
 }
 
@@ -418,19 +486,26 @@ fn forward_hex_command(
     tx: &mpsc::Sender<Command>,
 ) -> Result<String, String> {
     // 移除空格，支持 "0A 1B FF" 格式
-    let cleaned: String = hex_str.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let cleaned: String = hex_str
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
     let mut bytes = hex_str_to_bytes(&cleaned).map_err(|e| format!("十六进制解析失败: {}", e))?;
     if bytes.len() < 2 {
         return Err("十六进制长度过短（至少需 2 字节）".to_string());
     }
     bytes.push(get_sum(&bytes));
     let device_id = bytes[0] as u32;
-    let send_data = SendData { device_id, command: bytes };
+    let send_data = SendData {
+        device_id,
+        command: bytes,
+    };
     let cmd = Command {
         com: com.to_string(),
         command: CommandType::SendData(send_data),
     };
-    tx.send(cmd).map_err(|e| format!("转发命令到串口失败: {:?}", e))?;
+    tx.send(cmd)
+        .map_err(|e| format!("转发命令到串口失败: {:?}", e))?;
     Ok(format!("已发送到 {} 设备 {}", com, device_id))
 }
 
@@ -467,18 +542,22 @@ async fn poll_and_forward_commands(
 
                 info!("收到 OPC 客户端写命令: 串口 {} 数据 {}", com, v);
 
-                if let Some((idx, _)) = serial_ports.iter().enumerate().find(|(_, p)| &p.port_number == com) {
+                if let Some((idx, _)) = serial_ports
+                    .iter()
+                    .enumerate()
+                    .find(|(_, p)| &p.port_number == com)
+                {
                     match forward_hex_command(v, com, &txs[idx]) {
                         Ok(msg) => {
                             info!("{}", msg);
                             let local = chrono::Local::now();
-                            let mut record = system_record
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
+                            let mut record =
+                                system_record.lock().unwrap_or_else(|e| e.into_inner());
                             record.push_back(format!(
                                 "时间: {} 串口: {} 数据: {}",
                                 local.format("%Y-%m-%d %H:%M:%S"),
-                                com, v,
+                                com,
+                                v,
                             ));
                         }
                         Err(e) => warn!("{}", e),
@@ -493,4 +572,125 @@ async fn poll_and_forward_commands(
     }
 
     to_clear
+}
+
+// ============================================================
+//  单元测试
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::calc_engine::config::CalcRule;
+    use crate::csv_parser::{BitIndex, Config, DeviceConfig, Record};
+
+    fn make_record(kks: &str) -> Record {
+        Record {
+            kks: kks.to_string(),
+            type_: "uint".to_string(),
+            _f_type: String::new(),
+            byte_index: 1,
+            bit_index: BitIndex::Single(0),
+            _def: 0,
+            _max: 0,
+            _min: 0,
+            byte_order: 0,
+        }
+    }
+
+    fn make_device(device_id: u8, kks_list: &[&str]) -> DeviceConfig {
+        DeviceConfig {
+            config: Config {
+                com: "ttyAP0".into(),
+                baud_rate: 115200,
+                is_special: false,
+                com_index: 0,
+                device_id,
+                data_len: 8,
+                kks_prefix: String::new(),
+            },
+            records: kks_list.iter().map(|k| make_record(k)).collect(),
+        }
+    }
+
+    fn make_port(port_number: &str, devices: Vec<DeviceConfig>) -> SerialPortConfig {
+        SerialPortConfig {
+            port_number: port_number.to_string(),
+            baud_rate: 115200,
+            is_special: false,
+            devices,
+            status: true,
+        }
+    }
+
+    fn make_calc_engine(rules: Vec<(&str, &str, &str)>) -> CalcEngine {
+        let cfg_rules: Vec<CalcRule> = rules
+            .into_iter()
+            .map(|(kks, dt, expr)| CalcRule {
+                kks_calc: kks.into(),
+                data_type: dt.into(),
+                expression: expr.into(),
+                max_limit: f64::MAX,
+                min_limit: f64::MIN,
+                default_value: 0.0,
+            })
+            .collect();
+        CalcEngine::new(cfg_rules).expect("构建测试引擎失败")
+    }
+
+    #[test]
+    fn device_data_node_uses_pure_kks() {
+        let port = make_port(
+            "ttyAP0",
+            vec![make_device(11, &["9CYE91GH201_READY", "9CYE91GH201_SL1"])],
+        );
+        let engine = make_calc_engine(vec![]);
+        let (data_names, _) = plan_browse_names(&[port], &engine);
+        assert!(data_names.contains(&"9CYE91GH201_READY".to_string()));
+        assert!(data_names.contains(&"9CYE91GH201_SL1".to_string()));
+        assert!(
+            !data_names.iter().any(|n| n.contains("ttyAP0")),
+            "设备数据节点不应有串口前缀: {:?}",
+            data_names,
+        );
+    }
+
+    #[test]
+    fn send_node_keeps_port_prefix() {
+        let port = make_port("ttyAP0", vec![make_device(11, &["X"])]);
+        let engine = make_calc_engine(vec![]);
+        let (_, send_pairs) = plan_browse_names(&[port], &engine);
+        assert_eq!(send_pairs.len(), 1);
+        assert_eq!(send_pairs[0].0, "ttyAP0");
+        assert_eq!(send_pairs[0].1, "ttyAP0_Send");
+    }
+
+    #[test]
+    fn calc_derived_uses_pure_kks() {
+        let port = make_port("ttyAP0", vec![make_device(11, &["base"])]);
+        let engine = make_calc_engine(vec![("91UGM91110_Fire", "uint", "base + 1")]);
+        let (data_names, _) = plan_browse_names(&[port], &engine);
+        assert!(data_names.contains(&"91UGM91110_Fire".to_string()));
+        assert!(
+            !data_names.iter().any(|n| n.contains("ttyAP0_Fire")),
+            "计算衍生节点不应有串口前缀: {:?}",
+            data_names,
+        );
+    }
+
+    #[test]
+    fn multi_port_device_keeps_each_send() {
+        let p0 = make_port("ttyAP0", vec![make_device(11, &["a"])]);
+        let p1 = make_port("ttyAP1", vec![make_device(12, &["b"])]);
+        let engine = make_calc_engine(vec![]);
+        let (data_names, send_pairs) = plan_browse_names(&[p0, p1], &engine);
+        assert_eq!(data_names, vec!["a", "b"]);
+        assert_eq!(
+            send_pairs,
+            vec![
+                ("ttyAP0".into(), "ttyAP0_Send".into()),
+                ("ttyAP1".into(), "ttyAP1_Send".into()),
+            ]
+        );
+    }
 }

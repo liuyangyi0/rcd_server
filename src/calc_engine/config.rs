@@ -38,6 +38,37 @@ pub struct CalcRule {
     pub default_value: f64,
 }
 
+/// 计算结果输出类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalcDataType {
+    UInt,
+    Bool,
+    Float,
+    Double,
+}
+
+impl CalcDataType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CalcDataType::UInt => "uint",
+            CalcDataType::Bool => "bool",
+            CalcDataType::Float => "float",
+            CalcDataType::Double => "double",
+        }
+    }
+}
+
+/// 统一计算引擎和 OPC UA 节点的数据类型别名。
+pub fn normalize_data_type(s: &str) -> Option<CalcDataType> {
+    match s.to_ascii_lowercase().as_str() {
+        "u32" | "uint32" | "uint" => Some(CalcDataType::UInt),
+        "bool" | "boolean" => Some(CalcDataType::Bool),
+        "f32" | "float" => Some(CalcDataType::Float),
+        "f64" | "double" => Some(CalcDataType::Double),
+        _ => None,
+    }
+}
+
 fn default_max() -> f64 {
     f64::MAX
 }
@@ -129,6 +160,15 @@ expression = "a + b"
     }
 
     #[test]
+    fn normalize_data_type_aliases() {
+        assert_eq!(normalize_data_type("uint32"), Some(CalcDataType::UInt));
+        assert_eq!(normalize_data_type("BOOLEAN"), Some(CalcDataType::Bool));
+        assert_eq!(normalize_data_type("f32"), Some(CalcDataType::Float));
+        assert_eq!(normalize_data_type("double"), Some(CalcDataType::Double));
+        assert_eq!(normalize_data_type("bad"), None);
+    }
+
+    #[test]
     fn deserialize_empty() {
         let config: CalcConfig = toml::from_str("").unwrap();
         assert!(config.rules.is_empty());
@@ -139,5 +179,51 @@ expression = "a + b"
         let result = load_calc_config(Path::new("nonexistent_file.toml"));
         assert!(result.is_ok());
         assert!(result.unwrap().rules.is_empty());
+    }
+
+    /// 加载用户提供的真实 calc.toml，统计编译/循环依赖/基础变量情况。
+    /// 用 `cargo test load_user_calc_real -- --ignored --nocapture` 触发。
+    #[test]
+    #[ignore]
+    fn load_user_calc_real() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data")
+            .join("user_calc.toml");
+
+        if !path.exists() {
+            eprintln!("跳过真实 calc.toml 诊断测试：{} 不存在", path.display());
+            return;
+        }
+
+        let cfg = match load_calc_config(&path) {
+            Ok(c) => c,
+            Err(e) => panic!("TOML 解析失败: {}", e),
+        };
+
+        println!("\n=== TOML 加载 ===");
+        println!("总规则数: {}", cfg.rules.len());
+
+        let total = cfg.rules.len();
+        let engine = match crate::calc_engine::engine::CalcEngine::new(cfg.rules) {
+            Ok(e) => e,
+            Err(e) => panic!("引擎构建失败: {}", e),
+        };
+
+        let compiled = engine.output_names().len();
+        println!("\n=== 引擎构建 ===");
+        println!("成功编译/排序: {} / {}", compiled, total);
+        println!("被跳过(编译失败/自引用/循环): {}", total - compiled);
+
+        let base = engine.required_base_variables();
+        println!("\n=== 基础变量 ===");
+        println!("引擎需要的基础变量数: {}", base.len());
+        for (i, v) in base.iter().enumerate() {
+            if i < 30 {
+                println!("  [{:>3}] {}", i + 1, v);
+            }
+        }
+        if base.len() > 30 {
+            println!("  ... ({} more)", base.len() - 30);
+        }
     }
 }

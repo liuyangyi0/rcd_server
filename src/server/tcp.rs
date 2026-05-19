@@ -14,13 +14,13 @@
 //! 不要在接上公网的场景下解除注释。
 
 use std::io;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use bounded_vec_deque::BoundedVecDeque;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use log::{info, warn, error};
+use log::{error, info, warn};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::time::timeout;
@@ -117,9 +117,7 @@ async fn handle_client_message(
             // 记录日志
             if let CommandType::SendData(ref data) = cmd.command {
                 let local = chrono::Local::now();
-                let mut record = system_record
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut record = system_record.lock().unwrap_or_else(|e| e.into_inner());
                 record.push_back(format!(
                     "时间 {} 串口 {} 数据 {}",
                     local.format("%Y-%m-%d %H:%M:%S"),
@@ -143,9 +141,7 @@ async fn handle_client_message(
         }
         MessageType::QueryRecord => {
             let records: Vec<String> = {
-                let record = system_record
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let record = system_record.lock().unwrap_or_else(|e| e.into_inner());
                 record.iter().cloned().collect()
             };
             let msg = MessageType::AllRecord(records);

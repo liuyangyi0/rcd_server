@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use log::{error, info, warn};
 
-use super::config::CalcRule;
-use super::evaluator::{evaluate, EvalError};
+use super::config::{normalize_data_type, CalcDataType, CalcRule};
+use super::evaluator::{evaluate, EvalError, EvalValue};
 use super::parser::{extract_variables, parse, Expr};
 use super::tokenizer::tokenize;
 use crate::model::Value;
@@ -24,8 +24,8 @@ use crate::model::Value;
 struct CompiledRule {
     /// 输出变量名（OPC UA BrowseName）。
     kks_calc: String,
-    /// 输出数据类型标识：`"uint"` / `"bool"` / `"float"`。
-    data_type: String,
+    /// 输出数据类型。
+    data_type: CalcDataType,
     /// 原始表达式字符串（用于日志）。
     expression: String,
     /// 预编译的 AST。
@@ -71,6 +71,16 @@ impl CalcEngine {
         for rule in config_rules {
             match Self::compile_rule(&rule) {
                 Ok(cr) => {
+                    if compiled
+                        .iter()
+                        .any(|existing: &CompiledRule| existing.kks_calc == cr.kks_calc)
+                    {
+                        error!(
+                            "[CalcEngine] 编译失败，跳过重复输出变量 '{}': 已存在同名 kks_calc",
+                            cr.kks_calc
+                        );
+                        continue;
+                    }
                     info!(
                         "[CalcEngine] 编译成功: {} = \"{}\" (依赖: {:?})",
                         cr.kks_calc, cr.expression, cr.variables
@@ -78,10 +88,7 @@ impl CalcEngine {
                     compiled.push(cr);
                 }
                 Err(e) => {
-                    error!(
-                        "[CalcEngine] 编译失败，跳过规则 '{}': {}",
-                        rule.kks_calc, e
-                    );
+                    error!("[CalcEngine] 编译失败，跳过规则 '{}': {}", rule.kks_calc, e);
                 }
             }
         }
@@ -158,7 +165,7 @@ impl CalcEngine {
     /// 4. 执行 `[min_limit, max_limit]` 区间钳制。
     /// 5. 按 `data_type` 转换为 `Value::UInt` / `Value::Bool` / `Value::Float`。
     /// 6. 将结果写入变量表，供下游公式引用。
-    pub fn run_cycle(&self, base_variables: &HashMap<String, f64>) -> Vec<(String, Value)> {
+    pub fn run_cycle(&self, base_variables: &HashMap<String, EvalValue>) -> Vec<(String, Value)> {
         let mut variables = base_variables.clone();
         let mut results = Vec::with_capacity(self.rules.len());
 
@@ -180,42 +187,59 @@ impl CalcEngine {
                                 rule.kks_calc, rule.expression, rule.default_value
                             );
                         }
+                        EvalError::TypeError(msg) => {
+                            warn!(
+                                "[CalcEngine] 公式 '{}' (\"{}\") 求值失败: 类型错误: {}，输出默认值 {}",
+                                rule.kks_calc, rule.expression, msg, rule.default_value
+                            );
+                        }
                     }
-                    rule.default_value
+                    EvalValue::Float(rule.default_value)
                 }
             };
 
             // ---- NaN / Infinity 安全网 ----
-            let safe_value = if raw_value.is_nan() || raw_value.is_infinite() {
+            let safe_value = if raw_value.is_invalid_float() {
                 warn!(
                     "[CalcEngine] 公式 '{}' 产生非法浮点值 ({})，输出默认值 {}",
-                    rule.kks_calc, raw_value, rule.default_value
+                    rule.kks_calc,
+                    raw_value.as_f64(),
+                    rule.default_value
                 );
-                rule.default_value
+                EvalValue::Float(rule.default_value)
             } else {
                 raw_value
             };
 
             // ---- 上下限钳制 ----
-            let clamped = safe_value.clamp(rule.min_limit, rule.max_limit);
+            let clamped = safe_value.as_f64().clamp(rule.min_limit, rule.max_limit);
 
             // ---- 类型转换 ----
-            let typed_value = match rule.data_type.as_str() {
-                "uint" => {
+            let typed_value = match rule.data_type {
+                CalcDataType::UInt => {
                     if clamped > u32::MAX as f64 {
                         warn!(
                             "[CalcEngine] 公式 '{}' 结果 {} 超出 u32::MAX，饱和到 {}",
-                            rule.kks_calc, clamped, u32::MAX
+                            rule.kks_calc,
+                            clamped,
+                            u32::MAX
                         );
                     }
                     Value::UInt(clamped.max(0.0) as u32)
                 }
-                "bool" => Value::Bool(clamped != 0.0),
-                _ => Value::Float(clamped as f32), // "float" 及其他
+                CalcDataType::Bool => Value::Bool(match &safe_value {
+                    EvalValue::Bool(b) if clamped == safe_value.as_f64() => *b,
+                    _ => clamped != 0.0,
+                }),
+                CalcDataType::Float => Value::Float(clamped as f32),
+                CalcDataType::Double => Value::Double(clamped),
             };
 
             // ---- 写回变量表，供下游公式引用 ----
-            variables.insert(rule.kks_calc.clone(), clamped);
+            variables.insert(
+                rule.kks_calc.clone(),
+                EvalValue::from_model_value(&typed_value),
+            );
 
             results.push((rule.kks_calc.clone(), typed_value));
         }
@@ -231,6 +255,30 @@ impl CalcEngine {
     ///
     /// 同时检测自引用（kks_calc 出现在自身表达式的变量列表里）。
     fn compile_rule(rule: &CalcRule) -> Result<CompiledRule, String> {
+        let data_type = normalize_data_type(&rule.data_type).ok_or_else(|| {
+            format!(
+                "未知 data_type '{}': 仅支持 uint/u32/uint32、bool/boolean、float/f32、double/f64",
+                rule.data_type
+            )
+        })?;
+
+        if !rule.max_limit.is_finite()
+            || !rule.min_limit.is_finite()
+            || !rule.default_value.is_finite()
+        {
+            return Err(format!(
+                "上下限或默认值必须为有限数: min={}, max={}, default={}",
+                rule.min_limit, rule.max_limit, rule.default_value
+            ));
+        }
+
+        if rule.min_limit > rule.max_limit {
+            return Err(format!(
+                "min_limit ({}) 不能大于 max_limit ({})",
+                rule.min_limit, rule.max_limit
+            ));
+        }
+
         let tokens = tokenize(&rule.expression)?;
         let ast = parse(tokens)?;
         let variables = extract_variables(&ast);
@@ -244,7 +292,7 @@ impl CalcEngine {
 
         Ok(CompiledRule {
             kks_calc: rule.kks_calc.clone(),
-            data_type: rule.data_type.clone(),
+            data_type,
             expression: rule.expression.clone(),
             ast,
             variables,
@@ -313,8 +361,7 @@ impl CalcEngine {
         }
 
         // 只取 order 中的规则，剩余的（参与循环 / 依赖循环）丢弃
-        let mut rules_opt: Vec<Option<CompiledRule>> =
-            rules.into_iter().map(Some).collect();
+        let mut rules_opt: Vec<Option<CompiledRule>> = rules.into_iter().map(Some).collect();
         let sorted: Vec<CompiledRule> = order
             .into_iter()
             .map(|i| rules_opt[i].take().unwrap())
@@ -344,8 +391,23 @@ mod tests {
         }
     }
 
-    fn vars(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
-        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    fn vars(pairs: &[(&str, EvalValue)]) -> HashMap<String, EvalValue> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    fn int(n: i64) -> EvalValue {
+        EvalValue::Int(n)
+    }
+
+    fn float(n: f64) -> EvalValue {
+        EvalValue::Float(n)
+    }
+
+    fn bool_val(v: bool) -> EvalValue {
+        EvalValue::Bool(v)
     }
 
     // ---- 基础求值 ----
@@ -355,7 +417,7 @@ mod tests {
         let rules = vec![make_rule("rate_usv", "float", "rate_msv * 1000", 0.0)];
         let engine = CalcEngine::new(rules).unwrap();
 
-        let results = engine.run_cycle(&vars(&[("rate_msv", 0.5)]));
+        let results = engine.run_cycle(&vars(&[("rate_msv", float(0.5))]));
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "rate_usv");
         assert_eq!(results[0].1, Value::Float(500.0));
@@ -393,7 +455,7 @@ mod tests {
         rule.min_limit = 0.0;
         let engine = CalcEngine::new(vec![rule]).unwrap();
 
-        let results = engine.run_cycle(&vars(&[("a", 999.0)]));
+        let results = engine.run_cycle(&vars(&[("a", int(999))]));
         assert_eq!(results[0].1, Value::Float(100.0));
     }
 
@@ -404,7 +466,7 @@ mod tests {
         rule.min_limit = 0.0;
         let engine = CalcEngine::new(vec![rule]).unwrap();
 
-        let results = engine.run_cycle(&vars(&[("a", -50.0)]));
+        let results = engine.run_cycle(&vars(&[("a", int(-50))]));
         assert_eq!(results[0].1, Value::Float(0.0));
     }
 
@@ -415,7 +477,7 @@ mod tests {
         let rules = vec![make_rule("output", "uint", "a", 0.0)];
         let engine = CalcEngine::new(rules).unwrap();
 
-        let results = engine.run_cycle(&vars(&[("a", 42.7)]));
+        let results = engine.run_cycle(&vars(&[("a", float(42.7))]));
         assert_eq!(results[0].1, Value::UInt(42));
     }
 
@@ -424,7 +486,7 @@ mod tests {
         let rules = vec![make_rule("output", "bool", "a", 0.0)];
         let engine = CalcEngine::new(rules).unwrap();
 
-        let results = engine.run_cycle(&vars(&[("a", 1.0)]));
+        let results = engine.run_cycle(&vars(&[("a", bool_val(true))]));
         assert_eq!(results[0].1, Value::Bool(true));
     }
 
@@ -433,8 +495,52 @@ mod tests {
         let rules = vec![make_rule("output", "bool", "a", 0.0)];
         let engine = CalcEngine::new(rules).unwrap();
 
-        let results = engine.run_cycle(&vars(&[("a", 0.0)]));
+        let results = engine.run_cycle(&vars(&[("a", bool_val(false))]));
         assert_eq!(results[0].1, Value::Bool(false));
+    }
+
+    #[test]
+    fn engine_type_uint_alias() {
+        let rules = vec![make_rule("output", "uint32", "a", 0.0)];
+        let engine = CalcEngine::new(rules).unwrap();
+
+        let results = engine.run_cycle(&vars(&[("a", int(42))]));
+        assert_eq!(results[0].1, Value::UInt(42));
+    }
+
+    #[test]
+    fn engine_type_double_alias() {
+        let rules = vec![make_rule("output", "f64", "a / 4", 0.0)];
+        let engine = CalcEngine::new(rules).unwrap();
+
+        let results = engine.run_cycle(&vars(&[("a", int(10))]));
+        assert_eq!(results[0].1, Value::Double(2.5));
+    }
+
+    #[test]
+    fn engine_if_avoids_missing_branch() {
+        let rules = vec![make_rule("output", "uint", "IF(ready == 1, sl3, 4)", 0.0)];
+        let engine = CalcEngine::new(rules).unwrap();
+
+        let results = engine.run_cycle(&vars(&[("ready", int(0))]));
+        assert_eq!(results[0].1, Value::UInt(4));
+    }
+
+    #[test]
+    fn engine_boolean_arithmetic_formula_still_works() {
+        let rules = vec![make_rule(
+            "output",
+            "uint",
+            "(READY==1)*SL3+(READY!=1)*4",
+            0.0,
+        )];
+        let engine = CalcEngine::new(rules).unwrap();
+
+        let results = engine.run_cycle(&vars(&[("READY", int(1)), ("SL3", int(7))]));
+        assert_eq!(results[0].1, Value::UInt(7));
+
+        let results = engine.run_cycle(&vars(&[("READY", int(0)), ("SL3", int(7))]));
+        assert_eq!(results[0].1, Value::UInt(4));
     }
 
     // ---- DAG 拓扑排序 ----
@@ -453,7 +559,7 @@ mod tests {
         assert_eq!(engine.rules[0].kks_calc, "B");
         assert_eq!(engine.rules[1].kks_calc, "A");
 
-        let results = engine.run_cycle(&vars(&[("a", 5.0)]));
+        let results = engine.run_cycle(&vars(&[("a", int(5))]));
         // B = 5 * 2 = 10, A = 10 + 10 = 20
         assert_eq!(results.len(), 2);
         let result_map: HashMap<&str, &Value> =
@@ -479,7 +585,7 @@ mod tests {
         assert_eq!(engine.rules[1].kks_calc, "B");
         assert_eq!(engine.rules[2].kks_calc, "A");
 
-        let results = engine.run_cycle(&vars(&[("base", 2.0)]));
+        let results = engine.run_cycle(&vars(&[("base", int(2))]));
         let result_map: HashMap<&str, &Value> =
             results.iter().map(|(k, v)| (k.as_str(), v)).collect();
         // C = 2*3 = 6, B = 6+1 = 7, A = 7*2 = 14
@@ -524,7 +630,7 @@ mod tests {
         let names: Vec<&str> = engine.output_names();
         assert_eq!(names, vec!["A"], "循环规则应被跳过，独立规则保留");
 
-        let results = engine.run_cycle(&vars(&[("x", 10.0)]));
+        let results = engine.run_cycle(&vars(&[("x", int(10))]));
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, Value::Float(11.0));
     }
@@ -555,6 +661,29 @@ mod tests {
         let engine = CalcEngine::new(rules).unwrap();
         assert_eq!(engine.rules.len(), 1);
         assert_eq!(engine.rules[0].kks_calc, "good");
+    }
+
+    #[test]
+    fn engine_skip_bad_limits() {
+        let mut bad = make_rule("bad", "float", "a", 0.0);
+        bad.min_limit = 10.0;
+        bad.max_limit = 0.0;
+
+        let engine = CalcEngine::new(vec![bad]).unwrap();
+        assert!(engine.is_empty());
+    }
+
+    #[test]
+    fn engine_skip_duplicate_output_name() {
+        let rules = vec![
+            make_rule("out", "uint", "a", 0.0),
+            make_rule("out", "uint", "b", 0.0),
+        ];
+        let engine = CalcEngine::new(rules).unwrap();
+
+        assert_eq!(engine.output_names(), vec!["out"]);
+        let results = engine.run_cycle(&vars(&[("a", int(1)), ("b", int(2))]));
+        assert_eq!(results[0].1, Value::UInt(1));
     }
 
     // ---- 空引擎 ----

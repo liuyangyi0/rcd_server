@@ -13,13 +13,27 @@ use super::tokenizer::Token;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BinOp {
     // 算术
-    Add, Sub, Mul, Div, Mod,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
     // 位运算
-    BitAnd, BitOr, BitXor, ShiftLeft, ShiftRight,
+    BitAnd,
+    BitOr,
+    BitXor,
+    ShiftLeft,
+    ShiftRight,
     // 逻辑
-    And, Or,
+    And,
+    Or,
     // 比较
-    Eq, NotEq, Lt, Gt, LtEq, GtEq,
+    Eq,
+    NotEq,
+    Lt,
+    Gt,
+    LtEq,
+    GtEq,
 }
 
 /// 一元运算符。
@@ -33,11 +47,19 @@ pub enum UnaryOp {
     BitNot,
 }
 
+/// 字面量。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Literal {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+}
+
 /// 表达式 AST 节点。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    /// 数字字面量。
-    Literal(f64),
+    /// 字面量。
+    Literal(Literal),
     /// 变量引用。
     Variable(String),
     /// 二元运算。
@@ -47,9 +69,12 @@ pub enum Expr {
         right: Box<Expr>,
     },
     /// 一元运算。
-    Unary {
-        op: UnaryOp,
-        operand: Box<Expr>,
+    Unary { op: UnaryOp, operand: Box<Expr> },
+    /// 条件函数 `IF(condition, then_branch, else_branch)`。
+    If {
+        condition: Box<Expr>,
+        then_branch: Box<Expr>,
+        else_branch: Box<Expr>,
     },
 }
 
@@ -72,6 +97,15 @@ fn collect_variables(expr: &Expr, out: &mut Vec<String>) {
         }
         Expr::Unary { operand, .. } => {
             collect_variables(operand, out);
+        }
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            collect_variables(condition, out);
+            collect_variables(then_branch, out);
+            collect_variables(else_branch, out);
         }
     }
 }
@@ -114,8 +148,19 @@ impl Parser {
     fn expr_bp(&mut self, min_bp: u8) -> Result<Expr, String> {
         // ---- 前缀部分 ----
         let mut lhs = match self.advance() {
-            Token::Number(n) => Expr::Literal(n),
-            Token::Ident(name) => Expr::Variable(name),
+            Token::Int(n) => Expr::Literal(Literal::Int(n)),
+            Token::Float(n) => Expr::Literal(Literal::Float(n)),
+            Token::Ident(name) => {
+                if name.eq_ignore_ascii_case("true") {
+                    Expr::Literal(Literal::Bool(true))
+                } else if name.eq_ignore_ascii_case("false") {
+                    Expr::Literal(Literal::Bool(false))
+                } else if name.eq_ignore_ascii_case("if") && self.peek() == &Token::LParen {
+                    self.parse_if_function()?
+                } else {
+                    Expr::Variable(name)
+                }
+            }
             Token::LParen => {
                 let inner = self.expr_bp(0)?;
                 if self.advance() != Token::RParen {
@@ -127,17 +172,26 @@ impl Parser {
             Token::Minus => {
                 let ((), r_bp) = prefix_bp(&UnaryOp::Neg);
                 let operand = self.expr_bp(r_bp)?;
-                Expr::Unary { op: UnaryOp::Neg, operand: Box::new(operand) }
+                Expr::Unary {
+                    op: UnaryOp::Neg,
+                    operand: Box::new(operand),
+                }
             }
             Token::Bang => {
                 let ((), r_bp) = prefix_bp(&UnaryOp::Not);
                 let operand = self.expr_bp(r_bp)?;
-                Expr::Unary { op: UnaryOp::Not, operand: Box::new(operand) }
+                Expr::Unary {
+                    op: UnaryOp::Not,
+                    operand: Box::new(operand),
+                }
             }
             Token::Tilde => {
                 let ((), r_bp) = prefix_bp(&UnaryOp::BitNot);
                 let operand = self.expr_bp(r_bp)?;
-                Expr::Unary { op: UnaryOp::BitNot, operand: Box::new(operand) }
+                Expr::Unary {
+                    op: UnaryOp::BitNot,
+                    operand: Box::new(operand),
+                }
             }
             tok => return Err(format!("期望表达式，但遇到 {:?}", tok)),
         };
@@ -145,7 +199,7 @@ impl Parser {
         // ---- 中缀部分 ----
         loop {
             let op = match self.peek() {
-                Token::Eof | Token::RParen => break,
+                Token::Eof | Token::RParen | Token::Comma => break,
                 tok => match token_to_binop(tok) {
                     Some(op) => op,
                     None => break,
@@ -168,6 +222,33 @@ impl Parser {
 
         Ok(lhs)
     }
+
+    fn parse_if_function(&mut self) -> Result<Expr, String> {
+        if self.advance() != Token::LParen {
+            return Err("IF 函数缺少左括号 '('".to_string());
+        }
+
+        let condition = self.expr_bp(0)?;
+        if self.advance() != Token::Comma {
+            return Err("IF 函数第 1 个参数后缺少逗号 ','".to_string());
+        }
+
+        let then_branch = self.expr_bp(0)?;
+        if self.advance() != Token::Comma {
+            return Err("IF 函数第 2 个参数后缺少逗号 ','".to_string());
+        }
+
+        let else_branch = self.expr_bp(0)?;
+        if self.advance() != Token::RParen {
+            return Err("IF 函数缺少右括号 ')' 或参数过多".to_string());
+        }
+
+        Ok(Expr::If {
+            condition: Box::new(condition),
+            then_branch: Box::new(then_branch),
+            else_branch: Box::new(else_branch),
+        })
+    }
 }
 
 // ============================================================
@@ -180,12 +261,12 @@ impl Parser {
 /// 左结合：`r_bp = l_bp + 1`；右结合：`r_bp = l_bp`。
 fn infix_bp(op: &BinOp) -> (u8, u8) {
     match op {
-        BinOp::Or       => (2, 3),
-        BinOp::And      => (4, 5),
-        BinOp::BitOr    => (6, 7),
-        BinOp::BitXor   => (8, 9),
-        BinOp::BitAnd   => (10, 11),
-        BinOp::Eq | BinOp::NotEq     => (12, 13),
+        BinOp::Or => (2, 3),
+        BinOp::And => (4, 5),
+        BinOp::BitOr => (6, 7),
+        BinOp::BitXor => (8, 9),
+        BinOp::BitAnd => (10, 11),
+        BinOp::Eq | BinOp::NotEq => (12, 13),
         BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => (14, 15),
         BinOp::ShiftLeft | BinOp::ShiftRight => (16, 17),
         BinOp::Add | BinOp::Sub => (18, 19),
@@ -202,24 +283,24 @@ fn prefix_bp(_op: &UnaryOp) -> ((), u8) {
 /// 将 Token 映射为 BinOp。
 fn token_to_binop(tok: &Token) -> Option<BinOp> {
     match tok {
-        Token::Plus       => Some(BinOp::Add),
-        Token::Minus      => Some(BinOp::Sub),
-        Token::Star       => Some(BinOp::Mul),
-        Token::Slash      => Some(BinOp::Div),
-        Token::Percent    => Some(BinOp::Mod),
-        Token::Amp        => Some(BinOp::BitAnd),
-        Token::Pipe       => Some(BinOp::BitOr),
-        Token::Caret      => Some(BinOp::BitXor),
-        Token::ShiftLeft  => Some(BinOp::ShiftLeft),
+        Token::Plus => Some(BinOp::Add),
+        Token::Minus => Some(BinOp::Sub),
+        Token::Star => Some(BinOp::Mul),
+        Token::Slash => Some(BinOp::Div),
+        Token::Percent => Some(BinOp::Mod),
+        Token::Amp => Some(BinOp::BitAnd),
+        Token::Pipe => Some(BinOp::BitOr),
+        Token::Caret => Some(BinOp::BitXor),
+        Token::ShiftLeft => Some(BinOp::ShiftLeft),
         Token::ShiftRight => Some(BinOp::ShiftRight),
-        Token::And        => Some(BinOp::And),
-        Token::Or         => Some(BinOp::Or),
-        Token::Eq         => Some(BinOp::Eq),
-        Token::NotEq      => Some(BinOp::NotEq),
-        Token::Lt         => Some(BinOp::Lt),
-        Token::Gt         => Some(BinOp::Gt),
-        Token::LtEq       => Some(BinOp::LtEq),
-        Token::GtEq       => Some(BinOp::GtEq),
+        Token::And => Some(BinOp::And),
+        Token::Or => Some(BinOp::Or),
+        Token::Eq => Some(BinOp::Eq),
+        Token::NotEq => Some(BinOp::NotEq),
+        Token::Lt => Some(BinOp::Lt),
+        Token::Gt => Some(BinOp::Gt),
+        Token::LtEq => Some(BinOp::LtEq),
+        Token::GtEq => Some(BinOp::GtEq),
         _ => None,
     }
 }
@@ -241,7 +322,15 @@ mod tests {
 
     #[test]
     fn parse_literal() {
-        assert_eq!(parse_expr("42").unwrap(), Expr::Literal(42.0));
+        assert_eq!(parse_expr("42").unwrap(), Expr::Literal(Literal::Int(42)));
+        assert_eq!(
+            parse_expr("42.5").unwrap(),
+            Expr::Literal(Literal::Float(42.5))
+        );
+        assert_eq!(
+            parse_expr("true").unwrap(),
+            Expr::Literal(Literal::Bool(true))
+        );
     }
 
     #[test]
@@ -252,87 +341,108 @@ mod tests {
     #[test]
     fn parse_simple_add() {
         let expr = parse_expr("a + b").unwrap();
-        assert_eq!(expr, Expr::Binary {
-            op: BinOp::Add,
-            left: Box::new(Expr::Variable("a".into())),
-            right: Box::new(Expr::Variable("b".into())),
-        });
+        assert_eq!(
+            expr,
+            Expr::Binary {
+                op: BinOp::Add,
+                left: Box::new(Expr::Variable("a".into())),
+                right: Box::new(Expr::Variable("b".into())),
+            }
+        );
     }
 
     #[test]
     fn parse_precedence_mul_over_add() {
         // a + b * c => a + (b * c)
         let expr = parse_expr("a + b * c").unwrap();
-        assert_eq!(expr, Expr::Binary {
-            op: BinOp::Add,
-            left: Box::new(Expr::Variable("a".into())),
-            right: Box::new(Expr::Binary {
-                op: BinOp::Mul,
-                left: Box::new(Expr::Variable("b".into())),
-                right: Box::new(Expr::Variable("c".into())),
-            }),
-        });
+        assert_eq!(
+            expr,
+            Expr::Binary {
+                op: BinOp::Add,
+                left: Box::new(Expr::Variable("a".into())),
+                right: Box::new(Expr::Binary {
+                    op: BinOp::Mul,
+                    left: Box::new(Expr::Variable("b".into())),
+                    right: Box::new(Expr::Variable("c".into())),
+                }),
+            }
+        );
     }
 
     #[test]
     fn parse_parentheses() {
         // (a + b) * c
         let expr = parse_expr("(a + b) * c").unwrap();
-        assert_eq!(expr, Expr::Binary {
-            op: BinOp::Mul,
-            left: Box::new(Expr::Binary {
-                op: BinOp::Add,
-                left: Box::new(Expr::Variable("a".into())),
-                right: Box::new(Expr::Variable("b".into())),
-            }),
-            right: Box::new(Expr::Variable("c".into())),
-        });
+        assert_eq!(
+            expr,
+            Expr::Binary {
+                op: BinOp::Mul,
+                left: Box::new(Expr::Binary {
+                    op: BinOp::Add,
+                    left: Box::new(Expr::Variable("a".into())),
+                    right: Box::new(Expr::Variable("b".into())),
+                }),
+                right: Box::new(Expr::Variable("c".into())),
+            }
+        );
     }
 
     #[test]
     fn parse_unary_neg() {
         let expr = parse_expr("-a").unwrap();
-        assert_eq!(expr, Expr::Unary {
-            op: UnaryOp::Neg,
-            operand: Box::new(Expr::Variable("a".into())),
-        });
+        assert_eq!(
+            expr,
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                operand: Box::new(Expr::Variable("a".into())),
+            }
+        );
     }
 
     #[test]
     fn parse_unary_not() {
         let expr = parse_expr("!flag").unwrap();
-        assert_eq!(expr, Expr::Unary {
-            op: UnaryOp::Not,
-            operand: Box::new(Expr::Variable("flag".into())),
-        });
+        assert_eq!(
+            expr,
+            Expr::Unary {
+                op: UnaryOp::Not,
+                operand: Box::new(Expr::Variable("flag".into())),
+            }
+        );
     }
 
     #[test]
     fn parse_unary_bitnot() {
         let expr = parse_expr("~mask").unwrap();
-        assert_eq!(expr, Expr::Unary {
-            op: UnaryOp::BitNot,
-            operand: Box::new(Expr::Variable("mask".into())),
-        });
+        assert_eq!(
+            expr,
+            Expr::Unary {
+                op: UnaryOp::BitNot,
+                operand: Box::new(Expr::Variable("mask".into())),
+            }
+        );
     }
 
     #[test]
     fn parse_logic_and_comparison() {
         // (x == 1) && (y != 0)
         let expr = parse_expr("(x == 1) && (y != 0)").unwrap();
-        assert_eq!(expr, Expr::Binary {
-            op: BinOp::And,
-            left: Box::new(Expr::Binary {
-                op: BinOp::Eq,
-                left: Box::new(Expr::Variable("x".into())),
-                right: Box::new(Expr::Literal(1.0)),
-            }),
-            right: Box::new(Expr::Binary {
-                op: BinOp::NotEq,
-                left: Box::new(Expr::Variable("y".into())),
-                right: Box::new(Expr::Literal(0.0)),
-            }),
-        });
+        assert_eq!(
+            expr,
+            Expr::Binary {
+                op: BinOp::And,
+                left: Box::new(Expr::Binary {
+                    op: BinOp::Eq,
+                    left: Box::new(Expr::Variable("x".into())),
+                    right: Box::new(Expr::Literal(Literal::Int(1))),
+                }),
+                right: Box::new(Expr::Binary {
+                    op: BinOp::NotEq,
+                    left: Box::new(Expr::Variable("y".into())),
+                    right: Box::new(Expr::Literal(Literal::Int(0))),
+                }),
+            }
+        );
     }
 
     #[test]
@@ -341,36 +451,45 @@ mod tests {
         // 实际上 0xFF 会被 tokenizer 识别为标识符 "0xFF"
         // 使用纯数字测试
         let expr = parse_expr("a & 255").unwrap();
-        assert_eq!(expr, Expr::Binary {
-            op: BinOp::BitAnd,
-            left: Box::new(Expr::Variable("a".into())),
-            right: Box::new(Expr::Literal(255.0)),
-        });
+        assert_eq!(
+            expr,
+            Expr::Binary {
+                op: BinOp::BitAnd,
+                left: Box::new(Expr::Variable("a".into())),
+                right: Box::new(Expr::Literal(Literal::Int(255))),
+            }
+        );
     }
 
     #[test]
     fn parse_left_associativity() {
         // a - b - c => (a - b) - c
         let expr = parse_expr("a - b - c").unwrap();
-        assert_eq!(expr, Expr::Binary {
-            op: BinOp::Sub,
-            left: Box::new(Expr::Binary {
+        assert_eq!(
+            expr,
+            Expr::Binary {
                 op: BinOp::Sub,
-                left: Box::new(Expr::Variable("a".into())),
-                right: Box::new(Expr::Variable("b".into())),
-            }),
-            right: Box::new(Expr::Variable("c".into())),
-        });
+                left: Box::new(Expr::Binary {
+                    op: BinOp::Sub,
+                    left: Box::new(Expr::Variable("a".into())),
+                    right: Box::new(Expr::Variable("b".into())),
+                }),
+                right: Box::new(Expr::Variable("c".into())),
+            }
+        );
     }
 
     #[test]
     fn parse_complex_kks_expression() {
         let expr = parse_expr("9CYE91GH201_SL1 * 1000").unwrap();
-        assert_eq!(expr, Expr::Binary {
-            op: BinOp::Mul,
-            left: Box::new(Expr::Variable("9CYE91GH201_SL1".into())),
-            right: Box::new(Expr::Literal(1000.0)),
-        });
+        assert_eq!(
+            expr,
+            Expr::Binary {
+                op: BinOp::Mul,
+                left: Box::new(Expr::Variable("9CYE91GH201_SL1".into())),
+                right: Box::new(Expr::Literal(Literal::Int(1000))),
+            }
+        );
     }
 
     #[test]
@@ -394,37 +513,69 @@ mod tests {
     fn parse_or_precedence() {
         // a || b && c => a || (b && c)
         let expr = parse_expr("a || b && c").unwrap();
-        assert_eq!(expr, Expr::Binary {
-            op: BinOp::Or,
-            left: Box::new(Expr::Variable("a".into())),
-            right: Box::new(Expr::Binary {
-                op: BinOp::And,
-                left: Box::new(Expr::Variable("b".into())),
-                right: Box::new(Expr::Variable("c".into())),
-            }),
-        });
+        assert_eq!(
+            expr,
+            Expr::Binary {
+                op: BinOp::Or,
+                left: Box::new(Expr::Variable("a".into())),
+                right: Box::new(Expr::Binary {
+                    op: BinOp::And,
+                    left: Box::new(Expr::Variable("b".into())),
+                    right: Box::new(Expr::Variable("c".into())),
+                }),
+            }
+        );
     }
 
     #[test]
     fn parse_neg_literal() {
         // -42 => Unary(Neg, Literal(42))
         let expr = parse_expr("-42").unwrap();
-        assert_eq!(expr, Expr::Unary {
-            op: UnaryOp::Neg,
-            operand: Box::new(Expr::Literal(42.0)),
-        });
+        assert_eq!(
+            expr,
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                operand: Box::new(Expr::Literal(Literal::Int(42))),
+            }
+        );
     }
 
     #[test]
     fn parse_nested_unary() {
         // !!a => !(!(a))
         let expr = parse_expr("!!a").unwrap();
-        assert_eq!(expr, Expr::Unary {
-            op: UnaryOp::Not,
-            operand: Box::new(Expr::Unary {
+        assert_eq!(
+            expr,
+            Expr::Unary {
                 op: UnaryOp::Not,
-                operand: Box::new(Expr::Variable("a".into())),
-            }),
-        });
+                operand: Box::new(Expr::Unary {
+                    op: UnaryOp::Not,
+                    operand: Box::new(Expr::Variable("a".into())),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_if_function() {
+        let expr = parse_expr("IF(a == 1, b, 4)").unwrap();
+        assert_eq!(
+            expr,
+            Expr::If {
+                condition: Box::new(Expr::Binary {
+                    op: BinOp::Eq,
+                    left: Box::new(Expr::Variable("a".into())),
+                    right: Box::new(Expr::Literal(Literal::Int(1))),
+                }),
+                then_branch: Box::new(Expr::Variable("b".into())),
+                else_branch: Box::new(Expr::Literal(Literal::Int(4))),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_if_rejects_wrong_arity() {
+        assert!(parse_expr("IF(a, b)").is_err());
+        assert!(parse_expr("IF(a, b, c, d)").is_err());
     }
 }

@@ -47,16 +47,26 @@ pub mod threshold {
 /// 解析后的串口响应数据包。
 #[derive(Debug, Clone)]
 pub struct DataPacket {
-    #[allow(unused)] pub addr: u8,
-    #[allow(unused)] pub cmd: u8,
-    #[allow(unused)] pub len: u8,
+    #[allow(unused)]
+    pub addr: u8,
+    #[allow(unused)]
+    pub cmd: u8,
+    #[allow(unused)]
+    pub len: u8,
     pub status: Vec<u8>,
-    #[allow(unused)] pub crc: u8,
+    #[allow(unused)]
+    pub crc: u8,
 }
 
 impl DataPacket {
     pub fn new(addr: u8, cmd: u8, len: u8, status: Vec<u8>, crc: u8) -> Self {
-        Self { addr, cmd, len, status, crc }
+        Self {
+            addr,
+            cmd,
+            len,
+            status,
+            crc,
+        }
     }
 }
 
@@ -107,7 +117,10 @@ pub fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
         let byte_index = match record.byte_index.checked_sub(1) {
             Some(v) => v as usize,
             None => {
-                warn!("记录 '{}' 的 byte_index 为 0 (1-based)，跳过该数据点", record.kks);
+                warn!(
+                    "记录 '{}' 的 byte_index 为 0 (1-based)，跳过该数据点",
+                    record.kks
+                );
                 continue;
             }
         };
@@ -119,7 +132,10 @@ pub fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
             BitIndex::Single(bit) => {
                 // u8 移位宽度必须 < 8，否则 debug 下 panic、release 下行为未定
                 if *bit >= 8 {
-                    warn!("记录 '{}' 的 bit_index={} 超出 u8 范围 (0..=7)，跳过", record.kks, bit);
+                    warn!(
+                        "记录 '{}' 的 bit_index={} 超出 u8 范围 (0..=7)，跳过",
+                        record.kks, bit
+                    );
                     continue;
                 }
                 ((data[byte_index] >> (*bit as usize)) & 1) as u32
@@ -138,7 +154,11 @@ pub fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
                 let end_byte = byte_index + (end_bit / 8) as usize;
 
                 if end_byte >= data.len() {
-                    warn!("位范围越界: end_byte={} >= data.len()={}，跳过", end_byte, data.len());
+                    warn!(
+                        "位范围越界: end_byte={} >= data.len()={}，跳过",
+                        end_byte,
+                        data.len()
+                    );
                     continue;
                 }
 
@@ -273,7 +293,13 @@ mod tests {
 
     // ---- parse_status ----
 
-    fn make_record(kks: &str, type_: &str, byte_index: u32, bit_index: BitIndex, byte_order: u32) -> Record {
+    fn make_record(
+        kks: &str,
+        type_: &str,
+        byte_index: u32,
+        bit_index: BitIndex,
+        byte_order: u32,
+    ) -> Record {
         Record {
             kks: kks.to_string(),
             type_: type_.to_string(),
@@ -304,9 +330,7 @@ mod tests {
         // 2 bytes little-endian: 0x34, 0x12 → 0x1234
         // 取 bits 0..=15 → 0x1234 = 4660
         let data = [0x34, 0x12];
-        let records = vec![
-            make_record("K1", "uint", 1, BitIndex::Range(0..=15), 0),
-        ];
+        let records = vec![make_record("K1", "uint", 1, BitIndex::Range(0..=15), 0)];
         let result = parse_status(&data, &records);
         assert_eq!(result.get("K1"), Some(&Value::UInt(0x1234)));
     }
@@ -315,9 +339,7 @@ mod tests {
     fn parse_status_range_big_endian() {
         // 2 bytes big-endian: 0x12, 0x34 → 0x1234
         let data = [0x12, 0x34];
-        let records = vec![
-            make_record("K1", "uint", 1, BitIndex::Range(0..=15), 1),
-        ];
+        let records = vec![make_record("K1", "uint", 1, BitIndex::Range(0..=15), 1)];
         let result = parse_status(&data, &records);
         assert_eq!(result.get("K1"), Some(&Value::UInt(0x1234)));
     }
@@ -362,9 +384,7 @@ mod tests {
     fn parse_status_float() {
         // raw_value = 0x01F4 = 500 → float = 500 / 100.0 = 5.0
         let data = [0xF4, 0x01]; // little-endian
-        let records = vec![
-            make_record("K1", "float", 1, BitIndex::Range(0..=15), 0),
-        ];
+        let records = vec![make_record("K1", "float", 1, BitIndex::Range(0..=15), 0)];
         let result = parse_status(&data, &records);
         assert_eq!(result.get("K1"), Some(&Value::Float(5.0)));
     }

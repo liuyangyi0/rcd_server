@@ -65,7 +65,10 @@ impl SystemState {
                     *ds = status;
                     Ok(())
                 }
-                None => Err(format!("设备 {} 在端口 {} 中未找到", device_id, port_number)),
+                None => Err(format!(
+                    "设备 {} 在端口 {} 中未找到",
+                    device_id, port_number
+                )),
             },
             None => Err(format!("端口 {} 未找到", port_number)),
         }

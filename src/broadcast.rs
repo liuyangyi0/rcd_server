@@ -119,9 +119,6 @@ mod tests {
             bc.broadcast(sample(i));
         }
         let err = rx.recv().await;
-        assert!(matches!(
-            err,
-            Err(broadcast::error::RecvError::Lagged(_))
-        ));
+        assert!(matches!(err, Err(broadcast::error::RecvError::Lagged(_))));
     }
 }

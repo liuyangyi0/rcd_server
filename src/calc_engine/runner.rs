@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::calc_engine::engine::CalcEngine;
+use crate::calc_engine::evaluator::EvalValue;
 use crate::model::{DeviceStatus, Value};
 
 /// 持有 [`CalcEngine`] 与全局变量累加器的运行器。
@@ -19,7 +20,7 @@ use crate::model::{DeviceStatus, Value};
 /// （例如 `total = deviceA.x + deviceB.y`）可以引用不同时间点到达的值。
 pub struct CalcRunner {
     engine: Arc<CalcEngine>,
-    global_vars: HashMap<String, f64>,
+    global_vars: HashMap<String, EvalValue>,
 }
 
 impl CalcRunner {
@@ -38,7 +39,8 @@ impl CalcRunner {
             return Vec::new();
         }
         for (kks, val) in &status.value {
-            self.global_vars.insert(kks.clone(), val.to_f64());
+            self.global_vars
+                .insert(kks.clone(), EvalValue::from_model_value(val));
         }
         self.engine.run_cycle(&self.global_vars)
     }
@@ -67,7 +69,10 @@ mod tests {
             com: com.to_string(),
             com_status: true,
             device_status: true,
-            value: pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+            value: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
             raw_data: vec![],
         }
     }
@@ -87,7 +92,9 @@ mod tests {
     fn empty_engine_returns_empty_no_accumulation() {
         let engine = CalcEngine::new(vec![]).unwrap();
         let mut runner = CalcRunner::new(Arc::new(engine));
-        assert!(runner.on_update(&status("COM1", 1, &[("a", Value::UInt(10))])).is_empty());
+        assert!(runner
+            .on_update(&status("COM1", 1, &[("a", Value::UInt(10))]))
+            .is_empty());
     }
 
     #[test]

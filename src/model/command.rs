@@ -34,10 +34,7 @@ pub struct SendData {
 impl SendData {
     /// 将 `command` 转换为大写十六进制字符串（如 `"0A1BFF"`）。
     pub fn command_as_string(&self) -> String {
-        self.command
-            .iter()
-            .map(|b| format!("{:02X}", b))
-            .collect()
+        self.command.iter().map(|b| format!("{:02X}", b)).collect()
     }
 }
 

@@ -1,4 +1,4 @@
-﻿//! RCD Server  串口采集 OPC UA 网关。
+//! RCD Server  串口采集 OPC UA 网关。
 //!
 //! 主要流程：
 //! 1. 加载 `config/config.toml` 全局配置。
@@ -6,35 +6,27 @@
 //! 3. 为每个串口启动独立的通信线程（轮询采集 + 命令下发）。
 //! 4. 启动 OPC UA 服务器，将采集数据发布为变量节点。
 
-mod broadcast;
-mod calc_engine;
-mod config;
-mod csv_parser;
-mod file_scanner;
-mod model;
-mod protocol;
-mod serial;
-mod server;
-
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use bounded_vec_deque::BoundedVecDeque;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::broadcast::Broadcaster;
-use crate::model::{Command, SystemState};
-use crate::csv_parser::DeviceConfig;
-use crate::serial::manager::SerialConfig;
-use crate::serial::worker::spawn_serial_worker;
-use crate::serial::port_config::SerialPortConfig;
-use crate::server::opcua::run_opcua_server;
-use crate::calc_engine::config::load_calc_config;
-use crate::calc_engine::engine::CalcEngine;
-use log::{info, warn, error};
+use log::{error, info, warn};
+use rcd_server::broadcast::Broadcaster;
+use rcd_server::calc_engine::config::load_calc_config;
+use rcd_server::calc_engine::engine::CalcEngine;
+use rcd_server::config;
+use rcd_server::csv_parser::{self, DeviceConfig};
+use rcd_server::file_scanner;
+use rcd_server::model::{Command, SystemState};
+use rcd_server::serial::manager::SerialConfig;
+use rcd_server::serial::port_config::SerialPortConfig;
+use rcd_server::serial::worker::spawn_serial_worker;
+use rcd_server::server::opcua::run_opcua_server;
 
 // ============================================================
 //  程序入口
@@ -72,11 +64,10 @@ async fn main() -> tokio::io::Result<()> {
     let calc_engine = {
         let config_dir = config::config_dir().expect("获取配置目录失败");
         let calc_path = config_dir.join("calc.toml");
-        let calc_config = load_calc_config(&calc_path)
-            .unwrap_or_else(|e| {
-                error!("[CalcEngine] 加载计算规则失败: {}，以空规则启动", e);
-                crate::calc_engine::config::CalcConfig { rules: Vec::new() }
-            });
+        let calc_config = load_calc_config(&calc_path).unwrap_or_else(|e| {
+            error!("[CalcEngine] 加载计算规则失败: {}，以空规则启动", e);
+            rcd_server::calc_engine::config::CalcConfig { rules: Vec::new() }
+        });
 
         if calc_config.rules.is_empty() {
             info!("[CalcEngine] 无计算规则，引擎未启用");
@@ -105,34 +96,75 @@ async fn main() -> tokio::io::Result<()> {
         system_state.clone(),
         system_record.clone(),
         cancel.clone(),
-    ).await {
+    )
+    .await
+    {
         Ok((configs, txs, worker_handles)) => {
-            // 校验计算引擎的基础变量是否在 CSV 数据点中定义
-            if !calc_engine.is_empty() {
-                let all_kks: std::collections::HashSet<String> = configs.iter()
-                    .flat_map(|port| port.devices.iter())
-                    .flat_map(|dev| dev.records.iter())
-                    .map(|rec| rec.kks.clone())
-                    .collect();
+            // ---- KKS 全局唯一性校验（OPC 节点扁平化要求）----
+            let mut kks_owners: HashMap<String, (String, u8)> = HashMap::new();
+            let mut duplicates: Vec<(String, (String, u8), (String, u8))> = Vec::new();
+            for port in &configs {
+                for dev in &port.devices {
+                    for rec in &dev.records {
+                        let owner = (port.port_number.clone(), dev.config.device_id);
+                        if let Some(prev) = kks_owners.insert(rec.kks.clone(), owner.clone()) {
+                            duplicates.push((rec.kks.clone(), prev, owner));
+                        }
+                    }
+                }
+            }
+            if !duplicates.is_empty() {
+                error!(
+                    "[OPC UA] 检测到 {} 个 KKS 重复（不同串口/设备使用了相同 KKS），OPC 节点将冲突。请在 CSV 的 kks_prefix 中区分。前 5 条: {:?}",
+                    duplicates.len(),
+                    duplicates.iter().take(5).collect::<Vec<_>>(),
+                );
+            }
 
+            // calc 输出名 vs 设备数据 KKS 重名（扁平化后必查）
+            if !calc_engine.is_empty() {
+                let calc_collisions: Vec<&str> = calc_engine
+                    .output_names()
+                    .into_iter()
+                    .filter(|n| kks_owners.contains_key(*n))
+                    .collect();
+                if !calc_collisions.is_empty() {
+                    error!(
+                        "[OPC UA] 计算衍生变量与设备数据 KKS 重名（OPC 节点会冲突）: {:?}",
+                        calc_collisions
+                    );
+                }
+            }
+
+            // ---- 计算引擎基础变量是否在 CSV 数据点中定义 ----
+            if !calc_engine.is_empty() {
                 let required = calc_engine.required_base_variables();
-                let missing: Vec<&String> = required.iter()
-                    .filter(|v| !all_kks.contains(v.as_str()))
+                let missing: Vec<&String> = required
+                    .iter()
+                    .filter(|v| !kks_owners.contains_key(v.as_str()))
                     .collect();
 
                 if !missing.is_empty() {
                     warn!(
-                        "[CalcEngine] 以下公式变量未在 CSV 数据点中定义: {:?}，运行时将使用默认值",
-                        missing
+                        "[CalcEngine] {} 个公式基础变量未在 CSV 数据点中定义，运行时将使用默认值。前 20 条: {:?}",
+                        missing.len(),
+                        missing.iter().take(20).collect::<Vec<_>>(),
                     );
                 }
             }
 
             // 启动 OPC UA 服务器（阻塞直到退出或收到取消信号）
             match run_opcua_server(
-                configs, broadcaster, system_state, system_record, txs,
-                calc_engine, cancel.clone(),
-            ).await {
+                configs,
+                broadcaster,
+                system_state,
+                system_record,
+                txs,
+                calc_engine,
+                cancel.clone(),
+            )
+            .await
+            {
                 Ok(_) => info!("OPC UA 服务器已正常退出"),
                 Err(e) => error!("OPC UA 服务器运行失败: {}", e),
             }
@@ -182,8 +214,11 @@ async fn init_serial_ports(
     system_state: SystemState,
     system_record: Arc<Mutex<BoundedVecDeque<String>>>,
     cancel: CancellationToken,
-) -> io::Result<(Vec<SerialPortConfig>, Vec<mpsc::Sender<Command>>, Vec<JoinHandle<()>>)> {
-
+) -> io::Result<(
+    Vec<SerialPortConfig>,
+    Vec<mpsc::Sender<Command>>,
+    Vec<JoinHandle<()>>,
+)> {
     // 1. 扫描 CSV 并按串口号聚合
     let serial_port_configs = load_and_group_csv_configs()?;
 
@@ -193,7 +228,10 @@ async fn init_serial_ports(
         info!(
             "已加载 {} 个串口, 共 {} 个设备",
             serial_port_configs.len(),
-            serial_port_configs.iter().map(|c| c.devices.len()).sum::<usize>(),
+            serial_port_configs
+                .iter()
+                .map(|c| c.devices.len())
+                .sum::<usize>(),
         );
     }
 
@@ -231,8 +269,8 @@ async fn init_serial_ports(
 
 /// 从 config 目录加载所有 `rcd*.csv` 文件并按串口号聚合。
 fn load_and_group_csv_configs() -> io::Result<Vec<SerialPortConfig>> {
-    let config_dir = config::config_dir()
-        .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
+    let config_dir =
+        config::config_dir().map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
 
     let csv_files = file_scanner::read_and_process_files(&config_dir, r"^rcd.*\.csv$")
         .unwrap_or_else(|e| {

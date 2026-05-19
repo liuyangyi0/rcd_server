@@ -1,10 +1,10 @@
-﻿//! 软件配置模块。
+//! 软件配置模块。
 //!
 //! 从 `config/config.toml` 文件中加载串口参数、服务器参数和全局设置。
 
+use log::info;
 use serde::Deserialize;
 use serialport::{DataBits, Parity, StopBits};
-use log::info;
 
 // ============================================================
 //  远程类型桥接（serde 无法直接反序列化外部 crate 的枚举）

@@ -14,7 +14,12 @@ use regex::Regex;
 /// - `directory` - 要扫描的目录路径。
 /// - `pattern`   - 正则表达式字符串（匹配文件名）。
 pub fn read_and_process_files(directory: &Path, pattern: &str) -> io::Result<Vec<PathBuf>> {
-    let re = Regex::new(pattern).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("无效的正则表达式: {}", e)))?;
+    let re = Regex::new(pattern).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("无效的正则表达式: {}", e),
+        )
+    })?;
     let mut matched_files = Vec::new();
 
     for entry in fs::read_dir(directory)? {

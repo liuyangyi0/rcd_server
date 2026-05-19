@@ -8,6 +8,7 @@ pub enum Value {
     UInt(u32),
     Bool(bool),
     Float(f32),
+    Double(f64),
 }
 
 impl Value {
@@ -15,8 +16,15 @@ impl Value {
     pub fn to_f64(&self) -> f64 {
         match self {
             Value::UInt(n) => *n as f64,
-            Value::Bool(b) => if *b { 1.0 } else { 0.0 },
+            Value::Bool(b) => {
+                if *b {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
             Value::Float(f) => *f as f64,
+            Value::Double(f) => *f,
         }
     }
 }

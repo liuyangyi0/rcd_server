@@ -2,9 +2,9 @@
 //!
 //! 将同一串口下的多个设备配置聚合在一起。
 
-use std::collections::HashMap;
 use crate::csv_parser::{self, DeviceConfig};
 use crate::model::PortRuntimeState;
+use std::collections::HashMap;
 
 /// 单个串口的聚合配置（一个串口可挂载多个设备）。
 #[derive(Debug, Clone)]
@@ -40,7 +40,12 @@ impl SerialPortConfig {
 
     /// 从 CSV 配置头创建（初始无设备）。
     pub fn from_csv_config(conf: &csv_parser::Config) -> Self {
-        Self::new(conf.com.clone(), conf.baud_rate, conf.is_special, Vec::new())
+        Self::new(
+            conf.com.clone(),
+            conf.baud_rate,
+            conf.is_special,
+            Vec::new(),
+        )
     }
 
     /// 生成该串口的初始运行时状态快照。

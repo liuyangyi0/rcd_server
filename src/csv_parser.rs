@@ -1,4 +1,4 @@
-﻿//! CSV 配置文件解析模块。
+//! CSV 配置文件解析模块。
 //!
 //! 每个 CSV 文件描述一个设备的通信参数与数据点定义。
 //! 文件前 7 行为设备配置头，之后为数据记录表。
@@ -53,7 +53,10 @@ where
         .get(idx)
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .ok_or(CsvParseError::MissingHeader { field, row: idx + 1 })?;
+        .ok_or(CsvParseError::MissingHeader {
+            field,
+            row: idx + 1,
+        })?;
     raw.parse::<T>().map_err(|e| CsvParseError::BadHeaderValue {
         field,
         value: raw.to_string(),
@@ -101,6 +104,10 @@ where
 // ============================================================
 //  数据记录
 // ============================================================
+
+/// 数据点表的列头（与 [`Record`] 字段顺序一致）。
+/// 工具生成 csv 模板时复用此常量，避免字段顺序漂移。
+pub const RECORD_CSV_HEADER: &str = "kks,type_,f_type,byte_index,bit_index,def,max,min,lh";
 
 /// CSV 中一行数据点描述。
 #[derive(Debug, Deserialize, Clone)]
@@ -209,12 +216,18 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
         .get(0)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .ok_or(CsvParseError::MissingHeader { field: "com", row: 1 })?;
+        .ok_or(CsvParseError::MissingHeader {
+            field: "com",
+            row: 1,
+        })?;
 
     let config = Config {
         com,
         baud_rate: parse_required(&headers, 1, "baud_rate")?,
-        is_special: headers.get(2).and_then(|s| s.trim().parse().ok()).unwrap_or(false),
+        is_special: headers
+            .get(2)
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(false),
         com_index: parse_required(&headers, 3, "com_index")?,
         device_id: parse_required(&headers, 4, "device_id")?,
         data_len: parse_required(&headers, 5, "data_len")?,
@@ -278,7 +291,10 @@ kks,type_,f_type,byte_index,bit_index,def,max,min,lh
         let content = VALID_HEADERS.replacen("com,COM3,", "com,,", 1);
         let (_d, p) = write_tmp(&content);
         let err = parse_csv(&p).unwrap_err();
-        assert!(matches!(err, CsvParseError::MissingHeader { field: "com", .. }), "got {err:?}");
+        assert!(
+            matches!(err, CsvParseError::MissingHeader { field: "com", .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -287,7 +303,13 @@ kks,type_,f_type,byte_index,bit_index,def,max,min,lh
         let (_d, p) = write_tmp(&content);
         let err = parse_csv(&p).unwrap_err();
         assert!(
-            matches!(err, CsvParseError::BadHeaderValue { field: "baud_rate", .. }),
+            matches!(
+                err,
+                CsvParseError::BadHeaderValue {
+                    field: "baud_rate",
+                    ..
+                }
+            ),
             "got {err:?}"
         );
     }

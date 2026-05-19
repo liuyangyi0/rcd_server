@@ -14,13 +14,13 @@ use log::{error, info, warn};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use super::manager::{SerialConfig, SerialManager};
+use super::port_config::SerialPortConfig;
 use crate::broadcast::Broadcaster;
 use crate::config;
 use crate::config::RunLocation;
-use crate::model::{Command, CommandType, SendData, SystemState, get_sum};
+use crate::model::{get_sum, Command, CommandType, SendData, SystemState};
 use crate::protocol::{cmd, threshold};
-use super::manager::{SerialConfig, SerialManager};
-use super::port_config::SerialPortConfig;
 
 // ============================================================
 //  串口线程入口
@@ -74,12 +74,8 @@ pub fn spawn_serial_worker(
 
             // 根据主/备角色决定行为，返回是否已发送命令（需要接收响应）
             let should_receive = match manager.current_run {
-                RunLocation::Primary => {
-                    run_primary_cycle(&mut manager)
-                }
-                RunLocation::Secondary => {
-                    run_secondary_cycle(&mut manager)
-                }
+                RunLocation::Primary => run_primary_cycle(&mut manager),
+                RunLocation::Secondary => run_secondary_cycle(&mut manager),
             };
 
             // 仅在实际发送了命令（或备机监听模式）时才接收数据
@@ -105,17 +101,20 @@ fn process_incoming_commands(
     while let Ok(cmd) = rx.try_recv() {
         match cmd.command {
             CommandType::SendData(data) => {
-                manager.command_queue.lock().unwrap_or_else(|e| {
-                    warn!("命令队列锁中毒，恢复: {}", e);
-                    e.into_inner()
-                }).push_back(data);
+                manager
+                    .command_queue
+                    .lock()
+                    .unwrap_or_else(|e| {
+                        warn!("命令队列锁中毒，恢复: {}", e);
+                        e.into_inner()
+                    })
+                    .push_back(data);
             }
             CommandType::PortStatus(status) => {
                 manager.port_config.status = status.device_status;
-                if let Err(e) = system_state.set_port_status(
-                    &manager.port_config.port_number,
-                    status.device_status,
-                ) {
+                if let Err(e) = system_state
+                    .set_port_status(&manager.port_config.port_number, status.device_status)
+                {
                     error!("设置端口状态失败: {}", e);
                 }
             }
@@ -187,7 +186,10 @@ fn run_primary_cycle(manager: &mut SerialManager) -> bool {
     ];
     frame.push(get_sum(&frame));
 
-    manager.send_command(SendData { device_id: 1, command: frame });
+    manager.send_command(SendData {
+        device_id: 1,
+        command: frame,
+    });
     true
 }
 

@@ -11,16 +11,16 @@ use std::io::{ErrorKind, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local};
 use bounded_vec_deque::BoundedVecDeque;
-use log::{info, warn, error};
+use chrono::{DateTime, Local};
+use log::{error, info, warn};
 use serialport::{DataBits, Parity, SerialPort, StopBits};
 
+use super::port_config::SerialPortConfig;
 use crate::broadcast::Broadcaster;
 use crate::config::RunLocation;
 use crate::model::{DeviceStatus, SendData};
 use crate::protocol::{self, threshold};
-use super::port_config::SerialPortConfig;
 
 // ============================================================
 //  串口参数
@@ -36,8 +36,20 @@ pub struct SerialConfig {
 }
 
 impl SerialConfig {
-    pub fn new(port_name: String, baud_rate: u32, data_bits: DataBits, stop_bits: StopBits, parity: Parity) -> Self {
-        Self { port_name, baud_rate, data_bits, stop_bits, parity }
+    pub fn new(
+        port_name: String,
+        baud_rate: u32,
+        data_bits: DataBits,
+        stop_bits: StopBits,
+        parity: Parity,
+    ) -> Self {
+        Self {
+            port_name,
+            baud_rate,
+            data_bits,
+            stop_bits,
+            parity,
+        }
     }
 }
 
@@ -140,13 +152,18 @@ impl SerialManager {
             serial_config.data_bits,
             serial_config.stop_bits,
             serial_config.parity,
-        ).ok();
+        )
+        .ok();
 
         if port.is_none() {
             warn!("串口 {} 打开失败", serial_config.port_name);
         }
 
-        let device_states = port_config.devices.iter().map(|_| DeviceRuntimeState::new()).collect();
+        let device_states = port_config
+            .devices
+            .iter()
+            .map(|_| DeviceRuntimeState::new())
+            .collect();
 
         Self {
             port,
@@ -240,7 +257,11 @@ impl SerialManager {
         if command.command.is_empty() {
             return;
         }
-        info!("串口 {} 发送数据: {}", self.serial_config.port_name, format_hex(&command.command));
+        info!(
+            "串口 {} 发送数据: {}",
+            self.serial_config.port_name,
+            format_hex(&command.command)
+        );
 
         // 特殊串口：直接写入全部数据
         if self.port_config.is_special {
@@ -278,7 +299,7 @@ impl SerialManager {
                     self.restore_parity();
                     return;
                 }
-                 let _ = port.flush();
+                let _ = port.flush();
             }
             None => {
                 self.reconnect();
@@ -353,9 +374,8 @@ impl SerialManager {
                     total += n;
                     // 已读到帧头(3字节)时，可计算期望帧长
                     if total >= 3 {
-                        let expected = expected_frame_len(
-                            &self.read_buf[..total], &self.current_run,
-                        );
+                        let expected =
+                            expected_frame_len(&self.read_buf[..total], &self.current_run);
                         if total >= expected {
                             break; // 帧已完整
                         }
@@ -392,7 +412,11 @@ impl SerialManager {
 
         // ---- 提取有效数据切片 ----
         let frame = self.extract_frame(total);
-        info!("串口 {} 原始数据: {}", self.serial_config.port_name, format_hex(&frame));
+        info!(
+            "串口 {} 原始数据: {}",
+            self.serial_config.port_name,
+            format_hex(&frame)
+        );
 
         // ---- 解析数据帧 ----
         match protocol::parse_data_packet(&frame) {
@@ -402,7 +426,10 @@ impl SerialManager {
 
                 let dev = &self.port_config.devices[self.index];
                 let parsed = protocol::parse_status(&packet.status, &dev.records);
-                info!("串口 {} 解析数据: {:?}", self.serial_config.port_name, parsed);
+                info!(
+                    "串口 {} 解析数据: {:?}",
+                    self.serial_config.port_name, parsed
+                );
                 if self.device_states[self.index].should_broadcast(&packet.status) {
                     let status = DeviceStatus {
                         id: dev.config.com_index as u64,
@@ -484,7 +511,8 @@ impl SerialManager {
         self.time_out_count += 1;
 
         let dev = &self.port_config.devices[self.index];
-        warn!("串口 {} 设备 {} 读取超时 (连续{}次)",
+        warn!(
+            "串口 {} 设备 {} 读取超时 (连续{}次)",
             self.serial_config.port_name,
             dev.config.device_id,
             self.device_states[self.index].timeout_count,
@@ -503,8 +531,16 @@ impl SerialManager {
 
     /// 执行主备角色切换，重置所有故障计数器并记录日志。
     fn switch_role(&mut self, new_role: RunLocation, reason: &str) {
-        let old = if self.current_run == RunLocation::Primary { "主机" } else { "备机" };
-        let new = if new_role == RunLocation::Primary { "主机" } else { "备机" };
+        let old = if self.current_run == RunLocation::Primary {
+            "主机"
+        } else {
+            "备机"
+        };
+        let new = if new_role == RunLocation::Primary {
+            "主机"
+        } else {
+            "备机"
+        };
         let msg = format!("角色切换 {} → {}：{}", old, new, reason);
 
         warn!("{}", msg);
@@ -596,7 +632,7 @@ mod tests {
     fn should_broadcast_same_data_below_threshold() {
         let mut state = DeviceRuntimeState::new();
         state.should_broadcast(&[1, 2, 3]); // 第一次, 更新 last_data
-        // 连续发送相同数据, 次数不到阈值, 不推送
+                                            // 连续发送相同数据, 次数不到阈值, 不推送
         for _ in 0..threshold::SAME_DATA_BROADCAST - 1 {
             assert!(!state.should_broadcast(&[1, 2, 3]));
         }
@@ -606,7 +642,7 @@ mod tests {
     fn should_broadcast_same_data_at_threshold() {
         let mut state = DeviceRuntimeState::new();
         state.should_broadcast(&[1, 2, 3]); // 第一次
-        // 到达阈值时推送
+                                            // 到达阈值时推送
         for _ in 0..threshold::SAME_DATA_BROADCAST - 1 {
             state.should_broadcast(&[1, 2, 3]);
         }
