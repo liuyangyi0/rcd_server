@@ -213,7 +213,7 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
 
     // 必填字段缺失/不可解析时立即报错，避免默认 0 在 serialport::new() 里晚崩
     let com = headers
-        .get(0)
+        .first()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or(CsvParseError::MissingHeader {

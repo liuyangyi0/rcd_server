@@ -30,6 +30,7 @@ use crate::protocol::{cmd, threshold};
 ///
 /// 使用 `tokio::task::spawn_blocking` 在主运行时的阻塞线程池中运行，
 /// 无需创建独立的 tokio `Runtime`。
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_serial_worker(
     broadcaster: Broadcaster,
     serial_config: SerialConfig,

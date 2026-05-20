@@ -231,7 +231,29 @@ impl CalcEngine {
                     EvalValue::Bool(b) if clamped == safe_value.as_f64() => *b,
                     _ => clamped != 0.0,
                 }),
-                CalcDataType::Float => Value::Float(clamped as f32),
+                CalcDataType::Float => {
+                    let f32_max = f32::MAX as f64;
+                    let value = if clamped > f32_max {
+                        warn!(
+                            "[CalcEngine] 公式 '{}' 结果 {} 超出 f32::MAX，饱和到 {}",
+                            rule.kks_calc,
+                            clamped,
+                            f32::MAX
+                        );
+                        f32::MAX
+                    } else if clamped < -f32_max {
+                        warn!(
+                            "[CalcEngine] 公式 '{}' 结果 {} 小于 -f32::MAX，饱和到 {}",
+                            rule.kks_calc,
+                            clamped,
+                            -f32::MAX
+                        );
+                        -f32::MAX
+                    } else {
+                        clamped as f32
+                    };
+                    Value::Float(value)
+                }
                 CalcDataType::Double => Value::Double(clamped),
             };
 
@@ -332,8 +354,8 @@ impl CalcEngine {
 
         // Kahn BFS
         let mut queue: VecDeque<usize> = VecDeque::new();
-        for i in 0..n {
-            if in_degree[i] == 0 {
+        for (i, degree) in in_degree.iter().enumerate() {
+            if *degree == 0 {
                 queue.push_back(i);
             }
         }
@@ -515,6 +537,24 @@ mod tests {
 
         let results = engine.run_cycle(&vars(&[("a", int(10))]));
         assert_eq!(results[0].1, Value::Double(2.5));
+    }
+
+    #[test]
+    fn engine_type_float_saturates_above_f32_max() {
+        let rules = vec![make_rule("output", "float", "a", 0.0)];
+        let engine = CalcEngine::new(rules).unwrap();
+
+        let results = engine.run_cycle(&vars(&[("a", float(f32::MAX as f64 * 2.0))]));
+        assert_eq!(results[0].1, Value::Float(f32::MAX));
+    }
+
+    #[test]
+    fn engine_type_float_saturates_below_negative_f32_max() {
+        let rules = vec![make_rule("output", "float", "a", 0.0)];
+        let engine = CalcEngine::new(rules).unwrap();
+
+        let results = engine.run_cycle(&vars(&[("a", float(-(f32::MAX as f64) * 2.0))]));
+        assert_eq!(results[0].1, Value::Float(-f32::MAX));
     }
 
     #[test]

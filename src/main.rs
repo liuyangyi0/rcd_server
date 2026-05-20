@@ -6,7 +6,7 @@
 //! 3. 为每个串口启动独立的通信线程（轮询采集 + 命令下发）。
 //! 4. 启动 OPC UA 服务器，将采集数据发布为变量节点。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -100,48 +100,21 @@ async fn main() -> tokio::io::Result<()> {
     .await
     {
         Ok((configs, txs, worker_handles)) => {
-            // ---- KKS 全局唯一性校验（OPC 节点扁平化要求）----
-            let mut kks_owners: HashMap<String, (String, u8)> = HashMap::new();
-            let mut duplicates: Vec<(String, (String, u8), (String, u8))> = Vec::new();
+            // ---- 计算引擎基础变量是否在 CSV 数据点中定义 ----
+            let mut all_kks: HashSet<String> = HashSet::new();
             for port in &configs {
                 for dev in &port.devices {
                     for rec in &dev.records {
-                        let owner = (port.port_number.clone(), dev.config.device_id);
-                        if let Some(prev) = kks_owners.insert(rec.kks.clone(), owner.clone()) {
-                            duplicates.push((rec.kks.clone(), prev, owner));
-                        }
+                        all_kks.insert(rec.kks.clone());
                     }
                 }
             }
-            if !duplicates.is_empty() {
-                error!(
-                    "[OPC UA] 检测到 {} 个 KKS 重复（不同串口/设备使用了相同 KKS），OPC 节点将冲突。请在 CSV 的 kks_prefix 中区分。前 5 条: {:?}",
-                    duplicates.len(),
-                    duplicates.iter().take(5).collect::<Vec<_>>(),
-                );
-            }
 
-            // calc 输出名 vs 设备数据 KKS 重名（扁平化后必查）
-            if !calc_engine.is_empty() {
-                let calc_collisions: Vec<&str> = calc_engine
-                    .output_names()
-                    .into_iter()
-                    .filter(|n| kks_owners.contains_key(*n))
-                    .collect();
-                if !calc_collisions.is_empty() {
-                    error!(
-                        "[OPC UA] 计算衍生变量与设备数据 KKS 重名（OPC 节点会冲突）: {:?}",
-                        calc_collisions
-                    );
-                }
-            }
-
-            // ---- 计算引擎基础变量是否在 CSV 数据点中定义 ----
             if !calc_engine.is_empty() {
                 let required = calc_engine.required_base_variables();
                 let missing: Vec<&String> = required
                     .iter()
-                    .filter(|v| !kks_owners.contains_key(v.as_str()))
+                    .filter(|v| !all_kks.contains(v.as_str()))
                     .collect();
 
                 if !missing.is_empty() {
@@ -272,11 +245,7 @@ fn load_and_group_csv_configs() -> io::Result<Vec<SerialPortConfig>> {
     let config_dir =
         config::config_dir().map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
 
-    let csv_files = file_scanner::read_and_process_files(&config_dir, r"^rcd.*\.csv$")
-        .unwrap_or_else(|e| {
-            warn!("读取配置文件目录失败: {}", e);
-            Vec::new()
-        });
+    let csv_files = file_scanner::read_and_process_files(&config_dir, r"^rcd.*\.csv$")?;
 
     let mut configs: HashMap<String, SerialPortConfig> = HashMap::new();
 

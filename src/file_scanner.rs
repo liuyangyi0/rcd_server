@@ -41,5 +41,5 @@ fn is_matching_file(path: &Path, regex: &Regex) -> bool {
         && path
             .file_name()
             .and_then(|n| n.to_str())
-            .map_or(false, |name| regex.is_match(name))
+            .is_some_and(|name| regex.is_match(name))
 }

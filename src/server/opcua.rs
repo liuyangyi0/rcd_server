@@ -9,6 +9,7 @@ pub const OPCUA_BIND_PORT: u16 = 4840;
 /// 写命令节点轮询间隔。
 pub const SEND_NODE_POLL_INTERVAL_MS: u64 = 200;
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io;
 use std::sync::{mpsc, Arc, Mutex};
@@ -106,6 +107,8 @@ pub async fn run_opcua_server(
     calc_engine: Arc<CalcEngine>,
     cancel: CancellationToken,
 ) -> io::Result<()> {
+    validate_opcua_kks_namespace(&serial_ports, &calc_engine)?;
+
     let host = OPCUA_BIND_HOST;
     let port: u16 = OPCUA_BIND_PORT;
     let base = format!("opc.tcp://{}:{}/", host, port);
@@ -286,6 +289,77 @@ struct OpcuaNodes {
     send_node_ids: Vec<(String, NodeId)>,
     /// KKS browse_name → 预构建的 NodeId，避免运行时重复分配。
     kks_node_map: HashMap<String, NodeId>,
+}
+
+/// 校验扁平化 OPC UA 命名空间不会出现 NodeId/BrowseName 冲突。
+fn validate_opcua_kks_namespace(
+    serial_ports: &[SerialPortConfig],
+    calc_engine: &CalcEngine,
+) -> io::Result<()> {
+    let mut device_kks_owners: HashMap<String, (String, u8)> = HashMap::new();
+    let mut duplicate_device_kks: Vec<String> = Vec::new();
+
+    for port in serial_ports {
+        for dev in &port.devices {
+            for rec in &dev.records {
+                let owner = (port.port_number.clone(), dev.config.device_id);
+                match device_kks_owners.entry(rec.kks.clone()) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(owner);
+                    }
+                    Entry::Occupied(entry) => {
+                        let prev = entry.get();
+                        duplicate_device_kks.push(format!(
+                            "{}: {}:{} conflicts with {}:{}",
+                            rec.kks, owner.0, owner.1, prev.0, prev.1
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let calc_collisions: Vec<String> = calc_engine
+        .output_names()
+        .into_iter()
+        .filter(|name| device_kks_owners.contains_key(*name))
+        .map(str::to_string)
+        .collect();
+
+    if duplicate_device_kks.is_empty() && calc_collisions.is_empty() {
+        return Ok(());
+    }
+
+    let mut parts = Vec::new();
+    if !duplicate_device_kks.is_empty() {
+        parts.push(format!(
+            "设备 KKS 重复 {} 个，前 5 条: [{}]",
+            duplicate_device_kks.len(),
+            duplicate_device_kks
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    if !calc_collisions.is_empty() {
+        parts.push(format!(
+            "计算输出与设备 KKS 重名 {} 个，前 20 条: [{}]",
+            calc_collisions.len(),
+            calc_collisions
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("OPC UA 扁平化命名空间冲突，拒绝启动: {}", parts.join("; ")),
+    ))
 }
 
 /// 计算所有 OPC UA 节点的 browse_name（纯逻辑，便于单元测试）。
@@ -692,5 +766,41 @@ mod tests {
                 ("ttyAP1".into(), "ttyAP1_Send".into()),
             ]
         );
+    }
+
+    #[test]
+    fn namespace_validation_accepts_unique_device_and_calc_kks() {
+        let port = make_port("ttyAP0", vec![make_device(11, &["base"])]);
+        let engine = make_calc_engine(vec![("derived", "uint", "base + 1")]);
+
+        assert!(validate_opcua_kks_namespace(&[port], &engine).is_ok());
+    }
+
+    #[test]
+    fn namespace_validation_rejects_duplicate_device_kks() {
+        let port = make_port(
+            "ttyAP0",
+            vec![
+                make_device(11, &["9CYE91GH201_READY"]),
+                make_device(12, &["9CYE91GH201_READY"]),
+            ],
+        );
+        let engine = make_calc_engine(vec![]);
+
+        let err = validate_opcua_kks_namespace(&[port], &engine).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("设备 KKS 重复"));
+        assert!(err.to_string().contains("9CYE91GH201_READY"));
+    }
+
+    #[test]
+    fn namespace_validation_rejects_calc_output_device_collision() {
+        let port = make_port("ttyAP0", vec![make_device(11, &["base"])]);
+        let engine = make_calc_engine(vec![("base", "uint", "other + 1")]);
+
+        let err = validate_opcua_kks_namespace(&[port], &engine).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("计算输出与设备 KKS 重名"));
+        assert!(err.to_string().contains("base"));
     }
 }

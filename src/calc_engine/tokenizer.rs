@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn tokenize_arithmetic() {
-        let tokens = tokenize("a + b * 3.14").unwrap();
+        let tokens = tokenize("a + b * 3.125").unwrap();
         assert_eq!(
             tokens,
             vec![
@@ -249,7 +249,7 @@ mod tests {
                 Token::Plus,
                 Token::Ident("b".into()),
                 Token::Star,
-                Token::Float(3.14),
+                Token::Float(3.125),
                 Token::Eof,
             ]
         );

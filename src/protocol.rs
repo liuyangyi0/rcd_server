@@ -162,9 +162,18 @@ pub fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
                     continue;
                 }
 
-                let mut combined = 0u32;
-                for i in start_byte..=end_byte {
-                    let byte = data[i] as u32;
+                let num_bits = end_bit - start_bit + 1;
+                if num_bits > 32 {
+                    warn!(
+                        "位范围宽度 {} 超过 u32 范围: {}..={}，跳过该数据点",
+                        num_bits, start_bit, end_bit
+                    );
+                    continue;
+                }
+
+                let mut combined = 0u64;
+                for (i, byte) in data.iter().enumerate().take(end_byte + 1).skip(start_byte) {
+                    let byte = *byte as u64;
                     if record.byte_order == 1 {
                         combined = (combined << 8) | byte; // 大端
                     } else {
@@ -172,10 +181,13 @@ pub fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
                     }
                 }
 
-                let bit_offset = (start_bit % 8) as u32;
-                let num_bits = end_bit - start_bit + 1;
-                let mask = (1u32 << num_bits) - 1;
-                (combined >> bit_offset) & mask
+                let bit_offset = start_bit % 8;
+                let mask = if num_bits == 32 {
+                    u32::MAX as u64
+                } else {
+                    (1u64 << num_bits) - 1
+                };
+                ((combined >> bit_offset) & mask) as u32
             }
         };
 
@@ -345,6 +357,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_status_range_32_bits_little_endian() {
+        let data = [0x78, 0x56, 0x34, 0x12];
+        let records = vec![make_record("K1", "uint", 1, BitIndex::Range(0..=31), 0)];
+        let result = parse_status(&data, &records);
+        assert_eq!(result.get("K1"), Some(&Value::UInt(0x1234_5678)));
+    }
+
+    #[test]
+    fn parse_status_range_32_bits_big_endian() {
+        let data = [0x12, 0x34, 0x56, 0x78];
+        let records = vec![make_record("K1", "uint", 1, BitIndex::Range(0..=31), 1)];
+        let result = parse_status(&data, &records);
+        assert_eq!(result.get("K1"), Some(&Value::UInt(0x1234_5678)));
+    }
+
+    #[test]
+    fn parse_status_range_32_bits_unaligned_little_endian() {
+        let data = [0x00, 0x00, 0x00, 0x00, 0x01];
+        let records = vec![make_record("K1", "uint", 1, BitIndex::Range(1..=32), 0)];
+        let result = parse_status(&data, &records);
+        assert_eq!(result.get("K1"), Some(&Value::UInt(0x8000_0000)));
+    }
+
+    #[test]
+    fn parse_status_range_wider_than_u32_skipped() {
+        let data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let records = vec![make_record("bad", "uint", 1, BitIndex::Range(0..=32), 0)];
+        let result = parse_status(&data, &records);
+        assert!(!result.contains_key("bad"));
+    }
+
+    #[test]
     fn parse_status_out_of_bounds() {
         let data = [0xFF];
         let records = vec![
@@ -363,7 +407,7 @@ mod tests {
             make_record("ok", "bool", 1, BitIndex::Single(0), 0),
         ];
         let result = parse_status(&data, &records);
-        assert!(result.get("bad").is_none());
+        assert!(!result.contains_key("bad"));
         assert_eq!(result.get("ok"), Some(&Value::Bool(true)));
     }
 
@@ -376,7 +420,7 @@ mod tests {
             make_record("ok", "bool", 1, BitIndex::Single(3), 0),
         ];
         let result = parse_status(&data, &records);
-        assert!(result.get("bad").is_none());
+        assert!(!result.contains_key("bad"));
         assert_eq!(result.get("ok"), Some(&Value::Bool(true)));
     }
 
