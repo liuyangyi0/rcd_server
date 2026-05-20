@@ -206,6 +206,11 @@ async fn init_serial_ports(
                 .map(|c| c.devices.len())
                 .sum::<usize>(),
         );
+        println!(
+            "已加载 {} 个串口, 共 {} 个设备",
+            serial_port_configs.len(),
+            serial_port_configs.iter().map(|c| c.devices.len()).sum::<usize>(),
+        )
     }
 
     // 2. 为每个串口启动通信线程

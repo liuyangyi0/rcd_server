@@ -157,6 +157,7 @@ impl SerialManager {
 
         if port.is_none() {
             warn!("串口 {} 打开失败", serial_config.port_name);
+            println!("串口 {} 打开失败", serial_config.port_name);
         }
 
         let device_states = port_config
@@ -257,6 +258,8 @@ impl SerialManager {
         if command.command.is_empty() {
             return;
         }
+        //info!("串口 {} 发送数据: {}", self.serial_config.port_name, format_hex(&command.command));
+        println!("串口 {} 发送数据: {}", self.serial_config.port_name, format_hex(&command.command));
         info!(
             "串口 {} 发送数据: {}",
             self.serial_config.port_name,
@@ -325,7 +328,7 @@ impl SerialManager {
                     self.reconnect();
                     return;
                 }
-                let _ = port.flush();
+                // let _ = port.flush();
             }
             None => {
                 self.reconnect();
@@ -337,7 +340,7 @@ impl SerialManager {
         std::thread::sleep(Duration::from_millis(2));
 
         // 恢复原始校验位，供后续 receive_data 使用
-        self.restore_parity();
+        // self.restore_parity();
     }
 
     /// 将串口校验位恢复为配置文件中指定的原始值。
@@ -371,6 +374,7 @@ impl SerialManager {
             match port.read(&mut self.read_buf[total..]) {
                 Ok(0) => break,
                 Ok(n) => {
+                    println!("duqudao");
                     total += n;
                     // 已读到帧头(3字节)时，可计算期望帧长
                     if total >= 3 {
@@ -412,6 +416,7 @@ impl SerialManager {
 
         // ---- 提取有效数据切片 ----
         let frame = self.extract_frame(total);
+        println!("串口 {} 原始数据: {}", self.serial_config.port_name, format_hex(&frame));
         info!(
             "串口 {} 原始数据: {}",
             self.serial_config.port_name,

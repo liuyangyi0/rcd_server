@@ -1,0 +1,4 @@
+[[rules]]
+kks_calc       = "9CYE92CB093XQ01"
+data_type     = "uint"
+expression    = "(ttyAP1_18_9CYE92GH208_READY==1)*ttyAP1_18_9CYE92GH208_SL21+(ttyAP1_18_9CYE92GH208_READY!=1)*4"
