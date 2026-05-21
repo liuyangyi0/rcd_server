@@ -31,6 +31,21 @@ impl CalcRunner {
         }
     }
 
+    /// 清空已有累加表，并用一批最新设备状态重建计算上下文。
+    pub fn rebuild_from_statuses(&mut self, statuses: &[DeviceStatus]) -> Vec<(String, Value)> {
+        self.global_vars.clear();
+        if self.engine.is_empty() {
+            return Vec::new();
+        }
+        for status in statuses {
+            for (kks, val) in &status.value {
+                self.global_vars
+                    .insert(kks.clone(), EvalValue::from_model_value(val));
+            }
+        }
+        self.engine.run_cycle(&self.global_vars)
+    }
+
     /// 处理一次设备状态更新，返回本轮所有公式的计算结果。
     ///
     /// 空引擎情况下返回空 `Vec`，不进行任何累加，避免无谓分配。
@@ -120,5 +135,20 @@ mod tests {
         runner.on_update(&status("COM1", 1, &[("a", Value::UInt(1))]));
         let r = runner.on_update(&status("COM1", 1, &[("a", Value::UInt(100))]));
         assert_eq!(r[0].1, Value::UInt(101));
+    }
+
+    #[test]
+    fn rebuild_from_statuses_resets_old_variables() {
+        let engine = CalcEngine::new(vec![make_rule("total", "uint", "a + b")]).unwrap();
+        let mut runner = CalcRunner::new(Arc::new(engine));
+
+        let r1 = runner.rebuild_from_statuses(&[
+            status("COM1", 1, &[("a", Value::UInt(3))]),
+            status("COM2", 2, &[("b", Value::UInt(7))]),
+        ]);
+        assert_eq!(r1[0].1, Value::UInt(10));
+
+        let r2 = runner.rebuild_from_statuses(&[status("COM1", 1, &[("a", Value::UInt(3))])]);
+        assert_eq!(r2[0].1, Value::UInt(0));
     }
 }

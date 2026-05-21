@@ -21,6 +21,7 @@ use crate::broadcast::Broadcaster;
 use crate::config::RunLocation;
 use crate::model::{DeviceStatus, SendData};
 use crate::protocol::{self, threshold};
+use crate::runtime_cache::LatestStatusCache;
 
 // ============================================================
 //  串口参数
@@ -116,6 +117,7 @@ pub(crate) struct SerialManager {
     pub(crate) serial_config: SerialConfig,
     pub(crate) port_config: SerialPortConfig,
     pub(crate) broadcaster: Broadcaster,
+    pub(crate) latest_status_cache: LatestStatusCache,
     /// 每个设备的运行时状态（与 port_config.devices 一一对应）。
     pub(crate) device_states: Vec<DeviceRuntimeState>,
     /// 当前轮询的设备索引。
@@ -139,6 +141,7 @@ impl SerialManager {
         serial_config: SerialConfig,
         port_config: SerialPortConfig,
         broadcaster: Broadcaster,
+        latest_status_cache: LatestStatusCache,
         run_on: RunLocation,
         current_run: RunLocation,
         system_record: Arc<Mutex<BoundedVecDeque<String>>>,
@@ -172,6 +175,7 @@ impl SerialManager {
             serial_config,
             port_config,
             broadcaster,
+            latest_status_cache,
             device_states,
             index: 0,
             run_on,
@@ -221,17 +225,18 @@ impl SerialManager {
         let dev = &self.port_config.devices[self.index];
         let zero_data = vec![0u8; dev.config.data_len as usize];
         let parsed = protocol::parse_status(&zero_data, &dev.records);
+        let status = DeviceStatus {
+            id: dev.config.com_index as u64,
+            device_id: dev.config.device_id,
+            com: self.port_config.port_number.clone(),
+            com_status,
+            device_status,
+            value: parsed,
+            raw_data: zero_data.clone(),
+        };
+        self.latest_status_cache.update(status.clone());
 
         if self.device_states[self.index].should_broadcast(&zero_data) {
-            let status = DeviceStatus {
-                id: dev.config.com_index as u64,
-                device_id: dev.config.device_id,
-                com: self.port_config.port_number.clone(),
-                com_status,
-                device_status,
-                value: parsed,
-                raw_data: zero_data,
-            };
             self.broadcaster.broadcast(status);
         }
     }
@@ -259,7 +264,11 @@ impl SerialManager {
             return;
         }
         //info!("串口 {} 发送数据: {}", self.serial_config.port_name, format_hex(&command.command));
-        println!("串口 {} 发送数据: {}", self.serial_config.port_name, format_hex(&command.command));
+        println!(
+            "串口 {} 发送数据: {}",
+            self.serial_config.port_name,
+            format_hex(&command.command)
+        );
         info!(
             "串口 {} 发送数据: {}",
             self.serial_config.port_name,
@@ -416,7 +425,11 @@ impl SerialManager {
 
         // ---- 提取有效数据切片 ----
         let frame = self.extract_frame(total);
-        println!("串口 {} 原始数据: {}", self.serial_config.port_name, format_hex(&frame));
+        println!(
+            "串口 {} 原始数据: {}",
+            self.serial_config.port_name,
+            format_hex(&frame)
+        );
         info!(
             "串口 {} 原始数据: {}",
             self.serial_config.port_name,
@@ -435,16 +448,18 @@ impl SerialManager {
                     "串口 {} 解析数据: {:?}",
                     self.serial_config.port_name, parsed
                 );
+                let status = DeviceStatus {
+                    id: dev.config.com_index as u64,
+                    device_id: dev.config.device_id,
+                    com: self.port_config.port_number.clone(),
+                    com_status: true,
+                    device_status: true,
+                    value: parsed,
+                    raw_data: frame,
+                };
+                self.latest_status_cache.update(status.clone());
+
                 if self.device_states[self.index].should_broadcast(&packet.status) {
-                    let status = DeviceStatus {
-                        id: dev.config.com_index as u64,
-                        device_id: dev.config.device_id,
-                        com: self.port_config.port_number.clone(),
-                        com_status: true,
-                        device_status: true,
-                        value: parsed,
-                        raw_data: frame,
-                    };
                     self.broadcaster.broadcast(status);
                 }
             }
@@ -625,6 +640,9 @@ pub(crate) fn open_serial_port(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    use crate::model::Value;
 
     #[test]
     fn should_broadcast_data_changed() {
@@ -665,5 +683,39 @@ mod tests {
         assert!(state.should_broadcast(&[4, 5, 6]));
         // 再次发相同数据, 重新计数
         assert!(!state.should_broadcast(&[4, 5, 6]));
+    }
+
+    #[test]
+    fn cache_updates_even_when_same_data_is_not_broadcast() {
+        let cache = LatestStatusCache::new();
+        let mut state = DeviceRuntimeState::new();
+
+        let first = DeviceStatus {
+            id: 1,
+            device_id: 1,
+            com: "COM1".to_string(),
+            com_status: true,
+            device_status: true,
+            value: HashMap::from([("a".to_string(), Value::UInt(1))]),
+            raw_data: vec![1, 2, 3],
+        };
+        cache.update(first);
+        assert!(state.should_broadcast(&[1, 2, 3]));
+
+        let second = DeviceStatus {
+            id: 1,
+            device_id: 1,
+            com: "COM1".to_string(),
+            com_status: true,
+            device_status: true,
+            value: HashMap::from([("a".to_string(), Value::UInt(2))]),
+            raw_data: vec![1, 2, 3],
+        };
+        cache.update(second);
+        assert!(!state.should_broadcast(&[1, 2, 3]));
+
+        let snapshot = cache.snapshot_statuses();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].value.get("a"), Some(&Value::UInt(2)));
     }
 }

@@ -8,6 +8,12 @@ pub const OPCUA_BIND_HOST: &str = "0.0.0.0";
 pub const OPCUA_BIND_PORT: u16 = 4840;
 /// 写命令节点轮询间隔。
 pub const SEND_NODE_POLL_INTERVAL_MS: u64 = 200;
+/// OPC UA 大批量 Browse / 订阅的变量数余量。
+pub const OPCUA_LIMIT_MARGIN: usize = 512;
+/// OPC UA 大批量响应的最小消息上限。
+pub const OPCUA_MIN_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+/// OPC UA 大批量响应的最小分片数上限。
+pub const OPCUA_MIN_MAX_CHUNK_COUNT: usize = 256;
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -23,8 +29,9 @@ use crate::broadcast::Broadcaster;
 use crate::calc_engine::config::{normalize_data_type, CalcDataType};
 use crate::calc_engine::engine::CalcEngine;
 use crate::calc_engine::runner::CalcRunner;
-use crate::model::{get_sum, Command, CommandType, SendData, SystemState, Value};
+use crate::model::{get_sum, Command, CommandType, DeviceStatus, SendData, SystemState, Value};
 use crate::protocol::hex_str_to_bytes;
+use crate::runtime_cache::LatestStatusCache;
 use crate::serial::port_config::SerialPortConfig;
 
 // OPC UA 相关导入
@@ -86,6 +93,112 @@ fn value_to_variant(v: &Value) -> Variant {
     }
 }
 
+type OpcuaValueUpdate<'a> = (&'a NodeId, Option<&'a NumericRange>, DataValue);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpcuaVariableCounts {
+    device_variables: usize,
+    send_variables: usize,
+    calc_variables: usize,
+}
+
+impl OpcuaVariableCounts {
+    fn total(self) -> usize {
+        self.device_variables + self.send_variables + self.calc_variables
+    }
+}
+
+fn count_opcua_variables(
+    serial_ports: &[SerialPortConfig],
+    calc_engine: &CalcEngine,
+) -> OpcuaVariableCounts {
+    let device_variables = serial_ports
+        .iter()
+        .map(|port| {
+            port.devices
+                .iter()
+                .map(|device| device.records.len())
+                .sum::<usize>()
+        })
+        .sum();
+    OpcuaVariableCounts {
+        device_variables,
+        send_variables: serial_ports.len(),
+        calc_variables: calc_engine.output_names().len(),
+    }
+}
+
+fn opcua_limit_target(total_variables: usize) -> usize {
+    total_variables.saturating_add(OPCUA_LIMIT_MARGIN).max(1000)
+}
+
+fn configure_opcua_limits(builder: &mut ServerBuilder, total_variables: usize) -> usize {
+    let limit_target = opcua_limit_target(total_variables);
+    let message_size = OPCUA_MIN_MAX_MESSAGE_SIZE.max(limit_target.saturating_mul(2048));
+
+    let limits = builder.limits_mut();
+    limits.operational.max_references_per_browse_node = limit_target;
+    limits.operational.max_monitored_items_per_call = limit_target;
+    limits.subscriptions.max_monitored_items_per_sub = limit_target;
+    limits.max_message_size = message_size;
+    limits.max_chunk_count = OPCUA_MIN_MAX_CHUNK_COUNT;
+
+    limit_target
+}
+
+fn collect_device_updates<'a>(
+    status: &DeviceStatus,
+    kks_node_map: &'a HashMap<String, NodeId>,
+    updates: &mut Vec<OpcuaValueUpdate<'a>>,
+) {
+    for (kks, val) in &status.value {
+        if let Some(node_id) = kks_node_map.get(kks.as_str()) {
+            updates.push((node_id, None, DataValue::new_now(value_to_variant(val))));
+        }
+    }
+}
+
+fn collect_calc_updates<'a>(
+    calc_results: Vec<(String, Value)>,
+    kks_node_map: &'a HashMap<String, NodeId>,
+    updates: &mut Vec<OpcuaValueUpdate<'a>>,
+) {
+    for (kks_calc, val) in calc_results {
+        if let Some(node_id) = kks_node_map.get(&kks_calc) {
+            updates.push((node_id, None, DataValue::new_now(value_to_variant(&val))));
+        }
+    }
+}
+
+fn build_incremental_updates<'a>(
+    status: &DeviceStatus,
+    kks_node_map: &'a HashMap<String, NodeId>,
+    calc_runner: &mut CalcRunner,
+) -> Vec<OpcuaValueUpdate<'a>> {
+    let mut updates = Vec::with_capacity(status.value.len());
+    collect_device_updates(status, kks_node_map, &mut updates);
+    collect_calc_updates(calc_runner.on_update(status), kks_node_map, &mut updates);
+    updates
+}
+
+fn build_full_sync_updates<'a>(
+    statuses: &[DeviceStatus],
+    kks_node_map: &'a HashMap<String, NodeId>,
+    calc_runner: &mut CalcRunner,
+) -> Vec<OpcuaValueUpdate<'a>> {
+    let value_count = statuses.iter().map(|s| s.value.len()).sum();
+    let mut updates = Vec::with_capacity(value_count);
+    for status in statuses {
+        collect_device_updates(status, kks_node_map, &mut updates);
+    }
+    collect_calc_updates(
+        calc_runner.rebuild_from_statuses(statuses),
+        kks_node_map,
+        &mut updates,
+    );
+    updates
+}
+
 // ============================================================
 //  OPC UA 服务器
 // ============================================================
@@ -105,16 +218,18 @@ pub async fn run_opcua_server(
     _system_record: Arc<Mutex<BoundedVecDeque<String>>>,
     txs: Vec<mpsc::Sender<Command>>,
     calc_engine: Arc<CalcEngine>,
+    latest_status_cache: LatestStatusCache,
     cancel: CancellationToken,
 ) -> io::Result<()> {
     validate_opcua_kks_namespace(&serial_ports, &calc_engine)?;
+    let variable_counts = count_opcua_variables(&serial_ports, &calc_engine);
 
     let host = OPCUA_BIND_HOST;
     let port: u16 = OPCUA_BIND_PORT;
     let base = format!("opc.tcp://{}:{}/", host, port);
 
     // ---- 构建 OPC UA 服务器 ----
-    let (server, handle) = ServerBuilder::new()
+    let mut builder = ServerBuilder::new()
         .host(host)
         .port(port)
         .discovery_urls(vec![base.clone()])
@@ -151,11 +266,21 @@ pub async fn run_opcua_server(
             "simple",
         ))
         .trust_client_certs(true)
-        .diagnostics_enabled(true)
-        .build()
-        .map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("构建 OPC UA 服务器失败: {e}"))
-        })?;
+        .diagnostics_enabled(true);
+
+    let limit_target = configure_opcua_limits(&mut builder, variable_counts.total());
+    info!(
+        "[OPC UA] 变量规划: 设备变量={}, 写命令变量={}, 计算变量={}, 总变量={}, 动态限制={}",
+        variable_counts.device_variables,
+        variable_counts.send_variables,
+        variable_counts.calc_variables,
+        variable_counts.total(),
+        limit_target,
+    );
+
+    let (server, handle) = builder.build().map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("构建 OPC UA 服务器失败: {e}"))
+    })?;
 
     let node_manager: Arc<SimpleNodeManager> = handle
         .node_managers()
@@ -166,22 +291,51 @@ pub async fn run_opcua_server(
         .get_namespace_index("urn:SerialServer")
         .expect("自定义命名空间未注册");
 
+    // 先订阅广播，再创建节点。节点创建期间到达的数据会留在接收队列中；
+    // 若队列溢出，后续 Lagged 分支会用最新值缓存全量重同步。
+    let mut rx_opcua = broadcaster.subscribe();
+
     // ---- 创建 OPC UA 节点（变量 + Method）----
-    let opcua_nodes = create_opcua_nodes(&node_manager, ns, &serial_ports, &calc_engine);
+    let opcua_nodes = create_opcua_nodes(&node_manager, ns, &serial_ports, &calc_engine)?;
+    info!(
+        "[OPC UA] 节点创建完成: 设备变量={}, 写命令变量={}, 计算变量={}, 总变量={}, 成功插入={}, kks_map={}",
+        opcua_nodes.counts.device_variables,
+        opcua_nodes.counts.send_variables,
+        opcua_nodes.counts.calc_variables,
+        opcua_nodes.counts.total(),
+        opcua_nodes.inserted_variable_count,
+        opcua_nodes.kks_node_map.len(),
+    );
     let send_node_ids = opcua_nodes.send_node_ids;
-    let kks_node_map = Arc::new(opcua_nodes.kks_node_map);
+    let kks_node_map = opcua_nodes.kks_node_map;
 
     // ---- 注册 Method 回调 ----
     register_send_methods(&node_manager, ns, &serial_ports, &txs);
 
-    // ---- 注册本地通道接收串口数据 ----
-    let mut rx_opcua = broadcaster.subscribe();
+    let mut calc_runner = CalcRunner::new(calc_engine.clone());
+    let initial_statuses = latest_status_cache.snapshot_statuses();
+    let initial_updates =
+        build_full_sync_updates(&initial_statuses, &kks_node_map, &mut calc_runner);
+    if !initial_updates.is_empty() {
+        node_manager
+            .set_values(&subscriptions, initial_updates.into_iter())
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("OPC UA 缓存预热失败: {e:?}"))
+            })?;
+        info!(
+            "[OPC UA] 已用最新值缓存预热: 设备状态={} 条",
+            initial_statuses.len()
+        );
+    } else {
+        info!("[OPC UA] 最新值缓存为空，节点保持初始值等待首帧数据");
+    }
 
     // ---- 任务 1: 串口数据 -> OPC UA 节点更新 ----
     let nm_update = node_manager.clone();
     let subs_update = subscriptions.clone();
+    let kks_node_map = Arc::new(kks_node_map);
     let kks_map = kks_node_map.clone();
-    let mut calc_runner = CalcRunner::new(calc_engine.clone());
+    let latest_cache_update = latest_status_cache.clone();
     let cancel_update = cancel.clone();
     let task_update = tokio::spawn(async move {
         loop {
@@ -192,30 +346,25 @@ pub async fn run_opcua_server(
                     Ok(s) => s,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!("[OPC UA] 广播订阅落后 {} 条，已丢帧", n);
+                        let statuses = latest_cache_update.snapshot_statuses();
+                        let updates =
+                            build_full_sync_updates(&statuses, &kks_map, &mut calc_runner);
+                        if !updates.is_empty() {
+                            if let Err(e) = nm_update.set_values(&subs_update, updates.into_iter()) {
+                                warn!("OPC UA 全量重同步失败: {:?}", e);
+                            } else {
+                                info!("[OPC UA] 已从最新值缓存完成全量重同步: {} 条设备状态", statuses.len());
+                            }
+                        }
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             };
 
-            // ---- 1. 更新设备 OPC UA 节点（按纯 KKS 查询）----
-            let mut updates: Vec<_> = status
-                .value
-                .iter()
-                .filter_map(|(kks, val)| {
-                    let node_id = kks_map.get(kks.as_str())?;
-                    Some((node_id, None, DataValue::new_now(value_to_variant(val))))
-                })
-                .collect();
+            let updates = build_incremental_updates(&status, &kks_map, &mut calc_runner);
 
-            // ---- 2. 计算引擎：CalcRunner 累积变量并执行公式 ----
-            for (kks_calc, val) in calc_runner.on_update(&status) {
-                if let Some(node_id) = kks_map.get(&kks_calc) {
-                    updates.push((node_id, None, DataValue::new_now(value_to_variant(&val))));
-                }
-            }
-
-            // ---- 3. 批量写入所有变量（设备 + 计算），只获取一次写锁 ----
+            // 批量写入所有变量（设备 + 计算），只获取一次写锁。
             if !updates.is_empty() {
                 if let Err(e) = nm_update.set_values(&subs_update, updates.into_iter()) {
                     warn!("批量更新 OPC UA 变量失败: {:?}", e);
@@ -289,6 +438,10 @@ struct OpcuaNodes {
     send_node_ids: Vec<(String, NodeId)>,
     /// KKS browse_name → 预构建的 NodeId，避免运行时重复分配。
     kks_node_map: HashMap<String, NodeId>,
+    /// 变量数量规划。
+    counts: OpcuaVariableCounts,
+    /// 成功插入地址空间的变量节点数量。
+    inserted_variable_count: usize,
 }
 
 /// 校验扁平化 OPC UA 命名空间不会出现 NodeId/BrowseName 冲突。
@@ -397,20 +550,27 @@ fn create_opcua_nodes(
     ns: u16,
     serial_ports: &[SerialPortConfig],
     calc_engine: &CalcEngine,
-) -> OpcuaNodes {
+) -> io::Result<OpcuaNodes> {
     let devices_folder_id = NodeId::new(ns, "Devices");
     let mut send_node_ids: Vec<(String, NodeId)> = Vec::new();
     let mut kks_node_map = HashMap::new();
+    let counts = count_opcua_variables(serial_ports, calc_engine);
 
     let mut address_space = node_manager.address_space().write();
-    address_space.add_folder(
+    if !address_space.add_folder(
         &devices_folder_id,
         "Devices",
         "Devices",
         &NodeId::objects_folder_id(),
-    );
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "创建 OPC UA Devices 文件夹失败",
+        ));
+    }
 
     let mut variables = Vec::new();
+    let mut variable_names = Vec::with_capacity(counts.total());
 
     for port in serial_ports {
         // 数据变量节点：使用纯 KKS 作为 browse_name（要求 KKS 全局唯一）
@@ -429,6 +589,7 @@ fn create_opcua_nodes(
                     None,
                     init,
                 ));
+                variable_names.push(browse_name.clone());
                 kks_node_map.insert(browse_name, node_id);
             }
         }
@@ -445,6 +606,7 @@ fn create_opcua_nodes(
             None,
             Variant::String(UAString::from("")),
         ));
+        variable_names.push(send_name.clone());
         send_node_ids.push((port.port_number.clone(), send_node_id));
     }
 
@@ -462,11 +624,34 @@ fn create_opcua_nodes(
             None,
             init,
         ));
+        variable_names.push(kks_calc.to_string());
         kks_node_map.insert(kks_calc.to_string(), node_id);
     }
 
-    if !variables.is_empty() {
-        address_space.add_variables(variables, &devices_folder_id);
+    let inserted_results = if variables.is_empty() {
+        Vec::new()
+    } else {
+        address_space.add_variables(variables, &devices_folder_id)
+    };
+    let inserted_variable_count = inserted_results.iter().filter(|ok| **ok).count();
+
+    if inserted_variable_count != counts.total() || inserted_results.len() != variable_names.len() {
+        let failed_names: Vec<String> = variable_names
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !inserted_results.get(*idx).copied().unwrap_or(false))
+            .map(|(_, name)| name.clone())
+            .take(20)
+            .collect();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "OPC UA 变量节点创建不完整: 预期 {}, 成功 {}, 前 20 个失败节点: [{}]",
+                counts.total(),
+                inserted_variable_count,
+                failed_names.join(", ")
+            ),
+        ));
     }
 
     // 在同一次写锁内设置写命令节点的写权限
@@ -475,14 +660,19 @@ fn create_opcua_nodes(
             var.set_access_level(AccessLevel::CURRENT_READ | AccessLevel::CURRENT_WRITE);
             var.set_user_access_level(AccessLevel::CURRENT_READ | AccessLevel::CURRENT_WRITE);
         } else {
-            warn!("未找到写命令节点: {:?}", node_id);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("未找到写命令节点: {:?}", node_id),
+            ));
         }
     }
 
-    OpcuaNodes {
+    Ok(OpcuaNodes {
         send_node_ids,
         kks_node_map,
-    }
+        counts,
+        inserted_variable_count,
+    })
 }
 
 /// 为每个串口创建 `SendCommand` Method 节点，客户端可通过 OPC UA Call 服务直接调用。
@@ -802,5 +992,58 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("计算输出与设备 KKS 重名"));
         assert!(err.to_string().contains("base"));
+    }
+
+    #[test]
+    fn variable_count_includes_device_send_and_calc_nodes() {
+        let p0 = make_port("ttyAP0", vec![make_device(11, &["a", "b"])]);
+        let p1 = make_port("ttyAP1", vec![make_device(12, &["c"])]);
+        let engine = make_calc_engine(vec![("calc1", "uint", "a + b"), ("calc2", "uint", "c")]);
+
+        let counts = count_opcua_variables(&[p0, p1], &engine);
+        assert_eq!(
+            counts,
+            OpcuaVariableCounts {
+                device_variables: 3,
+                send_variables: 2,
+                calc_variables: 2,
+            }
+        );
+        assert_eq!(counts.total(), 7);
+    }
+
+    #[test]
+    fn opcua_limit_target_covers_large_flat_namespace() {
+        assert_eq!(opcua_limit_target(10), 1000);
+        assert_eq!(opcua_limit_target(2099), 2099 + OPCUA_LIMIT_MARGIN);
+    }
+
+    #[test]
+    fn large_calc_plan_keeps_flat_browse_names_and_counts_all_outputs() {
+        let port = make_port("ttyAP0", vec![make_device(11, &["base"])]);
+        let rules: Vec<CalcRule> = (0..2099)
+            .map(|idx| CalcRule {
+                kks_calc: format!("calc_{idx:04}"),
+                data_type: "uint".to_string(),
+                expression: "base + 1".to_string(),
+                max_limit: f64::MAX,
+                min_limit: f64::MIN,
+                default_value: 0.0,
+            })
+            .collect();
+        let engine = CalcEngine::new(rules).expect("构建大规模测试引擎失败");
+
+        let (data_names, send_pairs) = plan_browse_names(std::slice::from_ref(&port), &engine);
+        let counts = count_opcua_variables(&[port], &engine);
+
+        assert_eq!(send_pairs, vec![("ttyAP0".into(), "ttyAP0_Send".into())]);
+        assert_eq!(counts.device_variables, 1);
+        assert_eq!(counts.send_variables, 1);
+        assert_eq!(counts.calc_variables, 2099);
+        assert_eq!(counts.total(), 2101);
+        assert_eq!(data_names.len(), 2100);
+        assert!(data_names.contains(&"base".to_string()));
+        assert!(data_names.contains(&"calc_2098".to_string()));
+        assert!(!data_names.iter().any(|name| name.contains("Group_")));
     }
 }

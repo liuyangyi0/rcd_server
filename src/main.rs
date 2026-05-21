@@ -23,6 +23,7 @@ use rcd_server::config;
 use rcd_server::csv_parser::{self, DeviceConfig};
 use rcd_server::file_scanner;
 use rcd_server::model::{Command, SystemState};
+use rcd_server::runtime_cache::LatestStatusCache;
 use rcd_server::serial::manager::SerialConfig;
 use rcd_server::serial::port_config::SerialPortConfig;
 use rcd_server::serial::worker::spawn_serial_worker;
@@ -52,6 +53,7 @@ async fn main() -> tokio::io::Result<()> {
 
     // 全局广播器：串口数据会广播到所有订阅者（OPC UA / TCP 客户端）
     let broadcaster = Broadcaster::new();
+    let latest_status_cache = LatestStatusCache::new();
 
     // 加载配置
     let software_config = config::init_config().expect("加载配置文件失败");
@@ -95,6 +97,7 @@ async fn main() -> tokio::io::Result<()> {
         &software_config,
         system_state.clone(),
         system_record.clone(),
+        latest_status_cache.clone(),
         cancel.clone(),
     )
     .await
@@ -134,6 +137,7 @@ async fn main() -> tokio::io::Result<()> {
                 system_record,
                 txs,
                 calc_engine,
+                latest_status_cache,
                 cancel.clone(),
             )
             .await
@@ -186,6 +190,7 @@ async fn init_serial_ports(
     software_config: &config::Config,
     system_state: SystemState,
     system_record: Arc<Mutex<BoundedVecDeque<String>>>,
+    latest_status_cache: LatestStatusCache,
     cancel: CancellationToken,
 ) -> io::Result<(
     Vec<SerialPortConfig>,
@@ -209,7 +214,10 @@ async fn init_serial_ports(
         println!(
             "已加载 {} 个串口, 共 {} 个设备",
             serial_port_configs.len(),
-            serial_port_configs.iter().map(|c| c.devices.len()).sum::<usize>(),
+            serial_port_configs
+                .iter()
+                .map(|c| c.devices.len())
+                .sum::<usize>(),
         )
     }
 
@@ -237,6 +245,7 @@ async fn init_serial_ports(
             software_config.clone(),
             system_state.clone(),
             system_record.clone(),
+            latest_status_cache.clone(),
             cancel.clone(),
         );
         handles.push(handle);

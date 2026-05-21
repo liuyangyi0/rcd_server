@@ -13,5 +13,6 @@ pub mod csv_parser;
 pub mod file_scanner;
 pub mod model;
 pub mod protocol;
+pub mod runtime_cache;
 pub mod serial;
 pub mod server;

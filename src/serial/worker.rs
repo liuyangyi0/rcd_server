@@ -21,6 +21,7 @@ use crate::config;
 use crate::config::RunLocation;
 use crate::model::{get_sum, Command, CommandType, SendData, SystemState};
 use crate::protocol::{cmd, threshold};
+use crate::runtime_cache::LatestStatusCache;
 
 // ============================================================
 //  串口线程入口
@@ -39,6 +40,7 @@ pub fn spawn_serial_worker(
     software_config: config::Config,
     system_state: SystemState,
     system_record: Arc<Mutex<BoundedVecDeque<String>>>,
+    latest_status_cache: LatestStatusCache,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
@@ -47,6 +49,7 @@ pub fn spawn_serial_worker(
             serial_config,
             port_config,
             broadcaster,
+            latest_status_cache,
             software_config.server.run_on,
             software_config.server.current_run,
             system_record,
