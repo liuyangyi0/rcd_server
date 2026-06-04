@@ -22,6 +22,7 @@ use rcd_server::calc_engine::engine::CalcEngine;
 use rcd_server::config;
 use rcd_server::csv_parser::{self, DeviceConfig};
 use rcd_server::file_scanner;
+use rcd_server::logging;
 use rcd_server::model::{Command, SystemState};
 use rcd_server::runtime_cache::LatestStatusCache;
 use rcd_server::serial::manager::SerialConfig;
@@ -35,7 +36,7 @@ use rcd_server::server::opcua::run_opcua_server;
 
 #[tokio::main]
 async fn main() -> tokio::io::Result<()> {
-    env_logger::init();
+    let _logger = logging::init();
 
     // 全局取消信号：Ctrl+C / 服务器异常退出时通知所有子任务
     let cancel = CancellationToken::new();

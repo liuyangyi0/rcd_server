@@ -19,6 +19,7 @@ use serialport::{DataBits, Parity, SerialPort, StopBits};
 use super::port_config::SerialPortConfig;
 use crate::broadcast::Broadcaster;
 use crate::config::RunLocation;
+use crate::logging;
 use crate::model::{DeviceStatus, SendData};
 use crate::protocol::{self, threshold};
 use crate::runtime_cache::LatestStatusCache;
@@ -259,9 +260,9 @@ impl SerialManager {
     // ---- 数据发送 ----
 
     /// 向设备发送命令帧。
-    pub(crate) fn send_command(&mut self, mut command: SendData) {
+    pub(crate) fn send_command(&mut self, command: SendData) -> bool {
         if command.command.is_empty() {
-            return;
+            return false;
         }
         //info!("串口 {} 发送数据: {}", self.serial_config.port_name, format_hex(&command.command));
         println!(
@@ -269,33 +270,42 @@ impl SerialManager {
             self.serial_config.port_name,
             format_hex(&command.command)
         );
-        info!(
-            "串口 {} 发送数据: {}",
-            self.serial_config.port_name,
-            format_hex(&command.command)
-        );
+        if logging::serial_frame_logs_enabled() {
+            info!(
+                "串口 {} 发送数据: {}",
+                self.serial_config.port_name,
+                format_hex(&command.command)
+            );
+        }
 
         // 特殊串口：直接写入全部数据
         if self.port_config.is_special {
             match self.port {
                 Some(ref mut port) => {
-                    if let Err(e) = port.write(&command.command) {
+                    if let Err(e) = port.write_all(&command.command) {
                         error!("写入错误: {:?}", e);
                         self.port = None;
                         self.reconnect();
+                        return false;
                     }
-                    return;
+                    if let Err(e) = port.flush() {
+                        error!("刷新串口输出错误: {:?}", e);
+                        self.port = None;
+                        self.reconnect();
+                        return false;
+                    }
+                    return true;
                 }
                 None => {
                     self.reconnect();
-                    return;
+                    return false;
                 }
             }
         }
 
         // 普通串口：地址字节使用 Mark 校验，数据部分使用 Space 校验
-        let addr_byte = vec![command.command[0]];
-        command.command.remove(0);
+        let addr_byte = [command.command[0]];
+        let payload = &command.command[1..];
 
         // 发送地址字节（Mark 奇偶校验）
         match self.port {
@@ -304,18 +314,24 @@ impl SerialManager {
                     error!("设置 Mark 校验失败: {:?}", e);
                     self.port = None;
                     self.reconnect();
-                    return;
+                    return false;
                 }
-                if let Err(e) = port.write(&addr_byte) {
+                if let Err(e) = port.write_all(&addr_byte) {
                     warn!("写入地址字节错误: {:?}", e);
-                    self.restore_parity();
-                    return;
+                    self.port = None;
+                    self.reconnect();
+                    return false;
                 }
-                let _ = port.flush();
+                if let Err(e) = port.flush() {
+                    error!("刷新地址字节错误: {:?}", e);
+                    self.port = None;
+                    self.reconnect();
+                    return false;
+                }
             }
             None => {
                 self.reconnect();
-                return;
+                return false;
             }
         }
 
@@ -329,19 +345,24 @@ impl SerialManager {
                     error!("设置 Space 校验失败: {:?}", e);
                     self.port = None;
                     self.reconnect();
-                    return;
+                    return false;
                 }
-                if let Err(e) = port.write(&command.command) {
+                if let Err(e) = port.write_all(payload) {
                     error!("写入数据部分错误: {:?}", e);
                     self.port = None;
                     self.reconnect();
-                    return;
+                    return false;
                 }
-                // let _ = port.flush();
+                if let Err(e) = port.flush() {
+                    error!("刷新数据部分错误: {:?}", e);
+                    self.port = None;
+                    self.reconnect();
+                    return false;
+                }
             }
             None => {
                 self.reconnect();
-                return;
+                return false;
             }
         }
 
@@ -349,13 +370,14 @@ impl SerialManager {
         std::thread::sleep(Duration::from_millis(2));
 
         // 恢复原始校验位，供后续 receive_data 使用
-        // self.restore_parity();
+        self.restore_parity();
+        true
     }
 
     /// 将串口校验位恢复为配置文件中指定的原始值。
     fn restore_parity(&mut self) {
         if let Some(ref mut port) = self.port {
-            if let Err(e) = port.set_parity(Parity::None) {
+            if let Err(e) = port.set_parity(self.serial_config.parity) {
                 error!("恢复校验位失败: {:?}", e);
             }
         }
@@ -383,7 +405,6 @@ impl SerialManager {
             match port.read(&mut self.read_buf[total..]) {
                 Ok(0) => break,
                 Ok(n) => {
-                    println!("duqudao");
                     total += n;
                     // 已读到帧头(3字节)时，可计算期望帧长
                     if total >= 3 {
@@ -430,11 +451,13 @@ impl SerialManager {
             self.serial_config.port_name,
             format_hex(&frame)
         );
-        info!(
-            "串口 {} 原始数据: {}",
-            self.serial_config.port_name,
-            format_hex(&frame)
-        );
+        if logging::serial_frame_logs_enabled() {
+            info!(
+                "串口 {} 原始数据: {}",
+                self.serial_config.port_name,
+                format_hex(&frame)
+            );
+        }
 
         // ---- 解析数据帧 ----
         match protocol::parse_data_packet(&frame) {
@@ -444,10 +467,12 @@ impl SerialManager {
 
                 let dev = &self.port_config.devices[self.index];
                 let parsed = protocol::parse_status(&packet.status, &dev.records);
-                info!(
-                    "串口 {} 解析数据: {:?}",
-                    self.serial_config.port_name, parsed
-                );
+                if logging::serial_frame_logs_enabled() {
+                    info!(
+                        "串口 {} 解析数据: {:?}",
+                        self.serial_config.port_name, parsed
+                    );
+                }
                 let status = DeviceStatus {
                     id: dev.config.com_index as u64,
                     device_id: dev.config.device_id,
