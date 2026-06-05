@@ -186,6 +186,10 @@ fn build_full_sync_updates<'a>(
     kks_node_map: &'a HashMap<String, NodeId>,
     calc_runner: &mut CalcRunner,
 ) -> Vec<OpcuaValueUpdate<'a>> {
+    if statuses.is_empty() {
+        return Vec::new();
+    }
+
     let value_count = statuses.iter().map(|s| s.value.len()).sum();
     let mut updates = Vec::with_capacity(value_count);
     for status in statuses {
@@ -197,6 +201,25 @@ fn build_full_sync_updates<'a>(
         &mut updates,
     );
     updates
+}
+
+fn build_config_zero_statuses(serial_ports: &[SerialPortConfig]) -> Vec<DeviceStatus> {
+    let mut statuses = Vec::new();
+    for port in serial_ports {
+        for device in &port.devices {
+            let zero_data = vec![0u8; device.config.data_len as usize];
+            statuses.push(DeviceStatus {
+                id: device.config.com_index as u64,
+                device_id: device.config.device_id,
+                com: port.port_number.clone(),
+                com_status: false,
+                device_status: false,
+                value: crate::protocol::parse_status(&zero_data, &device.records),
+                raw_data: zero_data,
+            });
+        }
+    }
+    statuses
 }
 
 // ============================================================
@@ -313,7 +336,11 @@ pub async fn run_opcua_server(
     register_send_methods(&node_manager, ns, &serial_ports, &txs);
 
     let mut calc_runner = CalcRunner::new(calc_engine.clone());
-    let initial_statuses = latest_status_cache.snapshot_statuses();
+    let mut initial_statuses = latest_status_cache.snapshot_statuses();
+    let initial_statuses_from_config = initial_statuses.is_empty();
+    if initial_statuses_from_config {
+        initial_statuses = build_config_zero_statuses(&serial_ports);
+    }
     let initial_updates =
         build_full_sync_updates(&initial_statuses, &kks_node_map, &mut calc_runner);
     if !initial_updates.is_empty() {
@@ -322,10 +349,17 @@ pub async fn run_opcua_server(
             .map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("OPC UA 缓存预热失败: {e:?}"))
             })?;
-        info!(
-            "[OPC UA] 已用最新值缓存预热: 设备状态={} 条",
-            initial_statuses.len()
-        );
+        if initial_statuses_from_config {
+            info!(
+                "[OPC UA] 最新值缓存为空，已用配置零值预热: 设备状态={} 条",
+                initial_statuses.len()
+            );
+        } else {
+            info!(
+                "[OPC UA] 已用最新值缓存预热: 设备状态={} 条",
+                initial_statuses.len()
+            );
+        }
     } else {
         info!("[OPC UA] 最新值缓存为空，节点保持初始值等待首帧数据");
     }
@@ -1045,5 +1079,39 @@ mod tests {
         assert!(data_names.contains(&"base".to_string()));
         assert!(data_names.contains(&"calc_2098".to_string()));
         assert!(!data_names.iter().any(|name| name.contains("Group_")));
+    }
+
+    #[test]
+    fn full_sync_with_empty_cache_does_not_evaluate_calc_rules() {
+        let engine = Arc::new(make_calc_engine(vec![("always_one", "uint", "1")]));
+        let mut runner = CalcRunner::new(engine);
+        let mut kks_node_map = HashMap::new();
+        kks_node_map.insert("always_one".to_string(), NodeId::new(1, "always_one"));
+
+        let updates = build_full_sync_updates(&[], &kks_node_map, &mut runner);
+
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn config_zero_statuses_seed_all_configured_variables() {
+        let port = make_port(
+            "ttyAP0",
+            vec![make_device(11, &["9CYE91GH201_READY", "9CYE91GH201_SL1"])],
+        );
+
+        let statuses = build_config_zero_statuses(&[port]);
+
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].com, "ttyAP0");
+        assert_eq!(statuses[0].device_id, 11);
+        assert_eq!(
+            statuses[0].value.get("9CYE91GH201_READY"),
+            Some(&Value::UInt(0))
+        );
+        assert_eq!(
+            statuses[0].value.get("9CYE91GH201_SL1"),
+            Some(&Value::UInt(0))
+        );
     }
 }

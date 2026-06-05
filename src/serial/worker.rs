@@ -289,20 +289,34 @@ fn run_primary_cycle(manager: &mut SerialManager) -> bool {
 
     // 构造轮询查询命令
     let dev = &manager.port_config.devices[idx];
+    let device_id = dev.config.device_id;
+    let data_len = dev.config.data_len;
     let mut frame = vec![
-        dev.config.device_id,
+        device_id,
         cmd::READ_STATUS,
         cmd::READ_SUBCMD,
         cmd::STATUS_PAGE,
         cmd::STATUS_OFFSET,
-        dev.config.data_len,
+        data_len,
     ];
     frame.push(get_sum(&frame));
 
-    manager.send_command(SendData {
+    info!(
+        "串口 {} 准备发送轮询: index={}, device_id={}, data_len={}",
+        manager.serial_config.port_name, idx, device_id, data_len
+    );
+
+    let sent = manager.send_command(SendData {
         device_id: 1,
         command: frame,
-    })
+    });
+
+    info!(
+        "串口 {} 轮询发送完成: index={}, device_id={}, success={}",
+        manager.serial_config.port_name, idx, device_id, sent
+    );
+
+    sent
 }
 
 /// 备机模式的一次轮询周期。
