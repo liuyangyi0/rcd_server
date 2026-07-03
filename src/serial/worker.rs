@@ -6,7 +6,7 @@
 //! 运行同步串口 I/O，通过 `Handle` 桥接异步操作。
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,18 +15,26 @@ use log::{error, info, warn};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::manager::{SerialConfig, SerialManager};
+use super::manager::{QueuedCommand, SerialConfig, SerialManager};
 use super::port_config::SerialPortConfig;
 use crate::broadcast::Broadcaster;
 use crate::config;
 use crate::config::RunLocation;
-use crate::model::{get_sum, Command, CommandType, SendData, SystemState};
+use crate::model::{
+    get_sum, Command, CommandAckStatus, CommandAckUpdate, CommandType, SendData, SystemState,
+};
 use crate::protocol::{cmd, threshold};
 use crate::runtime_cache::LatestStatusCache;
 
 const WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_COMMANDS_PER_CYCLE: usize = 1024;
 const SLOW_RECEIVE_LOG_THRESHOLD: Duration = Duration::from_secs(2);
+
+enum CycleResult {
+    Idle,
+    NormalReceive,
+    CommandHandled,
+}
 
 // ============================================================
 //  串口线程入口
@@ -42,6 +50,7 @@ pub fn spawn_serial_worker(
     serial_config: SerialConfig,
     port_config: SerialPortConfig,
     rx: Receiver<Command>,
+    ack_status_tx: Sender<CommandAckUpdate>,
     software_config: config::Config,
     system_state: SystemState,
     system_record: Arc<Mutex<BoundedVecDeque<String>>>,
@@ -51,13 +60,17 @@ pub fn spawn_serial_worker(
     tokio::task::spawn_blocking(move || {
         let port_name = serial_config.port_name.clone();
         let result = catch_unwind(AssertUnwindSafe(|| {
+            let poll_interval = Duration::from_millis(software_config.settings.poll_interval_ms);
+            let command_retry_count = software_config.settings.command_retry_count.max(1);
+            let run_on = software_config.server.run_on.clone();
+            let current_run = software_config.server.current_run.clone();
             let mut manager = SerialManager::new(
                 serial_config,
                 port_config,
                 broadcaster,
                 latest_status_cache,
-                software_config.server.run_on,
-                software_config.server.current_run,
+                run_on,
+                current_run,
                 system_record,
             );
 
@@ -101,10 +114,14 @@ pub fn spawn_serial_worker(
                     continue;
                 }
 
-                // 根据主/备角色决定行为，返回是否已发送命令（需要接收响应）
-                let should_receive = match manager.current_run {
-                    RunLocation::Primary => run_primary_cycle(&mut manager),
-                    RunLocation::Secondary => run_secondary_cycle(&mut manager),
+                // 根据主/备角色决定行为。
+                let cycle_result = match manager.current_run {
+                    RunLocation::Primary => {
+                        run_primary_cycle(&mut manager, &ack_status_tx, command_retry_count)
+                    }
+                    RunLocation::Secondary => {
+                        run_secondary_cycle(&mut manager, &ack_status_tx, command_retry_count)
+                    }
                 };
 
                 if manager.current_run == RunLocation::Secondary {
@@ -113,7 +130,7 @@ pub fn spawn_serial_worker(
                         &mut last_idle_log,
                         "当前是备机监听模式，不主动轮询发送",
                     );
-                } else if !should_receive {
+                } else if matches!(cycle_result, CycleResult::Idle) {
                     log_idle_reason(
                         &port_name,
                         &mut last_idle_log,
@@ -122,7 +139,7 @@ pub fn spawn_serial_worker(
                 }
 
                 // 仅在实际发送了命令（或备机监听模式）时才接收数据
-                if should_receive {
+                if matches!(cycle_result, CycleResult::NormalReceive) {
                     let device_id = manager
                         .port_config
                         .devices
@@ -148,7 +165,7 @@ pub fn spawn_serial_worker(
                 if manager.current_run == RunLocation::Primary {
                     manager.index = (manager.index + 1) % manager.port_config.devices.len();
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(poll_interval);
             }
         }));
 
@@ -209,7 +226,10 @@ fn process_incoming_commands(
             Err(_) => return,
         };
         processed += 1;
-        match cmd.command {
+        let Command {
+            command, ack_id, ..
+        } = cmd;
+        match command {
             CommandType::SendData(data) => {
                 manager
                     .command_queue
@@ -218,7 +238,25 @@ fn process_incoming_commands(
                         warn!("命令队列锁中毒，恢复: {}", e);
                         e.into_inner()
                     })
-                    .push_back(data);
+                    .push_back(QueuedCommand {
+                        data,
+                        report_ack: false,
+                        ack_id,
+                    });
+            }
+            CommandType::SendDataWithAck(data) => {
+                manager
+                    .command_queue
+                    .lock()
+                    .unwrap_or_else(|e| {
+                        warn!("命令队列锁中毒，恢复: {}", e);
+                        e.into_inner()
+                    })
+                    .push_back(QueuedCommand {
+                        data,
+                        report_ack: true,
+                        ack_id,
+                    });
             }
             CommandType::PortStatus(status) => {
                 manager.port_config.status = status.device_status;
@@ -254,19 +292,24 @@ fn process_incoming_commands(
 /// 主机模式的一次轮询周期。
 ///
 /// 返回 `true` 表示已发送命令，需要接收响应；`false` 表示跳过本轮，不需要接收。
-fn run_primary_cycle(manager: &mut SerialManager) -> bool {
+fn run_primary_cycle(
+    manager: &mut SerialManager,
+    ack_status_tx: &Sender<CommandAckUpdate>,
+    command_retry_count: u32,
+) -> CycleResult {
     let mut queue = manager.command_queue.lock().unwrap_or_else(|e| {
         warn!("命令队列锁中毒，恢复: {}", e);
         e.into_inner()
     });
     if let Some(cmd) = queue.pop_front() {
         drop(queue);
-        return manager.send_command(cmd);
+        execute_queued_command(manager, cmd, ack_status_tx, command_retry_count);
+        return CycleResult::CommandHandled;
     }
     drop(queue);
 
     if manager.port_config.devices.is_empty() {
-        return false;
+        return CycleResult::Idle;
     }
 
     let idx = manager.index;
@@ -278,13 +321,13 @@ fn run_primary_cycle(manager: &mut SerialManager) -> bool {
         } else {
             manager.device_states[idx].current_round += 1;
             std::thread::sleep(Duration::from_millis(10));
-            return false;
+            return CycleResult::Idle;
         }
     }
 
     if !manager.device_states[idx].is_enabled {
         std::thread::sleep(Duration::from_millis(20));
-        return false;
+        return CycleResult::Idle;
     }
 
     // 构造轮询查询命令
@@ -316,21 +359,99 @@ fn run_primary_cycle(manager: &mut SerialManager) -> bool {
         manager.serial_config.port_name, idx, device_id, sent
     );
 
-    sent
+    if sent {
+        CycleResult::NormalReceive
+    } else {
+        CycleResult::Idle
+    }
 }
 
 /// 备机模式的一次轮询周期。
 ///
 /// 返回 `true` 表示备机始终需要监听数据（主机转发帧）。
-fn run_secondary_cycle(manager: &mut SerialManager) -> bool {
+fn run_secondary_cycle(
+    manager: &mut SerialManager,
+    ack_status_tx: &Sender<CommandAckUpdate>,
+    command_retry_count: u32,
+) -> CycleResult {
     let mut queue = manager.command_queue.lock().unwrap_or_else(|e| {
         warn!("命令队列锁中毒，恢复: {}", e);
         e.into_inner()
     });
     if let Some(cmd) = queue.pop_front() {
         drop(queue);
-        manager.send_command(cmd);
+        if cmd.report_ack {
+            execute_queued_command(manager, cmd, ack_status_tx, command_retry_count);
+            return CycleResult::CommandHandled;
+        }
+        manager.send_command(cmd.data);
     }
     // 备机始终需要监听转发数据
-    true
+    CycleResult::NormalReceive
+}
+
+fn execute_queued_command(
+    manager: &mut SerialManager,
+    command: QueuedCommand,
+    ack_status_tx: &Sender<CommandAckUpdate>,
+    command_retry_count: u32,
+) -> bool {
+    if !command.report_ack {
+        return manager.send_command(command.data);
+    }
+
+    execute_command_with_ack(
+        manager,
+        command.data,
+        command.ack_id,
+        ack_status_tx,
+        command_retry_count,
+    )
+}
+
+fn execute_command_with_ack(
+    manager: &mut SerialManager,
+    command: SendData,
+    ack_id: Option<u64>,
+    ack_status_tx: &Sender<CommandAckUpdate>,
+    command_retry_count: u32,
+) -> bool {
+    let attempts = command_retry_count.max(1);
+    for attempt in 1..=attempts {
+        info!(
+            "串口 {} 下发命令 ACK 尝试 {}/{}",
+            manager.serial_config.port_name, attempt, attempts
+        );
+        if !manager.send_command(command.clone()) {
+            send_ack_status(manager, ack_status_tx, ack_id, CommandAckStatus::Failed);
+            return false;
+        }
+
+        send_ack_status(manager, ack_status_tx, ack_id, CommandAckStatus::Waiting);
+        if manager.receive_command_ack() {
+            send_ack_status(manager, ack_status_tx, ack_id, CommandAckStatus::Received);
+            return true;
+        }
+    }
+
+    send_ack_status(manager, ack_status_tx, ack_id, CommandAckStatus::Failed);
+    false
+}
+
+fn send_ack_status(
+    manager: &SerialManager,
+    ack_status_tx: &Sender<CommandAckUpdate>,
+    ack_id: Option<u64>,
+    status: CommandAckStatus,
+) {
+    if let Err(e) = ack_status_tx.send(CommandAckUpdate {
+        com: manager.port_config.port_number.clone(),
+        ack_id,
+        status,
+    }) {
+        warn!(
+            "串口 {} 命令 ACK 状态回写通道发送失败: {:?}",
+            manager.serial_config.port_name, e
+        );
+    }
 }

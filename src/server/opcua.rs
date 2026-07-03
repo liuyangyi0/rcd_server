@@ -6,8 +6,8 @@
 pub const OPCUA_BIND_HOST: &str = "0.0.0.0";
 /// OPC UA 默认监听端口。
 pub const OPCUA_BIND_PORT: u16 = 4840;
-/// 写命令节点轮询间隔。
-pub const SEND_NODE_POLL_INTERVAL_MS: u64 = 200;
+/// 命令 ACK 状态回写检查间隔。
+pub const ACK_STATUS_DRAIN_INTERVAL_MS: u64 = 50;
 /// OPC UA 大批量 Browse / 订阅的变量数余量。
 pub const OPCUA_LIMIT_MARGIN: usize = 512;
 /// OPC UA 大批量响应的最小消息上限。
@@ -18,8 +18,9 @@ pub const OPCUA_MIN_MAX_CHUNK_COUNT: usize = 256;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bounded_vec_deque::BoundedVecDeque;
 use log::{info, warn};
@@ -29,7 +30,10 @@ use crate::broadcast::Broadcaster;
 use crate::calc_engine::config::{normalize_data_type, CalcDataType};
 use crate::calc_engine::engine::CalcEngine;
 use crate::calc_engine::runner::CalcRunner;
-use crate::model::{get_sum, Command, CommandType, DeviceStatus, SendData, SystemState, Value};
+use crate::model::{
+    get_sum, Command, CommandAckStatus, CommandAckUpdate, CommandType, DeviceStatus, SendData,
+    SystemState, Value,
+};
 use crate::protocol::hex_str_to_bytes;
 use crate::runtime_cache::LatestStatusCache;
 use crate::serial::port_config::SerialPortConfig;
@@ -45,8 +49,8 @@ use opcua::server::{
     ServerBuilder, ServerEndpoint, ServerUserToken, SubscriptionCache, ANONYMOUS_USER_TOKEN_ID,
 };
 use opcua::types::{
-    BuildInfo, DataEncoding, DataTypeId, DataValue, DateTime as UaDateTime, NodeId, NumericRange,
-    ObjectId, StatusCode, TimestampsToReturn, UAString, Variant,
+    BuildInfo, DataTypeId, DataValue, DateTime as UaDateTime, NodeId, NumericRange, ObjectId,
+    StatusCode, UAString, Variant,
 };
 
 // ============================================================
@@ -94,6 +98,26 @@ fn value_to_variant(v: &Value) -> Variant {
 }
 
 type OpcuaValueUpdate<'a> = (&'a NodeId, Option<&'a NumericRange>, DataValue);
+
+pub fn command_pending_timeout(timeout_ms: u64, command_retry_count: u32) -> Duration {
+    let attempts = u64::from(command_retry_count.max(1));
+    let timeout = timeout_ms.saturating_mul(attempts).saturating_add(2_000);
+    Duration::from_millis(timeout.max(5_000))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingCommand {
+    ack_id: u64,
+    deadline: Instant,
+}
+
+#[derive(Clone)]
+struct SendNodeWriteContext {
+    system_record: Arc<Mutex<BoundedVecDeque<String>>>,
+    pending_commands: Arc<Mutex<HashMap<String, PendingCommand>>>,
+    local_ack_status_tx: mpsc::Sender<CommandAckUpdate>,
+    command_pending_timeout: Duration,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OpcuaVariableCounts {
@@ -234,12 +258,15 @@ fn build_config_zero_statuses(serial_ports: &[SerialPortConfig]) -> Vec<DeviceSt
 /// - 计算衍生节点（只读）：纯 `kks_calc`，如 `91UGM91110_Fire`。
 /// - 写命令节点（可写）：`<串口号>_Send`，如 `ttyAP0_Send`，
 ///   客户端可通过写入十六进制字符串向设备下发命令。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_opcua_server(
     serial_ports: Vec<SerialPortConfig>,
     broadcaster: Broadcaster,
     _system_state: SystemState,
     _system_record: Arc<Mutex<BoundedVecDeque<String>>>,
     txs: Vec<mpsc::Sender<Command>>,
+    ack_status_rx: mpsc::Receiver<CommandAckUpdate>,
+    command_pending_timeout: Duration,
     calc_engine: Arc<CalcEngine>,
     latest_status_cache: LatestStatusCache,
     cancel: CancellationToken,
@@ -331,9 +358,30 @@ pub async fn run_opcua_server(
     );
     let send_node_ids = opcua_nodes.send_node_ids;
     let kks_node_map = opcua_nodes.kks_node_map;
+    let pending_commands = Arc::new(Mutex::new(HashMap::<String, PendingCommand>::new()));
+    let next_ack_id = Arc::new(AtomicU64::new(1));
+    let (local_ack_status_tx, local_ack_status_rx) = mpsc::channel::<CommandAckUpdate>();
+    let send_write_context = SendNodeWriteContext {
+        system_record: _system_record.clone(),
+        pending_commands: pending_commands.clone(),
+        local_ack_status_tx,
+        command_pending_timeout,
+    };
+    let tx_by_com: HashMap<String, mpsc::Sender<Command>> = serial_ports
+        .iter()
+        .zip(txs.iter())
+        .map(|(port, tx)| (port.port_number.clone(), tx.clone()))
+        .collect();
 
     // ---- 注册 Method 回调 ----
     register_send_methods(&node_manager, ns, &serial_ports, &txs);
+    register_send_node_write_callbacks(
+        &node_manager,
+        &send_node_ids,
+        &tx_by_com,
+        send_write_context,
+        next_ack_id,
+    );
 
     let mut calc_runner = CalcRunner::new(calc_engine.clone());
     let mut initial_statuses = latest_status_cache.snapshot_statuses();
@@ -407,38 +455,30 @@ pub async fn run_opcua_server(
         }
     });
 
-    // ---- 任务 2: 监听客户端写命令节点 ----
-    let nm_send = node_manager.clone();
-    let subs_send = subscriptions.clone();
-    let txs_clone = txs.clone();
-    let serial_ports_clone = serial_ports.clone();
-    let system_record_clone = _system_record.clone();
-    let cancel_poll = cancel.clone();
+    // ---- 任务 2: 串口命令 ACK -> OPC UA 写命令节点状态回写 ----
+    let nm_ack = node_manager.clone();
+    let subs_ack = subscriptions.clone();
+    let pending_ack = pending_commands.clone();
+    let cancel_ack = cancel.clone();
 
-    let task_poll = tokio::spawn(async move {
+    let task_ack = tokio::spawn(async move {
         loop {
             tokio::select! {
                 biased;
-                _ = cancel_poll.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_millis(SEND_NODE_POLL_INTERVAL_MS)) => {}
+                _ = cancel_ack.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis(ACK_STATUS_DRAIN_INTERVAL_MS)) => {}
             }
 
-            let to_clear = poll_and_forward_commands(
-                &nm_send,
+            drain_command_ack_updates(
+                &ack_status_rx,
+                &local_ack_status_rx,
+                &pending_ack,
+                &nm_ack,
+                &subs_ack,
                 &send_node_ids,
-                &serial_ports_clone,
-                &txs_clone,
-                &system_record_clone,
-            )
-            .await;
-
-            // 清零已处理的写命令节点
-            for id in to_clear {
-                let clear_val = DataValue::new_now(Variant::String(UAString::from("0")));
-                let iter = vec![(&id, None, clear_val)].into_iter();
-                if let Err(e) = nm_send.set_values(&subs_send, iter) {
-                    warn!("清零写命令节点失败: {:?}", e);
-                }
+            );
+            for update in collect_expired_pending_commands(&pending_ack, Instant::now()) {
+                write_send_status(&nm_ack, &subs_ack, &send_node_ids, &update);
             }
         }
     });
@@ -461,7 +501,7 @@ pub async fn run_opcua_server(
     // 服务器退出后，确保取消信号触发 + 等待子任务收尾
     cancel.cancel();
     let _ = task_update.await;
-    let _ = task_poll.await;
+    let _ = task_ack.await;
 
     result
 }
@@ -766,7 +806,7 @@ fn register_send_methods(
                     return Err(StatusCode::BadInvalidArgument);
                 }
 
-                match forward_hex_command(hex_str, &com, &tx) {
+                match forward_hex_command(hex_str, &com, &tx, false) {
                     Ok(msg) => Ok(vec![Variant::String(UAString::from(msg))]),
                     Err(msg) => {
                         warn!("Method 调用失败: {}", msg);
@@ -777,13 +817,105 @@ fn register_send_methods(
     }
 }
 
-/// 解析十六进制字符串并转发到串口线程（同步，供 Method 回调和轮询共用）。
-fn forward_hex_command(
-    hex_str: &str,
+fn register_send_node_write_callbacks(
+    node_manager: &Arc<SimpleNodeManager>,
+    send_node_ids: &[(String, NodeId)],
+    tx_by_com: &HashMap<String, mpsc::Sender<Command>>,
+    context: SendNodeWriteContext,
+    next_ack_id: Arc<AtomicU64>,
+) {
+    for (com, node_id) in send_node_ids {
+        let Some(tx) = tx_by_com.get(com).cloned() else {
+            warn!("写命令节点回调注册失败，未找到串口 {} 的命令通道", com);
+            continue;
+        };
+        let com = com.clone();
+        let context = context.clone();
+        let next_ack_id = next_ack_id.clone();
+
+        node_manager
+            .inner()
+            .add_write_callback(node_id.clone(), move |data_value, _range| {
+                let ack_id = next_ack_id.fetch_add(1, Ordering::Relaxed);
+                handle_send_node_write(data_value, &com, &tx, &context, ack_id)
+            });
+    }
+}
+
+fn handle_send_node_write(
+    data_value: DataValue,
     com: &str,
     tx: &mpsc::Sender<Command>,
-) -> Result<String, String> {
-    // 移除空格，支持 "0A 1B FF" 格式
+    context: &SendNodeWriteContext,
+    ack_id: u64,
+) -> StatusCode {
+    let Some(Variant::String(hex_ua)) = data_value.value else {
+        return StatusCode::BadTypeMismatch;
+    };
+    let hex_str = hex_ua.as_ref().trim();
+    if is_send_node_idle_or_status(hex_str) {
+        return StatusCode::Good;
+    }
+
+    let cmd = match build_hex_command(hex_str, com, true, Some(ack_id)) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            warn!("OPC 写命令无效: 串口={}, 数据={}, 错误={}", com, hex_str, e);
+            return StatusCode::BadInvalidArgument;
+        }
+    };
+
+    let mut pending = context.pending_commands.lock().unwrap_or_else(|e| {
+        warn!("命令 pending 状态锁中毒，恢复: {}", e);
+        e.into_inner()
+    });
+    if pending.contains_key(com) {
+        return StatusCode::BadWaitingForResponse;
+    }
+
+    if let Err(e) = tx.send(cmd) {
+        warn!("转发命令到串口失败: 串口={}, 错误={:?}", com, e);
+        return StatusCode::BadResourceUnavailable;
+    }
+    pending.insert(
+        com.to_string(),
+        PendingCommand {
+            ack_id,
+            deadline: Instant::now() + context.command_pending_timeout,
+        },
+    );
+    drop(pending);
+
+    if let Err(e) = context.local_ack_status_tx.send(CommandAckUpdate {
+        com: com.to_string(),
+        ack_id: Some(ack_id),
+        status: CommandAckStatus::Waiting,
+    }) {
+        warn!("本地 ACK 等待状态入队失败: 串口={}, 错误={:?}", com, e);
+    }
+
+    info!("收到 OPC 客户端写命令: 串口 {} 数据 {}", com, hex_str);
+    let local = chrono::Local::now();
+    let mut record = context.system_record.lock().unwrap_or_else(|e| {
+        warn!("系统操作记录锁中毒，恢复: {}", e);
+        e.into_inner()
+    });
+    record.push_back(format!(
+        "时间: {} 串口: {} 数据: {}",
+        local.format("%Y-%m-%d %H:%M:%S"),
+        com,
+        hex_str,
+    ));
+
+    StatusCode::Good
+}
+
+fn build_hex_command(
+    hex_str: &str,
+    com: &str,
+    with_ack: bool,
+    ack_id: Option<u64>,
+) -> Result<Command, String> {
     let cleaned: String = hex_str
         .chars()
         .filter(|c| !c.is_ascii_whitespace())
@@ -798,78 +930,171 @@ fn forward_hex_command(
         device_id,
         command: bytes,
     };
-    let cmd = Command {
+    Ok(Command {
         com: com.to_string(),
-        command: CommandType::SendData(send_data),
+        command: if with_ack {
+            CommandType::SendDataWithAck(send_data)
+        } else {
+            CommandType::SendData(send_data)
+        },
+        ack_id: if with_ack { ack_id } else { None },
+    })
+}
+
+/// 解析十六进制字符串并转发到串口线程（同步，供 Method 回调共用）。
+fn forward_hex_command(
+    hex_str: &str,
+    com: &str,
+    tx: &mpsc::Sender<Command>,
+    with_ack: bool,
+) -> Result<String, String> {
+    let cmd = build_hex_command(hex_str, com, with_ack, None)?;
+    let device_id = match &cmd.command {
+        CommandType::SendData(data) | CommandType::SendDataWithAck(data) => data.device_id,
+        CommandType::PortStatus(_) | CommandType::DeviceSetting(_) => 0,
     };
     tx.send(cmd)
         .map_err(|e| format!("转发命令到串口失败: {:?}", e))?;
     Ok(format!("已发送到 {} 设备 {}", com, device_id))
 }
 
-/// 轮询写命令节点，转发命令到串口线程，返回需要清零的节点 ID 列表。
-async fn poll_and_forward_commands(
-    nm: &Arc<SimpleNodeManager>,
+fn is_send_node_idle_or_status(value: &str) -> bool {
+    matches!(value, "" | "0" | "1" | "2" | "3")
+}
+
+fn drain_command_ack_updates(
+    ack_status_rx: &mpsc::Receiver<CommandAckUpdate>,
+    local_ack_status_rx: &mpsc::Receiver<CommandAckUpdate>,
+    pending_commands: &Arc<Mutex<HashMap<String, PendingCommand>>>,
+    node_manager: &Arc<SimpleNodeManager>,
+    subscriptions: &Arc<SubscriptionCache>,
     send_node_ids: &[(String, NodeId)],
-    serial_ports: &[SerialPortConfig],
-    txs: &[mpsc::Sender<Command>],
-    system_record: &Arc<Mutex<BoundedVecDeque<String>>>,
-) -> Vec<NodeId> {
-    let mut to_clear = Vec::new();
-    let address_space = nm.address_space().read();
+) {
+    while let Ok(update) = ack_status_rx.try_recv() {
+        process_command_ack_update(
+            update,
+            pending_commands,
+            node_manager,
+            subscriptions,
+            send_node_ids,
+        );
+    }
+    while let Ok(update) = local_ack_status_rx.try_recv() {
+        process_command_ack_update(
+            update,
+            pending_commands,
+            node_manager,
+            subscriptions,
+            send_node_ids,
+        );
+    }
+}
 
-    for (com, node_id) in send_node_ids {
-        let node = match address_space.find_node(node_id) {
-            Some(n) => n,
-            None => continue,
-        };
+fn process_command_ack_update(
+    update: CommandAckUpdate,
+    pending_commands: &Arc<Mutex<HashMap<String, PendingCommand>>>,
+    node_manager: &Arc<SimpleNodeManager>,
+    subscriptions: &Arc<SubscriptionCache>,
+    send_node_ids: &[(String, NodeId)],
+) {
+    let should_write = {
+        let mut pending = pending_commands.lock().unwrap_or_else(|e| {
+            warn!("命令 pending 状态锁中毒，恢复: {}", e);
+            e.into_inner()
+        });
+        apply_ack_pending_state(&mut pending, &update)
+    };
 
-        if let NodeType::Variable(var) = node {
-            let dv = var.value(
-                TimestampsToReturn::Both,
-                &NumericRange::default(),
-                &DataEncoding::default(),
-                0.0,
-            );
+    if should_write {
+        write_send_status(node_manager, subscriptions, send_node_ids, &update);
+    }
+}
 
-            if let Some(Variant::String(ref ua_str)) = dv.value {
-                let v = ua_str.as_ref().trim();
-                if v.is_empty() || v == "0" {
-                    continue;
-                }
-
-                info!("收到 OPC 客户端写命令: 串口 {} 数据 {}", com, v);
-
-                if let Some((idx, _)) = serial_ports
-                    .iter()
-                    .enumerate()
-                    .find(|(_, p)| &p.port_number == com)
-                {
-                    match forward_hex_command(v, com, &txs[idx]) {
-                        Ok(msg) => {
-                            info!("{}", msg);
-                            let local = chrono::Local::now();
-                            let mut record =
-                                system_record.lock().unwrap_or_else(|e| e.into_inner());
-                            record.push_back(format!(
-                                "时间: {} 串口: {} 数据: {}",
-                                local.format("%Y-%m-%d %H:%M:%S"),
-                                com,
-                                v,
-                            ));
-                        }
-                        Err(e) => warn!("{}", e),
-                    }
-                } else {
-                    warn!("未找到匹配的串口: {}", com);
-                }
-
-                to_clear.push(node_id.clone());
-            }
-        }
+fn apply_ack_pending_state(
+    pending_commands: &mut HashMap<String, PendingCommand>,
+    update: &CommandAckUpdate,
+) -> bool {
+    let Some(update_ack_id) = update.ack_id else {
+        return false;
+    };
+    let Some(pending) = pending_commands.get(&update.com) else {
+        return false;
+    };
+    if pending.ack_id != update_ack_id {
+        return false;
     }
 
-    to_clear
+    if update.status.is_terminal() {
+        pending_commands.remove(&update.com);
+    }
+    true
+}
+
+fn collect_expired_pending_commands(
+    pending_commands: &Arc<Mutex<HashMap<String, PendingCommand>>>,
+    now: Instant,
+) -> Vec<CommandAckUpdate> {
+    let mut pending = pending_commands.lock().unwrap_or_else(|e| {
+        warn!("命令 pending 状态锁中毒，恢复: {}", e);
+        e.into_inner()
+    });
+    let expired: Vec<(String, u64)> = pending
+        .iter()
+        .filter(|(_, command)| command.deadline <= now)
+        .map(|(com, command)| (com.clone(), command.ack_id))
+        .collect();
+
+    for (com, _) in &expired {
+        pending.remove(com);
+    }
+
+    expired
+        .into_iter()
+        .map(|(com, ack_id)| CommandAckUpdate {
+            com,
+            ack_id: Some(ack_id),
+            status: CommandAckStatus::Failed,
+        })
+        .collect()
+}
+
+fn send_status_variant(status: crate::model::CommandAckStatus) -> Variant {
+    Variant::String(UAString::from(status.as_opc_value()))
+}
+
+fn send_status_data_value(status: crate::model::CommandAckStatus) -> DataValue {
+    DataValue::new_now(send_status_variant(status))
+}
+
+fn send_status_value(status: crate::model::CommandAckStatus) -> &'static str {
+    status.as_opc_value()
+}
+
+#[cfg(test)]
+fn data_value_string(value: &str) -> DataValue {
+    DataValue::new_now(Variant::String(UAString::from(value)))
+}
+
+fn write_send_status(
+    node_manager: &Arc<SimpleNodeManager>,
+    subscriptions: &Arc<SubscriptionCache>,
+    send_node_ids: &[(String, NodeId)],
+    update: &CommandAckUpdate,
+) {
+    let Some((_, node_id)) = send_node_ids.iter().find(|(com, _)| com == &update.com) else {
+        warn!("命令 ACK 状态回写失败，未找到串口节点: {}", update.com);
+        return;
+    };
+
+    let status_value = send_status_value(update.status);
+    let data_value = send_status_data_value(update.status);
+    let iter = vec![(node_id, None, data_value)].into_iter();
+    if let Err(e) = node_manager.set_values(subscriptions, iter) {
+        warn!(
+            "命令 ACK 状态回写失败: 串口={}, 状态={}, 错误={:?}",
+            update.com, status_value, e
+        );
+    }
 }
 
 // ============================================================
@@ -881,6 +1106,7 @@ mod tests {
     use super::*;
     use crate::calc_engine::config::CalcRule;
     use crate::csv_parser::{BitIndex, Config, DeviceConfig, Record};
+    use crate::model::CommandAckStatus;
 
     fn make_record(kks: &str) -> Record {
         Record {
@@ -1113,5 +1339,260 @@ mod tests {
             statuses[0].value.get("9CYE91GH201_SL1"),
             Some(&Value::UInt(0))
         );
+    }
+
+    #[test]
+    fn send_node_ignores_idle_and_status_values() {
+        for value in ["", "0", "1", "2", "3"] {
+            assert!(is_send_node_idle_or_status(value));
+        }
+
+        assert!(!is_send_node_idle_or_status("00 50"));
+        assert!(!is_send_node_idle_or_status("005050"));
+    }
+
+    #[test]
+    fn send_node_write_enqueues_ack_command_and_checksum() {
+        let (tx, rx) = mpsc::channel();
+        let (local_tx, local_rx) = mpsc::channel();
+        let system_record = Arc::new(Mutex::new(BoundedVecDeque::<String>::new(10)));
+        let pending = Arc::new(Mutex::new(HashMap::<String, PendingCommand>::new()));
+        let context = SendNodeWriteContext {
+            system_record: system_record.clone(),
+            pending_commands: pending.clone(),
+            local_ack_status_tx: local_tx,
+            command_pending_timeout: Duration::from_secs(5),
+        };
+
+        let status = handle_send_node_write(data_value_string("01 02"), "COM1", &tx, &context, 42);
+
+        assert_eq!(status, StatusCode::Good);
+        let cmd = rx.try_recv().expect("命令应进入串口队列");
+        assert_eq!(cmd.com, "COM1");
+        assert_eq!(cmd.ack_id, Some(42));
+        match cmd.command {
+            CommandType::SendDataWithAck(data) => {
+                assert_eq!(data.device_id, 1);
+                assert_eq!(data.command, vec![0x01, 0x02, 0x03]);
+            }
+            other => panic!("应生成 SendDataWithAck，实际为 {:?}", other),
+        }
+        assert_eq!(pending.lock().unwrap().get("COM1").unwrap().ack_id, 42);
+        let local_update = local_rx.try_recv().expect("应入队本地 Waiting 状态");
+        assert_eq!(local_update.com, "COM1");
+        assert_eq!(local_update.ack_id, Some(42));
+        assert_eq!(local_update.status, CommandAckStatus::Waiting);
+        assert_eq!(system_record.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn send_node_write_ignores_idle_and_status_values() {
+        let (tx, rx) = mpsc::channel();
+        let (local_tx, local_rx) = mpsc::channel();
+        let system_record = Arc::new(Mutex::new(BoundedVecDeque::<String>::new(10)));
+        let pending = Arc::new(Mutex::new(HashMap::<String, PendingCommand>::new()));
+        let context = SendNodeWriteContext {
+            system_record: system_record.clone(),
+            pending_commands: pending.clone(),
+            local_ack_status_tx: local_tx,
+            command_pending_timeout: Duration::from_secs(5),
+        };
+
+        for value in ["", "0", "1", "2", "3"] {
+            let status =
+                handle_send_node_write(data_value_string(value), "COM1", &tx, &context, 42);
+            assert_eq!(status, StatusCode::Good);
+        }
+
+        assert!(rx.try_recv().is_err());
+        assert!(local_rx.try_recv().is_err());
+        assert!(pending.lock().unwrap().is_empty());
+        assert_eq!(system_record.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn send_node_write_rejects_bad_values() {
+        let (tx, rx) = mpsc::channel();
+        let (local_tx, local_rx) = mpsc::channel();
+        let system_record = Arc::new(Mutex::new(BoundedVecDeque::<String>::new(10)));
+        let pending = Arc::new(Mutex::new(HashMap::<String, PendingCommand>::new()));
+        let context = SendNodeWriteContext {
+            system_record: system_record.clone(),
+            pending_commands: pending.clone(),
+            local_ack_status_tx: local_tx,
+            command_pending_timeout: Duration::from_secs(5),
+        };
+
+        assert_eq!(
+            handle_send_node_write(
+                DataValue::new_now(Variant::UInt32(1)),
+                "COM1",
+                &tx,
+                &context,
+                42,
+            ),
+            StatusCode::BadTypeMismatch
+        );
+        assert_eq!(
+            handle_send_node_write(data_value_string("GG"), "COM1", &tx, &context, 42,),
+            StatusCode::BadInvalidArgument
+        );
+        assert_eq!(
+            handle_send_node_write(data_value_string("01"), "COM1", &tx, &context, 42,),
+            StatusCode::BadInvalidArgument
+        );
+
+        assert!(rx.try_recv().is_err());
+        assert!(local_rx.try_recv().is_err());
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn send_node_write_rejects_duplicate_until_terminal_ack() {
+        let (tx, rx) = mpsc::channel();
+        let (local_tx, _local_rx) = mpsc::channel();
+        let system_record = Arc::new(Mutex::new(BoundedVecDeque::<String>::new(10)));
+        let pending = Arc::new(Mutex::new(HashMap::<String, PendingCommand>::new()));
+        let context = SendNodeWriteContext {
+            system_record: system_record.clone(),
+            pending_commands: pending.clone(),
+            local_ack_status_tx: local_tx,
+            command_pending_timeout: Duration::from_secs(5),
+        };
+        pending.lock().unwrap().insert(
+            "COM1".into(),
+            PendingCommand {
+                ack_id: 7,
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
+        );
+
+        assert_eq!(
+            handle_send_node_write(data_value_string("01 02"), "COM1", &tx, &context, 42,),
+            StatusCode::BadWaitingForResponse
+        );
+        assert!(rx.try_recv().is_err());
+
+        apply_ack_pending_state(
+            &mut pending.lock().unwrap(),
+            &CommandAckUpdate {
+                com: "COM1".into(),
+                ack_id: Some(7),
+                status: CommandAckStatus::Received,
+            },
+        );
+
+        assert_eq!(
+            handle_send_node_write(data_value_string("01 02"), "COM1", &tx, &context, 42,),
+            StatusCode::Good
+        );
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn ack_pending_state_waiting_holds_terminal_clears() {
+        let mut pending = HashMap::new();
+        pending.insert(
+            "COM1".into(),
+            PendingCommand {
+                ack_id: 9,
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
+        );
+
+        assert!(apply_ack_pending_state(
+            &mut pending,
+            &CommandAckUpdate {
+                com: "COM1".into(),
+                ack_id: Some(9),
+                status: CommandAckStatus::Waiting,
+            },
+        ));
+        assert_eq!(pending.get("COM1").unwrap().ack_id, 9);
+
+        assert!(!apply_ack_pending_state(
+            &mut pending,
+            &CommandAckUpdate {
+                com: "COM1".into(),
+                ack_id: Some(8),
+                status: CommandAckStatus::Received,
+            },
+        ));
+        assert!(pending.contains_key("COM1"));
+
+        assert!(apply_ack_pending_state(
+            &mut pending,
+            &CommandAckUpdate {
+                com: "COM1".into(),
+                ack_id: Some(9),
+                status: CommandAckStatus::Received,
+            },
+        ));
+        assert!(!pending.contains_key("COM1"));
+
+        pending.insert(
+            "COM1".into(),
+            PendingCommand {
+                ack_id: 10,
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
+        );
+        assert!(apply_ack_pending_state(
+            &mut pending,
+            &CommandAckUpdate {
+                com: "COM1".into(),
+                ack_id: Some(10),
+                status: CommandAckStatus::Failed,
+            },
+        ));
+        assert!(!pending.contains_key("COM1"));
+    }
+
+    #[test]
+    fn expired_pending_commands_emit_failed_and_clear() {
+        let pending = Arc::new(Mutex::new(HashMap::<String, PendingCommand>::new()));
+        let now = Instant::now();
+        pending.lock().unwrap().insert(
+            "COM1".into(),
+            PendingCommand {
+                ack_id: 11,
+                deadline: now - Duration::from_millis(1),
+            },
+        );
+        pending.lock().unwrap().insert(
+            "COM2".into(),
+            PendingCommand {
+                ack_id: 12,
+                deadline: now + Duration::from_secs(1),
+            },
+        );
+
+        let mut updates = collect_expired_pending_commands(&pending, now);
+        updates.sort_by(|a, b| a.com.cmp(&b.com));
+
+        assert_eq!(
+            updates,
+            vec![CommandAckUpdate {
+                com: "COM1".into(),
+                ack_id: Some(11),
+                status: CommandAckStatus::Failed,
+            }]
+        );
+        let guard = pending.lock().unwrap();
+        assert!(!guard.contains_key("COM1"));
+        assert_eq!(guard.get("COM2").unwrap().ack_id, 12);
+    }
+
+    #[test]
+    fn command_pending_timeout_uses_retry_window_with_floor() {
+        assert_eq!(command_pending_timeout(300, 3), Duration::from_secs(5));
+        assert_eq!(command_pending_timeout(2_000, 3), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn ack_status_values_are_stable_opc_strings() {
+        assert_eq!(send_status_value(CommandAckStatus::Received), "1");
+        assert_eq!(send_status_value(CommandAckStatus::Waiting), "2");
+        assert_eq!(send_status_value(CommandAckStatus::Failed), "3");
     }
 }

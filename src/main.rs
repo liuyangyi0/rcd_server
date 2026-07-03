@@ -23,12 +23,12 @@ use rcd_server::config;
 use rcd_server::csv_parser::{self, DeviceConfig};
 use rcd_server::file_scanner;
 use rcd_server::logging;
-use rcd_server::model::{Command, SystemState};
+use rcd_server::model::{Command, CommandAckUpdate, SystemState};
 use rcd_server::runtime_cache::LatestStatusCache;
 use rcd_server::serial::manager::SerialConfig;
 use rcd_server::serial::port_config::SerialPortConfig;
 use rcd_server::serial::worker::spawn_serial_worker;
-use rcd_server::server::opcua::run_opcua_server;
+use rcd_server::server::opcua::{command_pending_timeout, run_opcua_server};
 
 // ============================================================
 //  程序入口
@@ -92,6 +92,8 @@ async fn main() -> tokio::io::Result<()> {
         }
     };
 
+    let (ack_status_tx, ack_status_rx) = mpsc::channel::<CommandAckUpdate>();
+
     // 初始化串口并启动通信线程
     match init_serial_ports(
         broadcaster.clone(),
@@ -99,6 +101,7 @@ async fn main() -> tokio::io::Result<()> {
         system_state.clone(),
         system_record.clone(),
         latest_status_cache.clone(),
+        ack_status_tx,
         cancel.clone(),
     )
     .await
@@ -131,12 +134,18 @@ async fn main() -> tokio::io::Result<()> {
             }
 
             // 启动 OPC UA 服务器（阻塞直到退出或收到取消信号）
+            let opcua_command_pending_timeout = command_pending_timeout(
+                software_config.settings.timeout,
+                software_config.settings.command_retry_count,
+            );
             match run_opcua_server(
                 configs,
                 broadcaster,
                 system_state,
                 system_record,
                 txs,
+                ack_status_rx,
+                opcua_command_pending_timeout,
                 calc_engine,
                 latest_status_cache,
                 cancel.clone(),
@@ -192,6 +201,7 @@ async fn init_serial_ports(
     system_state: SystemState,
     system_record: Arc<Mutex<BoundedVecDeque<String>>>,
     latest_status_cache: LatestStatusCache,
+    ack_status_tx: mpsc::Sender<CommandAckUpdate>,
     cancel: CancellationToken,
 ) -> io::Result<(
     Vec<SerialPortConfig>,
@@ -240,9 +250,11 @@ async fn init_serial_ports(
                 software_config.serial.data_bits,
                 software_config.serial.stop_bits,
                 software_config.serial.parity,
+                Duration::from_millis(software_config.settings.timeout),
             ),
             port_config.clone(),
             rx,
+            ack_status_tx.clone(),
             software_config.clone(),
             system_state.clone(),
             system_record.clone(),

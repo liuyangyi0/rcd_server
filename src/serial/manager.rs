@@ -24,6 +24,8 @@ use crate::model::{DeviceStatus, SendData};
 use crate::protocol::{self, threshold};
 use crate::runtime_cache::LatestStatusCache;
 
+const COMMAND_ACK_BYTES: [u8; 3] = [0x00, 0x50, 0x50];
+
 // ============================================================
 //  串口参数
 // ============================================================
@@ -35,6 +37,7 @@ pub struct SerialConfig {
     pub data_bits: DataBits,
     pub stop_bits: StopBits,
     pub parity: Parity,
+    pub read_timeout: Duration,
 }
 
 impl SerialConfig {
@@ -44,6 +47,7 @@ impl SerialConfig {
         data_bits: DataBits,
         stop_bits: StopBits,
         parity: Parity,
+        read_timeout: Duration,
     ) -> Self {
         Self {
             port_name,
@@ -51,6 +55,7 @@ impl SerialConfig {
             data_bits,
             stop_bits,
             parity,
+            read_timeout,
         }
     }
 }
@@ -112,9 +117,15 @@ impl DeviceRuntimeState {
 // ============================================================
 
 /// 管理单个串口上所有设备的轮询与数据收发。
+pub(crate) struct QueuedCommand {
+    pub(crate) data: SendData,
+    pub(crate) report_ack: bool,
+    pub(crate) ack_id: Option<u64>,
+}
+
 pub(crate) struct SerialManager {
     pub(crate) port: Option<Box<dyn SerialPort>>,
-    pub(crate) command_queue: Arc<Mutex<VecDeque<SendData>>>,
+    pub(crate) command_queue: Arc<Mutex<VecDeque<QueuedCommand>>>,
     pub(crate) serial_config: SerialConfig,
     pub(crate) port_config: SerialPortConfig,
     pub(crate) broadcaster: Broadcaster,
@@ -156,6 +167,7 @@ impl SerialManager {
             serial_config.data_bits,
             serial_config.stop_bits,
             serial_config.parity,
+            serial_config.read_timeout,
         )
         .ok();
 
@@ -208,6 +220,7 @@ impl SerialManager {
             self.serial_config.data_bits,
             self.serial_config.stop_bits,
             self.serial_config.parity,
+            self.serial_config.read_timeout,
         ) {
             Ok(port) => {
                 self.port = Some(port);
@@ -384,6 +397,60 @@ impl SerialManager {
     }
 
     // ---- 数据接收与解析 ----
+
+    /// 读取命令 ACK 回复。
+    ///
+    /// 该路径只用于客户端下发命令后的 ACK 判断，不进入采集帧解析，
+    /// 也不更新设备超时、解析失败、缓存或广播状态。
+    pub(crate) fn receive_command_ack(&mut self) -> bool {
+        let port = match self.port {
+            Some(ref mut p) => p,
+            None => {
+                self.log_record("命令 ACK 读取失败：串口未打开".into());
+                self.reconnect();
+                return false;
+            }
+        };
+
+        let mut total = 0usize;
+        loop {
+            match port.read(&mut self.read_buf[total..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    total += n;
+                    if contains_command_ack(&self.read_buf[..total]) {
+                        if logging::serial_frame_logs_enabled() {
+                            info!(
+                                "串口 {} 命令 ACK: {}",
+                                self.serial_config.port_name,
+                                format_hex(&self.read_buf[..total])
+                            );
+                        }
+                        return true;
+                    }
+                    if total >= self.read_buf.len() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::TimedOut => break,
+                Err(e) => {
+                    error!("读取命令 ACK 错误: {:?}", e);
+                    self.log_record("读取命令 ACK 错误".into());
+                    self.reconnect();
+                    return false;
+                }
+            }
+        }
+
+        if total > 0 {
+            warn!(
+                "串口 {} 命令 ACK 不匹配: {}",
+                self.serial_config.port_name,
+                format_hex(&self.read_buf[..total])
+            );
+        }
+        false
+    }
 
     /// 从串口读取并解析一帧数据。
     ///
@@ -603,6 +670,11 @@ impl SerialManager {
     }
 }
 
+pub(crate) fn contains_command_ack(data: &[u8]) -> bool {
+    data.windows(COMMAND_ACK_BYTES.len())
+        .any(|window| window == COMMAND_ACK_BYTES)
+}
+
 // ============================================================
 //  帧长度计算
 // ============================================================
@@ -653,12 +725,13 @@ pub(crate) fn open_serial_port(
     data_bits: DataBits,
     stop_bits: StopBits,
     parity: Parity,
+    read_timeout: Duration,
 ) -> Result<Box<dyn SerialPort>, serialport::Error> {
     serialport::new(port_name, baud_rate)
         .data_bits(data_bits)
         .stop_bits(stop_bits)
         .parity(parity)
-        .timeout(Duration::from_millis(400))
+        .timeout(read_timeout)
         .open()
 }
 
@@ -668,6 +741,23 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::model::Value;
+
+    #[test]
+    fn command_ack_detects_exact_reply() {
+        assert!(contains_command_ack(&[0x00, 0x50, 0x50]));
+    }
+
+    #[test]
+    fn command_ack_detects_embedded_reply() {
+        assert!(contains_command_ack(&[0xAA, 0x00, 0x50, 0x50, 0xBB]));
+    }
+
+    #[test]
+    fn command_ack_rejects_partial_or_reordered_reply() {
+        assert!(!contains_command_ack(&[]));
+        assert!(!contains_command_ack(&[0x00, 0x50]));
+        assert!(!contains_command_ack(&[0x50, 0x50, 0x00]));
+    }
 
     #[test]
     fn should_broadcast_data_changed() {

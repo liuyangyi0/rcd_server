@@ -4,12 +4,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use flexi_logger::{
+    filter::{LogLineFilter, LogLineWriter},
     Age, Cleanup, Criterion, DeferredNow, Duplicate, FileSpec, Logger, LoggerHandle, Naming,
     Record, WriteMode,
 };
 
 const DEFAULT_LOG_SPEC: &str = "info";
 const SERIAL_FRAME_LOG_ENV: &str = "RCD_LOG_SERIAL_FRAMES";
+const OPCUA_TRANSPORT_ERRORS_ENV: &str = "RCD_LOG_OPCUA_TRANSPORT_ERRORS";
 
 /// 初始化全局 logger。
 ///
@@ -33,7 +35,7 @@ pub fn init() -> Option<LoggerHandle> {
 
     match Logger::try_with_env_or_str(DEFAULT_LOG_SPEC)
         .map(|logger| {
-            logger
+            let logger = logger
                 .log_to_file(
                     FileSpec::default()
                         .directory(log_dir)
@@ -42,7 +44,8 @@ pub fn init() -> Option<LoggerHandle> {
                 .rotate(Criterion::Age(Age::Day), Naming::Timestamps, Cleanup::Never)
                 .write_mode(WriteMode::BufferAndFlush)
                 .format(log_format)
-                .duplicate_to_stderr(duplicate)
+                .duplicate_to_stderr(duplicate);
+            with_opcua_transport_filter(logger)
         })
         .and_then(|logger| logger.start())
     {
@@ -56,7 +59,7 @@ pub fn init() -> Option<LoggerHandle> {
 
 fn init_console_logger() -> Option<LoggerHandle> {
     match Logger::try_with_env_or_str("warn")
-        .map(|logger| logger.log_to_stderr().format(log_format))
+        .map(|logger| with_opcua_transport_filter(logger.log_to_stderr().format(log_format)))
         .and_then(|logger| logger.start())
     {
         Ok(handle) => Some(handle),
@@ -87,6 +90,65 @@ pub(crate) fn serial_frame_logs_enabled_from(value: Option<&std::ffi::OsStr>) ->
         .and_then(|v| v.to_str())
         .map(|v| v.trim() == "1")
         .unwrap_or(false)
+}
+
+fn with_opcua_transport_filter(logger: Logger) -> Logger {
+    if opcua_transport_errors_enabled() {
+        logger
+    } else {
+        logger.filter(Box::new(OpcuaTransportDisconnectFilter))
+    }
+}
+
+fn opcua_transport_errors_enabled() -> bool {
+    env_flag_enabled(std::env::var_os(OPCUA_TRANSPORT_ERRORS_ENV).as_deref())
+}
+
+fn env_flag_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value
+        .and_then(|v| v.to_str())
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+struct OpcuaTransportDisconnectFilter;
+
+impl LogLineFilter for OpcuaTransportDisconnectFilter {
+    fn write(
+        &self,
+        now: &mut DeferredNow,
+        record: &Record,
+        log_line_writer: &dyn LogLineWriter,
+    ) -> std::io::Result<()> {
+        if !is_async_opcua_transport_target(record.target()) {
+            return log_line_writer.write(now, record);
+        }
+        let message = record.args().to_string();
+        if should_suppress_opcua_transport_log(record.target(), &message, false) {
+            Ok(())
+        } else {
+            log_line_writer.write(now, record)
+        }
+    }
+}
+
+fn should_suppress_opcua_transport_log(
+    target: &str,
+    message: &str,
+    opcua_transport_errors_enabled: bool,
+) -> bool {
+    if opcua_transport_errors_enabled || !is_async_opcua_transport_target(target) {
+        return false;
+    }
+
+    message.contains("Connection reset by peer")
+        || message.contains("Broken pipe")
+        || message.contains("BadConnectionClosed")
+}
+
+fn is_async_opcua_transport_target(target: &str) -> bool {
+    target.contains("opcua")
+        && (target.contains("transport::tcp") || target.contains("session::controller"))
 }
 
 fn log_format(w: &mut dyn Write, now: &mut DeferredNow, record: &Record) -> std::io::Result<()> {
@@ -122,5 +184,47 @@ mod tests {
         assert!(serial_frame_logs_enabled_from(Some(OsStr::new("1"))));
         assert!(!serial_frame_logs_enabled_from(Some(OsStr::new("true"))));
         assert!(!serial_frame_logs_enabled_from(Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn opcua_transport_disconnect_logs_are_suppressed_by_default() {
+        assert!(should_suppress_opcua_transport_log(
+            "opcua_server::transport::tcp",
+            "Error reading from stream Os { message: \"Connection reset by peer\" }",
+            false,
+        ));
+        assert!(should_suppress_opcua_transport_log(
+            "opcua_server::transport::tcp",
+            "write bytes task failed: Broken pipe (os error 32)",
+            false,
+        ));
+        assert!(should_suppress_opcua_transport_log(
+            "opcua_server::session::controller",
+            "Fatal transport error: BadConnectionClosed",
+            false,
+        ));
+    }
+
+    #[test]
+    fn opcua_transport_disconnect_logs_can_be_enabled() {
+        assert!(!should_suppress_opcua_transport_log(
+            "opcua_server::transport::tcp",
+            "write bytes task failed: Broken pipe (os error 32)",
+            true,
+        ));
+    }
+
+    #[test]
+    fn opcua_transport_filter_keeps_other_errors() {
+        assert!(!should_suppress_opcua_transport_log(
+            "opcua_server::transport::tcp",
+            "TLS certificate validation failed",
+            false,
+        ));
+        assert!(!should_suppress_opcua_transport_log(
+            "rcd_server::server::opcua",
+            "BadConnectionClosed",
+            false,
+        ));
     }
 }

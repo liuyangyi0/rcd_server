@@ -9,6 +9,9 @@ pub struct Command {
     pub com: String,
     /// 具体命令类型。
     pub command: CommandType,
+    /// 内部 ACK 关联 ID，仅用于 OPC UA 写命令状态回写。
+    #[serde(skip)]
+    pub ack_id: Option<u64>,
 }
 
 /// 命令类型枚举。
@@ -20,6 +23,8 @@ pub enum CommandType {
     PortStatus(PortStatus),
     /// 设置单个设备的启用/禁用状态。
     DeviceSetting(DeviceSetting),
+    /// 向设备发送原始数据，并向 OPC UA 写命令变量回写 ACK 状态。
+    SendDataWithAck(SendData),
 }
 
 /// 发送到设备的原始数据。
@@ -49,4 +54,74 @@ pub struct PortStatus {
 pub struct DeviceSetting {
     pub device_id: u8,
     pub device_status: bool,
+}
+
+/// 串口命令 ACK 状态，供 worker 回写 OPC UA `<COM>_Send` 字符串变量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandAckStatus {
+    /// 命令已写入串口，等待下位机回复。
+    Waiting,
+    /// 收到下位机 ACK。
+    Received,
+    /// 写入失败或重试耗尽。
+    Failed,
+}
+
+impl CommandAckStatus {
+    pub fn as_opc_value(self) -> &'static str {
+        match self {
+            Self::Received => "1",
+            Self::Waiting => "2",
+            Self::Failed => "3",
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Received | Self::Failed)
+    }
+}
+
+/// 从串口 worker 发往 OPC UA 任务的命令 ACK 状态更新。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandAckUpdate {
+    pub com: String,
+    pub ack_id: Option<u64>,
+    pub status: CommandAckStatus,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_ack_status_maps_to_opc_string_values() {
+        assert_eq!(CommandAckStatus::Received.as_opc_value(), "1");
+        assert_eq!(CommandAckStatus::Waiting.as_opc_value(), "2");
+        assert_eq!(CommandAckStatus::Failed.as_opc_value(), "3");
+    }
+
+    #[test]
+    fn command_ack_status_terminal_only_for_final_states() {
+        assert!(CommandAckStatus::Received.is_terminal());
+        assert!(CommandAckStatus::Failed.is_terminal());
+        assert!(!CommandAckStatus::Waiting.is_terminal());
+    }
+
+    #[test]
+    fn command_ack_id_is_internal_only() {
+        let command = Command {
+            com: "COM1".into(),
+            command: CommandType::SendData(SendData {
+                device_id: 1,
+                command: vec![1, 2, 3],
+            }),
+            ack_id: Some(42),
+        };
+
+        let bytes = bincode::serialize(&command).expect("serialize command");
+        let decoded: Command = bincode::deserialize(&bytes).expect("deserialize command");
+
+        assert_eq!(decoded.com, "COM1");
+        assert_eq!(decoded.ack_id, None);
+    }
 }
