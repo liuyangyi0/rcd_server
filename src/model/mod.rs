@@ -10,7 +10,7 @@ pub mod state;
 pub mod value;
 
 // 重新导出常用类型，方便外部引用
-pub use command::{Command, CommandType, SendData};
+pub use command::{Command, CommandAckStatus, CommandAckUpdate, CommandType, SendData};
 pub use device::DeviceStatus;
 pub use message::MessageType;
 pub use state::{PortRuntimeState, SystemState};

@@ -6,6 +6,9 @@ use log::info;
 use serde::Deserialize;
 use serialport::{DataBits, Parity, StopBits};
 
+pub const DEFAULT_POLL_INTERVAL_MS: u64 = 20;
+pub const DEFAULT_COMMAND_RETRY_COUNT: u32 = 3;
+
 // ============================================================
 //  远程类型桥接（serde 无法直接反序列化外部 crate 的枚举）
 // ============================================================
@@ -84,9 +87,15 @@ pub struct Serial {
 /// 杂项设置。
 #[derive(Deserialize, Debug, Clone)]
 pub struct Settings {
-    /// 通信超时（毫秒，预留）。
+    /// 串口读取超时（毫秒）。
     #[serde(rename = "timeout")]
-    pub _timeout: u64,
+    pub timeout: u64,
+    /// 串口轮询间隔（毫秒）。
+    #[serde(default = "default_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    /// 命令未收到 ACK 时的最大连续下发次数。
+    #[serde(default = "default_command_retry_count")]
+    pub command_retry_count: u32,
 }
 
 /// 顶层配置结构，对应 `config.toml` 全部内容。
@@ -94,9 +103,16 @@ pub struct Settings {
 pub struct Config {
     pub server: Server,
     pub serial: Serial,
-    /// 杂项设置（预留）。
-    #[serde(rename = "settings")]
-    pub _settings: Settings,
+    /// 杂项设置。
+    pub settings: Settings,
+}
+
+fn default_poll_interval_ms() -> u64 {
+    DEFAULT_POLL_INTERVAL_MS
+}
+
+fn default_command_retry_count() -> u32 {
+    DEFAULT_COMMAND_RETRY_COUNT
 }
 
 // ============================================================
@@ -120,4 +136,61 @@ pub fn init_config() -> Result<Config, Box<dyn std::error::Error>> {
     let config_str = std::fs::read_to_string(&config_path)?;
     let config: Config = toml::from_str(&config_str)?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE_CONFIG: &str = r#"
+[server]
+primary_ip = "192.168.10.40:11001"
+secondary_ip = "192.168.101.92:8080"
+run_on = "primary"
+current_run = "primary"
+
+[serial]
+baud_rate = 28800
+data_bits = "Eight"
+parity = "None"
+stop_bits = "One"
+flow_control = "none"
+"#;
+
+    #[test]
+    fn settings_poll_interval_defaults_to_20_ms() {
+        let toml_str = format!(
+            r#"{BASE_CONFIG}
+[settings]
+timeout = 300
+"#
+        );
+
+        let config: Config = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(config.settings.timeout, 300);
+        assert_eq!(config.settings.poll_interval_ms, DEFAULT_POLL_INTERVAL_MS);
+        assert_eq!(
+            config.settings.command_retry_count,
+            DEFAULT_COMMAND_RETRY_COUNT
+        );
+    }
+
+    #[test]
+    fn settings_poll_interval_can_be_configured() {
+        let toml_str = format!(
+            r#"{BASE_CONFIG}
+[settings]
+timeout = 300
+poll_interval_ms = 50
+command_retry_count = 5
+"#
+        );
+
+        let config: Config = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(config.settings.timeout, 300);
+        assert_eq!(config.settings.poll_interval_ms, 50);
+        assert_eq!(config.settings.command_retry_count, 5);
+    }
 }
