@@ -278,11 +278,11 @@ impl SerialManager {
             return false;
         }
         //info!("串口 {} 发送数据: {}", self.serial_config.port_name, format_hex(&command.command));
-        println!(
-            "串口 {} 发送数据: {}",
-            self.serial_config.port_name,
-            format_hex(&command.command)
-        );
+        // println!(
+        //     "串口 {} 发送数据: {}",
+        //     self.serial_config.port_name,
+        //     format_hex(&command.command)
+        // );
         if logging::serial_frame_logs_enabled() {
             info!(
                 "串口 {} 发送数据: {}",
@@ -301,12 +301,12 @@ impl SerialManager {
                         self.reconnect();
                         return false;
                     }
-                    if let Err(e) = port.flush() {
-                        error!("刷新串口输出错误: {:?}", e);
-                        self.port = None;
-                        self.reconnect();
-                        return false;
-                    }
+                    // if let Err(e) = port.flush() {
+                    //     error!("刷新串口输出错误: {:?}", e);
+                    //     self.port = None;
+                    //     self.reconnect();
+                    //     return false;
+                    // }
                     return true;
                 }
                 None => {
@@ -335,12 +335,12 @@ impl SerialManager {
                     self.reconnect();
                     return false;
                 }
-                if let Err(e) = port.flush() {
-                    error!("刷新地址字节错误: {:?}", e);
-                    self.port = None;
-                    self.reconnect();
-                    return false;
-                }
+                // if let Err(e) = port.flush() {
+                //     error!("刷新地址字节错误: {:?}", e);
+                //     self.port = None;
+                //     self.reconnect();
+                //     return false;
+                // }
             }
             None => {
                 self.reconnect();
@@ -349,7 +349,7 @@ impl SerialManager {
         }
 
         // 等待地址字节在物理线路上完全发出后再切换校验位
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::sleep(Duration::from_millis(100));
 
         // 发送数据部分（Space 奇偶校验）
         match self.port {
@@ -366,12 +366,12 @@ impl SerialManager {
                     self.reconnect();
                     return false;
                 }
-                if let Err(e) = port.flush() {
-                    error!("刷新数据部分错误: {:?}", e);
-                    self.port = None;
-                    self.reconnect();
-                    return false;
-                }
+                // if let Err(e) = port.flush() {
+                //     error!("刷新数据部分错误: {:?}", e);
+                //     self.port = None;
+                //     self.reconnect();
+                //     return false;
+                // }
             }
             None => {
                 self.reconnect();
@@ -380,21 +380,21 @@ impl SerialManager {
         }
 
         // 等待数据在物理线路上完全发出后再恢复校验位
-        std::thread::sleep(Duration::from_millis(2));
+        // std::thread::sleep(Duration::from_millis(2));
 
         // 恢复原始校验位，供后续 receive_data 使用
-        self.restore_parity();
+        // self.restore_parity();
         true
     }
 
     /// 将串口校验位恢复为配置文件中指定的原始值。
-    fn restore_parity(&mut self) {
-        if let Some(ref mut port) = self.port {
-            if let Err(e) = port.set_parity(self.serial_config.parity) {
-                error!("恢复校验位失败: {:?}", e);
-            }
-        }
-    }
+    // fn restore_parity(&mut self) {
+    //     if let Some(ref mut port) = self.port {
+    //         if let Err(e) = port.set_parity(self.serial_config.parity) {
+    //             error!("恢复校验位失败: {:?}", e);
+    //         }
+    //     }
+    // }
 
     // ---- 数据接收与解析 ----
 
@@ -513,11 +513,11 @@ impl SerialManager {
 
         // ---- 提取有效数据切片 ----
         let frame = self.extract_frame(total);
-        println!(
-            "串口 {} 原始数据: {}",
-            self.serial_config.port_name,
-            format_hex(&frame)
-        );
+        // println!(
+        //     "串口 {} 原始数据: {}",
+        //     self.serial_config.port_name,
+        //     format_hex(&frame)
+        // );
         if logging::serial_frame_logs_enabled() {
             info!(
                 "串口 {} 原始数据: {}",
@@ -622,13 +622,13 @@ impl SerialManager {
         self.device_states[self.index].timeout_count += 1;
         self.time_out_count += 1;
 
-        let dev = &self.port_config.devices[self.index];
-        warn!(
-            "串口 {} 设备 {} 读取超时 (连续{}次)",
-            self.serial_config.port_name,
-            dev.config.device_id,
-            self.device_states[self.index].timeout_count,
-        );
+        // let dev = &self.port_config.devices[self.index];
+        // warn!(
+        //     "串口 {} 设备 {} 读取超时 (连续{}次)",
+        //     self.serial_config.port_name,
+        //     dev.config.device_id,
+        //     self.device_states[self.index].timeout_count,
+        // );
 
         self.send_zero_status(true, false);
 
