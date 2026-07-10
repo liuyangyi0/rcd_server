@@ -10,6 +10,7 @@ use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 use rcd_server::calc_engine::config::load_calc_config;
 use rcd_server::calc_engine::engine::CalcEngine;
+use rcd_server::calc_engine::evaluator::EvalValue;
 use rcd_server::model::Value;
 use serde::{Deserialize, Serialize};
 
@@ -378,7 +379,13 @@ impl RuleApp {
                 return;
             }
         };
-        let outputs = engine.run_cycle(&self.simulator.inputs);
+        let inputs: HashMap<String, EvalValue> = self
+            .simulator
+            .inputs
+            .iter()
+            .map(|(name, value)| (name.clone(), EvalValue::Float(*value)))
+            .collect();
+        let outputs = engine.run_cycle(&inputs);
         self.simulator.outputs = outputs;
         self.simulator.last_error = None;
     }
@@ -1359,6 +1366,7 @@ fn format_value(v: &Value) -> String {
         Value::UInt(n) => format!("UInt: {}", n),
         Value::Bool(b) => format!("Bool: {}", b),
         Value::Float(f) => format!("Float: {}", f),
+        Value::Double(f) => format!("Double: {}", f),
     }
 }
 

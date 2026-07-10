@@ -6,6 +6,8 @@ use log::info;
 use serde::Deserialize;
 use serialport::{DataBits, Parity, StopBits};
 
+use crate::logging::LoggingConfig;
+
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 20;
 pub const DEFAULT_COMMAND_RETRY_COUNT: u32 = 3;
 
@@ -105,6 +107,9 @@ pub struct Config {
     pub serial: Serial,
     /// 杂项设置。
     pub settings: Settings,
+    /// 日志设置。
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 fn default_poll_interval_ms() -> u64 {
@@ -163,6 +168,8 @@ flow_control = "none"
             r#"{BASE_CONFIG}
 [settings]
 timeout = 300
+
+[logging]
 "#
         );
 
@@ -174,6 +181,8 @@ timeout = 300
             config.settings.command_retry_count,
             DEFAULT_COMMAND_RETRY_COUNT
         );
+        assert_eq!(config.logging.level, "info");
+        assert_eq!(config.logging.keep_files, 30);
     }
 
     #[test]
@@ -184,6 +193,11 @@ timeout = 300
 timeout = 300
 poll_interval_ms = 50
 command_retry_count = 5
+
+[logging]
+level = "debug"
+duplicate_to_stderr = "info"
+serial_frame_logs = true
 "#
         );
 
@@ -192,5 +206,7 @@ command_retry_count = 5
         assert_eq!(config.settings.timeout, 300);
         assert_eq!(config.settings.poll_interval_ms, 50);
         assert_eq!(config.settings.command_retry_count, 5);
+        assert_eq!(config.logging.level, "debug");
+        assert!(config.logging.serial_frame_logs);
     }
 }

@@ -25,6 +25,10 @@ use crate::protocol::{self, threshold};
 use crate::runtime_cache::LatestStatusCache;
 
 const COMMAND_ACK_BYTES: [u8; 3] = [0x00, 0x50, 0x50];
+const FORWARD_HEADER_LEN: usize = 7;
+const FORWARD_SEPARATOR_LEN: usize = 2;
+const FORWARD_PREFIX_LEN: usize = FORWARD_HEADER_LEN + FORWARD_SEPARATOR_LEN;
+const FORWARD_PREFIX_GRACE: Duration = Duration::from_millis(5);
 
 // ============================================================
 //  串口参数
@@ -74,6 +78,10 @@ pub(crate) struct DeviceRuntimeState {
     pub(crate) parse_fail_count: u32,
     /// 上次收到的原始数据。
     last_data: Vec<u8>,
+    /// 上次广播的串口在线状态。
+    last_com_status: Option<bool>,
+    /// 上次广播的设备在线状态。
+    last_device_status: Option<bool>,
     /// 连续收到相同数据的次数。
     same_count: u32,
     /// 是否处于轮询读取状态。
@@ -86,7 +94,9 @@ impl DeviceRuntimeState {
             timeout_count: 0,
             current_round: 0,
             parse_fail_count: 0,
-            last_data: vec![0],
+            last_data: Vec::new(),
+            last_com_status: None,
+            last_device_status: None,
             same_count: 0,
             is_enabled: true,
         }
@@ -94,9 +104,17 @@ impl DeviceRuntimeState {
 
     /// 判断新数据是否应该推送给上层。
     ///
-    /// 规则：如果与上次数据不同则立即推送；如果连续相同超过阈值也推送一次。
-    pub(crate) fn should_broadcast(&mut self, data: &[u8]) -> bool {
-        if data == self.last_data {
+    /// 规则：数据或在线状态变化时立即推送；连续完全相同时按阈值定期推送。
+    pub(crate) fn should_broadcast(
+        &mut self,
+        data: &[u8],
+        com_status: bool,
+        device_status: bool,
+    ) -> bool {
+        let status_changed = self.last_com_status != Some(com_status)
+            || self.last_device_status != Some(device_status);
+
+        if data == self.last_data && !status_changed {
             self.same_count += 1;
             if self.same_count >= threshold::SAME_DATA_BROADCAST {
                 self.same_count = 0;
@@ -107,6 +125,8 @@ impl DeviceRuntimeState {
         } else {
             self.same_count = 0;
             self.last_data = data.to_vec();
+            self.last_com_status = Some(com_status);
+            self.last_device_status = Some(device_status);
             true
         }
     }
@@ -173,7 +193,6 @@ impl SerialManager {
 
         if port.is_none() {
             warn!("串口 {} 打开失败", serial_config.port_name);
-            println!("串口 {} 打开失败", serial_config.port_name);
         }
 
         let device_states = port_config
@@ -250,7 +269,7 @@ impl SerialManager {
         };
         self.latest_status_cache.update(status.clone());
 
-        if self.device_states[self.index].should_broadcast(&zero_data) {
+        if self.device_states[self.index].should_broadcast(&zero_data, com_status, device_status) {
             self.broadcaster.broadcast(status);
         }
     }
@@ -387,7 +406,7 @@ impl SerialManager {
         true
     }
 
-    /// 将串口校验位恢复为配置文件中指定的原始值。
+    // 将串口校验位恢复为配置文件中指定的原始值。
     // fn restore_parity(&mut self) {
     //     if let Some(ref mut port) = self.port {
     //         if let Err(e) = port.set_parity(self.serial_config.parity) {
@@ -473,10 +492,25 @@ impl SerialManager {
                 Ok(0) => break,
                 Ok(n) => {
                     total += n;
+                    if is_complete_short_direct_candidate(
+                        &self.read_buf[..total],
+                        &self.current_run,
+                        &self.run_on,
+                    ) {
+                        // 短直连帧与 7 字节转发头可能同样满足校验；给分隔符一个很短的到达窗口，
+                        // 避免没有后续字节时等待完整的串口读取超时。
+                        std::thread::sleep(FORWARD_PREFIX_GRACE);
+                        if matches!(port.bytes_to_read(), Ok(0)) {
+                            break;
+                        }
+                    }
                     // 已读到帧头(3字节)时，可计算期望帧长
                     if total >= 3 {
-                        let expected =
-                            expected_frame_len(&self.read_buf[..total], &self.current_run);
+                        let expected = expected_frame_len(
+                            &self.read_buf[..total],
+                            &self.current_run,
+                            &self.run_on,
+                        );
                         if total >= expected {
                             break; // 帧已完整
                         }
@@ -507,12 +541,8 @@ impl SerialManager {
             return;
         }
 
-        // 成功读到数据，重置超时计数
-        self.device_states[self.index].timeout_count = 0;
-        self.time_out_count = 0;
-
         // ---- 提取有效数据切片 ----
-        let frame = self.extract_frame(total);
+        let (frame, device_attributed) = self.extract_frame(total);
         // println!(
         //     "串口 {} 原始数据: {}",
         //     self.serial_config.port_name,
@@ -526,9 +556,18 @@ impl SerialManager {
             );
         }
 
+        // 备机监听到的无有效转发头数据无法归属到具体设备，不能沿用旧 index。
+        if !device_attributed {
+            self.handle_unattributed_frame();
+            return;
+        }
+
         // ---- 解析数据帧 ----
         match protocol::parse_data_packet(&frame) {
             Ok(packet) => {
+                // 只有长度与校验和均有效的完整帧才能证明通信恢复。
+                self.device_states[self.index].timeout_count = 0;
+                self.time_out_count = 0;
                 self.device_states[self.index].parse_fail_count = 0;
                 self.parse_fail_count = 0;
 
@@ -551,22 +590,11 @@ impl SerialManager {
                 };
                 self.latest_status_cache.update(status.clone());
 
-                if self.device_states[self.index].should_broadcast(&packet.status) {
+                if self.device_states[self.index].should_broadcast(&packet.status, true, true) {
                     self.broadcaster.broadcast(status);
                 }
             }
-            Err(_) => {
-                self.device_states[self.index].parse_fail_count += 1;
-                self.parse_fail_count += 1;
-
-                // 连续解析失败过多时尝试主备切换
-                if self.parse_fail_count > threshold::PARSE_FAIL_FAILOVER
-                    && self.current_run == RunLocation::Primary
-                    && self.run_on == RunLocation::Secondary
-                {
-                    self.switch_role(RunLocation::Secondary, "解析失败过多，切换为备机");
-                }
-            }
+            Err(_) => self.handle_invalid_frame(),
         }
     }
 
@@ -575,45 +603,75 @@ impl SerialManager {
     /// 备机模式下会解析转发头以更新 `index`，并剥离前缀。
     /// 如果当前由备机临时升级为主机，检测到有效转发头说明真正主机已恢复，
     /// 则自动切回备机。
-    fn extract_frame(&mut self, total: usize) -> Vec<u8> {
-        // 尝试检测转发头（含 00 00 分隔符）
-        let has_forward_header = protocol::find_double_zero(&self.read_buf[..total]);
+    fn extract_frame(&mut self, total: usize) -> (Vec<u8>, bool) {
+        let accepts_forwarded_frame =
+            self.current_run == RunLocation::Secondary || self.run_on == RunLocation::Secondary;
+        let forwarded = if accepts_forwarded_frame {
+            validated_forward_data_start(&self.read_buf[..total]).and_then(|data_start| {
+                let device_addr = self.read_buf[0];
+                self.port_config
+                    .devices
+                    .iter()
+                    .position(|dev| dev.config.device_id == device_addr)
+                    .map(|device_index| (data_start, device_index))
+            })
+        } else {
+            None
+        };
 
         // 回切检测：备机临时充当主机时，若收到转发头说明真正主机已恢复
         if self.current_run == RunLocation::Primary
             && self.run_on == RunLocation::Secondary
-            && has_forward_header.is_some()
+            && forwarded.is_some()
         {
             self.switch_role(RunLocation::Secondary, "检测到主机转发帧，切回备机");
         }
 
         if self.current_run == RunLocation::Secondary {
-            if let Some(idx) = has_forward_header {
-                // 校验转发头
-                let header = &self.read_buf[..idx];
-                if header.len() == 7 && protocol::verify_checksum(header) {
-                    let device_addr = header[0];
-                    for (i, dev) in self.port_config.devices.iter().enumerate() {
-                        if dev.config.device_id == device_addr {
-                            self.index = i;
-                            break;
-                        }
-                    }
-                }
-                // 提取数据帧部分（跳过 00 00 分隔符）
-                let data_start = idx + 2;
+            if let Some((data_start, device_index)) = forwarded {
+                self.index = device_index;
                 let data = &self.read_buf[data_start..total];
                 let effective_len = if data.len() >= 4 {
                     (data[2] as usize + 5).min(data.len())
                 } else {
                     data.len()
                 };
-                data[..effective_len].to_vec()
+                (data[..effective_len].to_vec(), true)
             } else {
-                self.read_buf[..total].to_vec()
+                (self.read_buf[..total].to_vec(), false)
             }
         } else {
-            self.read_buf[..total].to_vec()
+            (self.read_buf[..total].to_vec(), true)
+        }
+    }
+
+    /// 备机收到无法通过转发头归属到设备的数据时，只累计端口级故障。
+    fn handle_unattributed_frame(&mut self) {
+        self.parse_fail_count += 1;
+        self.time_out_count += 1;
+
+        if self.time_out_count > threshold::PORT_FAILOVER_TIMEOUT
+            && self.current_run == RunLocation::Secondary
+            && self.run_on == RunLocation::Secondary
+        {
+            self.switch_role(RunLocation::Primary, "无法归属的坏帧过多，备机升级为主机");
+        }
+    }
+
+    /// 将收到但无法通过长度或校验和验证的帧视为本轮没有有效响应。
+    fn handle_invalid_frame(&mut self) {
+        self.device_states[self.index].parse_fail_count += 1;
+        self.parse_fail_count += 1;
+
+        // 坏帧不能证明设备在线；复用超时路径更新离线状态和故障计数。
+        self.handle_timeout();
+
+        // 连续解析失败过多时尝试主备切换。
+        if self.parse_fail_count > threshold::PARSE_FAIL_FAILOVER
+            && self.current_run == RunLocation::Primary
+            && self.run_on == RunLocation::Secondary
+        {
+            self.switch_role(RunLocation::Secondary, "解析失败过多，切换为备机");
         }
     }
 
@@ -682,24 +740,55 @@ pub(crate) fn contains_command_ack(data: &[u8]) -> bool {
 /// 根据已读数据估算期望的完整帧长度。
 ///
 /// 帧格式 `[Addr][CMD][Len][Status×(Len+1)][CRC]`，总长 = Len + 5。
-fn expected_frame_len(buf: &[u8], current_run: &RunLocation) -> usize {
+fn expected_frame_len(buf: &[u8], current_run: &RunLocation, run_on: &RunLocation) -> usize {
     let total = buf.len();
-    if *current_run == RunLocation::Secondary {
-        // 备机帧可能有前缀 header(7字节)+00 00，数据帧在后面
-        if let Some(idx) = protocol::find_double_zero(buf) {
-            let data_start = idx + 2; // 跳过 00 00
+    let accepts_forwarded_frame =
+        *current_run == RunLocation::Secondary || *run_on == RunLocation::Secondary;
+
+    if accepts_forwarded_frame {
+        if let Some(data_start) = validated_forward_data_start(buf) {
             if data_start + 3 <= total {
                 let len_byte = buf[data_start + 2] as usize;
                 return data_start + len_byte + 5;
             }
+            return total + 1;
         }
-        // 无法确定时返回较大值继续读
-        total + 1
-    } else {
-        // 主机模式：直接取 buf[2] 作为 Len
-        let len_byte = buf[2] as usize;
-        len_byte + 5
+
+        // 在收齐固定长度的转发头前不能把头部第 3 字节误当成数据帧长度。
+        if total < FORWARD_PREFIX_LEN {
+            return FORWARD_PREFIX_LEN;
+        }
     }
+
+    // 普通直连帧：直接取 buf[2] 作为 Len。
+    let len_byte = buf[2] as usize;
+    len_byte + 5
+}
+
+fn is_complete_short_direct_candidate(
+    buf: &[u8],
+    current_run: &RunLocation,
+    run_on: &RunLocation,
+) -> bool {
+    if *current_run != RunLocation::Primary || *run_on != RunLocation::Secondary || buf.len() < 3 {
+        return false;
+    }
+
+    let expected = buf[2] as usize + 5;
+    expected < FORWARD_PREFIX_LEN
+        && buf.len() >= expected
+        && protocol::verify_checksum(&buf[..expected])
+}
+
+/// 仅接受固定的 `[7字节有效校验头][00 00]` 转发前缀。
+fn validated_forward_data_start(buf: &[u8]) -> Option<usize> {
+    if buf.len() < FORWARD_PREFIX_LEN
+        || buf[FORWARD_HEADER_LEN..FORWARD_PREFIX_LEN] != [0, 0]
+        || !protocol::verify_checksum(&buf[..FORWARD_HEADER_LEN])
+    {
+        return None;
+    }
+    Some(FORWARD_PREFIX_LEN)
 }
 
 // ============================================================
@@ -740,7 +829,54 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    use crate::csv_parser::{Config as CsvConfig, DeviceConfig};
     use crate::model::Value;
+
+    fn test_manager(run_on: RunLocation, current_run: RunLocation) -> SerialManager {
+        let device = DeviceConfig {
+            config: CsvConfig {
+                com: "COM1".to_string(),
+                baud_rate: 9_600,
+                is_special: true,
+                com_index: 1,
+                device_id: 1,
+                data_len: 3,
+                kks_prefix: String::new(),
+            },
+            records: Vec::new(),
+        };
+
+        SerialManager {
+            port: None,
+            command_queue: Arc::new(Mutex::new(VecDeque::new())),
+            serial_config: SerialConfig::new(
+                "COM1".to_string(),
+                9_600,
+                DataBits::Eight,
+                StopBits::One,
+                Parity::None,
+                Duration::from_millis(100),
+            ),
+            port_config: SerialPortConfig::new("COM1".to_string(), 9_600, true, vec![device]),
+            broadcaster: Broadcaster::new(),
+            latest_status_cache: LatestStatusCache::new(),
+            device_states: vec![DeviceRuntimeState::new()],
+            index: 0,
+            run_on,
+            current_run,
+            time_out_count: 0,
+            parse_fail_count: 0,
+            system_record: Arc::new(Mutex::new(BoundedVecDeque::new(10))),
+            read_buf: vec![0u8; 1024],
+            last_reconnect: Instant::now(),
+        }
+    }
+
+    fn with_checksum(mut bytes: Vec<u8>) -> Vec<u8> {
+        let checksum = crate::model::get_sum(&bytes);
+        bytes.push(checksum);
+        bytes
+    }
 
     #[test]
     fn command_ack_detects_exact_reply() {
@@ -762,42 +898,41 @@ mod tests {
     #[test]
     fn should_broadcast_data_changed() {
         let mut state = DeviceRuntimeState::new();
-        // 初始 last_data = [0], 新数据不同 → 推送
-        assert!(state.should_broadcast(&[1, 2, 3]));
+        assert!(state.should_broadcast(&[1, 2, 3], true, true));
     }
 
     #[test]
     fn should_broadcast_same_data_below_threshold() {
         let mut state = DeviceRuntimeState::new();
-        state.should_broadcast(&[1, 2, 3]); // 第一次, 更新 last_data
-                                            // 连续发送相同数据, 次数不到阈值, 不推送
+        state.should_broadcast(&[1, 2, 3], true, true); // 第一次, 更新 last_data
+                                                        // 连续发送相同数据, 次数不到阈值, 不推送
         for _ in 0..threshold::SAME_DATA_BROADCAST - 1 {
-            assert!(!state.should_broadcast(&[1, 2, 3]));
+            assert!(!state.should_broadcast(&[1, 2, 3], true, true));
         }
     }
 
     #[test]
     fn should_broadcast_same_data_at_threshold() {
         let mut state = DeviceRuntimeState::new();
-        state.should_broadcast(&[1, 2, 3]); // 第一次
-                                            // 到达阈值时推送
+        state.should_broadcast(&[1, 2, 3], true, true); // 第一次
+                                                        // 到达阈值时推送
         for _ in 0..threshold::SAME_DATA_BROADCAST - 1 {
-            state.should_broadcast(&[1, 2, 3]);
+            state.should_broadcast(&[1, 2, 3], true, true);
         }
-        assert!(state.should_broadcast(&[1, 2, 3])); // 第 SAME_DATA_BROADCAST 次
+        assert!(state.should_broadcast(&[1, 2, 3], true, true)); // 第 SAME_DATA_BROADCAST 次
     }
 
     #[test]
     fn should_broadcast_reset_on_change() {
         let mut state = DeviceRuntimeState::new();
-        state.should_broadcast(&[1, 2, 3]);
+        state.should_broadcast(&[1, 2, 3], true, true);
         // 发几次相同数据
-        state.should_broadcast(&[1, 2, 3]);
-        state.should_broadcast(&[1, 2, 3]);
+        state.should_broadcast(&[1, 2, 3], true, true);
+        state.should_broadcast(&[1, 2, 3], true, true);
         // 新数据 → 立即推送, 且计数器重置
-        assert!(state.should_broadcast(&[4, 5, 6]));
+        assert!(state.should_broadcast(&[4, 5, 6], true, true));
         // 再次发相同数据, 重新计数
-        assert!(!state.should_broadcast(&[4, 5, 6]));
+        assert!(!state.should_broadcast(&[4, 5, 6], true, true));
     }
 
     #[test]
@@ -815,7 +950,7 @@ mod tests {
             raw_data: vec![1, 2, 3],
         };
         cache.update(first);
-        assert!(state.should_broadcast(&[1, 2, 3]));
+        assert!(state.should_broadcast(&[1, 2, 3], true, true));
 
         let second = DeviceStatus {
             id: 1,
@@ -827,10 +962,103 @@ mod tests {
             raw_data: vec![1, 2, 3],
         };
         cache.update(second);
-        assert!(!state.should_broadcast(&[1, 2, 3]));
+        assert!(!state.should_broadcast(&[1, 2, 3], true, true));
 
         let snapshot = cache.snapshot_statuses();
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].value.get("a"), Some(&Value::UInt(2)));
+    }
+
+    #[test]
+    fn status_change_broadcasts_even_when_payload_is_unchanged() {
+        let mut state = DeviceRuntimeState::new();
+        assert!(state.should_broadcast(&[0, 0, 0], true, true));
+        assert!(!state.should_broadcast(&[0, 0, 0], true, true));
+        assert!(state.should_broadcast(&[0, 0, 0], true, false));
+    }
+
+    #[test]
+    fn direct_frame_with_double_zero_does_not_trigger_failback() {
+        let mut manager = test_manager(RunLocation::Secondary, RunLocation::Primary);
+        let frame = with_checksum(vec![1, 0x08, 2, 0, 0, 0]);
+        manager.read_buf[..frame.len()].copy_from_slice(&frame);
+
+        let (extracted, attributed) = manager.extract_frame(frame.len());
+
+        assert_eq!(extracted, frame);
+        assert!(attributed);
+        assert_eq!(manager.current_run, RunLocation::Primary);
+    }
+
+    #[test]
+    fn short_direct_frame_uses_fast_completion_only_for_temporary_primary() {
+        let frame = with_checksum(vec![1, 0x08, 2, 0, 0, 0]);
+
+        assert!(is_complete_short_direct_candidate(
+            &frame,
+            &RunLocation::Primary,
+            &RunLocation::Secondary,
+        ));
+        assert!(!is_complete_short_direct_candidate(
+            &frame,
+            &RunLocation::Secondary,
+            &RunLocation::Secondary,
+        ));
+        assert!(!is_complete_short_direct_candidate(
+            &frame,
+            &RunLocation::Primary,
+            &RunLocation::Primary,
+        ));
+    }
+
+    #[test]
+    fn valid_forward_header_triggers_failback_and_is_removed() {
+        let mut manager = test_manager(RunLocation::Secondary, RunLocation::Primary);
+        let header = with_checksum(vec![1, 2, 3, 4, 5, 6]);
+        let payload = with_checksum(vec![1, 0x08, 2, 7, 8, 9]);
+        let mut frame = header;
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(&payload);
+        manager.read_buf[..frame.len()].copy_from_slice(&frame);
+
+        let (extracted, attributed) = manager.extract_frame(frame.len());
+
+        assert_eq!(extracted, payload);
+        assert!(attributed);
+        assert_eq!(manager.current_run, RunLocation::Secondary);
+    }
+
+    #[test]
+    fn unattributed_secondary_frame_does_not_mark_previous_device_offline() {
+        let mut manager = test_manager(RunLocation::Secondary, RunLocation::Secondary);
+        let mut rx = manager.broadcaster.subscribe();
+        let noise = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        manager.read_buf[..noise.len()].copy_from_slice(&noise);
+
+        let (_, attributed) = manager.extract_frame(noise.len());
+        assert!(!attributed);
+        manager.handle_unattributed_frame();
+
+        assert_eq!(manager.time_out_count, 1);
+        assert_eq!(manager.device_states[0].timeout_count, 0);
+        assert!(manager.latest_status_cache.is_empty());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn invalid_frame_marks_device_offline() {
+        let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+        let mut rx = manager.broadcaster.subscribe();
+
+        manager.handle_invalid_frame();
+
+        assert_eq!(manager.time_out_count, 1);
+        assert_eq!(manager.device_states[0].timeout_count, 1);
+        let status = rx.try_recv().expect("离线状态应立即广播");
+        assert!(!status.device_status);
+        assert!(!manager.latest_status_cache.snapshot_statuses()[0].device_status);
     }
 }

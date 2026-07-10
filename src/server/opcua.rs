@@ -14,6 +14,8 @@ pub const OPCUA_LIMIT_MARGIN: usize = 512;
 pub const OPCUA_MIN_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 /// OPC UA 大批量响应的最小分片数上限。
 pub const OPCUA_MIN_MAX_CHUNK_COUNT: usize = 256;
+/// OPC 写命令日志最多展示的字符数，避免异常大输入阻塞控制台和日志文件。
+const OPC_WRITE_LOG_PREVIEW_CHARS: usize = 256;
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -857,6 +859,23 @@ fn handle_send_node_write(
         return StatusCode::Good;
     }
 
+    let (preview, truncated) = opc_write_log_preview(hex_str);
+    let suffix = if truncated { "…(已截断)" } else { "" };
+    println!(
+        "收到 OPC 客户端写值: 串口={} 数据长度={} 数据预览={}{}",
+        com,
+        hex_str.len(),
+        preview,
+        suffix,
+    );
+    info!(
+        "收到 OPC 客户端写值: 串口={} 数据长度={} 数据预览={}{}",
+        com,
+        hex_str.len(),
+        preview,
+        suffix,
+    );
+
     let cmd = match build_hex_command(hex_str, com, true, Some(ack_id)) {
         Ok(cmd) => cmd,
         Err(e) => {
@@ -894,7 +913,6 @@ fn handle_send_node_write(
         warn!("本地 ACK 等待状态入队失败: 串口={}, 错误={:?}", com, e);
     }
 
-    info!("收到 OPC 客户端写命令: 串口 {} 数据 {}", com, hex_str);
     let local = chrono::Local::now();
     let mut record = context.system_record.lock().unwrap_or_else(|e| {
         warn!("系统操作记录锁中毒，恢复: {}", e);
@@ -908,6 +926,12 @@ fn handle_send_node_write(
     ));
 
     StatusCode::Good
+}
+
+fn opc_write_log_preview(value: &str) -> (String, bool) {
+    let mut chars = value.chars();
+    let preview: String = chars.by_ref().take(OPC_WRITE_LOG_PREVIEW_CHARS).collect();
+    (preview, chars.next().is_some())
 }
 
 fn build_hex_command(
@@ -1349,6 +1373,17 @@ mod tests {
 
         assert!(!is_send_node_idle_or_status("00 50"));
         assert!(!is_send_node_idle_or_status("005050"));
+    }
+
+    #[test]
+    fn opc_write_log_preview_is_bounded() {
+        let short = "0102";
+        assert_eq!(opc_write_log_preview(short), (short.to_string(), false));
+
+        let long = "A".repeat(OPC_WRITE_LOG_PREVIEW_CHARS + 10);
+        let (preview, truncated) = opc_write_log_preview(&long);
+        assert_eq!(preview.len(), OPC_WRITE_LOG_PREVIEW_CHARS);
+        assert!(truncated);
     }
 
     #[test]

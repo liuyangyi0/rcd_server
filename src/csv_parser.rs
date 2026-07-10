@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use csv::ReaderBuilder;
+use log::warn;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -138,6 +139,55 @@ pub struct Record {
     pub byte_order: u32,
 }
 
+/// 校验一个数据点是否能在配置声明的状态数据区内安全取值。
+fn record_bounds_error(record: &Record, data_len: usize) -> Option<String> {
+    let byte_index = match record.byte_index.checked_sub(1) {
+        Some(value) => value as usize,
+        None => return Some("byte_index=0，但该字段从 1 开始计数".to_string()),
+    };
+
+    if byte_index >= data_len {
+        return Some(format!(
+            "byte_index={} 超出状态数据长度 1..={}",
+            record.byte_index, data_len
+        ));
+    }
+
+    match &record.bit_index {
+        BitIndex::Single(bit) if *bit >= 8 => {
+            Some(format!("bit_index={} 超出单字节位范围 0..=7", bit))
+        }
+        BitIndex::Single(_) => None,
+        BitIndex::Range(range) => {
+            let start_bit = u64::from(*range.start());
+            let end_bit = u64::from(*range.end());
+            if start_bit > end_bit {
+                return Some(format!("位范围 {}..{} 起点大于终点", start_bit, end_bit));
+            }
+
+            let num_bits = end_bit - start_bit + 1;
+            if num_bits > 32 {
+                return Some(format!(
+                    "位范围 {}..{} 宽度为 {}，超过 u32 的 32 位上限",
+                    start_bit, end_bit, num_bits
+                ));
+            }
+
+            let end_byte = byte_index as u64 + end_bit / 8;
+            if end_byte >= data_len as u64 {
+                return Some(format!(
+                    "位范围 {}..{} 需要访问第 {} 字节，但状态数据只有 {} 字节",
+                    start_bit,
+                    end_bit,
+                    end_byte + 1,
+                    data_len
+                ));
+            }
+            None
+        }
+    }
+}
+
 // ============================================================
 //  设备配置头
 // ============================================================
@@ -239,9 +289,19 @@ pub fn parse_csv<P: AsRef<Path>>(file_path: P) -> Result<(Config, Vec<Record>), 
 
     // 读取数据记录并拼接 KKS 前缀
     let mut records = Vec::new();
-    for result in rdr.deserialize() {
+    for (offset, result) in rdr.deserialize().enumerate() {
         let mut record: Record = result?;
         record.kks = format!("{}{}", config.kks_prefix, record.kks);
+        if let Some(reason) = record_bounds_error(&record, config.data_len as usize) {
+            warn!(
+                "CSV 数据点配置越界: 文件={}, 行={}, KKS={}, data_len={}, 原因={}",
+                path_ref.display(),
+                offset + 9,
+                record.kks,
+                config.data_len,
+                reason,
+            );
+        }
         records.push(record);
     }
 
@@ -318,5 +378,29 @@ kks,type_,f_type,byte_index,bit_index,def,max,min,lh
     fn nonexistent_file_returns_io_error() {
         let err = parse_csv(Path::new("./_does_not_exist_xyz.csv")).unwrap_err();
         assert!(matches!(err, CsvParseError::Io { .. }), "got {err:?}");
+    }
+
+    fn test_record(byte_index: u32, bit_index: BitIndex) -> Record {
+        Record {
+            kks: "TEST".to_string(),
+            type_: "uint".to_string(),
+            _f_type: String::new(),
+            byte_index,
+            bit_index,
+            _def: 0,
+            _max: 0,
+            _min: 0,
+            byte_order: 0,
+        }
+    }
+
+    #[test]
+    fn record_bounds_validation_reports_config_errors_at_load_time() {
+        assert!(record_bounds_error(&test_record(1, BitIndex::Single(7)), 1).is_none());
+        assert!(record_bounds_error(&test_record(0, BitIndex::Single(0)), 1).is_some());
+        assert!(record_bounds_error(&test_record(2, BitIndex::Single(0)), 1).is_some());
+        assert!(record_bounds_error(&test_record(1, BitIndex::Single(8)), 1).is_some());
+        assert!(record_bounds_error(&test_record(1, BitIndex::Range(0..=8)), 1).is_some());
+        assert!(record_bounds_error(&test_record(1, BitIndex::Range(0..=32)), 8).is_some());
     }
 }

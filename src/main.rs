@@ -95,7 +95,7 @@ async fn main() -> tokio::io::Result<()> {
     let (ack_status_tx, ack_status_rx) = mpsc::channel::<CommandAckUpdate>();
 
     // 初始化串口并启动通信线程
-    match init_serial_ports(
+    let result = match init_serial_ports(
         broadcaster.clone(),
         &software_config,
         system_state.clone(),
@@ -138,7 +138,7 @@ async fn main() -> tokio::io::Result<()> {
                 software_config.settings.timeout,
                 software_config.settings.command_retry_count,
             );
-            match run_opcua_server(
+            let server_result = run_opcua_server(
                 configs,
                 broadcaster,
                 system_state,
@@ -150,8 +150,8 @@ async fn main() -> tokio::io::Result<()> {
                 latest_status_cache,
                 cancel.clone(),
             )
-            .await
-            {
+            .await;
+            match &server_result {
                 Ok(_) => info!("OPC UA 服务器已正常退出"),
                 Err(e) => error!("OPC UA 服务器运行失败: {}", e),
             }
@@ -161,14 +161,17 @@ async fn main() -> tokio::io::Result<()> {
 
             // 等待串口 worker 结束，带 3 秒超时
             shutdown_workers(worker_handles).await;
+
+            server_result
         }
         Err(e) => {
             error!("初始化失败: {}", e);
             cancel.cancel();
+            Err(e)
         }
-    }
+    };
 
-    Ok(())
+    result
 }
 
 /// 等待所有串口 worker 自然结束，超时后放弃（tokio runtime drop 会清理）。
@@ -222,14 +225,6 @@ async fn init_serial_ports(
                 .map(|c| c.devices.len())
                 .sum::<usize>(),
         );
-        println!(
-            "已加载 {} 个串口, 共 {} 个设备",
-            serial_port_configs.len(),
-            serial_port_configs
-                .iter()
-                .map(|c| c.devices.len())
-                .sum::<usize>(),
-        )
     }
 
     // 2. 为每个串口启动通信线程

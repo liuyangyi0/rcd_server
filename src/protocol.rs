@@ -5,8 +5,6 @@
 
 use std::collections::HashMap;
 
-use log::warn;
-
 use crate::csv_parser::{BitIndex, Record};
 use crate::model::Value;
 
@@ -116,13 +114,7 @@ pub fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
         // byte_index 为 1-based，0 视为非法，避免 0 - 1 下溢
         let byte_index = match record.byte_index.checked_sub(1) {
             Some(v) => v as usize,
-            None => {
-                warn!(
-                    "记录 '{}' 的 byte_index 为 0 (1-based)，跳过该数据点",
-                    record.kks
-                );
-                continue;
-            }
+            None => continue,
         };
         if byte_index >= data.len() {
             continue;
@@ -132,10 +124,6 @@ pub fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
             BitIndex::Single(bit) => {
                 // u8 移位宽度必须 < 8，否则 debug 下 panic、release 下行为未定
                 if *bit >= 8 {
-                    warn!(
-                        "记录 '{}' 的 bit_index={} 超出 u8 范围 (0..=7)，跳过",
-                        record.kks, bit
-                    );
                     continue;
                 }
                 ((data[byte_index] >> (*bit as usize)) & 1) as u32
@@ -146,7 +134,6 @@ pub fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
                 let end_bit = *range.end();
 
                 if start_bit > end_bit || end_bit >= total_bits {
-                    warn!("无效的位范围: {}..={}，跳过该数据点", start_bit, end_bit);
                     continue;
                 }
 
@@ -154,20 +141,11 @@ pub fn parse_status(data: &[u8], records: &[Record]) -> HashMap<String, Value> {
                 let end_byte = byte_index + (end_bit / 8) as usize;
 
                 if end_byte >= data.len() {
-                    warn!(
-                        "位范围越界: end_byte={} >= data.len()={}，跳过",
-                        end_byte,
-                        data.len()
-                    );
                     continue;
                 }
 
                 let num_bits = end_bit - start_bit + 1;
                 if num_bits > 32 {
-                    warn!(
-                        "位范围宽度 {} 超过 u32 范围: {}..={}，跳过该数据点",
-                        num_bits, start_bit, end_bit
-                    );
                     continue;
                 }
 

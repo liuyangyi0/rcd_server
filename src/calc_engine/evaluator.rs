@@ -292,9 +292,10 @@ fn eval_mod(l: EvalValue, r: EvalValue) -> Result<EvalValue, EvalError> {
     if l.is_float() || r.is_float() {
         Ok(EvalValue::Float(l.as_f64() % r.as_f64()))
     } else {
-        Ok(EvalValue::Int(
-            l.as_int_for_integer_op()? % r.as_int_for_integer_op()?,
-        ))
+        l.as_int_for_integer_op()?
+            .checked_rem(r.as_int_for_integer_op()?)
+            .map(EvalValue::Int)
+            .ok_or_else(|| EvalError::TypeError("整数取模溢出".to_string()))
     }
 }
 
@@ -393,6 +394,13 @@ mod tests {
         let ast = parse(tokenize("10 % 0").unwrap()).unwrap();
         let result = evaluate(&ast, &HashMap::new());
         assert!(matches!(result, Err(EvalError::DivisionByZero)));
+    }
+
+    #[test]
+    fn eval_mod_overflow_returns_error() {
+        let ast = parse(tokenize("(-9223372036854775807 - 1) % -1").unwrap()).unwrap();
+        let result = evaluate(&ast, &HashMap::new());
+        assert!(matches!(result, Err(EvalError::TypeError(_))));
     }
 
     #[test]

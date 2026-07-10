@@ -468,6 +468,20 @@ mod tests {
         assert_eq!(results[0].1, Value::Float(-1.0));
     }
 
+    #[test]
+    fn engine_mod_overflow_uses_default() {
+        let rules = vec![make_rule(
+            "output",
+            "float",
+            "(-9223372036854775807 - 1) % -1",
+            -1.0,
+        )];
+        let engine = CalcEngine::new(rules).unwrap();
+
+        let results = engine.run_cycle(&HashMap::new());
+        assert_eq!(results[0].1, Value::Float(-1.0));
+    }
+
     // ---- Clamping ----
 
     #[test]
