@@ -832,14 +832,37 @@ fn register_send_node_write_callbacks(
             continue;
         };
         let com = com.clone();
+        let callback_node_id = node_id.clone();
         let context = context.clone();
         let next_ack_id = next_ack_id.clone();
 
+        log_opc_write_info(format!(
+            "[OPC 写诊断] 回调已注册: 串口={}, NodeId={}, 属性=Value, 类型=String, 权限=CurrentRead|CurrentWrite",
+            com, callback_node_id
+        ));
+
         node_manager
             .inner()
-            .add_write_callback(node_id.clone(), move |data_value, _range| {
+            .add_write_callback(node_id.clone(), move |data_value, range| {
                 let ack_id = next_ack_id.fetch_add(1, Ordering::Relaxed);
-                handle_send_node_write(data_value, &com, &tx, &context, ack_id)
+                let (value_type, value_summary) =
+                    opc_write_value_diagnostic(data_value.value.as_ref());
+                log_opc_write_info(format!(
+                    "[OPC 写诊断] 回调触发: 串口={}, NodeId={}, 属性=Value, IndexRange={:?}, Variant类型={}, DataValue状态={:?}, 值摘要={}",
+                    com,
+                    callback_node_id,
+                    range,
+                    value_type,
+                    data_value.status,
+                    value_summary,
+                ));
+
+                let status = handle_send_node_write(data_value, &com, &tx, &context, ack_id);
+                log_opc_write_info(format!(
+                    "[OPC 写诊断] 处理完成: 串口={}, NodeId={}, ack_id={}, 返回状态={:?}",
+                    com, callback_node_id, ack_id, status
+                ));
+                status
             });
     }
 }
@@ -851,35 +874,43 @@ fn handle_send_node_write(
     context: &SendNodeWriteContext,
     ack_id: u64,
 ) -> StatusCode {
-    let Some(Variant::String(hex_ua)) = data_value.value else {
+    let Some(value) = data_value.value else {
+        log_opc_write_warn(format!(
+            "[OPC 写诊断] 拒绝写入: 串口={}, 原因=未携带 Value",
+            com
+        ));
+        return StatusCode::BadTypeMismatch;
+    };
+    let actual_type = format!("{:?}", value.type_id());
+    let Variant::String(hex_ua) = value else {
+        log_opc_write_warn(format!(
+            "[OPC 写诊断] 拒绝写入: 串口={}, 期望类型=String, 实际类型={}",
+            com, actual_type
+        ));
         return StatusCode::BadTypeMismatch;
     };
     let hex_str = hex_ua.as_ref().trim();
     if is_send_node_idle_or_status(hex_str) {
+        log_opc_write_info(format!(
+            "[OPC 写诊断] 忽略写入: 串口={}, 值={:?}, 原因=空闲值或内部状态值(0/1/2/3)",
+            com, hex_str
+        ));
         return StatusCode::Good;
     }
 
     let (preview, truncated) = opc_write_log_preview(hex_str);
     let suffix = if truncated { "…(已截断)" } else { "" };
-    println!(
-        "收到 OPC 客户端写值: 串口={} 数据长度={} 数据预览={}{}",
-        com,
-        hex_str.len(),
-        preview,
-        suffix,
-    );
-    info!(
-        "收到 OPC 客户端写值: 串口={} 数据长度={} 数据预览={}{}",
-        com,
-        hex_str.len(),
-        preview,
-        suffix,
-    );
-
     let cmd = match build_hex_command(hex_str, com, true, Some(ack_id)) {
         Ok(cmd) => cmd,
         Err(e) => {
-            warn!("OPC 写命令无效: 串口={}, 数据={}, 错误={}", com, hex_str, e);
+            log_opc_write_warn(format!(
+                "[OPC 写诊断] 拒绝写入: 串口={}, 数据长度={}, 数据预览={}{}，原因={}",
+                com,
+                hex_str.len(),
+                preview,
+                suffix,
+                e
+            ));
             return StatusCode::BadInvalidArgument;
         }
     };
@@ -889,11 +920,18 @@ fn handle_send_node_write(
         e.into_inner()
     });
     if pending.contains_key(com) {
+        log_opc_write_warn(format!(
+            "[OPC 写诊断] 拒绝写入: 串口={}, 原因=上一条命令仍在等待设备回复",
+            com
+        ));
         return StatusCode::BadWaitingForResponse;
     }
 
     if let Err(e) = tx.send(cmd) {
-        warn!("转发命令到串口失败: 串口={}, 错误={:?}", com, e);
+        log_opc_write_warn(format!(
+            "[OPC 写诊断] 拒绝写入: 串口={}, 原因=命令通道不可用, 错误={:?}",
+            com, e
+        ));
         return StatusCode::BadResourceUnavailable;
     }
     pending.insert(
@@ -904,6 +942,15 @@ fn handle_send_node_write(
         },
     );
     drop(pending);
+
+    log_opc_write_info(format!(
+        "收到 OPC 客户端写值并已入队: 串口={} ack_id={} 数据长度={} 数据预览={}{}",
+        com,
+        ack_id,
+        hex_str.len(),
+        preview,
+        suffix,
+    ));
 
     if let Err(e) = context.local_ack_status_tx.send(CommandAckUpdate {
         com: com.to_string(),
@@ -928,10 +975,60 @@ fn handle_send_node_write(
     StatusCode::Good
 }
 
+fn log_opc_write_info(message: String) {
+    println!("{message}");
+    info!("{message}");
+}
+
+fn log_opc_write_warn(message: String) {
+    println!("{message}");
+    warn!("{message}");
+}
+
 fn opc_write_log_preview(value: &str) -> (String, bool) {
     let mut chars = value.chars();
     let preview: String = chars.by_ref().take(OPC_WRITE_LOG_PREVIEW_CHARS).collect();
     (preview, chars.next().is_some())
+}
+
+fn opc_write_value_diagnostic(value: Option<&Variant>) -> (String, String) {
+    let Some(value) = value else {
+        return ("None".to_string(), "<未携带值>".to_string());
+    };
+
+    let value_type = format!("{:?}", value.type_id());
+    let summary = match value {
+        Variant::Empty => "<Empty>".to_string(),
+        Variant::Boolean(value) => value.to_string(),
+        Variant::SByte(value) => value.to_string(),
+        Variant::Byte(value) => value.to_string(),
+        Variant::Int16(value) => value.to_string(),
+        Variant::UInt16(value) => value.to_string(),
+        Variant::Int32(value) => value.to_string(),
+        Variant::UInt32(value) => value.to_string(),
+        Variant::Int64(value) => value.to_string(),
+        Variant::UInt64(value) => value.to_string(),
+        Variant::Float(value) => value.to_string(),
+        Variant::Double(value) => value.to_string(),
+        Variant::String(value) => {
+            let raw = value.as_ref();
+            let (preview, truncated) = opc_write_log_preview(raw);
+            format!(
+                "长度={}, 内容={}{}",
+                raw.len(),
+                preview,
+                if truncated { "…(已截断)" } else { "" }
+            )
+        }
+        Variant::Array(value) => format!(
+            "数组长度={}, 维度={:?}",
+            value.values.len(),
+            value.dimensions
+        ),
+        _ => "<复杂值已省略>".to_string(),
+    };
+
+    (value_type, summary)
 }
 
 fn build_hex_command(
@@ -1384,6 +1481,25 @@ mod tests {
         let (preview, truncated) = opc_write_log_preview(&long);
         assert_eq!(preview.len(), OPC_WRITE_LOG_PREVIEW_CHARS);
         assert!(truncated);
+    }
+
+    #[test]
+    fn opc_write_diagnostic_reports_client_variant_type_and_bounded_value() {
+        let numeric = Variant::Double(12.5);
+        let (value_type, summary) = opc_write_value_diagnostic(Some(&numeric));
+        assert!(value_type.contains("Double"));
+        assert_eq!(summary, "12.5");
+
+        let long = Variant::String(UAString::from("A".repeat(OPC_WRITE_LOG_PREVIEW_CHARS + 10)));
+        let (value_type, summary) = opc_write_value_diagnostic(Some(&long));
+        assert!(value_type.contains("String"));
+        assert!(summary.contains("已截断"));
+        assert!(summary.len() < OPC_WRITE_LOG_PREVIEW_CHARS + 80);
+
+        assert_eq!(
+            opc_write_value_diagnostic(None),
+            ("None".to_string(), "<未携带值>".to_string())
+        );
     }
 
     #[test]
