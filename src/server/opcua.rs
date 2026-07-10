@@ -52,7 +52,7 @@ use opcua::server::{
 };
 use opcua::types::{
     BuildInfo, DataTypeId, DataValue, DateTime as UaDateTime, NodeId, NumericRange, ObjectId,
-    ReferenceTypeId, StatusCode, UAString, VariableTypeId, Variant,
+    QualifiedName, ReferenceTypeId, StatusCode, UAString, VariableTypeId, Variant,
 };
 
 // ============================================================
@@ -752,7 +752,7 @@ fn create_opcua_nodes(
     let mut address_space = node_manager.address_space().write();
     if !address_space.add_folder(
         &devices_folder_id,
-        "Devices",
+        QualifiedName::new(ns, "Devices"),
         "Devices",
         &NodeId::objects_folder_id(),
     ) {
@@ -776,7 +776,7 @@ fn create_opcua_nodes(
                 let (dt, init) = datatype_and_initial(expected);
                 variables.push(Variable::new_data_value(
                     &node_id,
-                    &browse_name,
+                    QualifiedName::new(ns, browse_name.clone()),
                     &browse_name,
                     dt,
                     Some(-1),
@@ -794,7 +794,7 @@ fn create_opcua_nodes(
         let send_node_id = NodeId::new(ns, send_name.clone());
         variables.push(Variable::new_data_value(
             &send_node_id,
-            &send_name,
+            QualifiedName::new(ns, send_name.clone()),
             &send_name,
             NodeId::from(DataTypeId::String),
             Some(-1),
@@ -813,7 +813,7 @@ fn create_opcua_nodes(
         let (dt, init) = datatype_and_initial(expected);
         variables.push(Variable::new_data_value(
             &node_id,
-            kks_calc,
+            QualifiedName::new(ns, kks_calc),
             kks_calc,
             dt,
             Some(-1),
@@ -888,10 +888,14 @@ fn register_send_methods(
     let methods_folder_id = NodeId::new(ns, "Methods");
     {
         let mut address_space = node_manager.address_space().write();
-        ObjectBuilder::new(&methods_folder_id, "Methods", "Methods")
-            .event_notifier(EventNotifier::empty())
-            .organized_by(ObjectId::ObjectsFolder)
-            .insert(&mut *address_space);
+        ObjectBuilder::new(
+            &methods_folder_id,
+            QualifiedName::new(ns, "Methods"),
+            "Methods",
+        )
+        .event_notifier(EventNotifier::empty())
+        .organized_by(ObjectId::ObjectsFolder)
+        .insert(&mut *address_space);
     }
 
     for (idx, port) in serial_ports.iter().enumerate() {
@@ -902,19 +906,23 @@ fn register_send_methods(
 
         {
             let mut address_space = node_manager.address_space().write();
-            MethodBuilder::new(&fn_node_id, &method_name, &method_name)
-                .component_of(methods_folder_id.clone())
-                .input_args(
-                    &mut *address_space,
-                    &input_id,
-                    &[("HexData", DataTypeId::String).into()],
-                )
-                .output_args(
-                    &mut *address_space,
-                    &output_id,
-                    &[("Result", DataTypeId::String).into()],
-                )
-                .insert(&mut *address_space);
+            MethodBuilder::new(
+                &fn_node_id,
+                QualifiedName::new(ns, method_name.clone()),
+                &method_name,
+            )
+            .component_of(methods_folder_id.clone())
+            .input_args(
+                &mut *address_space,
+                &input_id,
+                &[("HexData", DataTypeId::String).into()],
+            )
+            .output_args(
+                &mut *address_space,
+                &output_id,
+                &[("Result", DataTypeId::String).into()],
+            )
+            .insert(&mut *address_space);
         }
 
         let com = port.port_number.clone();
@@ -1351,6 +1359,7 @@ mod tests {
     use crate::calc_engine::config::CalcRule;
     use crate::csv_parser::{BitIndex, Config, DeviceConfig, Record};
     use crate::model::CommandAckStatus;
+    use opcua::server::address_space::NodeBase;
 
     fn make_record(kks: &str) -> Record {
         Record {
@@ -1450,7 +1459,7 @@ mod tests {
         let node_id = NodeId::new(1, "ttyAP0_Send");
         let variable = Variable::new_data_value(
             &node_id,
-            "ttyAP0_Send",
+            QualifiedName::new(1, "ttyAP0_Send"),
             "ttyAP0_Send",
             NodeId::from(DataTypeId::String),
             Some(-1),
@@ -1465,12 +1474,76 @@ mod tests {
         let Some(NodeType::Variable(variable)) = address_space.find_node(&node_id) else {
             panic!("应创建字符串 Variable");
         };
+        assert_eq!(
+            variable.browse_name(),
+            &QualifiedName::new(1, "ttyAP0_Send")
+        );
         assert_eq!(variable.data_type(), NodeId::from(DataTypeId::String));
         assert!(address_space.has_reference(
             &node_id,
             &NodeId::from(VariableTypeId::BaseDataVariableType),
             ReferenceTypeId::HasTypeDefinition,
         ));
+    }
+
+    #[test]
+    fn custom_browse_names_use_application_namespace_and_method_arguments_use_zero() {
+        let mut address_space = AddressSpace::new();
+        address_space.add_namespace("http://opcfoundation.org/UA/", 0);
+        address_space.add_namespace("urn:test", 1);
+
+        let folder_id = NodeId::new(1, "Devices");
+        assert!(
+            ObjectBuilder::new(&folder_id, QualifiedName::new(1, "Devices"), "Devices",)
+                .insert(&mut address_space)
+        );
+
+        let method_id = NodeId::new(1, "ttyAP0_SendCommand");
+        let input_id = NodeId::new(1, "ttyAP0_SendCommand_Input");
+        let output_id = NodeId::new(1, "ttyAP0_SendCommand_Output");
+        assert!(MethodBuilder::new(
+            &method_id,
+            QualifiedName::new(1, "ttyAP0_SendCommand"),
+            "ttyAP0_SendCommand",
+        )
+        .input_args(
+            &mut address_space,
+            &input_id,
+            &[("HexData", DataTypeId::String).into()],
+        )
+        .output_args(
+            &mut address_space,
+            &output_id,
+            &[("Result", DataTypeId::String).into()],
+        )
+        .insert(&mut address_space));
+
+        let Some(NodeType::Object(folder)) = address_space.find_node(&folder_id) else {
+            panic!("应创建自定义文件夹");
+        };
+        assert_eq!(folder.browse_name(), &QualifiedName::new(1, "Devices"));
+
+        let Some(NodeType::Method(method)) = address_space.find_node(&method_id) else {
+            panic!("应创建自定义 Method");
+        };
+        assert_eq!(
+            method.browse_name(),
+            &QualifiedName::new(1, "ttyAP0_SendCommand")
+        );
+
+        for (node_id, browse_name) in [
+            (&input_id, "InputArguments"),
+            (&output_id, "OutputArguments"),
+        ] {
+            let Some(NodeType::Variable(argument)) = address_space.find_node(node_id) else {
+                panic!("应创建 {browse_name} Variable");
+            };
+            assert_eq!(
+                argument.browse_name(),
+                &QualifiedName::new(0, browse_name),
+                "标准 Method 参数 BrowseName 必须保留在命名空间 0"
+            );
+        }
     }
 
     #[test]
