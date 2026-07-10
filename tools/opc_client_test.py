@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 STATUS_TEXT = {
     "": "idle",
     "0": "idle",
+    "IDLE": "idle",
     "1": "received",
     "2": "waiting",
     "3": "failed",
@@ -207,7 +208,13 @@ def format_access_levels(levels: set[object]) -> str:
     return " | ".join(sorted(getattr(level, "name", str(level)) for level in levels))
 
 
-def inspect_send_node(client, ua, namespace_index: int, send_name: str) -> bool:
+def inspect_send_node(
+    client,
+    ua,
+    namespace_index: int,
+    send_name: str,
+    expected_value: Optional[str] = None,
+) -> bool:
     """Read and strictly validate the OPC UA attributes of one send node."""
     node = node_for_send_name(client, ua, namespace_index, send_name)
     node_class = node.get_node_class()
@@ -250,6 +257,10 @@ def inspect_send_node(client, ua, namespace_index: int, send_name: str) -> bool:
         failures.append(f"VariantType expected String, got {variant_type.name}")
     if not isinstance(value, str):
         failures.append(f"Value expected str, got {type(value).__name__}")
+    elif not value:
+        failures.append("Value expected a non-empty compatibility string")
+    elif expected_value is not None and value != expected_value:
+        failures.append(f"Value expected {expected_value!r}, got {value!r}")
     if value_rank != -1:
         failures.append(f"ValueRank expected -1 (Scalar), got {value_rank}")
     if type_definition != expected_type_definition:
@@ -447,6 +458,10 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         help="with --check-types, validate this unavailable data node has Bad quality and no value",
     )
     parser.add_argument(
+        "--expect-send-value",
+        help="with --check-types or --check-node, require this current String value",
+    )
+    parser.add_argument(
         "--serial-monitor",
         help="optional receiving serial port used to verify actual bytes",
     )
@@ -493,7 +508,16 @@ def main(argv: Iterable[str]) -> int:
                 print("No <port>_Send nodes found.")
                 return 1
             print(f"TYPE SCAN: found {len(nodes)} send node(s)")
-            results = [inspect_send_node(client, ua, namespace_index, name) for name in nodes]
+            results = [
+                inspect_send_node(
+                    client,
+                    ua,
+                    namespace_index,
+                    name,
+                    args.expect_send_value,
+                )
+                for name in nodes
+            ]
             metadata_ok = inspect_server_metadata(client, ua, namespace_index, nodes)
             quality_ok = (
                 inspect_unavailable_data_quality(
@@ -526,7 +550,17 @@ def main(argv: Iterable[str]) -> int:
         print(f"EXPECTED SERIAL FRAME: {format_hex(expected_frame)}")
 
         if args.check_node:
-            return 0 if inspect_send_node(client, ua, namespace_index, send_name) else 1
+            return (
+                0
+                if inspect_send_node(
+                    client,
+                    ua,
+                    namespace_index,
+                    send_name,
+                    args.expect_send_value,
+                )
+                else 1
+            )
 
         monitor_thread, monitor_result = start_serial_monitor(
             args.serial_monitor,

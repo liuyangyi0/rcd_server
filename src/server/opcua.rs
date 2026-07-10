@@ -16,6 +16,8 @@ pub const OPCUA_MIN_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 pub const OPCUA_MIN_MAX_CHUNK_COUNT: usize = 256;
 /// OPC 写命令日志最多展示的字符数，避免异常大输入阻塞控制台和日志文件。
 const OPC_WRITE_LOG_PREVIEW_CHARS: usize = 256;
+/// `_Send` 节点启动时的非空字符串值，兼容按当前值推断点类型的 OPC 客户端。
+const SEND_NODE_IDLE_VALUE: &str = "IDLE";
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -938,7 +940,7 @@ fn create_opcua_nodes(
             NodeId::from(DataTypeId::String),
             Some(-1),
             None,
-            Variant::String(UAString::from("")),
+            Variant::String(UAString::from(SEND_NODE_IDLE_VALUE)),
         ));
         variable_names.push(send_name.clone());
         variable_node_ids.push(send_node_id.clone());
@@ -1204,7 +1206,7 @@ fn handle_send_node_write(
     let hex_str = hex_ua.as_ref().trim();
     if is_send_node_idle_or_status(hex_str) {
         log_opc_write_info(format!(
-            "[OPC 写诊断] 忽略写入: 串口={}, 值={:?}, 原因=空闲值或内部状态值(0/1/2/3)",
+            "[OPC 写诊断] 忽略写入: 串口={}, 值={:?}, 原因=空闲值或内部状态值(IDLE/0/1/2/3)",
             com, hex_str
         ));
         return StatusCode::Good;
@@ -1392,7 +1394,7 @@ fn forward_hex_command(
 }
 
 fn is_send_node_idle_or_status(value: &str) -> bool {
-    matches!(value, "" | "0" | "1" | "2" | "3")
+    matches!(value, "" | SEND_NODE_IDLE_VALUE | "0" | "1" | "2" | "3")
 }
 
 fn drain_command_ack_updates(
@@ -1541,6 +1543,7 @@ mod tests {
     use crate::csv_parser::{BitIndex, Config, DeviceConfig, Record};
     use crate::model::CommandAckStatus;
     use opcua::server::address_space::NodeBase;
+    use opcua::types::{DataEncoding, TimestampsToReturn};
 
     fn make_record(kks: &str) -> Record {
         Record {
@@ -1645,7 +1648,7 @@ mod tests {
             NodeId::from(DataTypeId::String),
             Some(-1),
             None,
-            Variant::String(UAString::from("")),
+            Variant::String(UAString::from(SEND_NODE_IDLE_VALUE)),
         );
         assert!(address_space.insert::<Variable, ReferenceTypeId>(variable, None));
 
@@ -1660,6 +1663,18 @@ mod tests {
             &QualifiedName::new(1, "ttyAP0_Send")
         );
         assert_eq!(variable.data_type(), NodeId::from(DataTypeId::String));
+        assert_eq!(variable.value_rank(), -1);
+        assert_eq!(
+            variable
+                .value(
+                    TimestampsToReturn::Neither,
+                    &NumericRange::None,
+                    &DataEncoding::Binary,
+                    0.0,
+                )
+                .value,
+            Some(Variant::String(UAString::from(SEND_NODE_IDLE_VALUE)))
+        );
         assert!(address_space.has_reference(
             &node_id,
             &NodeId::from(VariableTypeId::BaseDataVariableType),
@@ -1964,7 +1979,7 @@ mod tests {
 
     #[test]
     fn send_node_ignores_idle_and_status_values() {
-        for value in ["", "0", "1", "2", "3"] {
+        for value in [SEND_NODE_IDLE_VALUE, "", "0", "1", "2", "3"] {
             assert!(is_send_node_idle_or_status(value));
         }
 
@@ -2049,7 +2064,7 @@ mod tests {
             command_pending_timeout: Duration::from_secs(5),
         };
 
-        for value in ["", "0", "1", "2", "3"] {
+        for value in [SEND_NODE_IDLE_VALUE, "", "0", "1", "2", "3"] {
             let status =
                 handle_send_node_write(data_value_string(value), "COM1", &tx, &context, 42);
             assert_eq!(status, StatusCode::Good);

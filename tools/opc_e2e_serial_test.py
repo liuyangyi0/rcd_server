@@ -120,6 +120,8 @@ def wait_for_opc(endpoint: str, timeout: float) -> tuple[bool, str]:
                 "--endpoint",
                 endpoint,
                 "--check-types",
+                "--expect-send-value",
+                "IDLE",
                 "--quality-node",
                 "E2E_Status",
                 "--timeout",
