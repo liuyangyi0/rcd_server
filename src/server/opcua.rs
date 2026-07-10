@@ -43,7 +43,7 @@ use crate::serial::port_config::SerialPortConfig;
 // OPC UA 相关导入
 use opcua::nodes::AccessLevel;
 use opcua::server::address_space::{
-    EventNotifier, MethodBuilder, NodeType, ObjectBuilder, Variable,
+    AddressSpace, EventNotifier, MethodBuilder, NodeType, ObjectBuilder, Variable,
 };
 use opcua::server::diagnostics::NamespaceMetadata;
 use opcua::server::node_manager::memory::{simple_node_manager, SimpleNodeManager};
@@ -52,7 +52,7 @@ use opcua::server::{
 };
 use opcua::types::{
     BuildInfo, DataTypeId, DataValue, DateTime as UaDateTime, NodeId, NumericRange, ObjectId,
-    StatusCode, UAString, Variant,
+    ReferenceTypeId, StatusCode, UAString, VariableTypeId, Variant,
 };
 
 // ============================================================
@@ -711,6 +711,32 @@ fn plan_browse_names(
     (data_names, send_pairs)
 }
 
+/// 为每个数据变量补齐 OPC UA 标准要求的类型定义引用。
+fn add_base_data_variable_type_references(
+    address_space: &mut AddressSpace,
+    variable_node_ids: &[NodeId],
+) -> io::Result<()> {
+    let base_data_variable_type = NodeId::from(VariableTypeId::BaseDataVariableType);
+    for node_id in variable_node_ids {
+        address_space.insert_reference(
+            node_id,
+            &base_data_variable_type,
+            ReferenceTypeId::HasTypeDefinition,
+        );
+        if !address_space.has_reference(
+            node_id,
+            &base_data_variable_type,
+            ReferenceTypeId::HasTypeDefinition,
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("OPC UA 变量缺少 BaseDataVariableType 类型定义: {node_id}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// 在地址空间中创建所有设备变量节点、写命令节点和计算引擎衍生变量节点。
 fn create_opcua_nodes(
     node_manager: &Arc<SimpleNodeManager>,
@@ -738,6 +764,7 @@ fn create_opcua_nodes(
 
     let mut variables = Vec::new();
     let mut variable_names = Vec::with_capacity(counts.total());
+    let mut variable_node_ids = Vec::with_capacity(counts.total());
 
     for port in serial_ports {
         // 数据变量节点：使用纯 KKS 作为 browse_name（要求 KKS 全局唯一）
@@ -757,6 +784,7 @@ fn create_opcua_nodes(
                     init,
                 ));
                 variable_names.push(browse_name.clone());
+                variable_node_ids.push(node_id.clone());
                 kks_node_map.insert(browse_name, node_id);
             }
         }
@@ -774,6 +802,7 @@ fn create_opcua_nodes(
             Variant::String(UAString::from("")),
         ));
         variable_names.push(send_name.clone());
+        variable_node_ids.push(send_node_id.clone());
         send_node_ids.push((port.port_number.clone(), send_node_id));
     }
 
@@ -792,6 +821,7 @@ fn create_opcua_nodes(
             init,
         ));
         variable_names.push(kks_calc.to_string());
+        variable_node_ids.push(node_id.clone());
         kks_node_map.insert(kks_calc.to_string(), node_id);
     }
 
@@ -820,6 +850,8 @@ fn create_opcua_nodes(
             ),
         ));
     }
+
+    add_base_data_variable_type_references(&mut address_space, &variable_node_ids)?;
 
     // 在同一次写锁内设置写命令节点的写权限
     for (_, node_id) in &send_node_ids {
@@ -1408,6 +1440,37 @@ mod tests {
         assert_eq!(opc_port_stem("COM4"), "COM4");
         assert_eq!(opc_send_node_name("/dev/ttyAP0"), "ttyAP0_Send");
         assert_eq!(opc_send_method_name("/dev/ttyAP0"), "ttyAP0_SendCommand");
+    }
+
+    #[test]
+    fn string_variable_has_data_type_and_base_variable_type_reference() {
+        let mut address_space = AddressSpace::new();
+        address_space.add_namespace("http://opcfoundation.org/UA/", 0);
+        address_space.add_namespace("urn:test", 1);
+        let node_id = NodeId::new(1, "ttyAP0_Send");
+        let variable = Variable::new_data_value(
+            &node_id,
+            "ttyAP0_Send",
+            "ttyAP0_Send",
+            NodeId::from(DataTypeId::String),
+            Some(-1),
+            None,
+            Variant::String(UAString::from("")),
+        );
+        assert!(address_space.insert::<Variable, ReferenceTypeId>(variable, None));
+
+        add_base_data_variable_type_references(&mut address_space, std::slice::from_ref(&node_id))
+            .expect("类型定义引用应添加成功");
+
+        let Some(NodeType::Variable(variable)) = address_space.find_node(&node_id) else {
+            panic!("应创建字符串 Variable");
+        };
+        assert_eq!(variable.data_type(), NodeId::from(DataTypeId::String));
+        assert!(address_space.has_reference(
+            &node_id,
+            &NodeId::from(VariableTypeId::BaseDataVariableType),
+            ReferenceTypeId::HasTypeDefinition,
+        ));
     }
 
     #[test]
