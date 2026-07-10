@@ -5,6 +5,7 @@
 use log::info;
 use serde::Deserialize;
 use serialport::{DataBits, Parity, StopBits};
+use std::net::SocketAddr;
 
 use crate::logging::LoggingConfig;
 
@@ -57,16 +58,58 @@ pub enum RunLocation {
 /// 服务器网络与主备切换配置。
 #[derive(Deserialize, Debug, Clone)]
 pub struct Server {
-    /// 主机 IP 地址（预留，主备切换时使用）。
+    /// 主机服务地址，同时作为主机角色的 OPC UA 广告地址来源。
     #[serde(rename = "primary_ip")]
-    pub _primary_ip: String,
-    /// 备机 IP 地址（预留，主备切换时使用）。
+    pub primary_ip: String,
+    /// 备机服务地址，同时作为备机角色的 OPC UA 广告地址来源。
     #[serde(rename = "secondary_ip")]
-    pub _secondary_ip: String,
+    pub secondary_ip: String,
     /// 配置文件中指定的运行角色。
     pub run_on: RunLocation,
     /// 运行时实际生效的角色（可动态切换）。
     pub current_run: RunLocation,
+}
+
+impl Server {
+    /// 返回当前物理部署位置对客户端可访问的主机名/IP，用于 OPC UA EndpointUrl。
+    /// `current_run` 可在主备切换时改变，但机器的网络地址应始终由 `run_on` 决定。
+    pub fn opcua_advertised_host(&self) -> Result<String, String> {
+        let configured = match self.run_on {
+            RunLocation::Primary => &self.primary_ip,
+            RunLocation::Secondary => &self.secondary_ip,
+        };
+        advertised_host_from_server_address(configured)
+    }
+}
+
+fn advertised_host_from_server_address(address: &str) -> Result<String, String> {
+    let address = address.trim();
+    if address.is_empty() {
+        return Err("服务器地址为空".to_string());
+    }
+
+    let host = if let Ok(socket_addr) = address.parse::<SocketAddr>() {
+        match socket_addr {
+            SocketAddr::V4(addr) => addr.ip().to_string(),
+            SocketAddr::V6(addr) => format!("[{}]", addr.ip()),
+        }
+    } else if let Some((host, port)) = address.rsplit_once(':') {
+        if host.is_empty() || port.parse::<u16>().is_err() {
+            return Err(format!("服务器地址格式无效: {address}"));
+        }
+        host.to_string()
+    } else {
+        address.to_string()
+    };
+
+    if matches!(host.as_str(), "0.0.0.0" | "::" | "[::]") {
+        return Err(format!("OPC UA 广告地址不能使用通配地址: {host}"));
+    }
+    if host.contains("/") || host.contains("://") {
+        return Err(format!("OPC UA 广告主机名格式无效: {host}"));
+    }
+
+    Ok(host)
 }
 
 /// 串口全局默认参数。
@@ -208,5 +251,37 @@ serial_frame_logs = true
         assert_eq!(config.settings.command_retry_count, 5);
         assert_eq!(config.logging.level, "debug");
         assert!(config.logging.serial_frame_logs);
+    }
+
+    #[test]
+    fn opcua_advertised_host_follows_physical_run_location() {
+        let server = Server {
+            primary_ip: "192.168.10.40:11001".to_string(),
+            secondary_ip: "opc-secondary.local:11002".to_string(),
+            run_on: RunLocation::Secondary,
+            current_run: RunLocation::Primary,
+        };
+
+        assert_eq!(
+            server.opcua_advertised_host().unwrap(),
+            "opc-secondary.local"
+        );
+
+        let server = Server {
+            run_on: RunLocation::Primary,
+            current_run: RunLocation::Secondary,
+            ..server
+        };
+        assert_eq!(server.opcua_advertised_host().unwrap(), "192.168.10.40");
+    }
+
+    #[test]
+    fn opcua_advertised_host_supports_ipv6_and_rejects_wildcards() {
+        assert_eq!(
+            advertised_host_from_server_address("[2001:db8::1]:11001").unwrap(),
+            "[2001:db8::1]"
+        );
+        assert!(advertised_host_from_server_address("0.0.0.0:11001").is_err());
+        assert!(advertised_host_from_server_address("[::]:11001").is_err());
     }
 }

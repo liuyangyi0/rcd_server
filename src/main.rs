@@ -58,6 +58,10 @@ async fn main() -> tokio::io::Result<()> {
 
     // 加载配置
     let software_config = config::init_config().expect("加载配置文件失败");
+    let opcua_advertised_host = software_config
+        .server
+        .opcua_advertised_host()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
     // 系统状态 & 操作记录
     let system_state = SystemState::new();
@@ -146,6 +150,7 @@ async fn main() -> tokio::io::Result<()> {
                 txs,
                 ack_status_rx,
                 opcua_command_pending_timeout,
+                opcua_advertised_host,
                 calc_engine,
                 latest_status_cache,
                 cancel.clone(),

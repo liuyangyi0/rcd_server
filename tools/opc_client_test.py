@@ -16,6 +16,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Iterable, Optional
+from urllib.parse import urlparse
 
 
 STATUS_TEXT = {
@@ -288,6 +289,95 @@ def inspect_send_node(client, ua, namespace_index: int, send_name: str) -> bool:
     return True
 
 
+def inspect_server_metadata(client, ua, namespace_index: int, send_names: list[str]) -> bool:
+    failures: list[str] = []
+    endpoints = client.get_endpoints()
+    for endpoint in endpoints:
+        endpoint_host = urlparse(endpoint.EndpointUrl).hostname
+        discovery_hosts = [urlparse(url).hostname for url in endpoint.Server.DiscoveryUrls or []]
+        if endpoint_host in {"0.0.0.0", "::", None}:
+            failures.append(f"EndpointUrl is not client-accessible: {endpoint.EndpointUrl}")
+        if any(host in {"0.0.0.0", "::", None} for host in discovery_hosts):
+            failures.append(
+                f"DiscoveryUrls contain a wildcard or invalid host: {endpoint.Server.DiscoveryUrls}"
+            )
+        if not endpoint.Server.ProductUri:
+            failures.append("ApplicationDescription.ProductUri is empty")
+
+    methods_node = client.get_node(ua.NodeId("Methods", namespace_index))
+    methods_type = methods_node.get_type_definition()
+    expected_object_type = ua.NodeId(ua.ObjectIds.BaseObjectType)
+    if methods_type != expected_object_type:
+        failures.append(
+            f"Methods TypeDefinition expected {expected_object_type}, got {methods_type}"
+        )
+
+    for send_name in send_names:
+        port = send_name[: -len("_Send")]
+        method_name = f"{port}_SendCommand"
+        method = client.get_node(ua.NodeId(method_name, namespace_index))
+        executable = method.get_attribute(ua.AttributeIds.Executable).Value.Value
+        user_executable = method.get_attribute(ua.AttributeIds.UserExecutable).Value.Value
+        if executable is not True:
+            failures.append(f"{method_name}.Executable expected True, got {executable!r}")
+        if user_executable is not True:
+            failures.append(
+                f"{method_name}.UserExecutable expected True, got {user_executable!r}"
+            )
+
+        for suffix, expected_browse_name in [
+            ("Input", "InputArguments"),
+            ("Output", "OutputArguments"),
+        ]:
+            argument = client.get_node(
+                ua.NodeId(f"{method_name}_{suffix}", namespace_index)
+            )
+            browse_name = argument.get_browse_name()
+            type_definition = argument.get_type_definition()
+            expected_property_type = ua.NodeId(ua.ObjectIds.PropertyType)
+            if browse_name.NamespaceIndex != 0 or browse_name.Name != expected_browse_name:
+                failures.append(
+                    f"{method_name}_{suffix} BrowseName expected "
+                    f"0:{expected_browse_name}, got {browse_name}"
+                )
+            if type_definition != expected_property_type:
+                failures.append(
+                    f"{method_name}_{suffix} TypeDefinition expected "
+                    f"{expected_property_type}, got {type_definition}"
+                )
+
+    print(f"SERVER METADATA: endpoints={len(endpoints)}, methods={len(send_names)}")
+    if failures:
+        print("SERVER METADATA CHECK: FAIL")
+        for failure in failures:
+            print(f"  - {failure}")
+        return False
+    print("SERVER METADATA CHECK: PASS")
+    return True
+
+
+def inspect_unavailable_data_quality(client, ua, namespace_index: int, node_name: str) -> bool:
+    node = client.get_node(ua.NodeId(node_name, namespace_index))
+    read_value = ua.ReadValueId()
+    read_value.NodeId = node.nodeid
+    read_value.AttributeId = ua.AttributeIds.Value
+    read_params = ua.ReadParameters()
+    read_params.NodesToRead.append(read_value)
+    # Node.get_data_value 会对 Bad 质量直接抛异常；底层 Read 可保留状态和值供诊断。
+    data_value = client.uaclient.read(read_params)[0]
+    value = data_value.Value.Value
+    status = data_value.StatusCode
+    print(f"QUALITY NODE: {node_name} value={value!r}, status={status.name}")
+    if status.is_good():
+        print("QUALITY CHECK: FAIL (offline/unavailable value is marked Good)")
+        return False
+    if value is not None:
+        print("QUALITY CHECK: FAIL (Bad quality must not expose a synthetic zero value)")
+        return False
+    print("QUALITY CHECK: PASS")
+    return True
+
+
 def call_send_method(client, ua, namespace_index: int, port: str, command_hex: str) -> object:
     methods_node = client.get_node(ua.NodeId("Methods", namespace_index))
     method_node = client.get_node(ua.NodeId(f"{port}_SendCommand", namespace_index))
@@ -353,6 +443,10 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         help="browse and strictly validate every <port>_Send node, then exit",
     )
     parser.add_argument(
+        "--quality-node",
+        help="with --check-types, validate this unavailable data node has Bad quality and no value",
+    )
+    parser.add_argument(
         "--serial-monitor",
         help="optional receiving serial port used to verify actual bytes",
     )
@@ -400,9 +494,17 @@ def main(argv: Iterable[str]) -> int:
                 return 1
             print(f"TYPE SCAN: found {len(nodes)} send node(s)")
             results = [inspect_send_node(client, ua, namespace_index, name) for name in nodes]
+            metadata_ok = inspect_server_metadata(client, ua, namespace_index, nodes)
+            quality_ok = (
+                inspect_unavailable_data_quality(
+                    client, ua, namespace_index, args.quality_node
+                )
+                if args.quality_node
+                else True
+            )
             passed = sum(results)
             print(f"TYPE SCAN RESULT: {passed}/{len(results)} passed")
-            return 0 if all(results) else 1
+            return 0 if all(results) and metadata_ok and quality_ok else 1
 
         send_name = args.node or (f"{opc_port_stem(args.port)}_Send" if args.port else None)
         if not send_name:

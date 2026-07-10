@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use bounded_vec_deque::BoundedVecDeque;
 use log::{info, warn};
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::broadcast::Broadcaster;
@@ -52,7 +53,7 @@ use opcua::server::{
 };
 use opcua::types::{
     BuildInfo, DataTypeId, DataValue, DateTime as UaDateTime, NodeId, NumericRange, ObjectId,
-    QualifiedName, ReferenceTypeId, StatusCode, UAString, VariableTypeId, Variant,
+    ObjectTypeId, QualifiedName, ReferenceTypeId, StatusCode, UAString, VariableTypeId, Variant,
 };
 
 // ============================================================
@@ -100,6 +101,19 @@ fn value_to_variant(v: &Value) -> Variant {
 }
 
 type OpcuaValueUpdate<'a> = (&'a NodeId, Option<&'a NumericRange>, DataValue);
+
+fn unavailable_data_value(status: StatusCode) -> DataValue {
+    DataValue {
+        // async-opcua 0.16 的 Variable::value 仅在 value 为 Some 时复制 StatusCode；
+        // Variant::Empty 在线上仍编码为 Null，同时可保留 Bad 质量码。
+        value: Some(Variant::Empty),
+        status: Some(status),
+        source_timestamp: None,
+        source_picoseconds: None,
+        server_timestamp: Some(UaDateTime::now()),
+        server_picoseconds: Some(0),
+    }
+}
 
 pub fn command_pending_timeout(timeout_ms: u64, command_retry_count: u32) -> Duration {
     let attempts = u64::from(command_retry_count.max(1));
@@ -176,10 +190,16 @@ fn collect_device_updates<'a>(
     status: &DeviceStatus,
     kks_node_map: &'a HashMap<String, NodeId>,
     updates: &mut Vec<OpcuaValueUpdate<'a>>,
+    unavailable_status: StatusCode,
 ) {
     for (kks, val) in &status.value {
         if let Some(node_id) = kks_node_map.get(kks.as_str()) {
-            updates.push((node_id, None, DataValue::new_now(value_to_variant(val))));
+            let data_value = if status.com_status && status.device_status {
+                DataValue::new_now(value_to_variant(val))
+            } else {
+                unavailable_data_value(unavailable_status)
+            };
+            updates.push((node_id, None, data_value));
         }
     }
 }
@@ -202,7 +222,12 @@ fn build_incremental_updates<'a>(
     calc_runner: &mut CalcRunner,
 ) -> Vec<OpcuaValueUpdate<'a>> {
     let mut updates = Vec::with_capacity(status.value.len());
-    collect_device_updates(status, kks_node_map, &mut updates);
+    collect_device_updates(
+        status,
+        kks_node_map,
+        &mut updates,
+        StatusCode::BadNoCommunication,
+    );
     collect_calc_updates(calc_runner.on_update(status), kks_node_map, &mut updates);
     updates
 }
@@ -211,6 +236,7 @@ fn build_full_sync_updates<'a>(
     statuses: &[DeviceStatus],
     kks_node_map: &'a HashMap<String, NodeId>,
     calc_runner: &mut CalcRunner,
+    unavailable_status: StatusCode,
 ) -> Vec<OpcuaValueUpdate<'a>> {
     if statuses.is_empty() {
         return Vec::new();
@@ -219,7 +245,7 @@ fn build_full_sync_updates<'a>(
     let value_count = statuses.iter().map(|s| s.value.len()).sum();
     let mut updates = Vec::with_capacity(value_count);
     for status in statuses {
-        collect_device_updates(status, kks_node_map, &mut updates);
+        collect_device_updates(status, kks_node_map, &mut updates, unavailable_status);
     }
     collect_calc_updates(
         calc_runner.rebuild_from_statuses(statuses),
@@ -269,6 +295,7 @@ pub async fn run_opcua_server(
     txs: Vec<mpsc::Sender<Command>>,
     ack_status_rx: mpsc::Receiver<CommandAckUpdate>,
     command_pending_timeout: Duration,
+    advertised_host: String,
     calc_engine: Arc<CalcEngine>,
     latest_status_cache: LatestStatusCache,
     cancel: CancellationToken,
@@ -276,17 +303,17 @@ pub async fn run_opcua_server(
     validate_opcua_kks_namespace(&serial_ports, &calc_engine)?;
     let variable_counts = count_opcua_variables(&serial_ports, &calc_engine);
 
-    let host = OPCUA_BIND_HOST;
     let port: u16 = OPCUA_BIND_PORT;
-    let base = format!("opc.tcp://{}:{}/", host, port);
+    let base = format!("opc.tcp://{}:{}/", advertised_host, port);
 
     // ---- 构建 OPC UA 服务器 ----
     let mut builder = ServerBuilder::new()
-        .host(host)
+        .host(&advertised_host)
         .port(port)
         .discovery_urls(vec![base.clone()])
         .application_name("Serial OPC UA Server")
         .application_uri("urn:SerialServer:rcd_server")
+        .product_uri("urn:SerialServer")
         .pki_dir("./pki")
         .create_sample_keypair(true)
         .add_user_token("user1", ServerUserToken::user_pass("user1", "pwd"))
@@ -333,6 +360,18 @@ pub async fn run_opcua_server(
     let (server, handle) = builder.build().map_err(|e| {
         io::Error::new(io::ErrorKind::Other, format!("构建 OPC UA 服务器失败: {e}"))
     })?;
+    let listener = TcpListener::bind((OPCUA_BIND_HOST, port))
+        .await
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!("OPC UA 监听 {}:{} 失败: {e}", OPCUA_BIND_HOST, port),
+            )
+        })?;
+    info!(
+        "[OPC UA] 监听地址={}:{}, 广告地址={}",
+        OPCUA_BIND_HOST, port, base
+    );
 
     let node_manager: Arc<SimpleNodeManager> = handle
         .node_managers()
@@ -376,7 +415,7 @@ pub async fn run_opcua_server(
         .collect();
 
     // ---- 注册 Method 回调 ----
-    register_send_methods(&node_manager, ns, &serial_ports, &txs);
+    register_send_methods(&node_manager, ns, &serial_ports, &txs)?;
     register_send_node_write_callbacks(
         &node_manager,
         &send_node_ids,
@@ -391,8 +430,17 @@ pub async fn run_opcua_server(
     if initial_statuses_from_config {
         initial_statuses = build_config_zero_statuses(&serial_ports);
     }
-    let initial_updates =
-        build_full_sync_updates(&initial_statuses, &kks_node_map, &mut calc_runner);
+    let initial_unavailable_status = if initial_statuses_from_config {
+        StatusCode::BadWaitingForInitialData
+    } else {
+        StatusCode::BadNoCommunication
+    };
+    let initial_updates = build_full_sync_updates(
+        &initial_statuses,
+        &kks_node_map,
+        &mut calc_runner,
+        initial_unavailable_status,
+    );
     if !initial_updates.is_empty() {
         node_manager
             .set_values(&subscriptions, initial_updates.into_iter())
@@ -431,8 +479,12 @@ pub async fn run_opcua_server(
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!("[OPC UA] 广播订阅落后 {} 条，已丢帧", n);
                         let statuses = latest_cache_update.snapshot_statuses();
-                        let updates =
-                            build_full_sync_updates(&statuses, &kks_map, &mut calc_runner);
+                        let updates = build_full_sync_updates(
+                            &statuses,
+                            &kks_map,
+                            &mut calc_runner,
+                            StatusCode::BadNoCommunication,
+                        );
                         if !updates.is_empty() {
                             if let Err(e) = nm_update.set_values(&subs_update, updates.into_iter()) {
                                 warn!("OPC UA 全量重同步失败: {:?}", e);
@@ -496,7 +548,7 @@ pub async fn run_opcua_server(
     }
 
     let result = server
-        .run()
+        .run_with(listener)
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("OPC UA 服务器错误: {e}")));
 
@@ -569,6 +621,45 @@ fn validate_opcua_kks_namespace(
         }
     }
 
+    let mut infrastructure_node_owners: HashMap<String, String> = HashMap::new();
+    let mut duplicate_infrastructure_nodes = Vec::new();
+    let mut infrastructure_device_collisions = Vec::new();
+    let mut planned_infrastructure_nodes = vec![
+        ("Devices".to_string(), "系统 Devices 对象".to_string()),
+        ("Methods".to_string(), "系统 Methods 对象".to_string()),
+    ];
+    for port in serial_ports {
+        let method_name = opc_send_method_name(&port.port_number);
+        planned_infrastructure_nodes.extend([
+            (
+                method_name.clone(),
+                format!("串口 {} Method", port.port_number),
+            ),
+            (
+                format!("{method_name}_Input"),
+                format!("串口 {} Method 输入参数", port.port_number),
+            ),
+            (
+                format!("{method_name}_Output"),
+                format!("串口 {} Method 输出参数", port.port_number),
+            ),
+        ]);
+    }
+    for (node_name, owner) in planned_infrastructure_nodes {
+        if let Some(previous_owner) =
+            infrastructure_node_owners.insert(node_name.clone(), owner.clone())
+        {
+            duplicate_infrastructure_nodes.push(format!(
+                "{node_name}: {owner} conflicts with {previous_owner}"
+            ));
+        }
+        if let Some((device_port, device_id)) = device_kks_owners.get(&node_name) {
+            infrastructure_device_collisions.push(format!(
+                "{node_name}: {owner} conflicts with 设备 KKS {device_port}:{device_id}"
+            ));
+        }
+    }
+
     let calc_output_names = calc_engine.output_names();
     let calc_collisions: Vec<String> = calc_output_names
         .iter()
@@ -585,12 +676,24 @@ fn validate_opcua_kks_namespace(
         })
         .cloned()
         .collect();
+    let infrastructure_calc_collisions: Vec<String> = infrastructure_node_owners
+        .iter()
+        .filter(|(node_name, _)| {
+            calc_output_names
+                .iter()
+                .any(|calc_name| *calc_name == node_name.as_str())
+        })
+        .map(|(node_name, owner)| format!("{node_name}: {owner}"))
+        .collect();
 
     if duplicate_device_kks.is_empty()
         && calc_collisions.is_empty()
         && duplicate_send_nodes.is_empty()
         && send_device_collisions.is_empty()
         && send_calc_collisions.is_empty()
+        && duplicate_infrastructure_nodes.is_empty()
+        && infrastructure_device_collisions.is_empty()
+        && infrastructure_calc_collisions.is_empty()
     {
         return Ok(());
     }
@@ -654,6 +757,42 @@ fn validate_opcua_kks_namespace(
                 .cloned()
                 .collect::<Vec<_>>()
                 .join(", ")
+        ));
+    }
+    if !duplicate_infrastructure_nodes.is_empty() {
+        parts.push(format!(
+            "OPC UA 系统节点重名 {} 个，前 5 条: [{}]",
+            duplicate_infrastructure_nodes.len(),
+            duplicate_infrastructure_nodes
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    if !infrastructure_device_collisions.is_empty() {
+        parts.push(format!(
+            "OPC UA 系统节点与设备 KKS 重名 {} 个，前 5 条: [{}]",
+            infrastructure_device_collisions.len(),
+            infrastructure_device_collisions
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    if !infrastructure_calc_collisions.is_empty() {
+        parts.push(format!(
+            "OPC UA 系统节点与计算输出重名 {} 个，前 20 条: [{}]",
+            infrastructure_calc_collisions.len(),
+            infrastructure_calc_collisions
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
         ));
     }
 
@@ -883,19 +1022,37 @@ fn register_send_methods(
     ns: u16,
     serial_ports: &[SerialPortConfig],
     txs: &[mpsc::Sender<Command>],
-) {
+) -> io::Result<()> {
+    if serial_ports.len() != txs.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "OPC UA Method 注册参数不一致: 串口数={}, 发送队列数={}",
+                serial_ports.len(),
+                txs.len()
+            ),
+        ));
+    }
+
     // 创建 Methods 父对象文件夹
     let methods_folder_id = NodeId::new(ns, "Methods");
     {
         let mut address_space = node_manager.address_space().write();
-        ObjectBuilder::new(
+        let inserted = ObjectBuilder::new(
             &methods_folder_id,
             QualifiedName::new(ns, "Methods"),
             "Methods",
         )
         .event_notifier(EventNotifier::empty())
+        .has_type_definition(ObjectTypeId::BaseObjectType)
         .organized_by(ObjectId::ObjectsFolder)
         .insert(&mut *address_space);
+        if !inserted {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "创建 OPC UA Methods 对象失败",
+            ));
+        }
     }
 
     for (idx, port) in serial_ports.iter().enumerate() {
@@ -906,11 +1063,13 @@ fn register_send_methods(
 
         {
             let mut address_space = node_manager.address_space().write();
-            MethodBuilder::new(
+            let inserted = MethodBuilder::new(
                 &fn_node_id,
                 QualifiedName::new(ns, method_name.clone()),
                 &method_name,
             )
+            .executable(true)
+            .user_executable(true)
             .component_of(methods_folder_id.clone())
             .input_args(
                 &mut *address_space,
@@ -923,6 +1082,26 @@ fn register_send_methods(
                 &[("Result", DataTypeId::String).into()],
             )
             .insert(&mut *address_space);
+            if !inserted {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("创建 OPC UA Method 失败: {method_name}"),
+                ));
+            }
+            for (argument_id, argument_name) in [
+                (&input_id, "InputArguments"),
+                (&output_id, "OutputArguments"),
+            ] {
+                if !matches!(
+                    address_space.find_node(argument_id),
+                    Some(NodeType::Variable(_))
+                ) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("OPC UA Method {method_name} 缺少 {argument_name}"),
+                    ));
+                }
+            }
         }
 
         let com = port.port_number.clone();
@@ -948,6 +1127,8 @@ fn register_send_methods(
                 }
             });
     }
+
+    Ok(())
 }
 
 fn register_send_node_write_callbacks(
@@ -1495,6 +1676,7 @@ mod tests {
         let folder_id = NodeId::new(1, "Devices");
         assert!(
             ObjectBuilder::new(&folder_id, QualifiedName::new(1, "Devices"), "Devices",)
+                .has_type_definition(ObjectTypeId::BaseObjectType)
                 .insert(&mut address_space)
         );
 
@@ -1506,6 +1688,8 @@ mod tests {
             QualifiedName::new(1, "ttyAP0_SendCommand"),
             "ttyAP0_SendCommand",
         )
+        .executable(true)
+        .user_executable(true)
         .input_args(
             &mut address_space,
             &input_id,
@@ -1522,6 +1706,11 @@ mod tests {
             panic!("应创建自定义文件夹");
         };
         assert_eq!(folder.browse_name(), &QualifiedName::new(1, "Devices"));
+        assert!(address_space.has_reference(
+            &folder_id,
+            &NodeId::from(ObjectTypeId::BaseObjectType),
+            ReferenceTypeId::HasTypeDefinition,
+        ));
 
         let Some(NodeType::Method(method)) = address_space.find_node(&method_id) else {
             panic!("应创建自定义 Method");
@@ -1530,6 +1719,8 @@ mod tests {
             method.browse_name(),
             &QualifiedName::new(1, "ttyAP0_SendCommand")
         );
+        assert!(method.executable());
+        assert!(method.user_executable());
 
         for (node_id, browse_name) in [
             (&input_id, "InputArguments"),
@@ -1624,6 +1815,28 @@ mod tests {
     }
 
     #[test]
+    fn namespace_validation_rejects_system_node_device_collision() {
+        let port = make_port("ttyAP0", vec![make_device(11, &["Methods"])]);
+        let engine = make_calc_engine(vec![]);
+
+        let err = validate_opcua_kks_namespace(&[port], &engine).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("系统节点与设备 KKS 重名"));
+        assert!(err.to_string().contains("Methods"));
+    }
+
+    #[test]
+    fn namespace_validation_rejects_method_argument_calc_collision() {
+        let port = make_port("ttyAP0", vec![make_device(11, &["base"])]);
+        let engine = make_calc_engine(vec![("ttyAP0_SendCommand_Input", "uint", "base + 1")]);
+
+        let err = validate_opcua_kks_namespace(&[port], &engine).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("系统节点与计算输出重名"));
+        assert!(err.to_string().contains("ttyAP0_SendCommand_Input"));
+    }
+
+    #[test]
     fn variable_count_includes_device_send_and_calc_nodes() {
         let p0 = make_port("ttyAP0", vec![make_device(11, &["a", "b"])]);
         let p1 = make_port("ttyAP1", vec![make_device(12, &["c"])]);
@@ -1683,7 +1896,12 @@ mod tests {
         let mut kks_node_map = HashMap::new();
         kks_node_map.insert("always_one".to_string(), NodeId::new(1, "always_one"));
 
-        let updates = build_full_sync_updates(&[], &kks_node_map, &mut runner);
+        let updates = build_full_sync_updates(
+            &[],
+            &kks_node_map,
+            &mut runner,
+            StatusCode::BadNoCommunication,
+        );
 
         assert!(updates.is_empty());
     }
@@ -1708,6 +1926,40 @@ mod tests {
             statuses[0].value.get("9CYE91GH201_SL1"),
             Some(&Value::UInt(0))
         );
+    }
+
+    #[test]
+    fn device_updates_publish_quality_instead_of_good_zero_when_offline() {
+        let port = make_port("ttyAP0", vec![make_device(11, &["READY"])]);
+        let mut status = build_config_zero_statuses(&[port]).remove(0);
+        let mut kks_node_map = HashMap::new();
+        kks_node_map.insert("READY".to_string(), NodeId::new(1, "READY"));
+
+        let mut updates = Vec::new();
+        collect_device_updates(
+            &status,
+            &kks_node_map,
+            &mut updates,
+            StatusCode::BadWaitingForInitialData,
+        );
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].2.value, Some(Variant::Empty));
+        assert_eq!(
+            updates[0].2.status,
+            Some(StatusCode::BadWaitingForInitialData)
+        );
+
+        status.com_status = true;
+        status.device_status = true;
+        let mut online_updates = Vec::new();
+        collect_device_updates(
+            &status,
+            &kks_node_map,
+            &mut online_updates,
+            StatusCode::BadNoCommunication,
+        );
+        assert!(online_updates[0].2.value.is_some());
+        assert_eq!(online_updates[0].2.status, Some(StatusCode::Good));
     }
 
     #[test]

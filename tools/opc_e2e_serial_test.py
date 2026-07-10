@@ -120,6 +120,8 @@ def wait_for_opc(endpoint: str, timeout: float) -> tuple[bool, str]:
                 "--endpoint",
                 endpoint,
                 "--check-types",
+                "--quality-node",
+                "E2E_Status",
                 "--timeout",
                 "2",
             ],
@@ -257,7 +259,30 @@ def main(argv: Iterable[str]) -> int:
                 timeout=max(15.0, args.serial_timeout + 10.0),
             )
             print(test.stdout)
-            return test.returncode
+            if test.returncode != 0:
+                return test.returncode
+
+            method_test = subprocess.run(
+                [
+                    PYTHON,
+                    str(OPC_CLIENT),
+                    "--endpoint",
+                    args.endpoint,
+                    "--port",
+                    args.server_serial,
+                    "--hex",
+                    args.hex,
+                    "--mode",
+                    "method",
+                ],
+                cwd=str(ROOT),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=15,
+            )
+            print(method_test.stdout)
+            return method_test.returncode
         finally:
             server_output = terminate(process)
             if server_output.strip():
