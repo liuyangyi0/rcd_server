@@ -311,6 +311,10 @@ Objects/
 | 写命令节点 | `{串口号}_Send` | `COM3_Send` | 是 |
 | Method 节点 | `{串口号}_SendCommand` | `COM3_SendCommand` | — |
 
+Linux 串口配置使用完整设备路径时，OPC UA 节点只使用路径末段。例如
+`/dev/ttyAP0` 对外发布为 `ttyAP0_Send` 和 `ttyAP0_SendCommand`，串口通信内部仍使用
+`/dev/ttyAP0`。
+
 **约束**：所有 KKS（来自 CSV 的 `kks_prefix` + 数据点名）必须在所有串口/设备间**全局唯一**，否则启动时会输出 `[OPC UA] 检测到 ... KKS 重复` 错误日志，OPC 节点会冲突。请在 CSV 的 `kks_prefix` 中保证唯一。
 
 **计算引擎**：[calc.toml](#) 表达式中可以直接引用 OPC 节点暴露的同名变量（设备数据节点和计算衍生节点）。基础变量未在 CSV 数据点中定义时，公式将回退到 `default_value`，启动期会输出警告列表。

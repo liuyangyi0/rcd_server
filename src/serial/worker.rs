@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bounded_vec_deque::BoundedVecDeque;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -146,7 +146,7 @@ pub fn spawn_serial_worker(
                         .get(manager.index)
                         .map(|d| d.config.device_id)
                         .unwrap_or_default();
-                    info!(
+                    debug!(
                         "串口 {} 进入接收: role={:?}, index={}, device_id={}",
                         port_name, manager.current_run, manager.index, device_id
                     );
@@ -344,7 +344,7 @@ fn run_primary_cycle(
     ];
     frame.push(get_sum(&frame));
 
-    info!(
+    debug!(
         "串口 {} 准备发送轮询: index={}, device_id={}, data_len={}",
         manager.serial_config.port_name, idx, device_id, data_len
     );
@@ -354,7 +354,7 @@ fn run_primary_cycle(
         command: frame,
     });
 
-    info!(
+    debug!(
         "串口 {} 轮询发送完成: index={}, device_id={}, success={}",
         manager.serial_config.port_name, idx, device_id, sent
     );

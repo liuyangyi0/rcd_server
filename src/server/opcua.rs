@@ -258,7 +258,7 @@ fn build_config_zero_statuses(serial_ports: &[SerialPortConfig]) -> Vec<DeviceSt
 /// - 设备数据节点（只读）：纯 KKS 名，如 `9CYE91GH201_READY`。
 ///   要求 KKS 在所有串口/设备间全局唯一（在 CSV 的 `kks_prefix` 中保证）。
 /// - 计算衍生节点（只读）：纯 `kks_calc`，如 `91UGM91110_Fire`。
-/// - 写命令节点（可写）：`<串口号>_Send`，如 `ttyAP0_Send`，
+/// - 写命令节点（可写）：`<串口名>_Send`，如 `/dev/ttyAP0` 对应 `ttyAP0_Send`，
 ///   客户端可通过写入十六进制字符串向设备下发命令。
 #[allow(clippy::too_many_arguments)]
 pub async fn run_opcua_server(
@@ -548,14 +548,50 @@ fn validate_opcua_kks_namespace(
         }
     }
 
-    let calc_collisions: Vec<String> = calc_engine
-        .output_names()
-        .into_iter()
+    let mut send_node_owners: HashMap<String, String> = HashMap::new();
+    let mut duplicate_send_nodes = Vec::new();
+    let mut send_device_collisions = Vec::new();
+    for port in serial_ports {
+        let send_name = opc_send_node_name(&port.port_number);
+        if let Some(previous_port) =
+            send_node_owners.insert(send_name.clone(), port.port_number.clone())
+        {
+            duplicate_send_nodes.push(format!(
+                "{}: {} conflicts with {}",
+                send_name, port.port_number, previous_port
+            ));
+        }
+        if let Some((device_port, device_id)) = device_kks_owners.get(&send_name) {
+            send_device_collisions.push(format!(
+                "{}: 写命令节点 {} conflicts with 设备 KKS {}:{}",
+                send_name, port.port_number, device_port, device_id
+            ));
+        }
+    }
+
+    let calc_output_names = calc_engine.output_names();
+    let calc_collisions: Vec<String> = calc_output_names
+        .iter()
+        .copied()
         .filter(|name| device_kks_owners.contains_key(*name))
         .map(str::to_string)
         .collect();
+    let send_calc_collisions: Vec<String> = send_node_owners
+        .keys()
+        .filter(|send_name| {
+            calc_output_names
+                .iter()
+                .any(|calc_name| *calc_name == send_name.as_str())
+        })
+        .cloned()
+        .collect();
 
-    if duplicate_device_kks.is_empty() && calc_collisions.is_empty() {
+    if duplicate_device_kks.is_empty()
+        && calc_collisions.is_empty()
+        && duplicate_send_nodes.is_empty()
+        && send_device_collisions.is_empty()
+        && send_calc_collisions.is_empty()
+    {
         return Ok(());
     }
 
@@ -584,6 +620,42 @@ fn validate_opcua_kks_namespace(
                 .join(", ")
         ));
     }
+    if !duplicate_send_nodes.is_empty() {
+        parts.push(format!(
+            "串口路径归一化后写命令节点重名 {} 个，前 5 条: [{}]",
+            duplicate_send_nodes.len(),
+            duplicate_send_nodes
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    if !send_device_collisions.is_empty() {
+        parts.push(format!(
+            "写命令节点与设备 KKS 重名 {} 个，前 5 条: [{}]",
+            send_device_collisions.len(),
+            send_device_collisions
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    if !send_calc_collisions.is_empty() {
+        parts.push(format!(
+            "写命令节点与计算输出重名 {} 个，前 20 条: [{}]",
+            send_calc_collisions.len(),
+            send_calc_collisions
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
 
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
@@ -591,11 +663,30 @@ fn validate_opcua_kks_namespace(
     ))
 }
 
+/// 将系统串口路径转换为稳定的 OPC 节点前缀。
+///
+/// Linux 的 `/dev/ttyAP0` 和 Windows 的 `\\.\COM3` 分别映射为
+/// `ttyAP0`、`COM3`，避免路径分隔符被 OPC 客户端解释为额外层级。
+fn opc_port_stem(port_number: &str) -> &str {
+    port_number
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(port_number)
+}
+
+fn opc_send_node_name(port_number: &str) -> String {
+    format!("{}_Send", opc_port_stem(port_number))
+}
+
+fn opc_send_method_name(port_number: &str) -> String {
+    format!("{}_SendCommand", opc_port_stem(port_number))
+}
+
 /// 计算所有 OPC UA 节点的 browse_name（纯逻辑，便于单元测试）。
 ///
 /// 返回 `(data_browse_names, send_pairs)`：
 /// - `data_browse_names`：所有只读节点（设备数据 + 计算衍生），均为纯 KKS 名。
-/// - `send_pairs`：每个串口的写命令节点 `(port_number, "<port>_Send")`。
+/// - `send_pairs`：每个串口的写命令节点 `(port_number, "<port_stem>_Send")`。
 #[cfg(test)]
 fn plan_browse_names(
     serial_ports: &[SerialPortConfig],
@@ -611,7 +702,7 @@ fn plan_browse_names(
         }
         send_pairs.push((
             port.port_number.clone(),
-            format!("{}_Send", port.port_number),
+            opc_send_node_name(&port.port_number),
         ));
     }
     for (kks_calc, _) in calc_engine.output_definitions() {
@@ -671,7 +762,7 @@ fn create_opcua_nodes(
         }
 
         // 写命令节点（可写字符串）
-        let send_name = format!("{}_Send", port.port_number);
+        let send_name = opc_send_node_name(&port.port_number);
         let send_node_id = NodeId::new(ns, send_name.clone());
         variables.push(Variable::new_data_value(
             &send_node_id,
@@ -772,7 +863,7 @@ fn register_send_methods(
     }
 
     for (idx, port) in serial_ports.iter().enumerate() {
-        let method_name = format!("{}_SendCommand", port.port_number);
+        let method_name = opc_send_method_name(&port.port_number);
         let fn_node_id = NodeId::new(ns, method_name.clone());
         let input_id = NodeId::new(ns, format!("{}_Input", method_name));
         let output_id = NodeId::new(ns, format!("{}_Output", method_name));
@@ -1301,13 +1392,22 @@ mod tests {
     }
 
     #[test]
-    fn send_node_keeps_port_prefix() {
-        let port = make_port("ttyAP0", vec![make_device(11, &["X"])]);
+    fn send_node_uses_port_stem_without_os_path() {
+        let port = make_port("/dev/ttyAP0", vec![make_device(11, &["X"])]);
         let engine = make_calc_engine(vec![]);
         let (_, send_pairs) = plan_browse_names(&[port], &engine);
         assert_eq!(send_pairs.len(), 1);
-        assert_eq!(send_pairs[0].0, "ttyAP0");
+        assert_eq!(send_pairs[0].0, "/dev/ttyAP0");
         assert_eq!(send_pairs[0].1, "ttyAP0_Send");
+    }
+
+    #[test]
+    fn opc_port_names_normalize_linux_and_windows_paths() {
+        assert_eq!(opc_port_stem("/dev/ttyAP0"), "ttyAP0");
+        assert_eq!(opc_port_stem(r"\\.\COM3"), "COM3");
+        assert_eq!(opc_port_stem("COM4"), "COM4");
+        assert_eq!(opc_send_node_name("/dev/ttyAP0"), "ttyAP0_Send");
+        assert_eq!(opc_send_method_name("/dev/ttyAP0"), "ttyAP0_SendCommand");
     }
 
     #[test]
@@ -1373,6 +1473,18 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("计算输出与设备 KKS 重名"));
         assert!(err.to_string().contains("base"));
+    }
+
+    #[test]
+    fn namespace_validation_rejects_normalized_send_node_collision() {
+        let linux_path = make_port("/dev/ttyAP0", vec![make_device(11, &["a"])]);
+        let bare_name = make_port("ttyAP0", vec![make_device(12, &["b"])]);
+        let engine = make_calc_engine(vec![]);
+
+        let err = validate_opcua_kks_namespace(&[linux_path, bare_name], &engine).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("路径归一化后写命令节点重名"));
+        assert!(err.to_string().contains("ttyAP0_Send"));
     }
 
     #[test]
