@@ -277,6 +277,31 @@ def inspect_send_node(
     if ua.AccessLevel.CurrentWrite not in user_access_level:
         failures.append("UserAccessLevel is missing CurrentWrite")
 
+    devices_node = client.get_node(ua.NodeId("Devices", namespace_index))
+    component_references = devices_node.get_references(
+        refs=ua.ObjectIds.HasComponent,
+        direction=ua.BrowseDirection.Forward,
+        includesubtypes=False,
+    )
+    component_targets = {reference.NodeId for reference in component_references}
+    if expected_node_id not in component_targets:
+        failures.append(
+            f"Devices is missing HasComponent reference to {expected_node_id}"
+        )
+    else:
+        print(f"  ParentReference: Devices --HasComponent--> {send_name} (PASS)")
+
+    organizes_references = devices_node.get_references(
+        refs=ua.ObjectIds.Organizes,
+        direction=ua.BrowseDirection.Forward,
+        includesubtypes=False,
+    )
+    organizes_targets = {reference.NodeId for reference in organizes_references}
+    if expected_node_id in organizes_targets:
+        failures.append(
+            f"Devices still has an Organizes reference to {expected_node_id}"
+        )
+
     browse_path = [f"{namespace_index}:Devices", f"{namespace_index}:{send_name}"]
     try:
         browse_path_node = client.get_objects_node().get_child(browse_path)

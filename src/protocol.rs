@@ -189,6 +189,11 @@ pub fn find_double_zero(buffer: &[u8]) -> Option<usize> {
 
 /// 十六进制字符串转字节数组。
 pub fn hex_str_to_bytes(hex_str: &str) -> Result<Vec<u8>, String> {
+    // 后续按两个字节切片；先拒绝非 ASCII，既保证切片一定落在 UTF-8
+    // 字符边界上，也避免把全角数字等看起来相似的字符当成十六进制输入。
+    if !hex_str.is_ascii() {
+        return Err("Hex 字符串只能包含 ASCII 字符".to_string());
+    }
     if hex_str.len() % 2 != 0 {
         return Err("Hex 字符串长度不是偶数".to_string());
     }
@@ -464,5 +469,17 @@ mod tests {
     #[test]
     fn hex_str_to_bytes_lowercase() {
         assert_eq!(hex_str_to_bytes("ff00").unwrap(), vec![0xFF, 0x00]);
+    }
+
+    #[test]
+    fn hex_str_to_bytes_rejects_multibyte_unicode_without_panicking() {
+        assert!(hex_str_to_bytes("中0").is_err());
+        assert!(hex_str_to_bytes("🙂").is_err());
+    }
+
+    #[test]
+    fn hex_str_to_bytes_rejects_fullwidth_hex_characters() {
+        assert!(hex_str_to_bytes("ＦＦ").is_err());
+        assert!(hex_str_to_bytes("１２").is_err());
     }
 }

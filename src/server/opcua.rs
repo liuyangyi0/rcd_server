@@ -46,7 +46,8 @@ use crate::serial::port_config::SerialPortConfig;
 // OPC UA 相关导入
 use opcua::nodes::AccessLevel;
 use opcua::server::address_space::{
-    AddressSpace, EventNotifier, MethodBuilder, NodeType, ObjectBuilder, Variable,
+    AddressSpace, EventNotifier, MethodBuilder, NodeType, ObjectBuilder, ReferenceDirection,
+    Variable,
 };
 use opcua::server::diagnostics::NamespaceMetadata;
 use opcua::server::node_manager::memory::{simple_node_manager, SimpleNodeManager};
@@ -257,6 +258,14 @@ fn build_full_sync_updates<'a>(
     updates
 }
 
+/// 将广播接收器移动到当前通道尾部，丢弃快照之前已经排队的旧状态。
+///
+/// 状态生产者始终先更新 [`LatestStatusCache`]、再广播，因此重置接收游标后读取缓存快照
+/// 不会漏掉并发更新：快照之前的更新由缓存覆盖，快照之后的更新由新接收器继续消费。
+fn discard_pending_broadcasts<T: Clone>(receiver: &mut tokio::sync::broadcast::Receiver<T>) {
+    *receiver = receiver.resubscribe();
+}
+
 fn build_config_zero_statuses(serial_ports: &[SerialPortConfig]) -> Vec<DeviceStatus> {
     let mut statuses = Vec::new();
     for port in serial_ports {
@@ -384,8 +393,8 @@ pub async fn run_opcua_server(
         .get_namespace_index("urn:SerialServer")
         .expect("自定义命名空间未注册");
 
-    // 先订阅广播，再创建节点。节点创建期间到达的数据会留在接收队列中；
-    // 若队列溢出，后续 Lagged 分支会用最新值缓存全量重同步。
+    // 先建立广播接收器，再创建节点。节点创建期间的状态由最新值缓存承接；
+    // 节点就绪后会把接收游标切到通道尾部，再用缓存快照完成一致的初始同步。
     let mut rx_opcua = broadcaster.subscribe();
 
     // ---- 创建 OPC UA 节点（变量 + Method）----
@@ -427,6 +436,9 @@ pub async fn run_opcua_server(
     );
 
     let mut calc_runner = CalcRunner::new(calc_engine.clone());
+    // 节点创建期间的状态已经进入最新值缓存。先丢弃这段时间排队的广播，再读取快照，
+    // 避免快照应用后继续消费更旧的状态而造成数值回滚。
+    discard_pending_broadcasts(&mut rx_opcua);
     let mut initial_statuses = latest_status_cache.snapshot_statuses();
     let initial_statuses_from_config = initial_statuses.is_empty();
     if initial_statuses_from_config {
@@ -480,6 +492,9 @@ pub async fn run_opcua_server(
                     Ok(s) => s,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!("[OPC UA] 广播订阅落后 {} 条，已丢帧", n);
+                        // Lagged 会把游标留在通道中仍保留的最旧消息处。先切到尾部，
+                        // 再以缓存快照恢复，防止下一轮重新播放快照之前的旧状态。
+                        discard_pending_broadcasts(&mut rx_opcua);
                         let statuses = latest_cache_update.snapshot_statuses();
                         let updates = build_full_sync_updates(
                             &statuses,
@@ -878,6 +893,30 @@ fn add_base_data_variable_type_references(
     Ok(())
 }
 
+/// 将一组 DataVariable 作为父对象的组成部分插入地址空间。
+///
+/// `AddressSpace::add_variables` 会使用 `Organizes`，但 OPC UA DataVariable 应至少通过一条
+/// `HasComponent` 引用归属于 Object、ObjectType、DataVariable 或 VariableType。
+fn add_data_variables(
+    address_space: &mut AddressSpace,
+    variables: Vec<Variable>,
+    parent_node_id: &NodeId,
+) -> Vec<bool> {
+    variables
+        .into_iter()
+        .map(|variable| {
+            address_space.insert(
+                variable,
+                Some(&[(
+                    parent_node_id,
+                    &ReferenceTypeId::HasComponent,
+                    ReferenceDirection::Inverse,
+                )]),
+            )
+        })
+        .collect()
+}
+
 /// 在地址空间中创建所有设备变量节点、写命令节点和计算引擎衍生变量节点。
 fn create_opcua_nodes(
     node_manager: &Arc<SimpleNodeManager>,
@@ -969,7 +1008,7 @@ fn create_opcua_nodes(
     let inserted_results = if variables.is_empty() {
         Vec::new()
     } else {
-        address_space.add_variables(variables, &devices_folder_id)
+        add_data_variables(&mut address_space, variables, &devices_folder_id)
     };
     let inserted_variable_count = inserted_results.iter().filter(|ok| **ok).count();
 
@@ -1599,6 +1638,43 @@ mod tests {
         CalcEngine::new(cfg_rules).expect("构建测试引擎失败")
     }
 
+    #[tokio::test]
+    async fn discarding_pending_broadcasts_skips_startup_backlog() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        tx.send(1u32).expect("发送旧状态");
+        tx.send(2u32).expect("发送旧状态");
+
+        discard_pending_broadcasts(&mut rx);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        tx.send(3u32).expect("发送新状态");
+        assert_eq!(rx.recv().await.expect("接收新状态"), 3);
+    }
+
+    #[tokio::test]
+    async fn discarding_pending_broadcasts_skips_retained_items_after_lag() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(2);
+        tx.send(1u32).expect("发送旧状态");
+        tx.send(2u32).expect("发送旧状态");
+        tx.send(3u32).expect("制造接收器落后");
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+        ));
+        discard_pending_broadcasts(&mut rx);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        tx.send(4u32).expect("发送快照后的新状态");
+        assert_eq!(rx.recv().await.expect("接收快照后的新状态"), 4);
+    }
+
     #[test]
     fn device_data_node_uses_pure_kks() {
         let port = make_port(
@@ -1640,6 +1716,13 @@ mod tests {
         let mut address_space = AddressSpace::new();
         address_space.add_namespace("http://opcfoundation.org/UA/", 0);
         address_space.add_namespace("urn:test", 1);
+        let devices_id = NodeId::new(1, "Devices");
+        assert!(address_space.add_folder(
+            &devices_id,
+            QualifiedName::new(1, "Devices"),
+            "Devices",
+            &NodeId::objects_folder_id(),
+        ));
         let node_id = NodeId::new(1, "ttyAP0_Send");
         let variable = Variable::new_data_value(
             &node_id,
@@ -1650,7 +1733,10 @@ mod tests {
             None,
             Variant::String(UAString::from(SEND_NODE_IDLE_VALUE)),
         );
-        assert!(address_space.insert::<Variable, ReferenceTypeId>(variable, None));
+        assert_eq!(
+            add_data_variables(&mut address_space, vec![variable], &devices_id),
+            vec![true]
+        );
 
         add_base_data_variable_type_references(&mut address_space, std::slice::from_ref(&node_id))
             .expect("类型定义引用应添加成功");
@@ -1680,6 +1766,69 @@ mod tests {
             &NodeId::from(VariableTypeId::BaseDataVariableType),
             ReferenceTypeId::HasTypeDefinition,
         ));
+        assert!(address_space.has_reference(&devices_id, &node_id, ReferenceTypeId::HasComponent,));
+        assert!(!address_space.has_reference(&devices_id, &node_id, ReferenceTypeId::Organizes,));
+    }
+
+    #[test]
+    fn all_custom_data_variables_are_components_of_devices() {
+        let mut address_space = AddressSpace::new();
+        address_space.add_namespace("http://opcfoundation.org/UA/", 0);
+        address_space.add_namespace("urn:test", 1);
+
+        let devices_id = NodeId::new(1, "Devices");
+        assert!(address_space.add_folder(
+            &devices_id,
+            QualifiedName::new(1, "Devices"),
+            "Devices",
+            &NodeId::objects_folder_id(),
+        ));
+
+        let definitions = [
+            ("DEVICE_KKS", DataTypeId::UInt32, Variant::UInt32(0)),
+            (
+                "ttyAP0_Send",
+                DataTypeId::String,
+                Variant::String(UAString::from(SEND_NODE_IDLE_VALUE)),
+            ),
+            ("CALC_RESULT", DataTypeId::Float, Variant::Float(0.0)),
+        ];
+        let node_ids: Vec<NodeId> = definitions
+            .iter()
+            .map(|(name, _, _)| NodeId::new(1, *name))
+            .collect();
+        let variables: Vec<Variable> = definitions
+            .into_iter()
+            .zip(&node_ids)
+            .map(|((name, data_type, initial_value), node_id)| {
+                Variable::new_data_value(
+                    node_id,
+                    QualifiedName::new(1, name),
+                    name,
+                    NodeId::from(data_type),
+                    Some(-1),
+                    None,
+                    initial_value,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            add_data_variables(&mut address_space, variables, &devices_id),
+            vec![true; node_ids.len()]
+        );
+        for node_id in node_ids {
+            assert!(address_space.has_reference(
+                &devices_id,
+                &node_id,
+                ReferenceTypeId::HasComponent,
+            ));
+            assert!(!address_space.has_reference(
+                &devices_id,
+                &node_id,
+                ReferenceTypeId::Organizes,
+            ));
+        }
     }
 
     #[test]
