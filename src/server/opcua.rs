@@ -103,13 +103,23 @@ fn value_to_variant(v: &Value) -> Variant {
     }
 }
 
+/// 根据业务值类型生成对应的 OPC UA 零值。
+fn zero_variant_for_value(v: &Value) -> Variant {
+    match v {
+        Value::UInt(_) => Variant::UInt32(0),
+        Value::Bool(_) => Variant::Boolean(false),
+        Value::Float(_) => Variant::Float(0.0),
+        Value::Double(_) => Variant::Double(0.0),
+    }
+}
+
 type OpcuaValueUpdate<'a> = (&'a NodeId, Option<&'a NumericRange>, DataValue);
 
-fn unavailable_data_value(status: StatusCode) -> DataValue {
+fn unavailable_data_value(value: Variant, status: StatusCode) -> DataValue {
     DataValue {
         // async-opcua 0.16 的 Variable::value 仅在 value 为 Some 时复制 StatusCode；
-        // Variant::Empty 在线上仍编码为 Null，同时可保留 Bad 质量码。
-        value: Some(Variant::Empty),
+        // 启动等待数据时使用 Empty，运行中通信异常时使用类型匹配的零值。
+        value: Some(value),
         status: Some(status),
         source_timestamp: None,
         source_picoseconds: None,
@@ -200,7 +210,12 @@ fn collect_device_updates<'a>(
             let data_value = if status.com_status && status.device_status {
                 DataValue::new_now(value_to_variant(val))
             } else {
-                unavailable_data_value(unavailable_status)
+                let unavailable_value = if unavailable_status == StatusCode::BadNoCommunication {
+                    zero_variant_for_value(val)
+                } else {
+                    Variant::Empty
+                };
+                unavailable_data_value(unavailable_value, unavailable_status)
             };
             updates.push((node_id, None, data_value));
         }
@@ -2093,7 +2108,24 @@ mod tests {
     }
 
     #[test]
-    fn device_updates_publish_quality_instead_of_good_zero_when_offline() {
+    fn zero_variant_for_value_preserves_opcua_types() {
+        assert_eq!(zero_variant_for_value(&Value::UInt(42)), Variant::UInt32(0));
+        assert_eq!(
+            zero_variant_for_value(&Value::Bool(true)),
+            Variant::Boolean(false)
+        );
+        assert_eq!(
+            zero_variant_for_value(&Value::Float(42.5)),
+            Variant::Float(0.0)
+        );
+        assert_eq!(
+            zero_variant_for_value(&Value::Double(42.5)),
+            Variant::Double(0.0)
+        );
+    }
+
+    #[test]
+    fn device_updates_publish_zero_with_bad_quality_when_offline() {
         let port = make_port("ttyAP0", vec![make_device(11, &["READY"])]);
         let mut status = build_config_zero_statuses(&[port]).remove(0);
         let mut kks_node_map = HashMap::new();
@@ -2114,6 +2146,22 @@ mod tests {
         );
 
         status.com_status = true;
+        status.device_status = false;
+        status.value.insert("READY".to_string(), Value::UInt(42));
+        let mut offline_updates = Vec::new();
+        collect_device_updates(
+            &status,
+            &kks_node_map,
+            &mut offline_updates,
+            StatusCode::BadNoCommunication,
+        );
+        assert_eq!(offline_updates.len(), 1);
+        assert_eq!(offline_updates[0].2.value, Some(Variant::UInt32(0)));
+        assert_eq!(
+            offline_updates[0].2.status,
+            Some(StatusCode::BadNoCommunication)
+        );
+
         status.device_status = true;
         let mut online_updates = Vec::new();
         collect_device_updates(
@@ -2122,7 +2170,7 @@ mod tests {
             &mut online_updates,
             StatusCode::BadNoCommunication,
         );
-        assert!(online_updates[0].2.value.is_some());
+        assert_eq!(online_updates[0].2.value, Some(Variant::UInt32(42)));
         assert_eq!(online_updates[0].2.status, Some(StatusCode::Good));
     }
 
