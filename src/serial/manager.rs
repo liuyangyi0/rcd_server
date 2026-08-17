@@ -348,7 +348,7 @@ impl SerialManager {
                     self.reconnect();
                     return false;
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(50));
                 if let Err(e) = port.write_all(&addr_byte) {
                     warn!("写入地址字节错误: {:?}", e);
                     self.port = None;
