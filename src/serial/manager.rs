@@ -490,6 +490,8 @@ pub(crate) struct SerialManager {
     read_buf: Vec<u8>,
     /// 上次重连尝试的时间，用于冷却控制。
     last_reconnect: Instant,
+    /// 当前端口掉线状态是否已向全部设备发布，避免重连冷却期间重复广播。
+    port_offline_published: bool,
     /// 串口打开/重连故障周期的限频日志状态。
     reconnect_failure_log: ReconnectFailureLogState,
     /// 备机无法归属帧的端口级限频日志状态。
@@ -542,7 +544,7 @@ impl SerialManager {
             .map(|_| DeviceRuntimeState::new())
             .collect();
 
-        let manager = Self {
+        let mut manager = Self {
             port,
             command_queue: Arc::new(Mutex::new(VecDeque::new())),
             serial_config,
@@ -558,12 +560,14 @@ impl SerialManager {
             system_record,
             read_buf: vec![0u8; 1024],
             last_reconnect: Instant::now(),
+            port_offline_published: false,
             reconnect_failure_log,
             unattributed_failure_log: DeviceFailureLogState::default(),
         };
 
         if let Some(error) = initial_open_error {
             manager.log_record(format!("串口打开失败: error={error:?}"));
+            manager.publish_port_offline_once();
         }
 
         manager
@@ -571,11 +575,17 @@ impl SerialManager {
 
     // ---- 连接管理 ----
 
-    /// 尝试重新打开串口；失败时发送全零状态。
+    /// 进入重连路径时先将整口设备发布为离线零值，再尝试重新打开串口。
     ///
-    /// 内置 2 秒冷却：距上次重连不足 2 秒则跳过，避免频繁重连阻塞线程。
+    /// 内置 2 秒冷却：距上次重连不足 2 秒时仅跳过打开操作；整口离线状态仍会
+    /// 在当前故障周期首次进入时发布。串口打开成功只清除离线发布标记，各设备
+    /// 必须收到有效帧后才恢复在线状态。
     pub(crate) fn reconnect(&mut self) {
         const RECONNECT_COOLDOWN: Duration = Duration::from_secs(2);
+
+        // 连接恢复前，端口下所有设备都已经失去可信数据。该动作必须发生在
+        // 冷却判断之前，否则冷却期间会继续向 OPC 暴露旧值。
+        self.publish_port_offline_once();
 
         if self.last_reconnect.elapsed() < RECONNECT_COOLDOWN {
             return;
@@ -593,6 +603,7 @@ impl SerialManager {
         ) {
             Ok(port) => {
                 self.port = Some(port);
+                self.port_offline_published = false;
                 if let Some(stats) = self.reconnect_failure_log.recover(now) {
                     let message = format!(
                         "串口重新连接成功: duration_ms={} attempts={} last_error={:?}",
@@ -644,30 +655,55 @@ impl SerialManager {
                     ),
                     ReconnectLogAction::Suppressed => {}
                 }
-                self.send_zero_status(false, false);
                 self.port = None;
             }
         }
     }
 
-    /// 发送全零数据状态给所有订阅者。
+    /// 将当前设备的全零状态发送给所有订阅者。
     pub(crate) fn send_zero_status(&mut self, com_status: bool, device_status: bool) {
-        let dev = &self.port_config.devices[self.index];
-        let zero_data = vec![0u8; dev.config.data_len as usize];
-        let parsed = protocol::parse_status(&zero_data, &dev.records);
-        let status = DeviceStatus {
-            id: dev.config.com_index as u64,
-            device_id: dev.config.device_id,
-            com: self.port_config.port_number.clone(),
-            com_status,
-            device_status,
-            value: parsed,
-            raw_data: zero_data.clone(),
+        self.send_zero_status_for_index(self.index, com_status, device_status);
+    }
+
+    /// 将指定设备的全零状态写入缓存并按状态变化规则广播。
+    fn send_zero_status_for_index(&mut self, index: usize, com_status: bool, device_status: bool) {
+        let (zero_data, status) = {
+            let Some(dev) = self.port_config.devices.get(index) else {
+                return;
+            };
+            let zero_data = vec![0u8; dev.config.data_len as usize];
+            let parsed = protocol::parse_status(&zero_data, &dev.records);
+            let status = DeviceStatus {
+                id: dev.config.com_index as u64,
+                device_id: dev.config.device_id,
+                com: self.port_config.port_number.clone(),
+                com_status,
+                device_status,
+                value: parsed,
+                raw_data: zero_data.clone(),
+            };
+            (zero_data, status)
         };
         self.latest_status_cache.update(status.clone());
 
-        if self.device_states[self.index].should_broadcast(&zero_data, com_status, device_status) {
+        if self
+            .device_states
+            .get_mut(index)
+            .is_some_and(|state| state.should_broadcast(&zero_data, com_status, device_status))
+        {
             self.broadcaster.broadcast(status);
+        }
+    }
+
+    /// 首次检测到整口不可用时，将该端口下全部设备发布为离线零值。
+    fn publish_port_offline_once(&mut self) {
+        if self.port_offline_published {
+            return;
+        }
+        self.port_offline_published = true;
+
+        for index in 0..self.port_config.devices.len() {
+            self.send_zero_status_for_index(index, false, false);
         }
     }
 
@@ -817,8 +853,9 @@ impl SerialManager {
 
     /// 读取命令 ACK 回复。
     ///
-    /// 该路径只用于客户端下发命令后的 ACK 判断，不进入采集帧解析，
-    /// 也不更新设备超时、解析失败、缓存或广播状态。
+    /// 该路径只用于客户端下发命令后的 ACK 判断，不进入采集帧解析，也不更新
+    /// 设备超时或解析失败计数。普通 ACK 超时和内容不匹配不改变缓存或广播状态；
+    /// 串口未打开或发生非超时 I/O 错误时会进入重连流程并发布整口离线状态。
     pub(crate) fn receive_command_ack(&mut self) -> bool {
         let port = match self.port {
             Some(ref mut p) => p,
@@ -853,6 +890,7 @@ impl SerialManager {
                 Err(e) => {
                     error!("读取命令 ACK 错误: {:?}", e);
                     self.log_record("读取命令 ACK 错误".into());
+                    self.port = None;
                     self.reconnect();
                     return false;
                 }
@@ -1007,6 +1045,7 @@ impl SerialManager {
                 Err(e) => {
                     error!("读取错误: {:?}", e);
                     self.log_record("读取错误".into());
+                    self.port = None;
                     self.reconnect();
                     return ReceiveDataOutcome::TransportHandled;
                 }
@@ -1686,23 +1725,37 @@ mod tests {
     use std::collections::HashMap;
     use std::io::Read;
 
-    use crate::csv_parser::{Config as CsvConfig, DeviceConfig};
+    use crate::csv_parser::{BitIndex, Config as CsvConfig, DeviceConfig, Record};
     use crate::model::Value;
     use serialport::FlowControl;
 
-    fn test_manager(run_on: RunLocation, current_run: RunLocation) -> SerialManager {
-        let device = DeviceConfig {
+    fn test_device(device_id: u8) -> DeviceConfig {
+        DeviceConfig {
             config: CsvConfig {
                 com: "COM1".to_string(),
                 baud_rate: 9_600,
                 is_special: true,
-                com_index: 1,
-                device_id: 1,
+                com_index: device_id,
+                device_id,
                 data_len: 3,
                 kks_prefix: String::new(),
             },
-            records: Vec::new(),
-        };
+            records: vec![Record {
+                kks: format!("POINT_{device_id}"),
+                type_: "uint".to_string(),
+                _f_type: String::new(),
+                byte_index: 1,
+                bit_index: BitIndex::Range(0..=7),
+                _def: 0,
+                _max: 0,
+                _min: 0,
+                byte_order: 0,
+            }],
+        }
+    }
+
+    fn test_manager(run_on: RunLocation, current_run: RunLocation) -> SerialManager {
+        let device = test_device(1);
 
         SerialManager {
             port: None,
@@ -1727,9 +1780,19 @@ mod tests {
             system_record: Arc::new(Mutex::new(BoundedVecDeque::new(10))),
             read_buf: vec![0u8; 1024],
             last_reconnect: Instant::now(),
+            port_offline_published: false,
             reconnect_failure_log: ReconnectFailureLogState::default(),
             unattributed_failure_log: DeviceFailureLogState::default(),
         }
+    }
+
+    fn test_manager_with_devices(device_count: u8) -> SerialManager {
+        let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+        manager.port_config.devices = (1..=device_count).map(test_device).collect();
+        manager.device_states = (0..device_count)
+            .map(|_| DeviceRuntimeState::new())
+            .collect();
+        manager
     }
 
     fn with_checksum(mut bytes: Vec<u8>) -> Vec<u8> {
@@ -2333,6 +2396,127 @@ mod tests {
     }
 
     #[test]
+    fn read_io_error_marks_every_device_offline_once_during_reconnect_cooldown() {
+        let mut manager = test_manager_with_devices(3);
+        let mut rx = manager.broadcaster.subscribe();
+
+        // 先为每台设备发布非零有效值，模拟运行中整口掉线。
+        for index in 0..manager.port_config.devices.len() {
+            manager.index = index;
+            let device_id = manager.port_config.devices[index].config.device_id;
+            let frame = valid_status_frame(device_id, cmd::READ_STATUS);
+            let packet = protocol::parse_data_packet(&frame).expect("测试有效帧应能解析");
+            manager.handle_valid_packet(packet, frame);
+        }
+        while rx.try_recv().is_ok() {}
+
+        manager.index = 1;
+        manager.last_reconnect = Instant::now();
+        install_scripted_port(&mut manager, vec![ReadStep::IoError], vec![]);
+
+        manager.receive_data();
+
+        assert!(manager.port.is_none(), "读取错误后应先释放失效句柄");
+        assert!(manager.port_offline_published);
+        assert_eq!(manager.index, 1, "整口置零不应改变当前轮询索引");
+        assert!(manager
+            .device_states
+            .iter()
+            .all(|state| state.timeout_count == 0 && state.parse_fail_count == 0));
+
+        let mut offline = Vec::new();
+        while let Ok(status) = rx.try_recv() {
+            offline.push(status);
+        }
+        offline.sort_by_key(|status| status.device_id);
+        assert_eq!(offline.len(), 3);
+        for status in &offline {
+            assert!(!status.com_status);
+            assert!(!status.device_status);
+            assert_eq!(
+                status.value.get(&format!("POINT_{}", status.device_id)),
+                Some(&Value::UInt(0))
+            );
+        }
+
+        let cached = manager.latest_status_cache.snapshot_statuses();
+        assert_eq!(cached.len(), 3);
+        assert!(cached
+            .iter()
+            .all(|status| !status.com_status && !status.device_status));
+
+        // 冷却期再次进入重连路径，不应重复广播整口离线。
+        manager.receive_data();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn initial_query_write_failure_marks_every_device_offline() {
+        let mut manager = test_manager_with_devices(3);
+        let mut rx = manager.broadcaster.subscribe();
+        manager.last_reconnect = Instant::now();
+        install_scripted_port(&mut manager, vec![], vec![false]);
+
+        assert!(!manager.send_command(status_query()));
+
+        let mut device_ids = Vec::new();
+        while let Ok(status) = rx.try_recv() {
+            assert!(!status.com_status);
+            assert!(!status.device_status);
+            device_ids.push(status.device_id);
+        }
+        device_ids.sort_unstable();
+        assert_eq!(device_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn command_ack_io_error_releases_port_and_marks_every_device_offline() {
+        let mut manager = test_manager_with_devices(2);
+        let mut rx = manager.broadcaster.subscribe();
+        manager.last_reconnect = Instant::now();
+        install_scripted_port(&mut manager, vec![ReadStep::IoError], vec![]);
+
+        assert!(!manager.receive_command_ack());
+        assert!(manager.port.is_none());
+
+        let mut device_ids = Vec::new();
+        while let Ok(status) = rx.try_recv() {
+            assert!(!status.com_status);
+            assert!(!status.device_status);
+            device_ids.push(status.device_id);
+        }
+        device_ids.sort_unstable();
+        assert_eq!(device_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn valid_frame_recovers_only_the_responding_device_after_port_offline() {
+        let mut manager = test_manager_with_devices(2);
+        manager.publish_port_offline_once();
+        manager.port_offline_published = false; // 模拟串口已经重新打开
+
+        manager.index = 0;
+        let frame = valid_status_frame(1, cmd::READ_STATUS);
+        let packet = protocol::parse_data_packet(&frame).expect("测试有效帧应能解析");
+        manager.handle_valid_packet(packet, frame);
+
+        let cached = manager.latest_status_cache.snapshot_statuses();
+        let device_1 = cached
+            .iter()
+            .find(|status| status.device_id == 1)
+            .expect("设备1应存在缓存");
+        let device_2 = cached
+            .iter()
+            .find(|status| status.device_id == 2)
+            .expect("设备2应存在缓存");
+        assert!(device_1.com_status && device_1.device_status);
+        assert!(!device_2.com_status && !device_2.device_status);
+    }
+
+    #[test]
     fn automatic_query_timeout_then_retry_success_keeps_device_online() {
         let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
         let observations = install_scripted_port(
@@ -2587,10 +2771,18 @@ mod tests {
     #[test]
     fn missing_port_during_reconnect_cooldown_does_not_spam_system_record() {
         let mut manager = test_manager(RunLocation::Secondary, RunLocation::Secondary);
+        let mut rx = manager.broadcaster.subscribe();
 
         manager.receive_data();
         manager.receive_data();
 
         assert!(manager.system_record.lock().unwrap().is_empty());
+        let offline = rx.try_recv().expect("缺失串口应立即发布离线状态");
+        assert!(!offline.com_status);
+        assert!(!offline.device_status);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 }
