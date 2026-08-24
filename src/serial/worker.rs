@@ -32,7 +32,8 @@ const SLOW_RECEIVE_LOG_THRESHOLD: Duration = Duration::from_secs(2);
 
 enum CycleResult {
     Idle,
-    NormalReceive,
+    QuerySent(SendData),
+    PassiveReceive,
     CommandHandled,
 }
 
@@ -130,7 +131,7 @@ pub fn spawn_serial_worker(
                         &mut last_idle_log,
                         "当前是备机监听模式，不主动轮询发送",
                     );
-                } else if matches!(cycle_result, CycleResult::Idle) {
+                } else if matches!(&cycle_result, CycleResult::Idle) {
                     log_idle_reason(
                         &port_name,
                         &mut last_idle_log,
@@ -138,27 +139,45 @@ pub fn spawn_serial_worker(
                     );
                 }
 
-                // 仅在实际发送了命令（或备机监听模式）时才接收数据
-                if matches!(cycle_result, CycleResult::NormalReceive) {
-                    let device_id = manager
-                        .port_config
-                        .devices
-                        .get(manager.index)
-                        .map(|d| d.config.device_id)
-                        .unwrap_or_default();
-                    debug!(
-                        "串口 {} 进入接收: role={:?}, index={}, device_id={}",
-                        port_name, manager.current_run, manager.index, device_id
-                    );
-                    let receive_started = Instant::now();
-                    manager.receive_data();
-                    let elapsed = receive_started.elapsed();
-                    if elapsed >= SLOW_RECEIVE_LOG_THRESHOLD {
-                        warn!(
-                            "串口 {} 接收耗时 {:?}，可能存在串口 read 阻塞或设备响应异常",
-                            port_name, elapsed
+                // 主机查询和备机监听的接收语义不同：只有自动查询允许补发一次。
+                match cycle_result {
+                    CycleResult::QuerySent(query) => {
+                        let device_id = manager
+                            .port_config
+                            .devices
+                            .get(manager.index)
+                            .map(|d| d.config.device_id)
+                            .unwrap_or_default();
+                        debug!(
+                            "串口 {} 进入查询接收: role={:?}, index={}, device_id={}",
+                            port_name, manager.current_run, manager.index, device_id
                         );
+                        let receive_started = Instant::now();
+                        manager.receive_query_with_retry(query);
+                        let elapsed = receive_started.elapsed();
+                        if elapsed >= SLOW_RECEIVE_LOG_THRESHOLD {
+                            debug!(
+                                "串口 {} 查询收发耗时 {:?}，可能包含一次读取超时和补发",
+                                port_name, elapsed
+                            );
+                        }
                     }
+                    CycleResult::PassiveReceive => {
+                        debug!(
+                            "串口 {} 进入备机监听接收: role={:?}",
+                            port_name, manager.current_run
+                        );
+                        let receive_started = Instant::now();
+                        manager.receive_data();
+                        let elapsed = receive_started.elapsed();
+                        if elapsed >= SLOW_RECEIVE_LOG_THRESHOLD {
+                            warn!(
+                                "串口 {} 接收耗时 {:?}，可能存在串口 read 阻塞或设备响应异常",
+                                port_name, elapsed
+                            );
+                        }
+                    }
+                    CycleResult::Idle | CycleResult::CommandHandled => {}
                 }
 
                 // 主机模式：轮询下一个设备；备机模式：index 由 extract_frame 从转发头解析
@@ -177,7 +196,7 @@ pub fn spawn_serial_worker(
 
 fn log_idle_reason(port_name: &str, last_log: &mut Instant, reason: &str) {
     if last_log.elapsed() >= WORKER_HEARTBEAT_INTERVAL {
-        info!("串口 {} worker 正常运行但未发送: {}", port_name, reason);
+        debug!("串口 {} worker 正常运行但未发送: {}", port_name, reason);
         *last_log = Instant::now();
     }
 }
@@ -200,7 +219,7 @@ fn log_worker_heartbeat(manager: &SerialManager, port_name: &str, last_log: &mut
         .map(|q| q.len())
         .unwrap_or_default();
 
-    info!(
+    debug!(
         "串口 {} worker 心跳: role={:?}, port_enabled={}, index={}, device_id={}, timeout_count={}, queued_commands={}",
         port_name,
         manager.current_run,
@@ -291,7 +310,7 @@ fn process_incoming_commands(
 
 /// 主机模式的一次轮询周期。
 ///
-/// 返回 `true` 表示已发送命令，需要接收响应；`false` 表示跳过本轮，不需要接收。
+/// 返回本轮的接收动作，查询成功发送时保留原始帧用于可能的一次补发。
 fn run_primary_cycle(
     manager: &mut SerialManager,
     ack_status_tx: &Sender<CommandAckUpdate>,
@@ -349,10 +368,11 @@ fn run_primary_cycle(
         manager.serial_config.port_name, idx, device_id, data_len
     );
 
-    let sent = manager.send_command(SendData {
-        device_id: 1,
+    let query = SendData {
+        device_id: u32::from(device_id),
         command: frame,
-    });
+    };
+    let sent = manager.send_command(query.clone());
 
     debug!(
         "串口 {} 轮询发送完成: index={}, device_id={}, success={}",
@@ -360,7 +380,7 @@ fn run_primary_cycle(
     );
 
     if sent {
-        CycleResult::NormalReceive
+        CycleResult::QuerySent(query)
     } else {
         CycleResult::Idle
     }
@@ -368,7 +388,7 @@ fn run_primary_cycle(
 
 /// 备机模式的一次轮询周期。
 ///
-/// 返回 `true` 表示备机始终需要监听数据（主机转发帧）。
+/// 备机始终被动监听主机转发帧，不使用自动查询补发。
 fn run_secondary_cycle(
     manager: &mut SerialManager,
     ack_status_tx: &Sender<CommandAckUpdate>,
@@ -387,7 +407,7 @@ fn run_secondary_cycle(
         manager.send_command(cmd.data);
     }
     // 备机始终需要监听转发数据
-    CycleResult::NormalReceive
+    CycleResult::PassiveReceive
 }
 
 fn execute_queued_command(

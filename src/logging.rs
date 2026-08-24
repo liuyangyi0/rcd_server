@@ -11,7 +11,7 @@ use flexi_logger::{
 };
 use serde::Deserialize;
 
-const DEFAULT_LOG_SPEC: &str = "info";
+const DEFAULT_LOG_SPEC: &str = "warn,rcd_server=info";
 const DEFAULT_LOG_BASENAME: &str = "rcd_server";
 const SERIAL_FRAME_LOG_ENV: &str = "RCD_LOG_SERIAL_FRAMES";
 const OPCUA_TRANSPORT_ERRORS_ENV: &str = "RCD_LOG_OPCUA_TRANSPORT_ERRORS";
@@ -352,6 +352,11 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
     use std::path::PathBuf;
+
+    #[test]
+    fn default_log_spec_keeps_app_info_and_suppresses_dependency_info() {
+        assert_eq!(LoggingConfig::default().level, "warn,rcd_server=info");
+    }
 
     #[test]
     fn log_dir_is_next_to_exe() {

@@ -224,7 +224,7 @@ timeout = 300
             config.settings.command_retry_count,
             DEFAULT_COMMAND_RETRY_COUNT
         );
-        assert_eq!(config.logging.level, "info");
+        assert_eq!(config.logging.level, "warn,rcd_server=info");
         assert_eq!(config.logging.keep_files, 30);
     }
 

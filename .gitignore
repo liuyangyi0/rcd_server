@@ -17,6 +17,9 @@
 /tools/output/
 /tools/nesting-check/target-build-check/
 
+# Local vendor driver/tester bundles (large third-party binaries)
+/docs/Linux_COM_2025-09-30/
+
 # Python bytecode
 __pycache__/
 *.py[cod]

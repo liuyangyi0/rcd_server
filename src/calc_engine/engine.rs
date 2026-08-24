@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use log::{error, info, warn};
+use log::{debug, error, info, trace, warn};
 
 use super::config::{normalize_data_type, CalcDataType, CalcRule};
 use super::evaluator::{evaluate, EvalError, EvalValue};
@@ -81,7 +81,7 @@ impl CalcEngine {
                         );
                         continue;
                     }
-                    info!(
+                    debug!(
                         "[CalcEngine] 编译成功: {} = \"{}\" (依赖: {:?})",
                         cr.kks_calc, cr.expression, cr.variables
                     );
@@ -101,9 +101,9 @@ impl CalcEngine {
         // ---- 拓扑排序 ----
         let sorted = Self::topological_sort(compiled)?;
 
-        info!(
-            "[CalcEngine] 引擎初始化完成，共 {} 条规则，求值顺序: [{}]",
-            sorted.len(),
+        info!("[CalcEngine] 引擎初始化完成，共 {} 条规则", sorted.len());
+        trace!(
+            "[CalcEngine] 完整求值顺序: [{}]",
             sorted
                 .iter()
                 .map(|r| r.kks_calc.as_str())

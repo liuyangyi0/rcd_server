@@ -14,14 +14,14 @@ use std::time::{Duration, Instant};
 use bounded_vec_deque::BoundedVecDeque;
 use chrono::{DateTime, Local};
 use log::{error, info, warn};
-use serialport::{DataBits, Parity, SerialPort, StopBits};
+use serialport::{ClearBuffer, DataBits, Parity, SerialPort, StopBits};
 
 use super::port_config::SerialPortConfig;
 use crate::broadcast::Broadcaster;
 use crate::config::RunLocation;
 use crate::logging;
 use crate::model::{DeviceStatus, SendData};
-use crate::protocol::{self, threshold};
+use crate::protocol::{self, cmd, threshold};
 use crate::runtime_cache::LatestStatusCache;
 
 const COMMAND_ACK_BYTES: [u8; 3] = [0x00, 0x50, 0x50];
@@ -29,6 +29,331 @@ const FORWARD_HEADER_LEN: usize = 7;
 const FORWARD_SEPARATOR_LEN: usize = 2;
 const FORWARD_PREFIX_LEN: usize = FORWARD_HEADER_LEN + FORWARD_SEPARATOR_LEN;
 const FORWARD_PREFIX_GRACE: Duration = Duration::from_millis(5);
+const FAILURE_LOG_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+const BAD_FRAME_LOG_MAX_BYTES: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceFailureKind {
+    ReadTimeout,
+    BadFrame,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum QueryFailure {
+    ReadTimeout,
+    BadFrame { reason: String, frame: Vec<u8> },
+}
+
+impl QueryFailure {
+    fn kind(&self) -> DeviceFailureKind {
+        match self {
+            Self::ReadTimeout => DeviceFailureKind::ReadTimeout,
+            Self::BadFrame { .. } => DeviceFailureKind::BadFrame,
+        }
+    }
+
+    fn cause_name(&self) -> &'static str {
+        device_failure_kind_name(self.kind())
+    }
+
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::ReadTimeout => None,
+            Self::BadFrame { reason, .. } => Some(reason),
+        }
+    }
+
+    fn frame(&self) -> Option<&[u8]> {
+        match self {
+            Self::ReadTimeout => None,
+            Self::BadFrame { frame, .. } => Some(frame),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueryExpectation {
+    device_id: u8,
+    command: u8,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReceiveDataOutcome {
+    Success,
+    Retryable(QueryFailure),
+    TransportHandled,
+    UnattributedHandled,
+}
+
+#[derive(Clone, Debug)]
+struct QueryFailureContext {
+    attempts: u8,
+    first_failure: QueryFailure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QueryRetryEpisodeStats {
+    duration: Duration,
+    retries_succeeded: u32,
+    first_timeouts: u32,
+    first_bad_frames: u32,
+    suppressed: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum QueryRetryLogAction {
+    Immediate(QueryRetryEpisodeStats),
+    Summary(QueryRetryEpisodeStats),
+    Suppressed,
+}
+
+#[derive(Debug, Default)]
+struct QueryRetryLogState {
+    started_at: Option<Instant>,
+    last_log_at: Option<Instant>,
+    retries_succeeded: u32,
+    first_timeouts: u32,
+    first_bad_frames: u32,
+    suppressed_since_summary: u32,
+    timeout_logged: bool,
+    bad_frame_logged: bool,
+}
+
+impl QueryRetryLogState {
+    fn record_retry_success(
+        &mut self,
+        first_failure: DeviceFailureKind,
+        now: Instant,
+    ) -> QueryRetryLogAction {
+        if self.started_at.is_none() {
+            self.started_at = Some(now);
+            self.last_log_at = Some(now);
+        }
+        self.retries_succeeded = self.retries_succeeded.saturating_add(1);
+
+        let first_of_kind = match first_failure {
+            DeviceFailureKind::ReadTimeout => {
+                self.first_timeouts = self.first_timeouts.saturating_add(1);
+                let first = !self.timeout_logged;
+                self.timeout_logged = true;
+                first
+            }
+            DeviceFailureKind::BadFrame => {
+                self.first_bad_frames = self.first_bad_frames.saturating_add(1);
+                let first = !self.bad_frame_logged;
+                self.bad_frame_logged = true;
+                first
+            }
+        };
+
+        if first_of_kind {
+            self.last_log_at = Some(now);
+            return QueryRetryLogAction::Immediate(self.stats(now));
+        }
+
+        if self
+            .last_log_at
+            .is_some_and(|last| now.saturating_duration_since(last) >= FAILURE_LOG_SUMMARY_INTERVAL)
+        {
+            let stats = self.stats(now);
+            self.last_log_at = Some(now);
+            self.suppressed_since_summary = 0;
+            QueryRetryLogAction::Summary(stats)
+        } else {
+            self.suppressed_since_summary = self.suppressed_since_summary.saturating_add(1);
+            QueryRetryLogAction::Suppressed
+        }
+    }
+
+    fn recover_on_first_attempt(&mut self, now: Instant) -> Option<QueryRetryEpisodeStats> {
+        self.started_at?;
+        let stats = self.stats(now);
+        *self = Self::default();
+        Some(stats)
+    }
+
+    fn stats(&self, now: Instant) -> QueryRetryEpisodeStats {
+        QueryRetryEpisodeStats {
+            duration: self
+                .started_at
+                .map(|started| now.saturating_duration_since(started))
+                .unwrap_or_default(),
+            retries_succeeded: self.retries_succeeded,
+            first_timeouts: self.first_timeouts,
+            first_bad_frames: self.first_bad_frames,
+            suppressed: self.suppressed_since_summary,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FailureEpisodeStats {
+    duration: Duration,
+    timeouts: u32,
+    bad_frames: u32,
+    suppressed: u32,
+}
+
+impl FailureEpisodeStats {
+    fn total_failures(&self) -> u32 {
+        self.timeouts.saturating_add(self.bad_frames)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FailureLogAction {
+    Immediate(FailureEpisodeStats),
+    Summary(FailureEpisodeStats),
+    Suppressed,
+}
+
+#[derive(Debug, Default)]
+struct DeviceFailureLogState {
+    started_at: Option<Instant>,
+    last_log_at: Option<Instant>,
+    timeouts: u32,
+    bad_frames: u32,
+    suppressed_since_summary: u32,
+    timeout_logged: bool,
+    bad_frame_logged: bool,
+}
+
+impl DeviceFailureLogState {
+    fn record_failure(&mut self, kind: DeviceFailureKind, now: Instant) -> FailureLogAction {
+        if self.started_at.is_none() {
+            self.started_at = Some(now);
+            self.last_log_at = Some(now);
+        }
+
+        let first_of_kind = match kind {
+            DeviceFailureKind::ReadTimeout => {
+                self.timeouts = self.timeouts.saturating_add(1);
+                let first = !self.timeout_logged;
+                self.timeout_logged = true;
+                first
+            }
+            DeviceFailureKind::BadFrame => {
+                self.bad_frames = self.bad_frames.saturating_add(1);
+                let first = !self.bad_frame_logged;
+                self.bad_frame_logged = true;
+                first
+            }
+        };
+
+        if first_of_kind {
+            self.last_log_at = Some(now);
+            return FailureLogAction::Immediate(self.stats(now));
+        }
+
+        if self
+            .last_log_at
+            .is_some_and(|last| now.saturating_duration_since(last) >= FAILURE_LOG_SUMMARY_INTERVAL)
+        {
+            let stats = self.stats(now);
+            self.last_log_at = Some(now);
+            self.suppressed_since_summary = 0;
+            FailureLogAction::Summary(stats)
+        } else {
+            self.suppressed_since_summary = self.suppressed_since_summary.saturating_add(1);
+            FailureLogAction::Suppressed
+        }
+    }
+
+    fn recover(&mut self, now: Instant) -> Option<FailureEpisodeStats> {
+        self.started_at?;
+        let stats = self.stats(now);
+        *self = Self::default();
+        Some(stats)
+    }
+
+    fn stats(&self, now: Instant) -> FailureEpisodeStats {
+        FailureEpisodeStats {
+            duration: self
+                .started_at
+                .map(|started| now.saturating_duration_since(started))
+                .unwrap_or_default(),
+            timeouts: self.timeouts,
+            bad_frames: self.bad_frames,
+            suppressed: self.suppressed_since_summary,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReconnectEpisodeStats {
+    duration: Duration,
+    attempts: u32,
+    suppressed: u32,
+    last_error: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReconnectLogAction {
+    Immediate(ReconnectEpisodeStats),
+    Summary(ReconnectEpisodeStats),
+    Suppressed,
+}
+
+#[derive(Debug, Default)]
+struct ReconnectFailureLogState {
+    started_at: Option<Instant>,
+    last_log_at: Option<Instant>,
+    attempts: u32,
+    suppressed_since_summary: u32,
+    last_error: String,
+}
+
+impl ReconnectFailureLogState {
+    fn record_failure(&mut self, error: &str, now: Instant) -> ReconnectLogAction {
+        let first_failure = self.started_at.is_none();
+        if first_failure {
+            self.started_at = Some(now);
+            self.last_log_at = Some(now);
+        }
+        self.attempts = self.attempts.saturating_add(1);
+
+        let error_changed = !first_failure && self.last_error != error;
+        self.last_error.clear();
+        self.last_error.push_str(error);
+
+        if first_failure || error_changed {
+            self.last_log_at = Some(now);
+            return ReconnectLogAction::Immediate(self.stats(now));
+        }
+
+        if self
+            .last_log_at
+            .is_some_and(|last| now.saturating_duration_since(last) >= FAILURE_LOG_SUMMARY_INTERVAL)
+        {
+            let stats = self.stats(now);
+            self.last_log_at = Some(now);
+            self.suppressed_since_summary = 0;
+            ReconnectLogAction::Summary(stats)
+        } else {
+            self.suppressed_since_summary = self.suppressed_since_summary.saturating_add(1);
+            ReconnectLogAction::Suppressed
+        }
+    }
+
+    fn recover(&mut self, now: Instant) -> Option<ReconnectEpisodeStats> {
+        self.started_at?;
+        let stats = self.stats(now);
+        *self = Self::default();
+        Some(stats)
+    }
+
+    fn stats(&self, now: Instant) -> ReconnectEpisodeStats {
+        ReconnectEpisodeStats {
+            duration: self
+                .started_at
+                .map(|started| now.saturating_duration_since(started))
+                .unwrap_or_default(),
+            attempts: self.attempts,
+            suppressed: self.suppressed_since_summary,
+            last_error: self.last_error.clone(),
+        }
+    }
+}
 
 // ============================================================
 //  串口参数
@@ -86,6 +411,10 @@ pub(crate) struct DeviceRuntimeState {
     same_count: u32,
     /// 是否处于轮询读取状态。
     pub(crate) is_enabled: bool,
+    /// 当前设备通信故障周期的限频日志状态。
+    failure_log: DeviceFailureLogState,
+    /// 查询需要补发才能成功时的限频日志状态。
+    query_retry_log: QueryRetryLogState,
 }
 
 impl DeviceRuntimeState {
@@ -99,6 +428,8 @@ impl DeviceRuntimeState {
             last_device_status: None,
             same_count: 0,
             is_enabled: true,
+            failure_log: DeviceFailureLogState::default(),
+            query_retry_log: QueryRetryLogState::default(),
         }
     }
 
@@ -165,6 +496,10 @@ pub(crate) struct SerialManager {
     read_buf: Vec<u8>,
     /// 上次重连尝试的时间，用于冷却控制。
     last_reconnect: Instant,
+    /// 串口打开/重连故障周期的限频日志状态。
+    reconnect_failure_log: ReconnectFailureLogState,
+    /// 备机无法归属帧的端口级限频日志状态。
+    unattributed_failure_log: DeviceFailureLogState,
 }
 
 impl SerialManager {
@@ -181,19 +516,31 @@ impl SerialManager {
         // 首次启动等待设备就绪
         std::thread::sleep(Duration::from_millis(2000));
 
-        let port = open_serial_port(
+        let opened = open_serial_port(
             &serial_config.port_name,
             serial_config.baud_rate,
             serial_config.data_bits,
             serial_config.stop_bits,
             serial_config.parity,
             serial_config.read_timeout,
-        )
-        .ok();
+        );
 
-        if port.is_none() {
-            warn!("串口 {} 打开失败", serial_config.port_name);
-        }
+        let mut reconnect_failure_log = ReconnectFailureLogState::default();
+        let (port, initial_open_error) = match opened {
+            Ok(port) => (Some(port), None),
+            Err(error) => {
+                let error_text = format!("{error:?}");
+                let _ = reconnect_failure_log.record_failure(&error_text, Instant::now());
+                error!(
+                    "[串口打开失败] port={} baud_rate={} affected_devices={} error={:?}",
+                    serial_config.port_name,
+                    serial_config.baud_rate,
+                    port_config.devices.len(),
+                    error_text,
+                );
+                (None, Some(error_text))
+            }
+        };
 
         let device_states = port_config
             .devices
@@ -201,7 +548,7 @@ impl SerialManager {
             .map(|_| DeviceRuntimeState::new())
             .collect();
 
-        Self {
+        let manager = Self {
             port,
             command_queue: Arc::new(Mutex::new(VecDeque::new())),
             serial_config,
@@ -217,7 +564,15 @@ impl SerialManager {
             system_record,
             read_buf: vec![0u8; 1024],
             last_reconnect: Instant::now(),
+            reconnect_failure_log,
+            unattributed_failure_log: DeviceFailureLogState::default(),
+        };
+
+        if let Some(error) = initial_open_error {
+            manager.log_record(format!("串口打开失败: error={error:?}"));
         }
+
+        manager
     }
 
     // ---- 连接管理 ----
@@ -231,7 +586,8 @@ impl SerialManager {
         if self.last_reconnect.elapsed() < RECONNECT_COOLDOWN {
             return;
         }
-        self.last_reconnect = Instant::now();
+        let now = Instant::now();
+        self.last_reconnect = now;
 
         match open_serial_port(
             &self.serial_config.port_name,
@@ -243,10 +599,57 @@ impl SerialManager {
         ) {
             Ok(port) => {
                 self.port = Some(port);
-                info!("串口 {} 重新连接成功", self.serial_config.port_name);
+                if let Some(stats) = self.reconnect_failure_log.recover(now) {
+                    let message = format!(
+                        "串口重新连接成功: duration_ms={} attempts={} last_error={:?}",
+                        stats.duration.as_millis(),
+                        stats.attempts,
+                        stats.last_error,
+                    );
+                    info!(
+                        "[串口重新连接成功] port={} duration_ms={} attempts={} suppressed={} last_error={:?}",
+                        self.serial_config.port_name,
+                        stats.duration.as_millis(),
+                        stats.attempts,
+                        stats.suppressed,
+                        stats.last_error,
+                    );
+                    self.log_record(message);
+                } else {
+                    info!("[串口重新连接成功] port={}", self.serial_config.port_name);
+                }
             }
             Err(e) => {
-                error!("{:?}: 重连串口 {} 失败", e, self.serial_config.port_name);
+                let error_text = format!("{e:?}");
+                match self
+                    .reconnect_failure_log
+                    .record_failure(&error_text, now)
+                {
+                    ReconnectLogAction::Immediate(stats) => {
+                        error!(
+                            "[串口重连失败] port={} attempts={} duration_ms={} error={:?}",
+                            self.serial_config.port_name,
+                            stats.attempts,
+                            stats.duration.as_millis(),
+                            stats.last_error,
+                        );
+                        if stats.attempts == 1 {
+                            self.log_record(format!(
+                                "串口重连失败: attempts=1 error={:?}",
+                                stats.last_error
+                            ));
+                        }
+                    }
+                    ReconnectLogAction::Summary(stats) => warn!(
+                        "[串口重连持续失败] port={} duration_s={} attempts={} suppressed={} last_error={:?}",
+                        self.serial_config.port_name,
+                        stats.duration.as_secs(),
+                        stats.attempts,
+                        stats.suppressed,
+                        stats.last_error,
+                    ),
+                    ReconnectLogAction::Suppressed => {}
+                }
                 self.send_zero_status(false, false);
                 self.port = None;
             }
@@ -472,17 +875,103 @@ impl SerialManager {
         false
     }
 
-    /// 从串口读取并解析一帧数据。
-    ///
-    /// 采用循环读取策略：根据帧头中的长度字段判断帧是否完整，
-    /// 避免因一次 `read` 未返回完整帧而解析失败。
+    /// 从串口读取并解析一帧数据；超时或坏帧立即按原有语义提交故障。
     pub(crate) fn receive_data(&mut self) {
+        if let ReceiveDataOutcome::Retryable(failure) = self.receive_data_attempt(None) {
+            self.commit_query_failure(failure, None);
+        }
+    }
+
+    /// 接收主机自动查询响应，首轮超时或坏帧时向同一设备补发一次。
+    pub(crate) fn receive_query_with_retry(&mut self, query: SendData) {
+        let query_index = self.index;
+        let Some(device) = self.port_config.devices.get(query_index) else {
+            return;
+        };
+        let expectation = QueryExpectation {
+            device_id: device.config.device_id,
+            command: cmd::READ_STATUS,
+        };
+        let started_at = Instant::now();
+
+        let first_failure = match self.receive_data_attempt(Some(expectation)) {
+            ReceiveDataOutcome::Success => {
+                if self.current_run == RunLocation::Primary && self.index == query_index {
+                    self.log_query_first_attempt_recovery(query_index, Instant::now());
+                }
+                return;
+            }
+            ReceiveDataOutcome::Retryable(failure) => failure,
+            ReceiveDataOutcome::TransportHandled | ReceiveDataOutcome::UnattributedHandled => {
+                return
+            }
+        };
+
+        // 临时主机在接收期间可能因检测到有效转发头切回备机，此时禁止主动补发。
+        if self.current_run != RunLocation::Primary || self.index != query_index {
+            self.commit_query_failure(first_failure, None);
+            return;
+        }
+
+        if let Some(port) = self.port.as_ref() {
+            if let Err(error) = port.clear(ClearBuffer::Input) {
+                warn!(
+                    "[串口查询补发清理失败] port={} device_id={} index={} error={:?} action=continue_resend",
+                    self.serial_config.port_name,
+                    expectation.device_id,
+                    query_index,
+                    error,
+                );
+            }
+        }
+
+        if !self.send_command(query) {
+            let context = QueryFailureContext {
+                attempts: 2,
+                first_failure: first_failure.clone(),
+            };
+            // send_command 在写失败时可能已将端口置空或完成重连；
+            // 提交首次接收故障时必须保留当前真实的串口在线状态。
+            let com_status = self.port.is_some();
+            self.commit_query_failure_with_com_status(first_failure, Some(&context), com_status);
+            return;
+        }
+
+        match self.receive_data_attempt(Some(expectation)) {
+            ReceiveDataOutcome::Success => {
+                if self.current_run == RunLocation::Primary && self.index == query_index {
+                    self.log_query_retry_success(
+                        query_index,
+                        &first_failure,
+                        started_at.elapsed(),
+                        Instant::now(),
+                    );
+                }
+            }
+            ReceiveDataOutcome::Retryable(final_failure) => {
+                let context = QueryFailureContext {
+                    attempts: 2,
+                    first_failure,
+                };
+                self.commit_query_failure(final_failure, Some(&context));
+            }
+            ReceiveDataOutcome::TransportHandled => {
+                // 非超时 I/O 错误已在读取路径中完成重连和离线广播，不重复提交设备故障。
+            }
+            ReceiveDataOutcome::UnattributedHandled => {}
+        }
+    }
+
+    /// 只读取、校验并处理一帧；超时和坏帧返回给调用方决定是否提交故障。
+    fn receive_data_attempt(
+        &mut self,
+        expectation: Option<QueryExpectation>,
+    ) -> ReceiveDataOutcome {
         let port = match self.port {
             Some(ref mut p) => p,
             None => {
-                self.log_record("串口未打开".into());
                 self.reconnect();
-                return;
+                return ReceiveDataOutcome::TransportHandled;
             }
         };
 
@@ -525,21 +1014,19 @@ impl SerialManager {
                     if total > 0 {
                         break; // 已有部分数据，尝试解析
                     }
-                    self.handle_timeout();
-                    return;
+                    return ReceiveDataOutcome::Retryable(QueryFailure::ReadTimeout);
                 }
                 Err(e) => {
                     error!("读取错误: {:?}", e);
                     self.log_record("读取错误".into());
                     self.reconnect();
-                    return;
+                    return ReceiveDataOutcome::TransportHandled;
                 }
             }
         }
 
         if total == 0 {
-            self.handle_timeout();
-            return;
+            return ReceiveDataOutcome::Retryable(QueryFailure::ReadTimeout);
         }
 
         // ---- 提取有效数据切片 ----
@@ -559,43 +1046,78 @@ impl SerialManager {
 
         // 备机监听到的无有效转发头数据无法归属到具体设备，不能沿用旧 index。
         if !device_attributed {
-            self.handle_unattributed_frame();
-            return;
+            self.handle_unattributed_frame(&frame);
+            return ReceiveDataOutcome::UnattributedHandled;
         }
 
         // ---- 解析数据帧 ----
         match protocol::parse_data_packet(&frame) {
             Ok(packet) => {
-                // 只有长度与校验和均有效的完整帧才能证明通信恢复。
-                self.device_states[self.index].timeout_count = 0;
-                self.time_out_count = 0;
-                self.device_states[self.index].parse_fail_count = 0;
-                self.parse_fail_count = 0;
-
-                let dev = &self.port_config.devices[self.index];
-                let parsed = protocol::parse_status(&packet.status, &dev.records);
-                if logging::serial_frame_logs_enabled() {
-                    info!(
-                        "串口 {} 解析数据: {:?}",
-                        self.serial_config.port_name, parsed
-                    );
+                if self.current_run == RunLocation::Primary {
+                    if let Some(expected) = expectation {
+                        let mismatch = if packet.addr != expected.device_id {
+                            Some(format!(
+                                "响应设备地址不匹配(expected={}, actual={})",
+                                expected.device_id, packet.addr
+                            ))
+                        } else if packet.cmd != expected.command {
+                            Some(format!(
+                                "响应命令码不匹配(expected=0x{:02X}, actual=0x{:02X})",
+                                expected.command, packet.cmd
+                            ))
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = mismatch {
+                            return ReceiveDataOutcome::Retryable(QueryFailure::BadFrame {
+                                reason,
+                                frame,
+                            });
+                        }
+                    }
                 }
-                let status = DeviceStatus {
-                    id: dev.config.com_index as u64,
-                    device_id: dev.config.device_id,
-                    com: self.port_config.port_number.clone(),
-                    com_status: true,
-                    device_status: true,
-                    value: parsed,
-                    raw_data: frame,
-                };
-                self.latest_status_cache.update(status.clone());
 
-                if self.device_states[self.index].should_broadcast(&packet.status, true, true) {
-                    self.broadcaster.broadcast(status);
-                }
+                self.handle_valid_packet(packet, frame);
+                ReceiveDataOutcome::Success
             }
-            Err(_) => self.handle_invalid_frame(),
+            Err(reason) => ReceiveDataOutcome::Retryable(QueryFailure::BadFrame {
+                reason: reason.to_string(),
+                frame,
+            }),
+        }
+    }
+
+    fn handle_valid_packet(&mut self, packet: protocol::DataPacket, frame: Vec<u8>) {
+        // 只有长度、校验和及查询归属均有效的完整帧才能证明通信恢复。
+        let now = Instant::now();
+        self.log_device_recovery(now, frame.len());
+        self.log_unattributed_recovery(now, frame.len());
+        self.device_states[self.index].timeout_count = 0;
+        self.time_out_count = 0;
+        self.device_states[self.index].parse_fail_count = 0;
+        self.parse_fail_count = 0;
+
+        let dev = &self.port_config.devices[self.index];
+        let parsed = protocol::parse_status(&packet.status, &dev.records);
+        if logging::serial_frame_logs_enabled() {
+            info!(
+                "串口 {} 解析数据: {:?}",
+                self.serial_config.port_name, parsed
+            );
+        }
+        let status = DeviceStatus {
+            id: dev.config.com_index as u64,
+            device_id: dev.config.device_id,
+            com: self.port_config.port_number.clone(),
+            com_status: true,
+            device_status: true,
+            value: parsed,
+            raw_data: frame,
+        };
+        self.latest_status_cache.update(status.clone());
+
+        if self.device_states[self.index].should_broadcast(&packet.status, true, true) {
+            self.broadcaster.broadcast(status);
         }
     }
 
@@ -647,9 +1169,49 @@ impl SerialManager {
     }
 
     /// 备机收到无法通过转发头归属到设备的数据时，只累计端口级故障。
-    fn handle_unattributed_frame(&mut self) {
+    fn handle_unattributed_frame(&mut self, frame: &[u8]) {
         self.parse_fail_count += 1;
         self.time_out_count += 1;
+
+        let now = Instant::now();
+        let action = self
+            .unattributed_failure_log
+            .record_failure(DeviceFailureKind::BadFrame, now);
+        let (frame_hex, truncated) = format_hex_preview(frame, BAD_FRAME_LOG_MAX_BYTES);
+        match action {
+            FailureLogAction::Immediate(stats) => {
+                warn!(
+                    "[串口无法归属帧] port={} role={:?} reason={:?} frame_len={} frame_hex={:?} truncated={} duration_ms={} bad_frames={} action=port_failure_count_incremented",
+                    self.serial_config.port_name,
+                    self.current_run,
+                    "无有效转发头或设备地址未知",
+                    frame.len(),
+                    frame_hex,
+                    truncated,
+                    stats.duration.as_millis(),
+                    stats.bad_frames,
+                );
+                if stats.total_failures() == 1 {
+                    self.log_record(format!(
+                        "收到无法归属帧: reason={:?} frame_len={}",
+                        "无有效转发头或设备地址未知",
+                        frame.len()
+                    ));
+                }
+            }
+            FailureLogAction::Summary(stats) => warn!(
+                "[串口无法归属帧持续] port={} role={:?} duration_s={} bad_frames={} suppressed={} last_frame_len={} last_frame_hex={:?} truncated={}",
+                self.serial_config.port_name,
+                self.current_run,
+                stats.duration.as_secs(),
+                stats.bad_frames,
+                stats.suppressed,
+                frame.len(),
+                frame_hex,
+                truncated,
+            ),
+            FailureLogAction::Suppressed => {}
+        }
 
         if self.time_out_count > threshold::PORT_FAILOVER_TIMEOUT
             && self.current_run == RunLocation::Secondary
@@ -659,13 +1221,25 @@ impl SerialManager {
         }
     }
 
-    /// 将收到但无法通过长度或校验和验证的帧视为本轮没有有效响应。
-    fn handle_invalid_frame(&mut self) {
+    fn handle_invalid_frame_with_context(
+        &mut self,
+        reason: &str,
+        frame: &[u8],
+        context: Option<&QueryFailureContext>,
+        com_status: bool,
+    ) {
         self.device_states[self.index].parse_fail_count += 1;
         self.parse_fail_count += 1;
 
         // 坏帧不能证明设备在线；复用超时路径更新离线状态和故障计数。
-        self.handle_timeout();
+        self.handle_device_failure(
+            DeviceFailureKind::BadFrame,
+            Some(reason),
+            Some(frame),
+            Instant::now(),
+            context,
+            com_status,
+        );
 
         // 连续解析失败过多时尝试主备切换。
         if self.parse_fail_count > threshold::PARSE_FAIL_FAILOVER
@@ -676,20 +1250,58 @@ impl SerialManager {
         }
     }
 
-    /// 处理读取超时逻辑。
-    pub(crate) fn handle_timeout(&mut self) {
+    fn handle_timeout_with_context(
+        &mut self,
+        context: Option<&QueryFailureContext>,
+        com_status: bool,
+    ) {
+        self.handle_device_failure(
+            DeviceFailureKind::ReadTimeout,
+            None,
+            None,
+            Instant::now(),
+            context,
+            com_status,
+        );
+    }
+
+    fn commit_query_failure(
+        &mut self,
+        failure: QueryFailure,
+        context: Option<&QueryFailureContext>,
+    ) {
+        self.commit_query_failure_with_com_status(failure, context, true);
+    }
+
+    fn commit_query_failure_with_com_status(
+        &mut self,
+        failure: QueryFailure,
+        context: Option<&QueryFailureContext>,
+        com_status: bool,
+    ) {
+        match failure {
+            QueryFailure::ReadTimeout => self.handle_timeout_with_context(context, com_status),
+            QueryFailure::BadFrame { reason, frame } => {
+                self.handle_invalid_frame_with_context(&reason, &frame, context, com_status);
+            }
+        }
+    }
+
+    fn handle_device_failure(
+        &mut self,
+        kind: DeviceFailureKind,
+        reason: Option<&str>,
+        frame: Option<&[u8]>,
+        now: Instant,
+        context: Option<&QueryFailureContext>,
+        com_status: bool,
+    ) {
         self.device_states[self.index].timeout_count += 1;
         self.time_out_count += 1;
 
-        // let dev = &self.port_config.devices[self.index];
-        // warn!(
-        //     "串口 {} 设备 {} 读取超时 (连续{}次)",
-        //     self.serial_config.port_name,
-        //     dev.config.device_id,
-        //     self.device_states[self.index].timeout_count,
-        // );
+        self.log_device_failure(kind, reason, frame, now, context);
 
-        self.send_zero_status(true, false);
+        self.send_zero_status(com_status, false);
 
         // 超时过多时尝试主备切换
         if self.time_out_count > threshold::PORT_FAILOVER_TIMEOUT
@@ -698,6 +1310,247 @@ impl SerialManager {
         {
             self.switch_role(RunLocation::Primary, "超时过多，备机升级为主机");
         }
+    }
+
+    fn log_device_failure(
+        &mut self,
+        kind: DeviceFailureKind,
+        reason: Option<&str>,
+        frame: Option<&[u8]>,
+        now: Instant,
+        context: Option<&QueryFailureContext>,
+    ) {
+        let index = self.index;
+        let dev = &self.port_config.devices[index];
+        let device_id = dev.config.device_id;
+        let affected_points = dev.records.len();
+        let consecutive = self.device_states[index].timeout_count;
+        let parse_failures = self.device_states[index].parse_fail_count;
+        let attempts = context.map(|value| value.attempts).unwrap_or(1);
+        let first_cause = context
+            .map(|value| value.first_failure.cause_name())
+            .unwrap_or_else(|| device_failure_kind_name(kind));
+        let first_reason = context
+            .and_then(|value| value.first_failure.reason())
+            .or(reason)
+            .unwrap_or("-");
+        let first_frame_len = context
+            .and_then(|value| value.first_failure.frame())
+            .or(frame)
+            .map(|frame| frame.len())
+            .unwrap_or_default();
+        let action = self.device_states[index]
+            .failure_log
+            .record_failure(kind, now);
+
+        match action {
+            FailureLogAction::Immediate(stats) => {
+                match kind {
+                    DeviceFailureKind::ReadTimeout => warn!(
+                        "[串口通信异常] port={} device_id={} index={} role={:?} cause=read_timeout timeout_ms={} attempts={} first_cause={} first_reason={:?} first_frame_len={} final_cause=read_timeout consecutive={} affected_points={} action=publish_zero_bad_no_communication",
+                        self.serial_config.port_name,
+                        device_id,
+                        index,
+                        self.current_run,
+                        self.serial_config.read_timeout.as_millis(),
+                        attempts,
+                        first_cause,
+                        first_reason,
+                        first_frame_len,
+                        consecutive,
+                        affected_points,
+                    ),
+                    DeviceFailureKind::BadFrame => {
+                        let frame = frame.unwrap_or_default();
+                        let details =
+                            bad_frame_log_details(reason.unwrap_or("未知解析错误"), frame);
+                        warn!(
+                            "[串口坏帧] port={} device_id={} index={} role={:?} reason={:?} frame_len={} frame_hex={:?} truncated={} attempts={} first_cause={} first_reason={:?} first_frame_len={} final_cause=bad_frame consecutive={} parse_failures={} affected_points={} action=publish_zero_bad_no_communication",
+                            self.serial_config.port_name,
+                            device_id,
+                            index,
+                            self.current_run,
+                            details.reason,
+                            details.frame_len,
+                            details.frame_hex,
+                            details.truncated,
+                            attempts,
+                            first_cause,
+                            first_reason,
+                            first_frame_len,
+                            consecutive,
+                            parse_failures,
+                            affected_points,
+                        );
+                    }
+                }
+
+                if stats.total_failures() == 1 {
+                    self.log_record(format!(
+                        "设备通信异常: device_id={} attempts={} first_cause={} final_cause={} action=publish_zero_bad_no_communication",
+                        device_id,
+                        attempts,
+                        first_cause,
+                        device_failure_kind_name(kind)
+                    ));
+                }
+            }
+            FailureLogAction::Summary(stats) => warn!(
+                "[串口异常持续] port={} device_id={} index={} role={:?} duration_s={} timeouts={} bad_frames={} suppressed={} consecutive={} last_attempts={} last_first_cause={} current_cause={} action=publish_zero_bad_no_communication",
+                self.serial_config.port_name,
+                device_id,
+                index,
+                self.current_run,
+                stats.duration.as_secs(),
+                stats.timeouts,
+                stats.bad_frames,
+                stats.suppressed,
+                consecutive,
+                attempts,
+                first_cause,
+                device_failure_kind_name(kind),
+            ),
+            FailureLogAction::Suppressed => {}
+        }
+    }
+
+    fn log_query_retry_success(
+        &mut self,
+        index: usize,
+        first_failure: &QueryFailure,
+        exchange_duration: Duration,
+        now: Instant,
+    ) {
+        let action = self.device_states[index]
+            .query_retry_log
+            .record_retry_success(first_failure.kind(), now);
+        let device_id = self.port_config.devices[index].config.device_id;
+
+        match action {
+            QueryRetryLogAction::Immediate(stats) => match first_failure {
+                QueryFailure::ReadTimeout => warn!(
+                    "[串口查询补发成功] port={} device_id={} index={} role={:?} cause=read_timeout attempts=2 exchange_duration_ms={} retries_succeeded={} action=keep_good_state",
+                    self.serial_config.port_name,
+                    device_id,
+                    index,
+                    self.current_run,
+                    exchange_duration.as_millis(),
+                    stats.retries_succeeded,
+                ),
+                QueryFailure::BadFrame { reason, frame } => {
+                    let details = bad_frame_log_details(reason, frame);
+                    warn!(
+                        "[串口查询补发成功] port={} device_id={} index={} role={:?} cause=bad_frame reason={:?} frame_len={} frame_hex={:?} truncated={} attempts=2 exchange_duration_ms={} retries_succeeded={} action=keep_good_state",
+                        self.serial_config.port_name,
+                        device_id,
+                        index,
+                        self.current_run,
+                        details.reason,
+                        details.frame_len,
+                        details.frame_hex,
+                        details.truncated,
+                        exchange_duration.as_millis(),
+                        stats.retries_succeeded,
+                    );
+                }
+            },
+            QueryRetryLogAction::Summary(stats) => {
+                let reason = first_failure.reason().unwrap_or("-");
+                let frame = first_failure.frame().unwrap_or_default();
+                let (frame_hex, truncated) = format_hex_preview(frame, BAD_FRAME_LOG_MAX_BYTES);
+                warn!(
+                    "[串口查询补发持续] port={} device_id={} index={} role={:?} duration_s={} retries_succeeded={} first_timeouts={} first_bad_frames={} suppressed={} last_cause={} last_reason={:?} last_frame_len={} last_frame_hex={:?} truncated={} attempts=2 exchange_duration_ms={} action=keep_good_state",
+                    self.serial_config.port_name,
+                    device_id,
+                    index,
+                    self.current_run,
+                    stats.duration.as_secs(),
+                    stats.retries_succeeded,
+                    stats.first_timeouts,
+                    stats.first_bad_frames,
+                    stats.suppressed,
+                    first_failure.cause_name(),
+                    reason,
+                    frame.len(),
+                    frame_hex,
+                    truncated,
+                    exchange_duration.as_millis(),
+                );
+            }
+            QueryRetryLogAction::Suppressed => {}
+        }
+    }
+
+    fn log_query_first_attempt_recovery(&mut self, index: usize, now: Instant) {
+        let Some(stats) = self.device_states[index]
+            .query_retry_log
+            .recover_on_first_attempt(now)
+        else {
+            return;
+        };
+        let device_id = self.port_config.devices[index].config.device_id;
+
+        info!(
+            "[串口查询恢复单次成功] port={} device_id={} index={} role={:?} duration_ms={} retries_succeeded={} first_timeouts={} first_bad_frames={} suppressed={} attempts=1 action=single_attempt_success",
+            self.serial_config.port_name,
+            device_id,
+            index,
+            self.current_run,
+            stats.duration.as_millis(),
+            stats.retries_succeeded,
+            stats.first_timeouts,
+            stats.first_bad_frames,
+            stats.suppressed,
+        );
+    }
+
+    fn log_device_recovery(&mut self, now: Instant, frame_len: usize) {
+        let index = self.index;
+        let device_id = self.port_config.devices[index].config.device_id;
+        let Some(stats) = self.device_states[index].failure_log.recover(now) else {
+            return;
+        };
+
+        info!(
+            "[串口通信恢复] port={} device_id={} index={} role={:?} duration_ms={} timeouts={} bad_frames={} suppressed={} valid_frame_len={} action=publish_good_value",
+            self.serial_config.port_name,
+            device_id,
+            index,
+            self.current_run,
+            stats.duration.as_millis(),
+            stats.timeouts,
+            stats.bad_frames,
+            stats.suppressed,
+            frame_len,
+        );
+        self.log_record(format!(
+            "设备通信恢复: device_id={} duration_ms={} timeouts={} bad_frames={}",
+            device_id,
+            stats.duration.as_millis(),
+            stats.timeouts,
+            stats.bad_frames
+        ));
+    }
+
+    fn log_unattributed_recovery(&mut self, now: Instant, frame_len: usize) {
+        let Some(stats) = self.unattributed_failure_log.recover(now) else {
+            return;
+        };
+
+        info!(
+            "[串口转发恢复] port={} role={:?} duration_ms={} bad_frames={} suppressed={} valid_frame_len={}",
+            self.serial_config.port_name,
+            self.current_run,
+            stats.duration.as_millis(),
+            stats.bad_frames,
+            stats.suppressed,
+            frame_len,
+        );
+        self.log_record(format!(
+            "串口转发恢复: duration_ms={} bad_frames={}",
+            stats.duration.as_millis(),
+            stats.bad_frames
+        ));
     }
 
     /// 执行主备角色切换，重置所有故障计数器并记录日志。
@@ -804,6 +1657,36 @@ fn format_hex(data: &[u8]) -> String {
         .join(" ")
 }
 
+fn format_hex_preview(data: &[u8], max_bytes: usize) -> (String, bool) {
+    let preview_len = data.len().min(max_bytes);
+    (format_hex(&data[..preview_len]), data.len() > preview_len)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BadFrameLogDetails {
+    reason: String,
+    frame_len: usize,
+    frame_hex: String,
+    truncated: bool,
+}
+
+fn bad_frame_log_details(reason: &str, frame: &[u8]) -> BadFrameLogDetails {
+    let (frame_hex, truncated) = format_hex_preview(frame, BAD_FRAME_LOG_MAX_BYTES);
+    BadFrameLogDetails {
+        reason: reason.to_string(),
+        frame_len: frame.len(),
+        frame_hex,
+        truncated,
+    }
+}
+
+fn device_failure_kind_name(kind: DeviceFailureKind) -> &'static str {
+    match kind {
+        DeviceFailureKind::ReadTimeout => "read_timeout",
+        DeviceFailureKind::BadFrame => "bad_frame",
+    }
+}
+
 // ============================================================
 //  串口打开
 // ============================================================
@@ -829,9 +1712,11 @@ pub(crate) fn open_serial_port(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::io::Read;
 
     use crate::csv_parser::{Config as CsvConfig, DeviceConfig};
     use crate::model::Value;
+    use serialport::FlowControl;
 
     fn test_manager(run_on: RunLocation, current_run: RunLocation) -> SerialManager {
         let device = DeviceConfig {
@@ -870,6 +1755,8 @@ mod tests {
             system_record: Arc::new(Mutex::new(BoundedVecDeque::new(10))),
             read_buf: vec![0u8; 1024],
             last_reconnect: Instant::now(),
+            reconnect_failure_log: ReconnectFailureLogState::default(),
+            unattributed_failure_log: DeviceFailureLogState::default(),
         }
     }
 
@@ -877,6 +1764,222 @@ mod tests {
         let checksum = crate::model::get_sum(&bytes);
         bytes.push(checksum);
         bytes
+    }
+
+    #[derive(Debug)]
+    enum ReadStep {
+        Data(Vec<u8>),
+        Timeout,
+        IoError,
+    }
+
+    #[derive(Debug, Default)]
+    struct SerialObservations {
+        write_attempts: usize,
+        writes: Vec<Vec<u8>>,
+        input_clears: usize,
+    }
+
+    struct ScriptedSerialPort {
+        reads: VecDeque<ReadStep>,
+        write_results: VecDeque<bool>,
+        observations: Arc<Mutex<SerialObservations>>,
+        timeout: Duration,
+    }
+
+    impl Read for ScriptedSerialPort {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            match self.reads.pop_front().unwrap_or(ReadStep::Timeout) {
+                ReadStep::Data(mut data) => {
+                    let count = data.len().min(buffer.len());
+                    buffer[..count].copy_from_slice(&data[..count]);
+                    if count < data.len() {
+                        let remaining = data.split_off(count);
+                        self.reads.push_front(ReadStep::Data(remaining));
+                    }
+                    Ok(count)
+                }
+                ReadStep::Timeout => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "scripted timeout",
+                )),
+                ReadStep::IoError => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "scripted I/O error",
+                )),
+            }
+        }
+    }
+
+    impl std::io::Write for ScriptedSerialPort {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            let succeeds = self.write_results.pop_front().unwrap_or(true);
+            let mut observations = self.observations.lock().unwrap();
+            observations.write_attempts += 1;
+            observations.writes.push(buffer.to_vec());
+            if succeeds {
+                Ok(buffer.len())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "scripted write failure",
+                ))
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SerialPort for ScriptedSerialPort {
+        fn name(&self) -> Option<String> {
+            Some("scripted".to_string())
+        }
+
+        fn baud_rate(&self) -> serialport::Result<u32> {
+            Ok(9_600)
+        }
+
+        fn data_bits(&self) -> serialport::Result<DataBits> {
+            Ok(DataBits::Eight)
+        }
+
+        fn flow_control(&self) -> serialport::Result<FlowControl> {
+            Ok(FlowControl::None)
+        }
+
+        fn parity(&self) -> serialport::Result<Parity> {
+            Ok(Parity::None)
+        }
+
+        fn stop_bits(&self) -> serialport::Result<StopBits> {
+            Ok(StopBits::One)
+        }
+
+        fn timeout(&self) -> Duration {
+            self.timeout
+        }
+
+        fn set_baud_rate(&mut self, _baud_rate: u32) -> serialport::Result<()> {
+            Ok(())
+        }
+
+        fn set_data_bits(&mut self, _data_bits: DataBits) -> serialport::Result<()> {
+            Ok(())
+        }
+
+        fn set_flow_control(&mut self, _flow_control: FlowControl) -> serialport::Result<()> {
+            Ok(())
+        }
+
+        fn set_parity(&mut self, _parity: Parity) -> serialport::Result<()> {
+            Ok(())
+        }
+
+        fn set_stop_bits(&mut self, _stop_bits: StopBits) -> serialport::Result<()> {
+            Ok(())
+        }
+
+        fn set_timeout(&mut self, timeout: Duration) -> serialport::Result<()> {
+            self.timeout = timeout;
+            Ok(())
+        }
+
+        fn write_request_to_send(&mut self, _level: bool) -> serialport::Result<()> {
+            Ok(())
+        }
+
+        fn write_data_terminal_ready(&mut self, _level: bool) -> serialport::Result<()> {
+            Ok(())
+        }
+
+        fn read_clear_to_send(&mut self) -> serialport::Result<bool> {
+            Ok(false)
+        }
+
+        fn read_data_set_ready(&mut self) -> serialport::Result<bool> {
+            Ok(false)
+        }
+
+        fn read_ring_indicator(&mut self) -> serialport::Result<bool> {
+            Ok(false)
+        }
+
+        fn read_carrier_detect(&mut self) -> serialport::Result<bool> {
+            Ok(false)
+        }
+
+        fn bytes_to_read(&self) -> serialport::Result<u32> {
+            Ok(0)
+        }
+
+        fn bytes_to_write(&self) -> serialport::Result<u32> {
+            Ok(0)
+        }
+
+        fn clear(&self, buffer_to_clear: ClearBuffer) -> serialport::Result<()> {
+            if matches!(buffer_to_clear, ClearBuffer::Input | ClearBuffer::All) {
+                self.observations.lock().unwrap().input_clears += 1;
+            }
+            Ok(())
+        }
+
+        fn try_clone(&self) -> serialport::Result<Box<dyn SerialPort>> {
+            Err(serialport::Error::new(
+                serialport::ErrorKind::Unknown,
+                "scripted port cannot be cloned",
+            ))
+        }
+
+        fn set_break(&self) -> serialport::Result<()> {
+            Ok(())
+        }
+
+        fn clear_break(&self) -> serialport::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn install_scripted_port(
+        manager: &mut SerialManager,
+        reads: Vec<ReadStep>,
+        write_results: Vec<bool>,
+    ) -> Arc<Mutex<SerialObservations>> {
+        let observations = Arc::new(Mutex::new(SerialObservations::default()));
+        manager.port = Some(Box::new(ScriptedSerialPort {
+            reads: reads.into(),
+            write_results: write_results.into(),
+            observations: observations.clone(),
+            timeout: manager.serial_config.read_timeout,
+        }));
+        observations
+    }
+
+    fn status_query() -> SendData {
+        let mut command = vec![
+            1,
+            cmd::READ_STATUS,
+            cmd::READ_SUBCMD,
+            cmd::STATUS_PAGE,
+            cmd::STATUS_OFFSET,
+            3,
+        ];
+        command.push(crate::model::get_sum(&command));
+        SendData {
+            device_id: 1,
+            command,
+        }
+    }
+
+    fn valid_status_frame(device_id: u8, command: u8) -> Vec<u8> {
+        with_checksum(vec![device_id, command, 2, 7, 8, 9])
+    }
+
+    fn run_auto_query(manager: &mut SerialManager) {
+        let query = status_query();
+        assert!(manager.send_command(query.clone()));
+        manager.receive_query_with_retry(query);
     }
 
     #[test]
@@ -894,6 +1997,185 @@ mod tests {
         assert!(!contains_command_ack(&[]));
         assert!(!contains_command_ack(&[0x00, 0x50]));
         assert!(!contains_command_ack(&[0x50, 0x50, 0x00]));
+    }
+
+    #[test]
+    fn device_failure_log_records_first_event_suppresses_and_summarizes() {
+        let mut state = DeviceFailureLogState::default();
+        let started = Instant::now();
+
+        assert!(matches!(
+            state.record_failure(DeviceFailureKind::ReadTimeout, started),
+            FailureLogAction::Immediate(FailureEpisodeStats {
+                timeouts: 1,
+                bad_frames: 0,
+                ..
+            })
+        ));
+        assert_eq!(
+            state.record_failure(
+                DeviceFailureKind::ReadTimeout,
+                started + Duration::from_secs(1)
+            ),
+            FailureLogAction::Suppressed
+        );
+
+        let FailureLogAction::Summary(stats) = state.record_failure(
+            DeviceFailureKind::ReadTimeout,
+            started + FAILURE_LOG_SUMMARY_INTERVAL,
+        ) else {
+            panic!("60 秒后应生成持续异常汇总");
+        };
+        assert_eq!(stats.timeouts, 3);
+        assert_eq!(stats.bad_frames, 0);
+        assert_eq!(stats.suppressed, 1);
+    }
+
+    #[test]
+    fn device_failure_log_records_first_bad_frame_during_timeout_episode() {
+        let mut state = DeviceFailureLogState::default();
+        let started = Instant::now();
+        state.record_failure(DeviceFailureKind::ReadTimeout, started);
+
+        let FailureLogAction::Immediate(stats) = state.record_failure(
+            DeviceFailureKind::BadFrame,
+            started + Duration::from_secs(1),
+        ) else {
+            panic!("同一故障周期内的首次坏帧应立即记录");
+        };
+        assert_eq!(stats.timeouts, 1);
+        assert_eq!(stats.bad_frames, 1);
+    }
+
+    #[test]
+    fn device_failure_log_recovery_returns_totals_and_resets_episode() {
+        let mut state = DeviceFailureLogState::default();
+        let started = Instant::now();
+        state.record_failure(DeviceFailureKind::ReadTimeout, started);
+        state.record_failure(
+            DeviceFailureKind::BadFrame,
+            started + Duration::from_secs(1),
+        );
+
+        let stats = state
+            .recover(started + Duration::from_secs(5))
+            .expect("故障后应生成恢复统计");
+        assert_eq!(stats.duration, Duration::from_secs(5));
+        assert_eq!(stats.timeouts, 1);
+        assert_eq!(stats.bad_frames, 1);
+        assert!(state.recover(started + Duration::from_secs(6)).is_none());
+        assert!(matches!(
+            state.record_failure(
+                DeviceFailureKind::ReadTimeout,
+                started + Duration::from_secs(7)
+            ),
+            FailureLogAction::Immediate(_)
+        ));
+    }
+
+    #[test]
+    fn query_retry_log_limits_repeated_successes_and_recovers() {
+        let mut state = QueryRetryLogState::default();
+        let started = Instant::now();
+
+        assert!(matches!(
+            state.record_retry_success(DeviceFailureKind::ReadTimeout, started),
+            QueryRetryLogAction::Immediate(QueryRetryEpisodeStats {
+                retries_succeeded: 1,
+                first_timeouts: 1,
+                first_bad_frames: 0,
+                ..
+            })
+        ));
+        assert_eq!(
+            state.record_retry_success(
+                DeviceFailureKind::ReadTimeout,
+                started + Duration::from_secs(1)
+            ),
+            QueryRetryLogAction::Suppressed
+        );
+        assert!(matches!(
+            state.record_retry_success(
+                DeviceFailureKind::BadFrame,
+                started + Duration::from_secs(2)
+            ),
+            QueryRetryLogAction::Immediate(QueryRetryEpisodeStats {
+                retries_succeeded: 3,
+                first_timeouts: 2,
+                first_bad_frames: 1,
+                ..
+            })
+        ));
+
+        let QueryRetryLogAction::Summary(summary) = state.record_retry_success(
+            DeviceFailureKind::BadFrame,
+            started + Duration::from_secs(62),
+        ) else {
+            panic!("60 秒后应生成查询补发持续汇总");
+        };
+        assert_eq!(summary.retries_succeeded, 4);
+        assert_eq!(summary.first_timeouts, 2);
+        assert_eq!(summary.first_bad_frames, 2);
+        assert_eq!(summary.suppressed, 1);
+
+        let recovered = state
+            .recover_on_first_attempt(started + Duration::from_secs(65))
+            .expect("首发恢复成功应结束补发故障周期");
+        assert_eq!(recovered.retries_succeeded, 4);
+        assert!(state
+            .recover_on_first_attempt(started + Duration::from_secs(66))
+            .is_none());
+    }
+
+    #[test]
+    fn reconnect_log_reports_error_changes_summaries_and_recovery() {
+        let mut state = ReconnectFailureLogState::default();
+        let started = Instant::now();
+
+        assert!(matches!(
+            state.record_failure("not found", started),
+            ReconnectLogAction::Immediate(_)
+        ));
+        assert_eq!(
+            state.record_failure("not found", started + Duration::from_secs(10)),
+            ReconnectLogAction::Suppressed
+        );
+        assert!(matches!(
+            state.record_failure("permission denied", started + Duration::from_secs(20)),
+            ReconnectLogAction::Immediate(ReconnectEpisodeStats { attempts: 3, .. })
+        ));
+
+        let ReconnectLogAction::Summary(stats) =
+            state.record_failure("permission denied", started + Duration::from_secs(80))
+        else {
+            panic!("错误类型不变且超过 60 秒后应生成汇总");
+        };
+        assert_eq!(stats.attempts, 4);
+        assert_eq!(stats.suppressed, 1);
+        assert_eq!(stats.last_error, "permission denied");
+
+        let recovered = state
+            .recover(started + Duration::from_secs(90))
+            .expect("重连成功应返回故障周期统计");
+        assert_eq!(recovered.attempts, 4);
+        assert_eq!(recovered.duration, Duration::from_secs(90));
+        assert!(state.recover(started + Duration::from_secs(91)).is_none());
+    }
+
+    #[test]
+    fn bad_frame_details_preserve_reason_and_truncate_to_64_bytes() {
+        let frame: Vec<u8> = (0..100).collect();
+        let details = bad_frame_log_details("校验和不匹配", &frame);
+
+        assert_eq!(details.reason, "校验和不匹配");
+        assert_eq!(details.frame_len, 100);
+        assert!(details.truncated);
+        assert_eq!(details.frame_hex.split_whitespace().count(), 64);
+        assert_eq!(details.frame_hex, format_hex(&frame[..64]));
+
+        let short = bad_frame_log_details("数据帧过短", &[1, 2, 3]);
+        assert!(!short.truncated);
+        assert_eq!(short.frame_hex, "01 02 03");
     }
 
     #[test]
@@ -1038,7 +2320,7 @@ mod tests {
 
         let (_, attributed) = manager.extract_frame(noise.len());
         assert!(!attributed);
-        manager.handle_unattributed_frame();
+        manager.handle_unattributed_frame(&noise);
 
         assert_eq!(manager.time_out_count, 1);
         assert_eq!(manager.device_states[0].timeout_count, 0);
@@ -1054,12 +2336,290 @@ mod tests {
         let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
         let mut rx = manager.broadcaster.subscribe();
 
-        manager.handle_invalid_frame();
+        manager.handle_invalid_frame_with_context("校验和不匹配", &[1, 2, 3, 4], None, true);
 
         assert_eq!(manager.time_out_count, 1);
         assert_eq!(manager.device_states[0].timeout_count, 1);
         let status = rx.try_recv().expect("离线状态应立即广播");
         assert!(!status.device_status);
         assert!(!manager.latest_status_cache.snapshot_statuses()[0].device_status);
+    }
+
+    #[test]
+    fn first_timeout_still_marks_device_offline_immediately() {
+        let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+        let mut rx = manager.broadcaster.subscribe();
+
+        manager.handle_timeout_with_context(None, true);
+
+        assert_eq!(manager.time_out_count, 1);
+        assert_eq!(manager.device_states[0].timeout_count, 1);
+        let status = rx.try_recv().expect("首次超时仍应立即广播离线状态");
+        assert!(status.com_status);
+        assert!(!status.device_status);
+        assert!(!manager.latest_status_cache.snapshot_statuses()[0].device_status);
+    }
+
+    #[test]
+    fn automatic_query_timeout_then_retry_success_keeps_device_online() {
+        let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+        let observations = install_scripted_port(
+            &mut manager,
+            vec![
+                ReadStep::Timeout,
+                ReadStep::Data(valid_status_frame(1, cmd::READ_STATUS)),
+            ],
+            vec![true, true],
+        );
+        let mut rx = manager.broadcaster.subscribe();
+
+        run_auto_query(&mut manager);
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.write_attempts, 2);
+        assert_eq!(observations.writes[0], observations.writes[1]);
+        assert_eq!(observations.input_clears, 1);
+        drop(observations);
+        assert_eq!(manager.time_out_count, 0);
+        assert_eq!(manager.parse_fail_count, 0);
+        assert_eq!(manager.device_states[0].timeout_count, 0);
+        assert_eq!(manager.device_states[0].parse_fail_count, 0);
+        assert!(manager.system_record.lock().unwrap().is_empty());
+
+        let status = rx.try_recv().expect("补发成功应广播有效值");
+        assert!(status.com_status);
+        assert!(status.device_status);
+        assert_eq!(status.raw_data, valid_status_frame(1, cmd::READ_STATUS));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(manager.latest_status_cache.snapshot_statuses()[0].device_status);
+        assert_eq!(
+            manager.device_states[0]
+                .query_retry_log
+                .stats(Instant::now())
+                .first_timeouts,
+            1
+        );
+    }
+
+    #[test]
+    fn automatic_query_bad_frame_then_retry_success_does_not_commit_failure() {
+        let mut bad_frame = valid_status_frame(1, cmd::READ_STATUS);
+        *bad_frame.last_mut().unwrap() ^= 0xFF;
+        let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+        let observations = install_scripted_port(
+            &mut manager,
+            vec![
+                ReadStep::Data(bad_frame),
+                ReadStep::Data(valid_status_frame(1, cmd::READ_STATUS)),
+            ],
+            vec![true, true],
+        );
+
+        run_auto_query(&mut manager);
+
+        assert_eq!(observations.lock().unwrap().write_attempts, 2);
+        assert_eq!(manager.time_out_count, 0);
+        assert_eq!(manager.parse_fail_count, 0);
+        assert_eq!(manager.device_states[0].timeout_count, 0);
+        assert_eq!(manager.device_states[0].parse_fail_count, 0);
+        assert!(manager.system_record.lock().unwrap().is_empty());
+        let retry_stats = manager.device_states[0]
+            .query_retry_log
+            .stats(Instant::now());
+        assert_eq!(retry_stats.retries_succeeded, 1);
+        assert_eq!(retry_stats.first_bad_frames, 1);
+    }
+
+    #[test]
+    fn automatic_query_two_timeouts_commit_one_offline_failure() {
+        let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+        let observations = install_scripted_port(
+            &mut manager,
+            vec![ReadStep::Timeout, ReadStep::Timeout],
+            vec![true, true],
+        );
+        let mut rx = manager.broadcaster.subscribe();
+
+        run_auto_query(&mut manager);
+
+        assert_eq!(observations.lock().unwrap().write_attempts, 2);
+        assert_eq!(manager.time_out_count, 1);
+        assert_eq!(manager.parse_fail_count, 0);
+        assert_eq!(manager.device_states[0].timeout_count, 1);
+        assert_eq!(manager.device_states[0].failure_log.timeouts, 1);
+        assert_eq!(manager.device_states[0].failure_log.bad_frames, 0);
+        assert_eq!(manager.system_record.lock().unwrap().len(), 1);
+        let status = rx.try_recv().expect("两次超时后应只广播一次离线");
+        assert!(status.com_status);
+        assert!(!status.device_status);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn automatic_query_two_bad_frames_commit_one_parse_failure() {
+        let mut bad_frame = valid_status_frame(1, cmd::READ_STATUS);
+        *bad_frame.last_mut().unwrap() ^= 0xFF;
+        let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+        let observations = install_scripted_port(
+            &mut manager,
+            vec![ReadStep::Data(bad_frame.clone()), ReadStep::Data(bad_frame)],
+            vec![true, true],
+        );
+        let mut rx = manager.broadcaster.subscribe();
+
+        run_auto_query(&mut manager);
+
+        assert_eq!(observations.lock().unwrap().write_attempts, 2);
+        assert_eq!(manager.time_out_count, 1);
+        assert_eq!(manager.parse_fail_count, 1);
+        assert_eq!(manager.device_states[0].timeout_count, 1);
+        assert_eq!(manager.device_states[0].parse_fail_count, 1);
+        assert_eq!(manager.device_states[0].failure_log.timeouts, 0);
+        assert_eq!(manager.device_states[0].failure_log.bad_frames, 1);
+        assert!(!rx.try_recv().expect("两次坏帧后应广播离线").device_status);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn automatic_query_final_attempt_determines_failure_counters() {
+        let mut bad_frame = valid_status_frame(1, cmd::READ_STATUS);
+        *bad_frame.last_mut().unwrap() ^= 0xFF;
+
+        let mut timeout_then_bad = test_manager(RunLocation::Primary, RunLocation::Primary);
+        install_scripted_port(
+            &mut timeout_then_bad,
+            vec![ReadStep::Timeout, ReadStep::Data(bad_frame.clone())],
+            vec![true, true],
+        );
+        run_auto_query(&mut timeout_then_bad);
+        assert_eq!(timeout_then_bad.time_out_count, 1);
+        assert_eq!(timeout_then_bad.parse_fail_count, 1);
+        assert_eq!(timeout_then_bad.device_states[0].failure_log.timeouts, 0);
+        assert_eq!(timeout_then_bad.device_states[0].failure_log.bad_frames, 1);
+
+        let mut bad_then_timeout = test_manager(RunLocation::Primary, RunLocation::Primary);
+        install_scripted_port(
+            &mut bad_then_timeout,
+            vec![ReadStep::Data(bad_frame), ReadStep::Timeout],
+            vec![true, true],
+        );
+        run_auto_query(&mut bad_then_timeout);
+        assert_eq!(bad_then_timeout.time_out_count, 1);
+        assert_eq!(bad_then_timeout.parse_fail_count, 0);
+        assert_eq!(bad_then_timeout.device_states[0].failure_log.timeouts, 1);
+        assert_eq!(bad_then_timeout.device_states[0].failure_log.bad_frames, 0);
+    }
+
+    #[test]
+    fn automatic_query_retry_send_failure_commits_first_receive_failure() {
+        let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+        let observations =
+            install_scripted_port(&mut manager, vec![ReadStep::Timeout], vec![true, false]);
+        let mut rx = manager.broadcaster.subscribe();
+
+        run_auto_query(&mut manager);
+
+        assert_eq!(observations.lock().unwrap().write_attempts, 2);
+        assert_eq!(manager.time_out_count, 1);
+        assert_eq!(manager.parse_fail_count, 0);
+        assert_eq!(manager.device_states[0].failure_log.timeouts, 1);
+        let status = rx.try_recv().expect("补发写入失败不能丢失离线通知");
+        assert!(!status.com_status);
+        assert!(!status.device_status);
+        let cached = manager.latest_status_cache.snapshot_statuses();
+        assert_eq!(cached.len(), 1);
+        assert!(!cached[0].com_status);
+        assert!(!cached[0].device_status);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn automatic_query_first_attempt_success_sends_only_once() {
+        let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+        let observations = install_scripted_port(
+            &mut manager,
+            vec![ReadStep::Data(valid_status_frame(1, cmd::READ_STATUS))],
+            vec![true],
+        );
+
+        run_auto_query(&mut manager);
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.write_attempts, 1);
+        assert_eq!(observations.input_clears, 0);
+        drop(observations);
+        assert_eq!(manager.time_out_count, 0);
+        assert_eq!(manager.parse_fail_count, 0);
+        assert!(manager.device_states[0]
+            .query_retry_log
+            .started_at
+            .is_none());
+    }
+
+    #[test]
+    fn automatic_query_io_error_does_not_trigger_active_retry() {
+        let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+        let observations = install_scripted_port(&mut manager, vec![ReadStep::IoError], vec![true]);
+
+        run_auto_query(&mut manager);
+
+        assert_eq!(observations.lock().unwrap().write_attempts, 1);
+        assert_eq!(manager.time_out_count, 0);
+        assert_eq!(manager.parse_fail_count, 0);
+        assert_eq!(manager.device_states[0].timeout_count, 0);
+        assert!(manager.device_states[0]
+            .query_retry_log
+            .started_at
+            .is_none());
+    }
+
+    #[test]
+    fn automatic_query_retries_address_and_command_mismatches() {
+        for mismatched_frame in [
+            valid_status_frame(2, cmd::READ_STATUS),
+            valid_status_frame(1, 0x09),
+        ] {
+            let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+            let observations = install_scripted_port(
+                &mut manager,
+                vec![
+                    ReadStep::Data(mismatched_frame),
+                    ReadStep::Data(valid_status_frame(1, cmd::READ_STATUS)),
+                ],
+                vec![true, true],
+            );
+
+            run_auto_query(&mut manager);
+
+            assert_eq!(observations.lock().unwrap().write_attempts, 2);
+            assert_eq!(manager.time_out_count, 0);
+            assert_eq!(manager.parse_fail_count, 0);
+            let statuses = manager.latest_status_cache.snapshot_statuses();
+            assert_eq!(statuses.len(), 1);
+            assert_eq!(statuses[0].device_id, 1);
+            assert!(statuses[0].device_status);
+        }
+    }
+
+    #[test]
+    fn missing_port_during_reconnect_cooldown_does_not_spam_system_record() {
+        let mut manager = test_manager(RunLocation::Secondary, RunLocation::Secondary);
+
+        manager.receive_data();
+        manager.receive_data();
+
+        assert!(manager.system_record.lock().unwrap().is_empty());
     }
 }
