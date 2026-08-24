@@ -752,12 +752,12 @@ impl SerialManager {
                     self.reconnect();
                     return false;
                 }
-                // if let Err(e) = port.flush() {
-                //     error!("刷新地址字节错误: {:?}", e);
-                //     self.port = None;
-                //     self.reconnect();
-                //     return false;
-                // }
+                if let Err(e) = port.flush() {
+                    error!("刷新地址字节错误: {:?}", e);
+                    self.port = None;
+                    self.reconnect();
+                    return false;
+                }
             }
             None => {
                 self.reconnect();
@@ -766,7 +766,7 @@ impl SerialManager {
         }
 
         // 等待地址字节在物理线路上完全发出后再切换校验位
-        std::thread::sleep(Duration::from_millis(10));
+        // std::thread::sleep(Duration::from_millis(10));
 
         // 发送数据部分（Space 奇偶校验）
         match self.port {
@@ -783,12 +783,12 @@ impl SerialManager {
                     self.reconnect();
                     return false;
                 }
-                // if let Err(e) = port.flush() {
-                //     error!("刷新数据部分错误: {:?}", e);
-                //     self.port = None;
-                //     self.reconnect();
-                //     return false;
-                // }
+                if let Err(e) = port.flush() {
+                    error!("刷新数据部分错误: {:?}", e);
+                    self.port = None;
+                    self.reconnect();
+                    return false;
+                }
             }
             None => {
                 self.reconnect();
