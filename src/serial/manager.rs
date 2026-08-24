@@ -21,7 +21,7 @@ use crate::broadcast::Broadcaster;
 use crate::config::RunLocation;
 use crate::logging;
 use crate::model::{DeviceStatus, SendData};
-use crate::protocol::{self, cmd, threshold};
+use crate::protocol::{self, threshold};
 use crate::runtime_cache::LatestStatusCache;
 
 const COMMAND_ACK_BYTES: [u8; 3] = [0x00, 0x50, 0x50];
@@ -69,12 +69,6 @@ impl QueryFailure {
             Self::BadFrame { frame, .. } => Some(frame),
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct QueryExpectation {
-    device_id: u8,
-    command: u8,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -877,24 +871,21 @@ impl SerialManager {
 
     /// 从串口读取并解析一帧数据；超时或坏帧立即按原有语义提交故障。
     pub(crate) fn receive_data(&mut self) {
-        if let ReceiveDataOutcome::Retryable(failure) = self.receive_data_attempt(None) {
+        if let ReceiveDataOutcome::Retryable(failure) = self.receive_data_attempt() {
             self.commit_query_failure(failure, None);
         }
     }
 
-    /// 接收主机自动查询响应，首轮超时或坏帧时向同一设备补发一次。
+    /// 接收主机自动查询响应，首轮读取超时或协议解析失败时向同一设备补发一次。
     pub(crate) fn receive_query_with_retry(&mut self, query: SendData) {
         let query_index = self.index;
         let Some(device) = self.port_config.devices.get(query_index) else {
             return;
         };
-        let expectation = QueryExpectation {
-            device_id: device.config.device_id,
-            command: cmd::READ_STATUS,
-        };
+        let device_id = device.config.device_id;
         let started_at = Instant::now();
 
-        let first_failure = match self.receive_data_attempt(Some(expectation)) {
+        let first_failure = match self.receive_data_attempt() {
             ReceiveDataOutcome::Success => {
                 if self.current_run == RunLocation::Primary && self.index == query_index {
                     self.log_query_first_attempt_recovery(query_index, Instant::now());
@@ -918,7 +909,7 @@ impl SerialManager {
                 warn!(
                     "[串口查询补发清理失败] port={} device_id={} index={} error={:?} action=continue_resend",
                     self.serial_config.port_name,
-                    expectation.device_id,
+                    device_id,
                     query_index,
                     error,
                 );
@@ -937,7 +928,7 @@ impl SerialManager {
             return;
         }
 
-        match self.receive_data_attempt(Some(expectation)) {
+        match self.receive_data_attempt() {
             ReceiveDataOutcome::Success => {
                 if self.current_run == RunLocation::Primary && self.index == query_index {
                     self.log_query_retry_success(
@@ -963,10 +954,7 @@ impl SerialManager {
     }
 
     /// 只读取、校验并处理一帧；超时和坏帧返回给调用方决定是否提交故障。
-    fn receive_data_attempt(
-        &mut self,
-        expectation: Option<QueryExpectation>,
-    ) -> ReceiveDataOutcome {
+    fn receive_data_attempt(&mut self) -> ReceiveDataOutcome {
         let port = match self.port {
             Some(ref mut p) => p,
             None => {
@@ -1053,30 +1041,6 @@ impl SerialManager {
         // ---- 解析数据帧 ----
         match protocol::parse_data_packet(&frame) {
             Ok(packet) => {
-                if self.current_run == RunLocation::Primary {
-                    if let Some(expected) = expectation {
-                        let mismatch = if packet.addr != expected.device_id {
-                            Some(format!(
-                                "响应设备地址不匹配(expected={}, actual={})",
-                                expected.device_id, packet.addr
-                            ))
-                        } else if packet.cmd != expected.command {
-                            Some(format!(
-                                "响应命令码不匹配(expected=0x{:02X}, actual=0x{:02X})",
-                                expected.command, packet.cmd
-                            ))
-                        } else {
-                            None
-                        };
-                        if let Some(reason) = mismatch {
-                            return ReceiveDataOutcome::Retryable(QueryFailure::BadFrame {
-                                reason,
-                                frame,
-                            });
-                        }
-                    }
-                }
-
                 self.handle_valid_packet(packet, frame);
                 ReceiveDataOutcome::Success
             }
@@ -1088,7 +1052,7 @@ impl SerialManager {
     }
 
     fn handle_valid_packet(&mut self, packet: protocol::DataPacket, frame: Vec<u8>) {
-        // 只有长度、校验和及查询归属均有效的完整帧才能证明通信恢复。
+        // 只有长度与校验和均有效的完整帧才能证明通信恢复。
         let now = Instant::now();
         self.log_device_recovery(now, frame.len());
         self.log_unattributed_recovery(now, frame.len());
@@ -1334,11 +1298,14 @@ impl SerialManager {
             .and_then(|value| value.first_failure.reason())
             .or(reason)
             .unwrap_or("-");
-        let first_frame_len = context
-            .and_then(|value| value.first_failure.frame())
-            .or(frame)
-            .map(|frame| frame.len())
-            .unwrap_or_default();
+        let first_frame = match context {
+            Some(value) => value.first_failure.frame(),
+            None => frame,
+        }
+        .unwrap_or_default();
+        let first_frame_len = first_frame.len();
+        let (first_frame_hex, first_frame_truncated) =
+            format_hex_preview(first_frame, BAD_FRAME_LOG_MAX_BYTES);
         let action = self.device_states[index]
             .failure_log
             .record_failure(kind, now);
@@ -1347,7 +1314,7 @@ impl SerialManager {
             FailureLogAction::Immediate(stats) => {
                 match kind {
                     DeviceFailureKind::ReadTimeout => warn!(
-                        "[串口通信异常] port={} device_id={} index={} role={:?} cause=read_timeout timeout_ms={} attempts={} first_cause={} first_reason={:?} first_frame_len={} final_cause=read_timeout consecutive={} affected_points={} action=publish_zero_bad_no_communication",
+                        "[串口通信异常] port={} device_id={} index={} role={:?} cause=read_timeout timeout_ms={} attempts={} first_cause={} first_reason={:?} first_frame_len={} first_frame_hex={:?} first_frame_truncated={} final_cause=read_timeout consecutive={} affected_points={} action=publish_zero_bad_no_communication",
                         self.serial_config.port_name,
                         device_id,
                         index,
@@ -1357,6 +1324,8 @@ impl SerialManager {
                         first_cause,
                         first_reason,
                         first_frame_len,
+                        first_frame_hex,
+                        first_frame_truncated,
                         consecutive,
                         affected_points,
                     ),
@@ -1365,7 +1334,7 @@ impl SerialManager {
                         let details =
                             bad_frame_log_details(reason.unwrap_or("未知解析错误"), frame);
                         warn!(
-                            "[串口坏帧] port={} device_id={} index={} role={:?} reason={:?} frame_len={} frame_hex={:?} truncated={} attempts={} first_cause={} first_reason={:?} first_frame_len={} final_cause=bad_frame consecutive={} parse_failures={} affected_points={} action=publish_zero_bad_no_communication",
+                            "[串口坏帧] port={} device_id={} index={} role={:?} reason={:?} frame_len={} frame_hex={:?} truncated={} attempts={} first_cause={} first_reason={:?} first_frame_len={} first_frame_hex={:?} first_frame_truncated={} final_cause=bad_frame consecutive={} parse_failures={} affected_points={} action=publish_zero_bad_no_communication",
                             self.serial_config.port_name,
                             device_id,
                             index,
@@ -1378,6 +1347,8 @@ impl SerialManager {
                             first_cause,
                             first_reason,
                             first_frame_len,
+                            first_frame_hex,
+                            first_frame_truncated,
                             consecutive,
                             parse_failures,
                             affected_points,
@@ -1711,6 +1682,7 @@ pub(crate) fn open_serial_port(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::cmd;
     use std::collections::HashMap;
     use std::io::Read;
 
@@ -2586,30 +2558,29 @@ mod tests {
     }
 
     #[test]
-    fn automatic_query_retries_address_and_command_mismatches() {
-        for mismatched_frame in [
+    fn automatic_query_preserves_existing_frame_validation_rules() {
+        for accepted_frame in [
+            valid_status_frame(0, cmd::READ_STATUS),
             valid_status_frame(2, cmd::READ_STATUS),
             valid_status_frame(1, 0x09),
         ] {
             let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
             let observations = install_scripted_port(
                 &mut manager,
-                vec![
-                    ReadStep::Data(mismatched_frame),
-                    ReadStep::Data(valid_status_frame(1, cmd::READ_STATUS)),
-                ],
-                vec![true, true],
+                vec![ReadStep::Data(accepted_frame.clone())],
+                vec![true],
             );
 
             run_auto_query(&mut manager);
 
-            assert_eq!(observations.lock().unwrap().write_attempts, 2);
+            assert_eq!(observations.lock().unwrap().write_attempts, 1);
             assert_eq!(manager.time_out_count, 0);
             assert_eq!(manager.parse_fail_count, 0);
             let statuses = manager.latest_status_cache.snapshot_statuses();
             assert_eq!(statuses.len(), 1);
             assert_eq!(statuses[0].device_id, 1);
             assert!(statuses[0].device_status);
+            assert_eq!(statuses[0].raw_data, accepted_frame);
         }
     }
 
