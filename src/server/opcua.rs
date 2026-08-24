@@ -117,7 +117,7 @@ type OpcuaValueUpdate<'a> = (&'a NodeId, Option<&'a NumericRange>, DataValue);
 
 fn unavailable_data_value(value: Variant, status: StatusCode) -> DataValue {
     DataValue {
-        // async-opcua 0.16 的 Variable::value 仅在 value 为 Some 时复制 StatusCode；
+        // async-opcua 的 Variable::value 仅在 value 为 Some 时复制 StatusCode；
         // 启动等待数据时使用 Empty，运行中通信异常时使用类型匹配的零值。
         value: Some(value),
         status: Some(status),
@@ -383,9 +383,9 @@ pub async fn run_opcua_server(
         limit_target,
     );
 
-    let (server, handle) = builder.build().map_err(|e| {
-        io::Error::new(io::ErrorKind::Other, format!("构建 OPC UA 服务器失败: {e}"))
-    })?;
+    let (server, handle) = builder
+        .build()
+        .map_err(|e| io::Error::other(format!("构建 OPC UA 服务器失败: {e}")))?;
     let listener = TcpListener::bind((OPCUA_BIND_HOST, port))
         .await
         .map_err(|e| {
@@ -473,9 +473,7 @@ pub async fn run_opcua_server(
     if !initial_updates.is_empty() {
         node_manager
             .set_values(&subscriptions, initial_updates.into_iter())
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("OPC UA 缓存预热失败: {e:?}"))
-            })?;
+            .map_err(|e| io::Error::other(format!("OPC UA 缓存预热失败: {e:?}")))?;
         if initial_statuses_from_config {
             info!(
                 "[OPC UA] 最新值缓存为空，已用配置零值预热: 设备状态={} 条",
@@ -582,7 +580,7 @@ pub async fn run_opcua_server(
     let result = server
         .run_with(listener)
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("OPC UA 服务器错误: {e}")));
+        .map_err(|e| io::Error::other(format!("OPC UA 服务器错误: {e}")));
 
     // 服务器退出后，确保取消信号触发 + 等待子任务收尾
     cancel.cancel();
@@ -701,20 +699,12 @@ fn validate_opcua_kks_namespace(
         .collect();
     let send_calc_collisions: Vec<String> = send_node_owners
         .keys()
-        .filter(|send_name| {
-            calc_output_names
-                .iter()
-                .any(|calc_name| *calc_name == send_name.as_str())
-        })
+        .filter(|send_name| calc_output_names.contains(&send_name.as_str()))
         .cloned()
         .collect();
     let infrastructure_calc_collisions: Vec<String> = infrastructure_node_owners
         .iter()
-        .filter(|(node_name, _)| {
-            calc_output_names
-                .iter()
-                .any(|calc_name| *calc_name == node_name.as_str())
-        })
+        .filter(|(node_name, _)| calc_output_names.contains(&node_name.as_str()))
         .map(|(node_name, owner)| format!("{node_name}: {owner}"))
         .collect();
 

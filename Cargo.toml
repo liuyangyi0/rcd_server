@@ -2,6 +2,7 @@
 name = "rcd_server"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.87"
 
 [dependencies]
 tokio = { version = "1.37.0", features = ["full"] }
@@ -18,7 +19,7 @@ regex = "1.10.4"
 toml = "0.8.19"
 bounded-vec-deque = "0.1.1"
 chrono = "0.4"
-async-opcua = { version = "0.16", features = ["server"] }
+async-opcua = { version = "0.19", features = ["server"] }
 log = "0.4"
 flexi_logger = "0.29.8"
 thiserror = "1"
