@@ -751,7 +751,7 @@ impl SerialManager {
                     self.reconnect();
                     return false;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(25));
                 if let Err(e) = port.write_all(&addr_byte) {
                     warn!("写入地址字节错误: {:?}", e);
                     self.port = None;
@@ -772,7 +772,7 @@ impl SerialManager {
         }
 
         // 等待地址字节在物理线路上完全发出后再切换校验位
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(10));
 
         // 发送数据部分（Space 奇偶校验）
         match self.port {
