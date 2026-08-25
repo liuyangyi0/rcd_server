@@ -182,16 +182,18 @@ pub(crate) fn set_parity(termios: &mut Termios, parity: Parity) -> Result<()> {
         Parity::Mark => {
             termios.c_cflag |= libc::PARODD;
             termios.c_cflag |= libc::PARENB;
-            termios.c_iflag |= libc::INPCK;
-            termios.c_iflag &= !libc::IGNPAR;
+            // Mark/Space is required for transmitting the 9th address/data bit, but the
+            // receive side must stay raw. With INPCK enabled and both IGNPAR/PARMRK clear,
+            // Linux replaces every byte carrying a parity/framing error with NUL.
+            termios.c_iflag &= !(libc::INPCK | libc::IGNPAR | libc::PARMRK);
             termios.c_cflag |= libc::CMSPAR;
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         Parity::Space => {
             termios.c_cflag &= !libc::PARODD;
             termios.c_cflag |= libc::PARENB;
-            termios.c_iflag |= libc::INPCK;
-            termios.c_iflag &= !libc::IGNPAR;
+            // Keep Space generation enabled while accepting received parity bits as raw data.
+            termios.c_iflag &= !(libc::INPCK | libc::IGNPAR | libc::PARMRK);
             termios.c_cflag |= libc::CMSPAR;
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -210,6 +212,47 @@ pub(crate) fn set_parity(termios: &mut Termios, parity: Parity) -> Result<()> {
         }
     };
     Ok(())
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod tests {
+    use super::*;
+
+    fn termios_with_input_parity_processing() -> Termios {
+        let mut value: Termios = unsafe { std::mem::zeroed() };
+        value.c_iflag = libc::INPCK | libc::IGNPAR | libc::PARMRK;
+        value
+    }
+
+    #[test]
+    fn mark_parity_keeps_output_format_and_disables_input_error_conversion() {
+        let mut value = termios_with_input_parity_processing();
+
+        set_parity(&mut value, Parity::Mark).unwrap();
+
+        assert_eq!(value.c_cflag & libc::PARENB, libc::PARENB);
+        assert_eq!(value.c_cflag & libc::PARODD, libc::PARODD);
+        assert_eq!(value.c_cflag & libc::CMSPAR, libc::CMSPAR);
+        assert_eq!(
+            value.c_iflag & (libc::INPCK | libc::IGNPAR | libc::PARMRK),
+            0
+        );
+    }
+
+    #[test]
+    fn space_parity_keeps_output_format_and_disables_input_error_conversion() {
+        let mut value = termios_with_input_parity_processing();
+
+        set_parity(&mut value, Parity::Space).unwrap();
+
+        assert_eq!(value.c_cflag & libc::PARENB, libc::PARENB);
+        assert_eq!(value.c_cflag & libc::PARODD, 0);
+        assert_eq!(value.c_cflag & libc::CMSPAR, libc::CMSPAR);
+        assert_eq!(
+            value.c_iflag & (libc::INPCK | libc::IGNPAR | libc::PARMRK),
+            0
+        );
+    }
 }
 
 pub(crate) fn set_flow_control(termios: &mut Termios, flow_control: FlowControl) {
