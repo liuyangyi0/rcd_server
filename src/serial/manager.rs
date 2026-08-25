@@ -28,9 +28,14 @@ const COMMAND_ACK_BYTES: [u8; 3] = [0x00, 0x50, 0x50];
 const FORWARD_HEADER_LEN: usize = 7;
 const FORWARD_SEPARATOR_LEN: usize = 2;
 const FORWARD_PREFIX_LEN: usize = FORWARD_HEADER_LEN + FORWARD_SEPARATOR_LEN;
+// 协议帧总长为 Len + 地址、命令、长度、状态和校验共 5 个固定字节。
+const RESPONSE_FRAME_OVERHEAD: usize = 5;
+// 部分历史配置把 data_len 写成实际状态区长度（协议 Len + 1）。
+const RESPONSE_FRAME_OVERHEAD_WITH_STATUS_LEN: usize = 4;
 const FORWARD_PREFIX_GRACE: Duration = Duration::from_millis(5);
 const FAILURE_LOG_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 const BAD_FRAME_LOG_MAX_BYTES: usize = 64;
+const TRANSMIT_SETTLE_MARGIN: Duration = Duration::from_millis(25);
 const MAX_TRANSMIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -500,6 +505,8 @@ pub(crate) struct SerialManager {
     reconnect_failure_log: ReconnectFailureLogState,
     /// 备机无法归属帧的端口级限频日志状态。
     unattributed_failure_log: DeviceFailureLogState,
+    /// 串口接收尝试序号，仅用于把交错的多端口诊断日志关联到同一次 read/组帧。
+    receive_sequence: u64,
 }
 
 impl SerialManager {
@@ -568,6 +575,7 @@ impl SerialManager {
             port_offline_published: false,
             reconnect_failure_log,
             unattributed_failure_log: DeviceFailureLogState::default(),
+            receive_sequence: 0,
         };
 
         if let Some(error) = initial_open_error {
@@ -796,11 +804,19 @@ impl SerialManager {
             );
             return false;
         }
-        if logging::serial_frame_logs_enabled() {
+        let frame_diagnostics = logging::serial_frame_logs_enabled();
+        let send_started = Instant::now();
+        if frame_diagnostics {
             info!(
-                "串口 {} 发送数据: {}",
+                "[串口发送诊断开始] port={} device_id={} index={} role={:?} special={} baud_rate={} frame_len={} frame_hex={:?}",
                 self.serial_config.port_name,
-                format_hex(&command.command)
+                command.device_id,
+                self.index,
+                self.current_run,
+                self.port_config.is_special,
+                self.serial_config.baud_rate,
+                command.command.len(),
+                format_hex(&command.command),
             );
         }
 
@@ -814,6 +830,20 @@ impl SerialManager {
                     error,
                 );
             }
+            if frame_diagnostics {
+                let queued_after = self
+                    .port
+                    .as_ref()
+                    .and_then(|port| port.bytes_to_write().ok());
+                info!(
+                    "[串口发送诊断结束] port={} device_id={} index={} result=success mode=special elapsed_us={} queued_after={:?}",
+                    self.serial_config.port_name,
+                    command.device_id,
+                    self.index,
+                    send_started.elapsed().as_micros(),
+                    queued_after,
+                );
+            }
             return true;
         }
 
@@ -822,6 +852,7 @@ impl SerialManager {
         let payload = &command.command[1..];
 
         // 发送地址字节（Mark 奇偶校验）
+        let address_started = Instant::now();
         if let Err(error) = self.write_segment(
             Some(Parity::Mark),
             &addr_byte,
@@ -834,8 +865,24 @@ impl SerialManager {
                 error,
             );
         }
+        if frame_diagnostics {
+            let queued_after = self
+                .port
+                .as_ref()
+                .and_then(|port| port.bytes_to_write().ok());
+            info!(
+                "[串口发送诊断阶段] port={} device_id={} index={} phase=address_mark bytes={} elapsed_us={} queued_after={:?}",
+                self.serial_config.port_name,
+                command.device_id,
+                self.index,
+                addr_byte.len(),
+                address_started.elapsed().as_micros(),
+                queued_after,
+            );
+        }
 
         // 发送数据部分（Space 奇偶校验）
+        let payload_started = Instant::now();
         if let Err(error) = self.write_segment(Some(Parity::Space), payload, Duration::ZERO, true) {
             return self.handle_send_transport_error(
                 command.device_id,
@@ -843,18 +890,35 @@ impl SerialManager {
                 error,
             );
         }
+        if frame_diagnostics {
+            let queued_after = self
+                .port
+                .as_ref()
+                .and_then(|port| port.bytes_to_write().ok());
+            info!(
+                "[串口发送诊断结束] port={} device_id={} index={} result=success mode=mark_space rx_parity=Space payload_bytes={} payload_elapsed_us={} total_elapsed_us={} queued_after={:?}",
+                self.serial_config.port_name,
+                command.device_id,
+                self.index,
+                payload.len(),
+                payload_started.elapsed().as_micros(),
+                send_started.elapsed().as_micros(),
+                queued_after,
+            );
+        }
 
         true
     }
 
-    /// 在有限总时限内写入一段数据；普通串口在每段写入后调用 `flush`（Linux
-    /// 下为 `tcdrain`），确保地址字节完全发出后再切换 Mark/Space 校验位。
+    /// 在有限总时限内写入一段数据；普通串口在每段写入后按波特率和字节数等待
+    /// 线速发送时间，并增加驱动缓冲余量。XR17 驱动的 `tcdrain` 可能永久阻塞，
+    /// 因此这里不能调用 `flush`。
     fn write_segment(
         &mut self,
         parity: Option<Parity>,
         data: &[u8],
         pre_write_delay: Duration,
-        wait_for_drain: bool,
+        wait_for_settle: bool,
     ) -> io::Result<()> {
         let timeout = transmit_timeout(
             data.len(),
@@ -874,8 +938,8 @@ impl SerialManager {
             std::thread::sleep(pre_write_delay);
         }
         write_all_before_deadline(port.as_mut(), data, deadline)?;
-        if wait_for_drain {
-            port.flush()?;
+        if wait_for_settle {
+            wait_for_output_settle(data.len(), self.serial_config.baud_rate, deadline)?;
         }
         Ok(())
     }
@@ -1005,7 +1069,7 @@ impl SerialManager {
 
     /// 从串口读取并解析一帧数据；超时或坏帧立即按原有语义提交故障。
     pub(crate) fn receive_data(&mut self) {
-        if let ReceiveDataOutcome::Retryable(failure) = self.receive_data_attempt() {
+        if let ReceiveDataOutcome::Retryable(failure) = self.receive_data_attempt(1) {
             self.commit_query_failure(failure, None);
         }
     }
@@ -1019,7 +1083,7 @@ impl SerialManager {
         let device_id = device.config.device_id;
         let started_at = Instant::now();
 
-        let first_failure = match self.receive_data_attempt() {
+        let first_failure = match self.receive_data_attempt(1) {
             ReceiveDataOutcome::Success => {
                 if self.current_run == RunLocation::Primary && self.index == query_index {
                     self.log_query_first_attempt_recovery(query_index, Instant::now());
@@ -1038,14 +1102,40 @@ impl SerialManager {
             return;
         }
 
+        let frame_diagnostics = logging::serial_frame_logs_enabled();
+        let (pending_hex, pending_truncated) =
+            format_hex_preview(&self.rx_pending, BAD_FRAME_LOG_MAX_BYTES);
         if let Some(port) = self.port.as_ref() {
-            if let Err(error) = port.clear(ClearBuffer::Input) {
+            let queued_before = frame_diagnostics
+                .then(|| port.bytes_to_read().ok())
+                .flatten();
+            let clear_result = port.clear(ClearBuffer::Input);
+            let queued_after = frame_diagnostics
+                .then(|| port.bytes_to_read().ok())
+                .flatten();
+            if let Err(error) = &clear_result {
                 warn!(
                     "[串口查询补发清理失败] port={} device_id={} index={} error={:?} action=continue_resend",
                     self.serial_config.port_name,
                     device_id,
                     query_index,
                     error,
+                );
+            }
+            if frame_diagnostics {
+                info!(
+                    "[串口补发清理诊断] port={} device_id={} index={} first_receive_seq={} retry_receive_seq={} result={} kernel_bytes_before={:?} kernel_bytes_after={:?} pending_len={} pending_hex={:?} pending_truncated={} action=clear_kernel_and_memory_before_retry",
+                    self.serial_config.port_name,
+                    device_id,
+                    query_index,
+                    self.receive_sequence,
+                    self.receive_sequence.wrapping_add(1),
+                    if clear_result.is_ok() { "success" } else { "failed" },
+                    queued_before,
+                    queued_after,
+                    self.rx_pending.len(),
+                    pending_hex,
+                    pending_truncated,
                 );
             }
         }
@@ -1065,7 +1155,7 @@ impl SerialManager {
             return;
         }
 
-        match self.receive_data_attempt() {
+        match self.receive_data_attempt(2) {
             ReceiveDataOutcome::Success => {
                 if self.current_run == RunLocation::Primary && self.index == query_index {
                     self.log_query_retry_success(
@@ -1091,7 +1181,50 @@ impl SerialManager {
     }
 
     /// 只读取、校验并处理一帧；超时和坏帧返回给调用方决定是否提交故障。
-    fn receive_data_attempt(&mut self) -> ReceiveDataOutcome {
+    fn receive_data_attempt(&mut self, attempt: u8) -> ReceiveDataOutcome {
+        self.receive_sequence = self.receive_sequence.wrapping_add(1);
+        let sequence = self.receive_sequence;
+        let receive_started = Instant::now();
+        let frame_diagnostics = logging::serial_frame_logs_enabled();
+        let device_id = self
+            .port_config
+            .devices
+            .get(self.index)
+            .map(|device| device.config.device_id)
+            .unwrap_or_default();
+        let configured_frame_len_range = self.port_config.devices.get(self.index).map(|device| {
+            (
+                device.config.data_len as usize + RESPONSE_FRAME_OVERHEAD_WITH_STATUS_LEN,
+                device.config.data_len as usize + RESPONSE_FRAME_OVERHEAD,
+            )
+        });
+        let (pending_hex, pending_truncated) =
+            format_hex_preview(&self.rx_pending, BAD_FRAME_LOG_MAX_BYTES);
+        let kernel_bytes_at_start = frame_diagnostics
+            .then(|| {
+                self.port
+                    .as_ref()
+                    .and_then(|port| port.bytes_to_read().ok())
+            })
+            .flatten();
+        if frame_diagnostics {
+            info!(
+                "[串口接收诊断开始] port={} seq={} attempt={} device_id={} index={} role={:?} timeout_ms={} rx_parity={} configured_frame_len_range={:?} kernel_bytes={:?} pending_len={} pending_hex={:?} pending_truncated={}",
+                self.serial_config.port_name,
+                sequence,
+                attempt,
+                device_id,
+                self.index,
+                self.current_run,
+                self.serial_config.read_timeout.as_millis(),
+                if self.port_config.is_special { format!("{:?}", self.serial_config.parity) } else { "Space".to_string() },
+                configured_frame_len_range,
+                kernel_bytes_at_start,
+                self.rx_pending.len(),
+                pending_hex,
+                pending_truncated,
+            );
+        }
         if self.port.is_none() {
             self.reconnect();
             return ReceiveDataOutcome::TransportHandled;
@@ -1100,6 +1233,7 @@ impl SerialManager {
         // `SerialPort::read` 的 timeout 是单次 read 超时。这里另设整帧截止时间，
         // 防止设备持续零星发送字节时每次 read 都重新获得一个完整超时窗口。
         let deadline = Instant::now() + self.serial_config.read_timeout;
+        let mut read_call = 0u32;
         let raw_frame = loop {
             if let Some(frame_len) = complete_frame_len(
                 &self.rx_pending,
@@ -1135,20 +1269,118 @@ impl SerialManager {
                 break std::mem::take(&mut self.rx_pending);
             }
 
+            read_call = read_call.saturating_add(1);
+            let pending_before = self.rx_pending.len();
+            let kernel_bytes_before = frame_diagnostics
+                .then(|| {
+                    self.port
+                        .as_ref()
+                        .and_then(|port| port.bytes_to_read().ok())
+                })
+                .flatten();
+            let read_started = Instant::now();
             let read_result = {
                 let port = self.port.as_mut().expect("端口已在读取前检查");
                 read_before_deadline(port.as_mut(), &mut self.read_buf, deadline)
             };
+            let read_elapsed = read_started.elapsed();
+            let kernel_bytes_after = frame_diagnostics
+                .then(|| {
+                    self.port
+                        .as_ref()
+                        .and_then(|port| port.bytes_to_read().ok())
+                })
+                .flatten();
             match read_result {
                 Ok(0) => {
+                    if frame_diagnostics {
+                        info!(
+                            "[串口读取块诊断] port={} seq={} attempt={} read_call={} result=empty read_len=0 elapsed_us={} kernel_bytes_before={:?} kernel_bytes_after={:?} pending_before={} pending_after={} deadline_remaining_ms={}",
+                            self.serial_config.port_name,
+                            sequence,
+                            attempt,
+                            read_call,
+                            read_elapsed.as_micros(),
+                            kernel_bytes_before,
+                            kernel_bytes_after,
+                            pending_before,
+                            self.rx_pending.len(),
+                            deadline.saturating_duration_since(Instant::now()).as_millis(),
+                        );
+                    }
                     if self.rx_pending.is_empty() {
+                        if frame_diagnostics {
+                            info!(
+                                "[串口接收诊断结束] port={} seq={} attempt={} device_id={} index={} result=read_timeout read_calls={} elapsed_ms={} pending_len=0 kernel_bytes_after={:?}",
+                                self.serial_config.port_name,
+                                sequence,
+                                attempt,
+                                device_id,
+                                self.index,
+                                read_call,
+                                receive_started.elapsed().as_millis(),
+                                kernel_bytes_after,
+                            );
+                        }
                         return ReceiveDataOutcome::Retryable(QueryFailure::ReadTimeout);
                     }
                     break std::mem::take(&mut self.rx_pending);
                 }
-                Ok(n) => self.rx_pending.extend_from_slice(&self.read_buf[..n]),
+                Ok(n) => {
+                    self.rx_pending.extend_from_slice(&self.read_buf[..n]);
+                    if frame_diagnostics {
+                        let (chunk_hex, chunk_truncated) =
+                            format_hex_preview(&self.read_buf[..n], BAD_FRAME_LOG_MAX_BYTES);
+                        info!(
+                            "[串口读取块诊断] port={} seq={} attempt={} read_call={} result=data read_len={} elapsed_us={} kernel_bytes_before={:?} kernel_bytes_after={:?} pending_before={} pending_after={} chunk_zero_bytes={} chunk_all_zero={} chunk_hex={:?} chunk_truncated={} deadline_remaining_ms={}",
+                            self.serial_config.port_name,
+                            sequence,
+                            attempt,
+                            read_call,
+                            n,
+                            read_elapsed.as_micros(),
+                            kernel_bytes_before,
+                            kernel_bytes_after,
+                            pending_before,
+                            self.rx_pending.len(),
+                            self.read_buf[..n].iter().filter(|byte| **byte == 0).count(),
+                            self.read_buf[..n].iter().all(|byte| *byte == 0),
+                            chunk_hex,
+                            chunk_truncated,
+                            deadline.saturating_duration_since(Instant::now()).as_millis(),
+                        );
+                    }
+                }
                 Err(error) if error.kind() == ErrorKind::TimedOut => {
+                    if frame_diagnostics {
+                        info!(
+                            "[串口读取块诊断] port={} seq={} attempt={} read_call={} result=timeout read_len=0 elapsed_us={} kernel_bytes_before={:?} kernel_bytes_after={:?} pending_before={} pending_after={} deadline_remaining_ms={}",
+                            self.serial_config.port_name,
+                            sequence,
+                            attempt,
+                            read_call,
+                            read_elapsed.as_micros(),
+                            kernel_bytes_before,
+                            kernel_bytes_after,
+                            pending_before,
+                            self.rx_pending.len(),
+                            deadline.saturating_duration_since(Instant::now()).as_millis(),
+                        );
+                    }
                     if self.rx_pending.is_empty() {
+                        if frame_diagnostics {
+                            info!(
+                                "[串口接收诊断结束] port={} seq={} attempt={} device_id={} index={} result=read_timeout read_calls={} elapsed_ms={} pending_len=0 kernel_bytes_after={:?}",
+                                self.serial_config.port_name,
+                                sequence,
+                                attempt,
+                                device_id,
+                                self.index,
+                                read_call,
+                                receive_started.elapsed().as_millis(),
+                                kernel_bytes_after,
+                            );
+                        }
                         return ReceiveDataOutcome::Retryable(QueryFailure::ReadTimeout);
                     }
                     break std::mem::take(&mut self.rx_pending);
@@ -1157,10 +1389,16 @@ impl SerialManager {
                     let error_kind = error.kind();
                     let error_text = error.to_string();
                     error!(
-                        "[串口读取错误] port={} index={} role={:?} phase=read_frame error_kind={:?} error={:?} action=close_publish_all_offline_reconnect",
+                        "[串口读取错误] port={} seq={} attempt={} device_id={} index={} role={:?} phase=read_frame read_call={} elapsed_ms={} pending_len={} error_kind={:?} error={:?} action=close_publish_all_offline_reconnect",
                         self.serial_config.port_name,
+                        sequence,
+                        attempt,
+                        device_id,
                         self.index,
                         self.current_run,
+                        read_call,
+                        receive_started.elapsed().as_millis(),
+                        self.rx_pending.len(),
                         error_kind,
                         error_text,
                     );
@@ -1177,26 +1415,79 @@ impl SerialManager {
         };
 
         if raw_frame.is_empty() {
+            if frame_diagnostics {
+                info!(
+                    "[串口接收诊断结束] port={} seq={} attempt={} device_id={} index={} result=read_timeout reason=empty_raw_frame read_calls={} elapsed_ms={}",
+                    self.serial_config.port_name,
+                    sequence,
+                    attempt,
+                    device_id,
+                    self.index,
+                    read_call,
+                    receive_started.elapsed().as_millis(),
+                );
+            }
             return ReceiveDataOutcome::Retryable(QueryFailure::ReadTimeout);
         }
 
         // ---- 提取有效数据切片 ----
         let (frame, device_attributed) = self.extract_frame(&raw_frame);
+        let discarded_tail_len = self.rx_pending.len();
+        let (discarded_tail_hex, discarded_tail_truncated) =
+            format_hex_preview(&self.rx_pending, BAD_FRAME_LOG_MAX_BYTES);
         // 主机发送查询时只接受本轮的一帧响应。任何粘连尾部都属于迟到/重复数据，
         // 必须丢弃，防止下一台设备的轮询错误消费；备机被动监听则保留后续帧。
         if self.current_run == RunLocation::Primary {
             self.rx_pending.clear();
         }
-        if logging::serial_frame_logs_enabled() {
+        if frame_diagnostics {
+            let (raw_hex, raw_truncated) = format_hex_preview(&raw_frame, BAD_FRAME_LOG_MAX_BYTES);
+            let (frame_hex, frame_truncated) = format_hex_preview(&frame, BAD_FRAME_LOG_MAX_BYTES);
+            let leading_zero_bytes = frame.iter().take_while(|byte| **byte == 0).count();
+            let zero_bytes = frame.iter().filter(|byte| **byte == 0).count();
             info!(
-                "串口 {} 原始数据: {}",
+                "[串口组帧诊断] port={} seq={} attempt={} device_id={} index={} read_calls={} raw_len={} raw_hex={:?} raw_truncated={} frame_len={} frame_hex={:?} frame_truncated={} declared_len={:?} expected_from_header={:?} configured_frame_len_range={:?} attributed={} zero_bytes={} all_zero={} leading_zero_bytes={} discarded_tail_len={} discarded_tail_hex={:?} discarded_tail_truncated={} elapsed_ms={}",
                 self.serial_config.port_name,
-                format_hex(&frame)
+                sequence,
+                attempt,
+                device_id,
+                self.index,
+                read_call,
+                raw_frame.len(),
+                raw_hex,
+                raw_truncated,
+                frame.len(),
+                frame_hex,
+                frame_truncated,
+                frame.get(2),
+                frame.get(2).map(|len| *len as usize + 5),
+                configured_frame_len_range,
+                device_attributed,
+                zero_bytes,
+                !frame.is_empty() && zero_bytes == frame.len(),
+                leading_zero_bytes,
+                discarded_tail_len,
+                discarded_tail_hex,
+                discarded_tail_truncated,
+                receive_started.elapsed().as_millis(),
             );
         }
 
         // 备机监听到的无有效转发头数据无法归属到具体设备，不能沿用旧 index。
         if !device_attributed {
+            if frame_diagnostics {
+                info!(
+                    "[串口接收诊断结束] port={} seq={} attempt={} device_id={} index={} result=unattributed_frame frame_len={} read_calls={} elapsed_ms={}",
+                    self.serial_config.port_name,
+                    sequence,
+                    attempt,
+                    device_id,
+                    self.index,
+                    frame.len(),
+                    read_call,
+                    receive_started.elapsed().as_millis(),
+                );
+            }
             self.handle_unattributed_frame(&frame);
             return ReceiveDataOutcome::UnattributedHandled;
         }
@@ -1204,13 +1495,46 @@ impl SerialManager {
         // ---- 解析数据帧 ----
         match protocol::parse_data_packet(&frame) {
             Ok(packet) => {
+                if frame_diagnostics {
+                    info!(
+                        "[串口接收诊断结束] port={} seq={} attempt={} device_id={} index={} result=success frame_len={} response_addr={:?} response_cmd={:?} read_calls={} elapsed_ms={} action=publish_good_value",
+                        self.serial_config.port_name,
+                        sequence,
+                        attempt,
+                        device_id,
+                        self.index,
+                        frame.len(),
+                        frame.first(),
+                        frame.get(1),
+                        read_call,
+                        receive_started.elapsed().as_millis(),
+                    );
+                }
                 self.handle_valid_packet(packet, frame);
                 ReceiveDataOutcome::Success
             }
-            Err(reason) => ReceiveDataOutcome::Retryable(QueryFailure::BadFrame {
-                reason: reason.to_string(),
-                frame,
-            }),
+            Err(reason) => {
+                if frame_diagnostics {
+                    info!(
+                        "[串口接收诊断结束] port={} seq={} attempt={} device_id={} index={} result=bad_frame reason={:?} frame_len={} response_addr={:?} response_cmd={:?} read_calls={} elapsed_ms={}",
+                        self.serial_config.port_name,
+                        sequence,
+                        attempt,
+                        device_id,
+                        self.index,
+                        reason,
+                        frame.len(),
+                        frame.first(),
+                        frame.get(1),
+                        read_call,
+                        receive_started.elapsed().as_millis(),
+                    );
+                }
+                ReceiveDataOutcome::Retryable(QueryFailure::BadFrame {
+                    reason: reason.to_string(),
+                    frame,
+                })
+            }
         }
     }
 
@@ -1817,6 +2141,23 @@ fn transmit_timeout(byte_count: usize, baud_rate: u32, configured: Duration) -> 
     wire_budget.saturating_add(io_slack)
 }
 
+/// 等待驱动缓冲中的数据按线速发送完成。固定余量覆盖 XR17/USB 串口从驱动队列
+/// 到 UART 的调度延迟，同时由调用方截止时间限制最长等待时间。
+fn wait_for_output_settle(byte_count: usize, baud_rate: u32, deadline: Instant) -> io::Result<()> {
+    let settle = wire_duration(byte_count, baud_rate).saturating_add(TRANSMIT_SETTLE_MARGIN);
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if settle > remaining {
+        return Err(io::Error::new(
+            ErrorKind::TimedOut,
+            "serial output settle deadline elapsed",
+        ));
+    }
+    if !settle.is_zero() {
+        std::thread::sleep(settle);
+    }
+    Ok(())
+}
+
 // ============================================================
 //  帧长度计算
 // ============================================================
@@ -1845,23 +2186,55 @@ fn configured_response_frame_len(
 ) -> Option<usize> {
     let accepts_forwarded_frame =
         *current_run == RunLocation::Secondary || *run_on == RunLocation::Secondary;
-    if accepts_forwarded_frame && validated_forward_data_start(buf).is_some() {
+    if accepts_forwarded_frame {
+        let Some(data_start) = validated_forward_data_start(buf) else {
+            return (*current_run == RunLocation::Primary)
+                .then(|| {
+                    port_config.devices.get(current_index).map(|device| {
+                        configured_protocol_frame_len(buf, 0, device.config.data_len as usize)
+                    })
+                })
+                .flatten();
+        };
         let device_id = *buf.first()?;
         return port_config
             .devices
             .iter()
             .find(|device| device.config.device_id == device_id)
-            .map(|device| FORWARD_PREFIX_LEN + device.config.data_len as usize + 4);
+            .map(|device| {
+                data_start
+                    + configured_protocol_frame_len(
+                        buf,
+                        data_start,
+                        device.config.data_len as usize,
+                    )
+            });
     }
 
     (*current_run == RunLocation::Primary)
         .then(|| {
-            port_config
-                .devices
-                .get(current_index)
-                .map(|device| device.config.data_len as usize + 4)
+            port_config.devices.get(current_index).map(|device| {
+                configured_protocol_frame_len(buf, 0, device.config.data_len as usize)
+            })
         })
         .flatten()
+}
+
+/// 同时兼容两种已投入使用的 `data_len` 含义：
+/// - 等于协议 Len 字段：总长为 `data_len + 5`；
+/// - 等于实际状态区长度（Len + 1）：总长为 `data_len + 4`。
+fn configured_protocol_frame_len(
+    buf: &[u8],
+    data_start: usize,
+    configured_data_len: usize,
+) -> usize {
+    let overhead = match buf.get(data_start + 2) {
+        Some(declared_len) if *declared_len as usize + 1 == configured_data_len => {
+            RESPONSE_FRAME_OVERHEAD_WITH_STATUS_LEN
+        }
+        _ => RESPONSE_FRAME_OVERHEAD,
+    };
+    configured_data_len + overhead
 }
 
 /// 根据已读数据估算期望的完整帧长度。
@@ -2047,6 +2420,7 @@ mod tests {
             port_offline_published: false,
             reconnect_failure_log: ReconnectFailureLogState::default(),
             unattributed_failure_log: DeviceFailureLogState::default(),
+            receive_sequence: 0,
         }
     }
 
@@ -2308,6 +2682,69 @@ mod tests {
         let query = status_query();
         assert!(manager.send_command(query.clone()));
         manager.receive_query_with_retry(query);
+    }
+
+    #[test]
+    fn configured_response_length_supports_both_data_len_meanings_and_modes() {
+        let direct_manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+        assert_eq!(
+            configured_response_frame_len(
+                &[0, 0, 3],
+                &direct_manager.port_config,
+                0,
+                &direct_manager.current_run,
+                &direct_manager.run_on,
+            ),
+            Some(3 + RESPONSE_FRAME_OVERHEAD)
+        );
+        assert_eq!(
+            configured_response_frame_len(
+                &[0, 0, 2],
+                &direct_manager.port_config,
+                0,
+                &direct_manager.current_run,
+                &direct_manager.run_on,
+            ),
+            Some(3 + RESPONSE_FRAME_OVERHEAD_WITH_STATUS_LEN)
+        );
+
+        let forwarded_manager = test_manager(RunLocation::Secondary, RunLocation::Secondary);
+        let mut forwarded = forwarded_status_frame(1);
+        assert_eq!(
+            configured_response_frame_len(
+                &forwarded,
+                &forwarded_manager.port_config,
+                0,
+                &forwarded_manager.current_run,
+                &forwarded_manager.run_on,
+            ),
+            Some(FORWARD_PREFIX_LEN + 3 + RESPONSE_FRAME_OVERHEAD_WITH_STATUS_LEN)
+        );
+
+        forwarded[FORWARD_PREFIX_LEN + 2] = 3;
+        assert_eq!(
+            configured_response_frame_len(
+                &forwarded,
+                &forwarded_manager.port_config,
+                0,
+                &forwarded_manager.current_run,
+                &forwarded_manager.run_on,
+            ),
+            Some(FORWARD_PREFIX_LEN + 3 + RESPONSE_FRAME_OVERHEAD)
+        );
+
+        // 配置在备机、当前临时切为主机时仍可能接收转发帧。
+        let temporary_primary = test_manager(RunLocation::Secondary, RunLocation::Primary);
+        assert_eq!(
+            configured_response_frame_len(
+                &forwarded,
+                &temporary_primary.port_config,
+                0,
+                &temporary_primary.current_run,
+                &temporary_primary.run_on,
+            ),
+            Some(FORWARD_PREFIX_LEN + 3 + RESPONSE_FRAME_OVERHEAD)
+        );
     }
 
     #[test]
@@ -2688,7 +3125,7 @@ mod tests {
         install_scripted_port(&mut manager, reads, vec![]);
 
         let started = Instant::now();
-        let outcome = manager.receive_data_attempt();
+        let outcome = manager.receive_data_attempt(1);
 
         assert!(started.elapsed() < Duration::from_millis(120));
         assert!(matches!(
@@ -2698,7 +3135,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_send_flushes_each_parity_segment() {
+    fn normal_send_uses_bounded_settle_without_flush() {
         let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
         manager.port_config.is_special = false;
         let observations = install_scripted_port(&mut manager, vec![], vec![true, true]);
@@ -2707,7 +3144,7 @@ mod tests {
 
         let observations = observations.lock().unwrap();
         assert_eq!(observations.write_attempts, 2);
-        assert_eq!(observations.flush_attempts, 2);
+        assert_eq!(observations.flush_attempts, 0);
         assert_eq!(observations.writes[0], vec![1]);
         assert_eq!(observations.writes[1].len(), 6);
     }
@@ -2730,7 +3167,7 @@ mod tests {
         let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
         install_scripted_port(&mut manager, vec![ReadStep::Data(vec![0; 7])], vec![]);
 
-        let outcome = manager.receive_data_attempt();
+        let outcome = manager.receive_data_attempt(1);
 
         match outcome {
             ReceiveDataOutcome::Retryable(QueryFailure::BadFrame { reason, frame }) => {
