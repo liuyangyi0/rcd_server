@@ -31,7 +31,6 @@ const FORWARD_PREFIX_LEN: usize = FORWARD_HEADER_LEN + FORWARD_SEPARATOR_LEN;
 const FORWARD_PREFIX_GRACE: Duration = Duration::from_millis(5);
 const FAILURE_LOG_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 const BAD_FRAME_LOG_MAX_BYTES: usize = 64;
-const TRANSMIT_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MAX_TRANSMIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -848,8 +847,8 @@ impl SerialManager {
         true
     }
 
-    /// 在有限总时限内写入一段数据；普通串口还会等待驱动发送队列排空并补足
-    /// 一个线速时间，避免用可能无限阻塞的 `tcdrain`/`flush` 切换 Mark/Space 校验位。
+    /// 在有限总时限内写入一段数据；普通串口在每段写入后调用 `flush`（Linux
+    /// 下为 `tcdrain`），确保地址字节完全发出后再切换 Mark/Space 校验位。
     fn write_segment(
         &mut self,
         parity: Option<Parity>,
@@ -876,12 +875,7 @@ impl SerialManager {
         }
         write_all_before_deadline(port.as_mut(), data, deadline)?;
         if wait_for_drain {
-            wait_for_output_drain(
-                port.as_mut(),
-                data.len(),
-                self.serial_config.baud_rate,
-                deadline,
-            )?;
+            port.flush()?;
         }
         Ok(())
     }
@@ -1823,44 +1817,6 @@ fn transmit_timeout(byte_count: usize, baud_rate: u32, configured: Duration) -> 
     wire_budget.saturating_add(io_slack)
 }
 
-/// 等待驱动发送队列排空，并额外等待一段线速时间覆盖 UART/FIFO 中尚未完成的字节。
-/// 整个过程受调用方截止时间约束，不调用 Linux 上可能无限阻塞的 `tcdrain`。
-fn wait_for_output_drain(
-    port: &mut dyn SerialPort,
-    byte_count: usize,
-    baud_rate: u32,
-    deadline: Instant,
-) -> io::Result<()> {
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(io::Error::new(
-                ErrorKind::TimedOut,
-                "serial output drain deadline elapsed",
-            ));
-        }
-
-        let pending = port.bytes_to_write().map_err(serial_error_to_io)?;
-        if pending == 0 {
-            // TIOCOUTQ 为 0 时，UART/FIFO 中仍可能保留少量字节；按常见 16 字节
-            // FIFO 的线速时间保守等待，避免为整帧再额外等待一遍。
-            let settle = wire_duration(byte_count.min(16), baud_rate);
-            if settle > remaining {
-                return Err(io::Error::new(
-                    ErrorKind::TimedOut,
-                    "serial output settle deadline elapsed",
-                ));
-            }
-            if !settle.is_zero() {
-                std::thread::sleep(settle);
-            }
-            return Ok(());
-        }
-
-        std::thread::sleep(TRANSMIT_DRAIN_POLL_INTERVAL.min(remaining));
-    }
-}
-
 // ============================================================
 //  帧长度计算
 // ============================================================
@@ -2742,7 +2698,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_send_does_not_call_unbounded_flush() {
+    fn normal_send_flushes_each_parity_segment() {
         let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
         manager.port_config.is_special = false;
         let observations = install_scripted_port(&mut manager, vec![], vec![true, true]);
@@ -2751,7 +2707,7 @@ mod tests {
 
         let observations = observations.lock().unwrap();
         assert_eq!(observations.write_attempts, 2);
-        assert_eq!(observations.flush_attempts, 0);
+        assert_eq!(observations.flush_attempts, 2);
         assert_eq!(observations.writes[0], vec![1]);
         assert_eq!(observations.writes[1].len(), 6);
     }
