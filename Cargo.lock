@@ -174,8 +174,6 @@ dependencies = [
 [[package]]
 name = "async-opcua-server"
 version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d1738e1141549d976e6f23cf1598e3dc02150c440c390ec7a72da6a2c6e4935"
 dependencies = [
  "arc-swap",
  "async-opcua-core",

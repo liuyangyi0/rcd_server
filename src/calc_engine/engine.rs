@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use log::{debug, error, info, trace, warn};
 
 use super::config::{normalize_data_type, CalcDataType, CalcRule};
-use super::evaluator::{evaluate, EvalError, EvalValue};
+use super::evaluator::{evaluate_with_validity, EvalError, EvalValue};
 use super::parser::{extract_variables, parse, Expr};
 use super::tokenizer::tokenize;
 use crate::model::Value;
@@ -166,13 +166,32 @@ impl CalcEngine {
     /// 5. 按 `data_type` 转换为 `Value::UInt` / `Value::Bool` / `Value::Float`。
     /// 6. 将结果写入变量表，供下游公式引用。
     pub fn run_cycle(&self, base_variables: &HashMap<String, EvalValue>) -> Vec<(String, Value)> {
+        let base_validity = base_variables
+            .keys()
+            .map(|name| (name.clone(), true))
+            .collect();
+        self.run_cycle_with_quality(base_variables, &base_validity)
+            .into_iter()
+            .map(|(kks, value, _valid)| (kks, value))
+            .collect()
+    }
+
+    /// 执行公式求值并传播实际执行路径上的输入有效性。
+    pub fn run_cycle_with_quality(
+        &self,
+        base_variables: &HashMap<String, EvalValue>,
+        base_validity: &HashMap<String, bool>,
+    ) -> Vec<(String, Value, bool)> {
         let mut variables = base_variables.clone();
+        let mut validity = base_validity.clone();
         let mut results = Vec::with_capacity(self.rules.len());
 
         for rule in &self.rules {
             // ---- 求值 ----
-            let raw_value = match evaluate(&rule.ast, &variables) {
-                Ok(val) => val,
+            let (raw_value, mut result_valid) = match evaluate_with_validity(
+                &rule.ast, &variables, &validity,
+            ) {
+                Ok(result) => result,
                 Err(e) => {
                     match &e {
                         EvalError::MissingVariable(var) => {
@@ -194,7 +213,7 @@ impl CalcEngine {
                             );
                         }
                     }
-                    EvalValue::Float(rule.default_value)
+                    (EvalValue::Float(rule.default_value), false)
                 }
             };
 
@@ -206,6 +225,7 @@ impl CalcEngine {
                     raw_value.as_f64(),
                     rule.default_value
                 );
+                result_valid = false;
                 EvalValue::Float(rule.default_value)
             } else {
                 raw_value
@@ -262,8 +282,9 @@ impl CalcEngine {
                 rule.kks_calc.clone(),
                 EvalValue::from_model_value(&typed_value),
             );
+            validity.insert(rule.kks_calc.clone(), result_valid);
 
-            results.push((rule.kks_calc.clone(), typed_value));
+            results.push((rule.kks_calc.clone(), typed_value, result_valid));
         }
 
         results
@@ -775,5 +796,27 @@ mod tests {
         assert!(base.contains(&"a".to_string()));
         assert!(base.contains(&"c".to_string()));
         assert!(!base.contains(&"B".to_string()));
+    }
+
+    #[test]
+    fn engine_propagates_invalid_base_quality_through_calc_dependencies() {
+        let engine = CalcEngine::new(vec![
+            make_rule("B", "float", "a * 2", 0.0),
+            make_rule("A", "float", "B + c", 0.0),
+            make_rule("constant", "uint", "1", 0.0),
+        ])
+        .unwrap();
+        let validity = HashMap::from([("a".to_string(), false), ("c".to_string(), true)]);
+        let values = vars(&[("a", int(2)), ("c", int(3))]);
+
+        let outputs: HashMap<_, _> = engine
+            .run_cycle_with_quality(&values, &validity)
+            .into_iter()
+            .map(|(name, _value, valid)| (name, valid))
+            .collect();
+
+        assert_eq!(outputs.get("B"), Some(&false));
+        assert_eq!(outputs.get("A"), Some(&false));
+        assert_eq!(outputs.get("constant"), Some(&true));
     }
 }

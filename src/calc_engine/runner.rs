@@ -21,6 +21,7 @@ use crate::model::{DeviceStatus, Value};
 pub struct CalcRunner {
     engine: Arc<CalcEngine>,
     global_vars: HashMap<String, EvalValue>,
+    valid_vars: HashMap<String, bool>,
 }
 
 impl CalcRunner {
@@ -28,36 +29,66 @@ impl CalcRunner {
         Self {
             engine,
             global_vars: HashMap::new(),
+            valid_vars: HashMap::new(),
         }
     }
 
     /// 清空已有累加表，并用一批最新设备状态重建计算上下文。
     pub fn rebuild_from_statuses(&mut self, statuses: &[DeviceStatus]) -> Vec<(String, Value)> {
+        self.rebuild_from_statuses_with_quality(statuses)
+            .into_iter()
+            .map(|(kks, value, _valid)| (kks, value))
+            .collect()
+    }
+
+    /// 重建计算上下文，并返回每个计算点是否由完整有效的输入得到。
+    pub fn rebuild_from_statuses_with_quality(
+        &mut self,
+        statuses: &[DeviceStatus],
+    ) -> Vec<(String, Value, bool)> {
         self.global_vars.clear();
+        self.valid_vars.clear();
         if self.engine.is_empty() {
             return Vec::new();
         }
         for status in statuses {
+            let valid = status.com_status && status.device_status;
             for (kks, val) in &status.value {
                 self.global_vars
                     .insert(kks.clone(), EvalValue::from_model_value(val));
+                self.valid_vars.insert(kks.clone(), valid);
             }
         }
-        self.engine.run_cycle(&self.global_vars)
+        self.run_with_quality()
     }
 
     /// 处理一次设备状态更新，返回本轮所有公式的计算结果。
     ///
     /// 空引擎情况下返回空 `Vec`，不进行任何累加，避免无谓分配。
     pub fn on_update(&mut self, status: &DeviceStatus) -> Vec<(String, Value)> {
+        self.on_update_with_quality(status)
+            .into_iter()
+            .map(|(kks, value, _valid)| (kks, value))
+            .collect()
+    }
+
+    /// 处理设备状态更新，并返回计算值及其输入有效性。
+    pub fn on_update_with_quality(&mut self, status: &DeviceStatus) -> Vec<(String, Value, bool)> {
         if self.engine.is_empty() {
             return Vec::new();
         }
+        let valid = status.com_status && status.device_status;
         for (kks, val) in &status.value {
             self.global_vars
                 .insert(kks.clone(), EvalValue::from_model_value(val));
+            self.valid_vars.insert(kks.clone(), valid);
         }
-        self.engine.run_cycle(&self.global_vars)
+        self.run_with_quality()
+    }
+
+    fn run_with_quality(&self) -> Vec<(String, Value, bool)> {
+        self.engine
+            .run_cycle_with_quality(&self.global_vars, &self.valid_vars)
     }
 }
 
@@ -150,5 +181,33 @@ mod tests {
 
         let r2 = runner.rebuild_from_statuses(&[status("COM1", 1, &[("a", Value::UInt(3))])]);
         assert_eq!(r2[0].1, Value::UInt(0));
+    }
+
+    #[test]
+    fn offline_input_marks_dependent_calculation_invalid_until_recovery() {
+        let engine = CalcEngine::new(vec![make_rule("out", "uint", "a + 1")]).unwrap();
+        let mut runner = CalcRunner::new(Arc::new(engine));
+        let mut offline = status("COM1", 1, &[("a", Value::UInt(0))]);
+        offline.device_status = false;
+
+        let failed = runner.on_update_with_quality(&offline);
+        assert_eq!(failed[0], ("out".to_string(), Value::UInt(1), false));
+
+        let recovered = runner.on_update_with_quality(&status("COM1", 1, &[("a", Value::UInt(5))]));
+        assert_eq!(recovered[0], ("out".to_string(), Value::UInt(6), true));
+    }
+
+    #[test]
+    fn unused_if_branch_does_not_invalidate_deterministic_output() {
+        let engine =
+            CalcEngine::new(vec![make_rule("out", "uint", "IF(ready == 0, 4, sl3)")]).unwrap();
+        let mut runner = CalcRunner::new(Arc::new(engine));
+        runner.on_update_with_quality(&status("COM1", 1, &[("ready", Value::UInt(0))]));
+        let mut offline_sl3 = status("COM2", 2, &[("sl3", Value::UInt(99))]);
+        offline_sl3.device_status = false;
+
+        let result = runner.on_update_with_quality(&offline_sl3);
+
+        assert_eq!(result[0], ("out".to_string(), Value::UInt(4), true));
     }
 }

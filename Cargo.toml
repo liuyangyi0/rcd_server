@@ -26,3 +26,9 @@ thiserror = "1"
 
 [dev-dependencies]
 tempfile = "3"
+
+# async-opcua-server 0.19 默认的无过滤器路径只比较 Variant，导致
+# `0/Good -> 0/BadNoCommunication` 不会产生数据变更通知。固定项目内补丁，
+# 仅补上 OPC UA 默认 StatusValue 语义，避免修改全局 Cargo 缓存。
+[patch.crates-io]
+async-opcua-server = { path = "vendor/async-opcua-server" }

@@ -14,13 +14,15 @@ pub const OPCUA_LIMIT_MARGIN: usize = 512;
 pub const OPCUA_MIN_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 /// OPC UA 大批量响应的最小分片数上限。
 pub const OPCUA_MIN_MAX_CHUNK_COUNT: usize = 256;
+/// 串口事件已经完成采样，允许客户端请求零采样间隔。
+const OPCUA_MIN_SAMPLING_INTERVAL_MS: f64 = 0.0;
 /// OPC 写命令日志最多展示的字符数，避免异常大输入阻塞控制台和日志文件。
 const OPC_WRITE_LOG_PREVIEW_CHARS: usize = 256;
 /// `_Send` 节点启动时的非空字符串值，兼容按当前值推断点类型的 OPC 客户端。
 const SEND_NODE_IDLE_VALUE: &str = "IDLE";
 
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -115,7 +117,13 @@ fn zero_variant_for_value(v: &Value) -> Variant {
 
 type OpcuaValueUpdate<'a> = (&'a NodeId, Option<&'a NumericRange>, DataValue);
 
-fn unavailable_data_value(value: Variant, status: StatusCode) -> DataValue {
+/// 构造由网关主动推送的 OPC UA 数据值。
+///
+/// `async-opcua` 0.19 会对带 SourceTimestamp 的推送值再次应用客户端请求的
+/// SamplingInterval；其延迟通知调度可能使非零采样周期的客户端一直保留旧值。
+/// 串口数据已经由网关完成采样，因此不再提供源时间戳，只保留服务器时间戳，
+/// 让依赖库把更新作为已采样的事件立即放入订阅队列。
+fn pushed_data_value(value: Variant, status: StatusCode) -> DataValue {
     DataValue {
         // async-opcua 的 Variable::value 仅在 value 为 Some 时复制 StatusCode；
         // 启动等待数据时使用 Empty，运行中通信异常时使用类型匹配的零值。
@@ -193,6 +201,9 @@ fn configure_opcua_limits(builder: &mut ServerBuilder, total_variables: usize) -
     limits.operational.max_references_per_browse_node = limit_target;
     limits.operational.max_monitored_items_per_call = limit_target;
     limits.subscriptions.max_monitored_items_per_sub = limit_target;
+    // 串口采集已经决定了数据产生频率；不再由 OPC UA 层追加默认 100 ms
+    // 的二次采样延迟。Publishing Interval 保持库原有约束。
+    limits.subscriptions.min_sampling_interval_ms = OPCUA_MIN_SAMPLING_INTERVAL_MS;
     limits.max_message_size = message_size;
     limits.max_chunk_count = OPCUA_MIN_MAX_CHUNK_COUNT;
 
@@ -208,14 +219,14 @@ fn collect_device_updates<'a>(
     for (kks, val) in &status.value {
         if let Some(node_id) = kks_node_map.get(kks.as_str()) {
             let data_value = if status.com_status && status.device_status {
-                DataValue::new_now(value_to_variant(val))
+                pushed_data_value(value_to_variant(val), StatusCode::Good)
             } else {
                 let unavailable_value = if unavailable_status == StatusCode::BadNoCommunication {
                     zero_variant_for_value(val)
                 } else {
                     Variant::Empty
                 };
-                unavailable_data_value(unavailable_value, unavailable_status)
+                pushed_data_value(unavailable_value, unavailable_status)
             };
             updates.push((node_id, None, data_value));
         }
@@ -223,13 +234,23 @@ fn collect_device_updates<'a>(
 }
 
 fn collect_calc_updates<'a>(
-    calc_results: Vec<(String, Value)>,
+    calc_results: Vec<(String, Value, bool)>,
     kks_node_map: &'a HashMap<String, NodeId>,
     updates: &mut Vec<OpcuaValueUpdate<'a>>,
+    unavailable_status: StatusCode,
 ) {
-    for (kks_calc, val) in calc_results {
+    for (kks_calc, val, valid) in calc_results {
         if let Some(node_id) = kks_node_map.get(&kks_calc) {
-            updates.push((node_id, None, DataValue::new_now(value_to_variant(&val))));
+            let status = if valid {
+                StatusCode::Good
+            } else {
+                unavailable_status
+            };
+            updates.push((
+                node_id,
+                None,
+                pushed_data_value(value_to_variant(&val), status),
+            ));
         }
     }
 }
@@ -246,7 +267,12 @@ fn build_incremental_updates<'a>(
         &mut updates,
         StatusCode::BadNoCommunication,
     );
-    collect_calc_updates(calc_runner.on_update(status), kks_node_map, &mut updates);
+    collect_calc_updates(
+        calc_runner.on_update_with_quality(status),
+        kks_node_map,
+        &mut updates,
+        StatusCode::BadNoCommunication,
+    );
     updates
 }
 
@@ -266,9 +292,69 @@ fn build_full_sync_updates<'a>(
         collect_device_updates(status, kks_node_map, &mut updates, unavailable_status);
     }
     collect_calc_updates(
-        calc_runner.rebuild_from_statuses(statuses),
+        calc_runner.rebuild_from_statuses_with_quality(statuses),
         kks_node_map,
         &mut updates,
+        unavailable_status,
+    );
+    updates
+}
+
+type DeviceStatusKey = (String, u8);
+
+/// 以配置中的全部设备为基线，再覆盖已有缓存，保证部分缓存不会让其余节点继续
+/// 保持构造时的 `0 + Good`。
+fn merge_initial_statuses(
+    serial_ports: &[SerialPortConfig],
+    cached_statuses: Vec<DeviceStatus>,
+) -> (Vec<DeviceStatus>, HashSet<DeviceStatusKey>) {
+    let mut cached_by_key: HashMap<DeviceStatusKey, DeviceStatus> = cached_statuses
+        .into_iter()
+        .map(|status| ((status.com.clone(), status.device_id), status))
+        .collect();
+    let mut cached_keys = HashSet::new();
+    let mut merged = Vec::new();
+
+    for baseline in build_config_zero_statuses(serial_ports) {
+        let key = (baseline.com.clone(), baseline.device_id);
+        if let Some(cached) = cached_by_key.remove(&key) {
+            cached_keys.insert(key);
+            merged.push(cached);
+        } else {
+            merged.push(baseline);
+        }
+    }
+    (merged, cached_keys)
+}
+
+fn build_initial_sync_updates<'a>(
+    statuses: &[DeviceStatus],
+    cached_keys: &HashSet<DeviceStatusKey>,
+    kks_node_map: &'a HashMap<String, NodeId>,
+    calc_runner: &mut CalcRunner,
+) -> Vec<OpcuaValueUpdate<'a>> {
+    let value_count = statuses.iter().map(|status| status.value.len()).sum();
+    let mut updates = Vec::with_capacity(value_count);
+    for status in statuses {
+        let key = (status.com.clone(), status.device_id);
+        let unavailable_status = if cached_keys.contains(&key) {
+            StatusCode::BadNoCommunication
+        } else {
+            StatusCode::BadWaitingForInitialData
+        };
+        collect_device_updates(status, kks_node_map, &mut updates, unavailable_status);
+    }
+
+    let calc_unavailable_status = if cached_keys.len() < statuses.len() {
+        StatusCode::BadWaitingForInitialData
+    } else {
+        StatusCode::BadNoCommunication
+    };
+    collect_calc_updates(
+        calc_runner.rebuild_from_statuses_with_quality(statuses),
+        kks_node_map,
+        &mut updates,
+        calc_unavailable_status,
     );
     updates
 }
@@ -375,12 +461,13 @@ pub async fn run_opcua_server(
 
     let limit_target = configure_opcua_limits(&mut builder, variable_counts.total());
     info!(
-        "[OPC UA] 变量规划: 设备变量={}, 写命令变量={}, 计算变量={}, 总变量={}, 动态限制={}",
+        "[OPC UA] 变量规划: 设备变量={}, 写命令变量={}, 计算变量={}, 总变量={}, 动态限制={}, min_sampling_interval_ms={}",
         variable_counts.device_variables,
         variable_counts.send_variables,
         variable_counts.calc_variables,
         variable_counts.total(),
         limit_target,
+        OPCUA_MIN_SAMPLING_INTERVAL_MS,
     );
 
     let (server, handle) = builder
@@ -454,39 +541,30 @@ pub async fn run_opcua_server(
     // 节点创建期间的状态已经进入最新值缓存。先丢弃这段时间排队的广播，再读取快照，
     // 避免快照应用后继续消费更旧的状态而造成数值回滚。
     discard_pending_broadcasts(&mut rx_opcua);
-    let mut initial_statuses = latest_status_cache.snapshot_statuses();
-    let initial_statuses_from_config = initial_statuses.is_empty();
-    if initial_statuses_from_config {
-        initial_statuses = build_config_zero_statuses(&serial_ports);
-    }
-    let initial_unavailable_status = if initial_statuses_from_config {
-        StatusCode::BadWaitingForInitialData
-    } else {
-        StatusCode::BadNoCommunication
-    };
-    let initial_updates = build_full_sync_updates(
+    let cached_statuses = latest_status_cache.snapshot_statuses();
+    let cached_status_count = cached_statuses.len();
+    let (initial_statuses, cached_initial_keys) =
+        merge_initial_statuses(&serial_ports, cached_statuses);
+    let initial_updates = build_initial_sync_updates(
         &initial_statuses,
+        &cached_initial_keys,
         &kks_node_map,
         &mut calc_runner,
-        initial_unavailable_status,
     );
     if !initial_updates.is_empty() {
         node_manager
             .set_values(&subscriptions, initial_updates.into_iter())
             .map_err(|e| io::Error::other(format!("OPC UA 缓存预热失败: {e:?}")))?;
-        if initial_statuses_from_config {
-            info!(
-                "[OPC UA] 最新值缓存为空，已用配置零值预热: 设备状态={} 条",
-                initial_statuses.len()
-            );
-        } else {
-            info!(
-                "[OPC UA] 已用最新值缓存预热: 设备状态={} 条",
-                initial_statuses.len()
-            );
-        }
+        info!(
+            "[OPC UA] 启动预热完成: configured_devices={} cached_devices={} waiting_devices={}",
+            initial_statuses.len(),
+            cached_status_count,
+            initial_statuses
+                .len()
+                .saturating_sub(cached_initial_keys.len()),
+        );
     } else {
-        info!("[OPC UA] 最新值缓存为空，节点保持初始值等待首帧数据");
+        info!("[OPC UA] 无设备变量需要启动预热");
     }
 
     // ---- 任务 1: 串口数据 -> OPC UA 节点更新 ----
@@ -496,11 +574,11 @@ pub async fn run_opcua_server(
     let kks_map = kks_node_map.clone();
     let latest_cache_update = latest_status_cache.clone();
     let cancel_update = cancel.clone();
-    let task_update = tokio::spawn(async move {
+    let mut task_update = tokio::spawn(async move {
         loop {
             let status = tokio::select! {
                 biased;
-                _ = cancel_update.cancelled() => break,
+                _ = cancel_update.cancelled() => return Ok::<(), String>(()),
                 res = rx_opcua.recv() => match res {
                     Ok(s) => s,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -517,14 +595,16 @@ pub async fn run_opcua_server(
                         );
                         if !updates.is_empty() {
                             if let Err(e) = nm_update.set_values(&subs_update, updates.into_iter()) {
-                                warn!("OPC UA 全量重同步失败: {:?}", e);
+                                return Err(format!("OPC UA 全量重同步失败: {e:?}"));
                             } else {
                                 info!("[OPC UA] 已从最新值缓存完成全量重同步: {} 条设备状态", statuses.len());
                             }
                         }
                         continue;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err("串口状态广播通道已关闭".to_string());
+                    }
                 }
             };
 
@@ -533,7 +613,7 @@ pub async fn run_opcua_server(
             // 批量写入所有变量（设备 + 计算），只获取一次写锁。
             if !updates.is_empty() {
                 if let Err(e) = nm_update.set_values(&subs_update, updates.into_iter()) {
-                    warn!("批量更新 OPC UA 变量失败: {:?}", e);
+                    return Err(format!("批量更新 OPC UA 变量失败: {e:?}"));
                 }
             }
         }
@@ -545,11 +625,11 @@ pub async fn run_opcua_server(
     let pending_ack = pending_commands.clone();
     let cancel_ack = cancel.clone();
 
-    let task_ack = tokio::spawn(async move {
+    let mut task_ack = tokio::spawn(async move {
         loop {
             tokio::select! {
                 biased;
-                _ = cancel_ack.cancelled() => break,
+                _ = cancel_ack.cancelled() => return Ok::<(), String>(()),
                 _ = tokio::time::sleep(Duration::from_millis(ACK_STATUS_DRAIN_INTERVAL_MS)) => {}
             }
 
@@ -577,17 +657,67 @@ pub async fn run_opcua_server(
         });
     }
 
-    let result = server
-        .run_with(listener)
-        .await
-        .map_err(|e| io::Error::other(format!("OPC UA 服务器错误: {e}")));
+    let mut update_task_completed = false;
+    let mut ack_task_completed = false;
+    let result = tokio::select! {
+        server_result = server.run_with(listener) => {
+            server_result.map_err(|e| io::Error::other(format!("OPC UA 服务器错误: {e}")))
+        }
+        update_result = &mut task_update => {
+            update_task_completed = true;
+            if cancel.is_cancelled() && matches!(&update_result, Ok(Ok(()))) {
+                Ok(())
+            } else {
+                Err(background_task_error("value_update", update_result))
+            }
+        }
+        ack_result = &mut task_ack => {
+            ack_task_completed = true;
+            if cancel.is_cancelled() && matches!(&ack_result, Ok(Ok(()))) {
+                Ok(())
+            } else {
+                Err(background_task_error("command_ack", ack_result))
+            }
+        }
+    };
 
     // 服务器退出后，确保取消信号触发 + 等待子任务收尾
     cancel.cancel();
-    let _ = task_update.await;
-    let _ = task_ack.await;
+    handle.cancel();
+    if !update_task_completed {
+        log_background_task_shutdown("value_update", task_update.await);
+    }
+    if !ack_task_completed {
+        log_background_task_shutdown("command_ack", task_ack.await);
+    }
 
     result
+}
+
+fn log_background_task_shutdown(
+    name: &str,
+    result: Result<Result<(), String>, tokio::task::JoinError>,
+) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!("[OPC UA] 后台任务收尾失败: task={} error={}", name, error),
+        Err(error) => warn!("[OPC UA] 后台任务收尾崩溃: task={} error={:?}", name, error),
+    }
+}
+
+fn background_task_error(
+    name: &str,
+    result: Result<Result<(), String>, tokio::task::JoinError>,
+) -> io::Error {
+    match result {
+        Ok(Ok(())) => io::Error::other(format!(
+            "OPC UA 后台任务意外退出: task={name} result=completed"
+        )),
+        Ok(Err(error)) => {
+            io::Error::other(format!("OPC UA 后台任务失败: task={name} error={error}"))
+        }
+        Err(error) => io::Error::other(format!("OPC UA 后台任务崩溃: task={name} error={error}")),
+    }
 }
 
 /// 初始化后的 OPC UA 节点信息。
@@ -1258,7 +1388,7 @@ fn handle_send_node_write(
 
     let (preview, truncated) = opc_write_log_preview(hex_str);
     let suffix = if truncated { "…(已截断)" } else { "" };
-    let cmd = match build_hex_command(hex_str, com, true, Some(ack_id)) {
+    let mut cmd = match build_hex_command(hex_str, com, true, Some(ack_id)) {
         Ok(cmd) => cmd,
         Err(e) => {
             log_opc_write_warn(format!(
@@ -1285,6 +1415,8 @@ fn handle_send_node_write(
         return StatusCode::BadWaitingForResponse;
     }
 
+    let deadline = Instant::now() + context.command_pending_timeout;
+    cmd.expires_at = Some(deadline);
     if let Err(e) = tx.send(cmd) {
         log_opc_write_warn(format!(
             "[OPC 写诊断] 拒绝写入: 串口={}, 原因=命令通道不可用, 错误={:?}",
@@ -1292,13 +1424,7 @@ fn handle_send_node_write(
         ));
         return StatusCode::BadResourceUnavailable;
     }
-    pending.insert(
-        com.to_string(),
-        PendingCommand {
-            ack_id,
-            deadline: Instant::now() + context.command_pending_timeout,
-        },
-    );
+    pending.insert(com.to_string(), PendingCommand { ack_id, deadline });
     drop(pending);
 
     log_opc_write_info(format!(
@@ -1334,12 +1460,10 @@ fn handle_send_node_write(
 }
 
 fn log_opc_write_info(message: String) {
-    println!("{message}");
     info!("{message}");
 }
 
 fn log_opc_write_warn(message: String) {
-    println!("{message}");
     warn!("{message}");
 }
 
@@ -1417,6 +1541,7 @@ fn build_hex_command(
             CommandType::SendData(send_data)
         },
         ack_id: if with_ack { ack_id } else { None },
+        expires_at: None,
     })
 }
 
@@ -1542,7 +1667,7 @@ fn send_status_variant(status: crate::model::CommandAckStatus) -> Variant {
 }
 
 fn send_status_data_value(status: crate::model::CommandAckStatus) -> DataValue {
-    DataValue::new_now(send_status_variant(status))
+    pushed_data_value(send_status_variant(status), StatusCode::Good)
 }
 
 fn send_status_value(status: crate::model::CommandAckStatus) -> &'static str {
@@ -2030,6 +2155,18 @@ mod tests {
     }
 
     #[test]
+    fn opcua_limits_allow_event_driven_zero_sampling_interval() {
+        let mut builder = ServerBuilder::new();
+
+        configure_opcua_limits(&mut builder, 10);
+
+        assert_eq!(
+            builder.limits_mut().subscriptions.min_sampling_interval_ms,
+            OPCUA_MIN_SAMPLING_INTERVAL_MS
+        );
+    }
+
+    #[test]
     fn large_calc_plan_keeps_flat_browse_names_and_counts_all_outputs() {
         let port = make_port("ttyAP0", vec![make_device(11, &["base"])]);
         let rules: Vec<CalcRule> = (0..2099)
@@ -2098,6 +2235,85 @@ mod tests {
     }
 
     #[test]
+    fn partial_startup_cache_is_merged_with_waiting_config_baseline() {
+        let port = make_port(
+            "ttyAP0",
+            vec![make_device(11, &["a"]), make_device(12, &["b"])],
+        );
+        let cached = DeviceStatus {
+            id: 0,
+            device_id: 11,
+            com: "ttyAP0".to_string(),
+            com_status: true,
+            device_status: true,
+            value: HashMap::from([("a".to_string(), Value::UInt(42))]),
+            raw_data: vec![42],
+        };
+        let (statuses, cached_keys) =
+            merge_initial_statuses(std::slice::from_ref(&port), vec![cached]);
+        let kks_node_map = HashMap::from([
+            ("a".to_string(), NodeId::new(1, "a")),
+            ("b".to_string(), NodeId::new(1, "b")),
+        ]);
+        let mut runner = CalcRunner::new(Arc::new(make_calc_engine(vec![])));
+
+        let updates =
+            build_initial_sync_updates(&statuses, &cached_keys, &kks_node_map, &mut runner);
+
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(cached_keys.len(), 1);
+        let a = updates
+            .iter()
+            .find(|(node_id, _, _)| **node_id == NodeId::new(1, "a"))
+            .unwrap();
+        let b = updates
+            .iter()
+            .find(|(node_id, _, _)| **node_id == NodeId::new(1, "b"))
+            .unwrap();
+        assert_eq!(a.2.value, Some(Variant::UInt32(42)));
+        assert_eq!(a.2.status, Some(StatusCode::Good));
+        assert_eq!(b.2.value, Some(Variant::Empty));
+        assert_eq!(b.2.status, Some(StatusCode::BadWaitingForInitialData));
+    }
+
+    #[test]
+    fn calculated_point_quality_follows_input_communication_state() {
+        let engine = Arc::new(make_calc_engine(vec![("out", "uint", "a + 1")]));
+        let mut runner = CalcRunner::new(engine);
+        let kks_node_map = HashMap::from([
+            ("a".to_string(), NodeId::new(1, "a")),
+            ("out".to_string(), NodeId::new(1, "out")),
+        ]);
+        let mut status = DeviceStatus {
+            id: 0,
+            device_id: 11,
+            com: "ttyAP0".to_string(),
+            com_status: true,
+            device_status: false,
+            value: HashMap::from([("a".to_string(), Value::UInt(0))]),
+            raw_data: vec![0],
+        };
+
+        let offline = build_incremental_updates(&status, &kks_node_map, &mut runner);
+        let offline_calc = offline
+            .iter()
+            .find(|(node_id, _, _)| **node_id == NodeId::new(1, "out"))
+            .unwrap();
+        assert_eq!(offline_calc.2.value, Some(Variant::UInt32(1)));
+        assert_eq!(offline_calc.2.status, Some(StatusCode::BadNoCommunication));
+
+        status.device_status = true;
+        status.value.insert("a".to_string(), Value::UInt(5));
+        let online = build_incremental_updates(&status, &kks_node_map, &mut runner);
+        let online_calc = online
+            .iter()
+            .find(|(node_id, _, _)| **node_id == NodeId::new(1, "out"))
+            .unwrap();
+        assert_eq!(online_calc.2.value, Some(Variant::UInt32(6)));
+        assert_eq!(online_calc.2.status, Some(StatusCode::Good));
+    }
+
+    #[test]
     fn zero_variant_for_value_preserves_opcua_types() {
         assert_eq!(zero_variant_for_value(&Value::UInt(42)), Variant::UInt32(0));
         assert_eq!(
@@ -2112,6 +2328,18 @@ mod tests {
             zero_variant_for_value(&Value::Double(42.5)),
             Variant::Double(0.0)
         );
+    }
+
+    #[test]
+    fn pushed_values_bypass_dependency_sampling_delay() {
+        let data_value = pushed_data_value(Variant::UInt32(42), StatusCode::Good);
+
+        assert_eq!(data_value.value, Some(Variant::UInt32(42)));
+        assert_eq!(data_value.status, Some(StatusCode::Good));
+        assert!(data_value.source_timestamp.is_none());
+        assert!(data_value.source_picoseconds.is_none());
+        assert!(data_value.server_timestamp.is_some());
+        assert_eq!(data_value.server_picoseconds, Some(0));
     }
 
     #[test]
@@ -2162,6 +2390,8 @@ mod tests {
         );
         assert_eq!(online_updates[0].2.value, Some(Variant::UInt32(42)));
         assert_eq!(online_updates[0].2.status, Some(StatusCode::Good));
+        assert!(online_updates[0].2.source_timestamp.is_none());
+        assert!(online_updates[0].2.server_timestamp.is_some());
     }
 
     #[test]

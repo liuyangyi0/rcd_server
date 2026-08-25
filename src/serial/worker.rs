@@ -60,138 +60,190 @@ pub fn spawn_serial_worker(
 ) -> JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         let port_name = serial_config.port_name.clone();
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            let poll_interval = Duration::from_millis(software_config.settings.poll_interval_ms);
-            let command_retry_count = software_config.settings.command_retry_count.max(1);
-            let run_on = software_config.server.run_on.clone();
-            let current_run = software_config.server.current_run.clone();
-            let mut manager = SerialManager::new(
-                serial_config,
-                port_config,
-                broadcaster,
-                latest_status_cache,
-                run_on,
-                current_run,
-                system_record,
-            );
+        let poll_interval = Duration::from_millis(software_config.settings.poll_interval_ms);
+        let command_retry_count = software_config.settings.command_retry_count.max(1);
+        let run_on = software_config.server.run_on.clone();
+        let current_run = software_config.server.current_run.clone();
+        let mut manager = SerialManager::new(
+            serial_config,
+            port_config,
+            broadcaster,
+            latest_status_cache,
+            run_on,
+            current_run,
+            system_record,
+        );
 
-            info!(
-                "串口 {} worker 已启动，当前角色: {:?}，设备数: {}，端口启用: {}",
-                port_name,
-                manager.current_run,
-                manager.port_config.devices.len(),
-                manager.port_config.status
-            );
+        info!(
+            "串口 {} worker 已启动，当前角色: {:?}，设备数: {}，端口启用: {}",
+            port_name,
+            manager.current_run,
+            manager.port_config.devices.len(),
+            manager.port_config.status
+        );
 
-            let mut last_idle_log = Instant::now() - WORKER_HEARTBEAT_INTERVAL;
-            let mut last_heartbeat_log = Instant::now() - WORKER_HEARTBEAT_INTERVAL;
+        let mut restart_count = 0u32;
+        loop {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                run_worker_loop(
+                    &mut manager,
+                    &port_name,
+                    &rx,
+                    &ack_status_tx,
+                    &system_state,
+                    &cancel,
+                    poll_interval,
+                    command_retry_count,
+                );
+            }));
 
-            loop {
-                log_worker_heartbeat(&manager, &port_name, &mut last_heartbeat_log);
-
-                if cancel.is_cancelled() {
-                    info!("串口 {} worker 收到取消信号，退出", port_name);
-                    return;
-                }
-
-                // 处理来自上层的命令
-                process_incoming_commands(&mut manager, &rx, &system_state);
-
-                // 串口被禁用时跳过轮询
-                if !manager.port_config.status {
-                    log_idle_reason(
-                        &port_name,
-                        &mut last_idle_log,
-                        "端口被上层设置为禁用，暂停轮询发送",
+            match result {
+                Ok(()) => break,
+                Err(payload) => {
+                    restart_count = restart_count.saturating_add(1);
+                    let panic_text = panic_payload_text(payload.as_ref());
+                    error!(
+                        "[串口worker异常] port={} restart_count={} panic={:?} action=publish_all_offline_restart_worker",
+                        port_name, restart_count, panic_text,
                     );
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
-                }
-
-                // 无设备配置时跳过轮询
-                if manager.port_config.devices.is_empty() {
-                    log_idle_reason(&port_name, &mut last_idle_log, "没有设备配置，暂停轮询发送");
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
-                }
-
-                // 根据主/备角色决定行为。
-                let cycle_result = match manager.current_run {
-                    RunLocation::Primary => {
-                        run_primary_cycle(&mut manager, &ack_status_tx, command_retry_count)
+                    manager.log_record(format!(
+                        "串口 worker 异常: restart_count={} panic={:?} action=publish_all_offline_restart_worker",
+                        restart_count, panic_text
+                    ));
+                    manager.prepare_worker_restart();
+                    reject_queued_commands(&mut manager, None, &ack_status_tx, "worker_panic");
+                    if cancel.is_cancelled() {
+                        break;
                     }
-                    RunLocation::Secondary => {
-                        run_secondary_cycle(&mut manager, &ack_status_tx, command_retry_count)
-                    }
-                };
-
-                if manager.current_run == RunLocation::Secondary {
-                    log_idle_reason(
-                        &port_name,
-                        &mut last_idle_log,
-                        "当前是备机监听模式，不主动轮询发送",
-                    );
-                } else if matches!(&cycle_result, CycleResult::Idle) {
-                    log_idle_reason(
-                        &port_name,
-                        &mut last_idle_log,
-                        "本轮没有发送命令，通常是设备禁用或超时跳过窗口",
+                    std::thread::sleep(Duration::from_secs(1));
+                    manager.reconnect();
+                    info!(
+                        "[串口worker重启] port={} restart_count={} action=resume_polling",
+                        port_name, restart_count
                     );
                 }
-
-                // 主机查询和备机监听的接收语义不同：只有自动查询允许补发一次。
-                match cycle_result {
-                    CycleResult::QuerySent(query) => {
-                        let device_id = manager
-                            .port_config
-                            .devices
-                            .get(manager.index)
-                            .map(|d| d.config.device_id)
-                            .unwrap_or_default();
-                        debug!(
-                            "串口 {} 进入查询接收: role={:?}, index={}, device_id={}",
-                            port_name, manager.current_run, manager.index, device_id
-                        );
-                        let receive_started = Instant::now();
-                        manager.receive_query_with_retry(query);
-                        let elapsed = receive_started.elapsed();
-                        if elapsed >= SLOW_RECEIVE_LOG_THRESHOLD {
-                            debug!(
-                                "串口 {} 查询收发耗时 {:?}，可能包含一次读取超时和补发",
-                                port_name, elapsed
-                            );
-                        }
-                    }
-                    CycleResult::PassiveReceive => {
-                        debug!(
-                            "串口 {} 进入备机监听接收: role={:?}",
-                            port_name, manager.current_run
-                        );
-                        let receive_started = Instant::now();
-                        manager.receive_data();
-                        let elapsed = receive_started.elapsed();
-                        if elapsed >= SLOW_RECEIVE_LOG_THRESHOLD {
-                            warn!(
-                                "串口 {} 接收耗时 {:?}，可能存在串口 read 阻塞或设备响应异常",
-                                port_name, elapsed
-                            );
-                        }
-                    }
-                    CycleResult::Idle | CycleResult::CommandHandled => {}
-                }
-
-                // 主机模式：轮询下一个设备；备机模式：index 由 extract_frame 从转发头解析
-                if manager.current_run == RunLocation::Primary {
-                    manager.index = (manager.index + 1) % manager.port_config.devices.len();
-                }
-                std::thread::sleep(poll_interval);
             }
-        }));
-
-        if result.is_err() {
-            error!("串口 {} worker panic，线程已退出", port_name);
         }
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_worker_loop(
+    manager: &mut SerialManager,
+    port_name: &str,
+    rx: &Receiver<Command>,
+    ack_status_tx: &Sender<CommandAckUpdate>,
+    system_state: &SystemState,
+    cancel: &CancellationToken,
+    poll_interval: Duration,
+    command_retry_count: u32,
+) {
+    let mut last_idle_log = Instant::now() - WORKER_HEARTBEAT_INTERVAL;
+    let mut last_heartbeat_log = Instant::now() - WORKER_HEARTBEAT_INTERVAL;
+
+    loop {
+        log_worker_heartbeat(manager, port_name, &mut last_heartbeat_log);
+
+        if cancel.is_cancelled() {
+            info!("串口 {} worker 收到取消信号，退出", port_name);
+            return;
+        }
+
+        process_incoming_commands(manager, rx, system_state, ack_status_tx);
+
+        if !manager.port_config.status {
+            log_idle_reason(
+                port_name,
+                &mut last_idle_log,
+                "端口被上层设置为禁用，暂停轮询发送",
+            );
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+
+        if manager.port_config.devices.is_empty() {
+            log_idle_reason(port_name, &mut last_idle_log, "没有设备配置，暂停轮询发送");
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+
+        let cycle_result = match manager.current_run {
+            RunLocation::Primary => run_primary_cycle(manager, ack_status_tx, command_retry_count),
+            RunLocation::Secondary => {
+                run_secondary_cycle(manager, ack_status_tx, command_retry_count)
+            }
+        };
+
+        if manager.current_run == RunLocation::Secondary {
+            log_idle_reason(
+                port_name,
+                &mut last_idle_log,
+                "当前是备机监听模式，不主动轮询发送",
+            );
+        } else if matches!(&cycle_result, CycleResult::Idle) {
+            log_idle_reason(
+                port_name,
+                &mut last_idle_log,
+                "本轮没有发送命令，通常是设备禁用或超时跳过窗口",
+            );
+        }
+
+        match cycle_result {
+            CycleResult::QuerySent(query) => {
+                let device_id = manager
+                    .port_config
+                    .devices
+                    .get(manager.index)
+                    .map(|d| d.config.device_id)
+                    .unwrap_or_default();
+                debug!(
+                    "串口 {} 进入查询接收: role={:?}, index={}, device_id={}",
+                    port_name, manager.current_run, manager.index, device_id
+                );
+                let receive_started = Instant::now();
+                manager.receive_query_with_retry(query);
+                let elapsed = receive_started.elapsed();
+                if elapsed >= SLOW_RECEIVE_LOG_THRESHOLD {
+                    debug!(
+                        "串口 {} 查询收发耗时 {:?}，可能包含一次读取超时和补发",
+                        port_name, elapsed
+                    );
+                }
+            }
+            CycleResult::PassiveReceive => {
+                debug!(
+                    "串口 {} 进入备机监听接收: role={:?}",
+                    port_name, manager.current_run
+                );
+                let receive_started = Instant::now();
+                manager.receive_data();
+                let elapsed = receive_started.elapsed();
+                if elapsed >= SLOW_RECEIVE_LOG_THRESHOLD {
+                    warn!(
+                        "串口 {} 接收耗时 {:?}，可能存在串口 read 阻塞或设备响应异常",
+                        port_name, elapsed
+                    );
+                }
+            }
+            CycleResult::Idle | CycleResult::CommandHandled => {}
+        }
+
+        // 主机模式：轮询下一个设备；备机模式：index 由 extract_frame 从转发头解析。
+        if manager.current_run == RunLocation::Primary {
+            manager.index = (manager.index + 1) % manager.port_config.devices.len();
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
+fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 fn log_idle_reason(port_name: &str, last_log: &mut Instant, reason: &str) {
@@ -237,6 +289,7 @@ fn process_incoming_commands(
     manager: &mut SerialManager,
     rx: &Receiver<Command>,
     system_state: &SystemState,
+    ack_status_tx: &Sender<CommandAckUpdate>,
 ) {
     let mut processed = 0usize;
     while processed < MAX_COMMANDS_PER_CYCLE {
@@ -246,39 +299,35 @@ fn process_incoming_commands(
         };
         processed += 1;
         let Command {
-            command, ack_id, ..
+            command,
+            ack_id,
+            expires_at,
+            ..
         } = cmd;
         match command {
             CommandType::SendData(data) => {
-                manager
-                    .command_queue
-                    .lock()
-                    .unwrap_or_else(|e| {
-                        warn!("命令队列锁中毒，恢复: {}", e);
-                        e.into_inner()
-                    })
-                    .push_back(QueuedCommand {
-                        data,
-                        report_ack: false,
-                        ack_id,
-                    });
+                enqueue_or_reject_command(manager, data, false, ack_id, expires_at, ack_status_tx);
             }
             CommandType::SendDataWithAck(data) => {
-                manager
-                    .command_queue
-                    .lock()
-                    .unwrap_or_else(|e| {
-                        warn!("命令队列锁中毒，恢复: {}", e);
-                        e.into_inner()
-                    })
-                    .push_back(QueuedCommand {
-                        data,
-                        report_ack: true,
-                        ack_id,
-                    });
+                enqueue_or_reject_command(manager, data, true, ack_id, expires_at, ack_status_tx);
             }
             CommandType::PortStatus(status) => {
+                let previous = manager.port_config.status;
                 manager.port_config.status = status.device_status;
+                if previous != status.device_status {
+                    if status.device_status {
+                        info!(
+                            "[串口已启用] port={} action=wait_for_valid_device_frames",
+                            manager.serial_config.port_name
+                        );
+                        manager.log_record(
+                            "串口已启用: action=wait_for_valid_device_frames".to_string(),
+                        );
+                    } else {
+                        manager.publish_port_disabled();
+                        reject_queued_commands(manager, None, ack_status_tx, "port_disabled");
+                    }
+                }
                 if let Err(e) = system_state
                     .set_port_status(&manager.port_config.port_number, status.device_status)
                 {
@@ -286,10 +335,42 @@ fn process_incoming_commands(
                 }
             }
             CommandType::DeviceSetting(setting) => {
-                for (i, dev) in manager.port_config.devices.iter().enumerate() {
-                    if dev.config.device_id == setting.device_id {
-                        manager.device_states[i].is_enabled = setting.device_status;
+                let matching_indexes: Vec<usize> = manager
+                    .port_config
+                    .devices
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, dev)| {
+                        (dev.config.device_id == setting.device_id).then_some(index)
+                    })
+                    .collect();
+                for index in matching_indexes {
+                    let previous = manager.device_states[index].is_enabled;
+                    manager.device_states[index].is_enabled = setting.device_status;
+                    if previous != setting.device_status {
+                        if setting.device_status {
+                            info!(
+                                "[串口设备已启用] port={} device_id={} index={} action=wait_for_valid_frame",
+                                manager.serial_config.port_name,
+                                setting.device_id,
+                                index,
+                            );
+                            manager.log_record(format!(
+                                "串口设备已启用: device_id={} index={} action=wait_for_valid_frame",
+                                setting.device_id, index
+                            ));
+                        } else {
+                            manager.publish_device_disabled(index);
+                        }
                     }
+                }
+                if !setting.device_status {
+                    reject_queued_commands(
+                        manager,
+                        Some(u32::from(setting.device_id)),
+                        ack_status_tx,
+                        "device_disabled",
+                    );
                 }
                 if let Err(e) = system_state.set_device_status(
                     &manager.port_config.port_number,
@@ -306,6 +387,101 @@ fn process_incoming_commands(
         "串口 {} 单轮处理命令达到上限 {}，本轮先进入轮询，剩余命令下轮继续处理",
         manager.serial_config.port_name, MAX_COMMANDS_PER_CYCLE
     );
+}
+
+fn enqueue_or_reject_command(
+    manager: &mut SerialManager,
+    data: SendData,
+    report_ack: bool,
+    ack_id: Option<u64>,
+    expires_at: Option<Instant>,
+    ack_status_tx: &Sender<CommandAckUpdate>,
+) {
+    let configured_device_disabled = manager
+        .port_config
+        .devices
+        .iter()
+        .position(|device| u32::from(device.config.device_id) == data.device_id)
+        .is_some_and(|index| !manager.device_states[index].is_enabled);
+    let reject_reason = if !manager.port_config.status {
+        Some("port_disabled")
+    } else if configured_device_disabled {
+        Some("device_disabled")
+    } else {
+        None
+    };
+
+    if let Some(reason) = reject_reason {
+        warn!(
+            "[串口命令拒绝] port={} device_id={} reason={} report_ack={} action=drop_command",
+            manager.serial_config.port_name, data.device_id, reason, report_ack,
+        );
+        if report_ack {
+            send_ack_status(manager, ack_status_tx, ack_id, CommandAckStatus::Failed);
+        }
+        return;
+    }
+
+    manager
+        .command_queue
+        .lock()
+        .unwrap_or_else(|e| {
+            warn!("命令队列锁中毒，恢复: {}", e);
+            e.into_inner()
+        })
+        .push_back(QueuedCommand {
+            data,
+            report_ack,
+            ack_id,
+            expires_at,
+        });
+}
+
+/// 丢弃因端口或设备被禁用而不再允许执行的命令，并立即结束其 ACK 等待状态。
+fn reject_queued_commands(
+    manager: &mut SerialManager,
+    target_device_id: Option<u32>,
+    ack_status_tx: &Sender<CommandAckUpdate>,
+    reason: &str,
+) {
+    let rejected = {
+        let mut queue = manager.command_queue.lock().unwrap_or_else(|e| {
+            warn!("命令队列锁中毒，恢复: {}", e);
+            e.into_inner()
+        });
+        let mut retained = std::collections::VecDeque::with_capacity(queue.len());
+        let mut rejected = Vec::new();
+        while let Some(command) = queue.pop_front() {
+            if target_device_id.is_none_or(|device_id| command.data.device_id == device_id) {
+                rejected.push(command);
+            } else {
+                retained.push_back(command);
+            }
+        }
+        *queue = retained;
+        rejected
+    };
+
+    if rejected.is_empty() {
+        return;
+    }
+    warn!(
+        "[串口命令队列清理] port={} reason={} target_device_id={:?} dropped={} action=fail_pending_ack",
+        manager.serial_config.port_name,
+        reason,
+        target_device_id,
+        rejected.len(),
+    );
+    for command in rejected {
+        if command.report_ack {
+            send_ack_status(
+                manager,
+                ack_status_tx,
+                command.ack_id,
+                CommandAckStatus::Failed,
+            );
+        }
+    }
 }
 
 /// 主机模式的一次轮询周期。
@@ -400,11 +576,11 @@ fn run_secondary_cycle(
     });
     if let Some(cmd) = queue.pop_front() {
         drop(queue);
-        if cmd.report_ack {
-            execute_queued_command(manager, cmd, ack_status_tx, command_retry_count);
+        let report_ack = cmd.report_ack;
+        execute_queued_command(manager, cmd, ack_status_tx, command_retry_count);
+        if report_ack {
             return CycleResult::CommandHandled;
         }
-        manager.send_command(cmd.data);
     }
     // 备机始终需要监听转发数据
     CycleResult::PassiveReceive
@@ -416,6 +592,25 @@ fn execute_queued_command(
     ack_status_tx: &Sender<CommandAckUpdate>,
     command_retry_count: u32,
 ) -> bool {
+    if command
+        .expires_at
+        .is_some_and(|deadline| Instant::now() >= deadline)
+    {
+        warn!(
+            "[串口命令过期] port={} device_id={} ack_id={:?} action=drop_without_sending",
+            manager.serial_config.port_name, command.data.device_id, command.ack_id,
+        );
+        if command.report_ack {
+            send_ack_status(
+                manager,
+                ack_status_tx,
+                command.ack_id,
+                CommandAckStatus::Failed,
+            );
+        }
+        return false;
+    }
+
     if !command.report_ack {
         return manager.send_command(command.data);
     }
@@ -424,6 +619,7 @@ fn execute_queued_command(
         manager,
         command.data,
         command.ack_id,
+        command.expires_at,
         ack_status_tx,
         command_retry_count,
     )
@@ -433,11 +629,20 @@ fn execute_command_with_ack(
     manager: &mut SerialManager,
     command: SendData,
     ack_id: Option<u64>,
+    expires_at: Option<Instant>,
     ack_status_tx: &Sender<CommandAckUpdate>,
     command_retry_count: u32,
 ) -> bool {
     let attempts = command_retry_count.max(1);
     for attempt in 1..=attempts {
+        if expires_at.is_some_and(|deadline| Instant::now() >= deadline) {
+            warn!(
+                "[串口命令过期] port={} device_id={} ack_id={:?} attempt={} action=stop_retrying",
+                manager.serial_config.port_name, command.device_id, ack_id, attempt,
+            );
+            send_ack_status(manager, ack_status_tx, ack_id, CommandAckStatus::Failed);
+            return false;
+        }
         info!(
             "串口 {} 下发命令 ACK 尝试 {}/{}",
             manager.serial_config.port_name, attempt, attempts

@@ -176,6 +176,67 @@ pub fn evaluate(
     }
 }
 
+/// 在一次求值中同时传播输入有效性。逻辑运算和 `IF()` 只检查实际执行的分支，
+/// 因此未命中的离线变量不会错误地污染一个可确定的计算结果。
+pub fn evaluate_with_validity(
+    expr: &Expr,
+    variables: &HashMap<String, EvalValue>,
+    validity: &HashMap<String, bool>,
+) -> Result<(EvalValue, bool), EvalError> {
+    match expr {
+        Expr::Literal(lit) => Ok((eval_literal(lit), true)),
+        Expr::Variable(name) => variables
+            .get(name.as_str())
+            .cloned()
+            .map(|value| {
+                let valid = validity.get(name.as_str()).copied().unwrap_or(false);
+                (value, valid)
+            })
+            .ok_or_else(|| EvalError::MissingVariable(name.clone())),
+        Expr::Unary { op, operand } => {
+            let (value, valid) = evaluate_with_validity(operand, variables, validity)?;
+            Ok((eval_unary(*op, value)?, valid))
+        }
+        Expr::Binary { op, left, right } => match op {
+            BinOp::And => {
+                let (left, left_valid) = evaluate_with_validity(left, variables, validity)?;
+                if !left.as_bool() {
+                    return Ok((EvalValue::Bool(false), left_valid));
+                }
+                let (right, right_valid) = evaluate_with_validity(right, variables, validity)?;
+                Ok((EvalValue::Bool(right.as_bool()), left_valid && right_valid))
+            }
+            BinOp::Or => {
+                let (left, left_valid) = evaluate_with_validity(left, variables, validity)?;
+                if left.as_bool() {
+                    return Ok((EvalValue::Bool(true), left_valid));
+                }
+                let (right, right_valid) = evaluate_with_validity(right, variables, validity)?;
+                Ok((EvalValue::Bool(right.as_bool()), left_valid && right_valid))
+            }
+            _ => {
+                let (left, left_valid) = evaluate_with_validity(left, variables, validity)?;
+                let (right, right_valid) = evaluate_with_validity(right, variables, validity)?;
+                Ok((eval_binary(*op, left, right)?, left_valid && right_valid))
+            }
+        },
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            let (condition, condition_valid) =
+                evaluate_with_validity(condition, variables, validity)?;
+            let (value, branch_valid) = if condition.as_bool() {
+                evaluate_with_validity(then_branch, variables, validity)?
+            } else {
+                evaluate_with_validity(else_branch, variables, validity)?
+            };
+            Ok((value, condition_valid && branch_valid))
+        }
+    }
+}
+
 fn eval_literal(lit: &Literal) -> EvalValue {
     match lit {
         Literal::Int(n) => EvalValue::Int(*n),

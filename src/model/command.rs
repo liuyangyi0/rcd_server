@@ -1,6 +1,7 @@
 //! 命令体系类型。
 
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 /// 指向特定串口的命令。
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -12,6 +13,9 @@ pub struct Command {
     /// 内部 ACK 关联 ID，仅用于 OPC UA 写命令状态回写。
     #[serde(skip)]
     pub ack_id: Option<u64>,
+    /// 内部执行截止时间，防止 OPC 已判定超时后 worker 再执行积压命令。
+    #[serde(skip)]
+    pub expires_at: Option<Instant>,
 }
 
 /// 命令类型枚举。
@@ -116,6 +120,7 @@ mod tests {
                 command: vec![1, 2, 3],
             }),
             ack_id: Some(42),
+            expires_at: Some(Instant::now()),
         };
 
         let bytes = bincode::serialize(&command).expect("serialize command");
@@ -123,5 +128,6 @@ mod tests {
 
         assert_eq!(decoded.com, "COM1");
         assert_eq!(decoded.ack_id, None);
+        assert_eq!(decoded.expires_at, None);
     }
 }
