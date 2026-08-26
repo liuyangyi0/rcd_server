@@ -7,11 +7,14 @@
 //! 4. 启动 OPC UA 服务器，将采集数据发布为变量节点。
 
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use bounded_vec_deque::BoundedVecDeque;
+use fs2::FileExt;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -36,8 +39,44 @@ use rcd_server::server::opcua::{command_pending_timeout, run_opcua_server};
 
 #[tokio::main]
 async fn main() -> tokio::io::Result<()> {
-    let _logger = logging::init();
+    // 必须在初始化文件 logger 和打开串口之前加锁，避免第二个实例扰乱
+    // rCURRENT 日志、抢占串口或短暂创建一套重复 worker。
+    let _instance_lock = match InstanceLock::acquire() {
+        Ok(lock) => lock,
+        Err(error) => {
+            let message = format!(
+                "无法获取单实例锁，程序可能已在运行: pid={} error={error}",
+                std::process::id()
+            );
+            logging::write_startup_failure(&message);
+            eprintln!("[程序启动失败] {message}");
+            return Err(error);
+        }
+    };
 
+    let _logger = logging::init();
+    install_panic_hook();
+    info!(
+        "[程序启动] pid={} version={} exe={:?}",
+        std::process::id(),
+        env!("CARGO_PKG_VERSION"),
+        std::env::current_exe().ok(),
+    );
+
+    let result = run_server().await;
+    match &result {
+        Ok(()) => info!("[程序退出] pid={} reason=normal", std::process::id()),
+        Err(error) => error!(
+            "[程序退出] pid={} reason=error error={:?}",
+            std::process::id(),
+            error
+        ),
+    }
+    log::logger().flush();
+    result
+}
+
+async fn run_server() -> tokio::io::Result<()> {
     // 全局取消信号：Ctrl+C / 服务器异常退出时通知所有子任务
     let cancel = CancellationToken::new();
     {
@@ -179,6 +218,86 @@ async fn main() -> tokio::io::Result<()> {
     result
 }
 
+/// 持有操作系统级独占文件锁；进程正常退出、panic 展开或被系统终止时，
+/// 文件句柄关闭会自动释放锁。锁文件本身保留，不能删除，否则可能产生 inode 竞争。
+#[derive(Debug)]
+struct InstanceLock {
+    _file: File,
+}
+
+impl InstanceLock {
+    fn acquire() -> io::Result<Self> {
+        let exe = std::env::current_exe()?;
+        let lock_path = exe
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".rcd_server.lock");
+        Self::acquire_at(&lock_path)
+    }
+
+    fn acquire_at(path: &Path) -> io::Result<Self> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+
+        // Windows 的 LockFileEx 锁冲突在部分 Rust 版本中仍映射为
+        // Uncategorized，Linux 则通常是 WouldBlock。文件已经成功打开后，
+        // try_lock_exclusive 失败在这里统一视为存在锁持有者。
+        FileExt::try_lock_exclusive(&file).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("另一个 rcd_server 实例持有锁文件 {path:?}: {error}"),
+            )
+        })?;
+
+        file.set_len(0)?;
+        writeln!(file, "{}", std::process::id())?;
+        file.flush()?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("unnamed");
+        let message = panic_info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| {
+                panic_info
+                    .payload()
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+            })
+            .unwrap_or("non-string panic payload");
+        let (file, line, column) = panic_info
+            .location()
+            .map(|location| (location.file(), location.line(), location.column()))
+            .unwrap_or(("unknown", 0, 0));
+        let backtrace = std::backtrace::Backtrace::force_capture();
+
+        error!(
+            "[程序Panic] pid={} thread={:?} location={}:{}:{} message={:?} backtrace={}",
+            std::process::id(),
+            thread_name,
+            file,
+            line,
+            column,
+            message,
+            backtrace,
+        );
+        // BufferAndFlush 模式下显式刷新，尽量在进程结束前落盘。
+        log::logger().flush();
+        default_hook(panic_info);
+    }));
+}
+
 /// 等待所有串口 worker 自然结束，超时后放弃（tokio runtime drop 会清理）。
 async fn shutdown_workers(handles: Vec<JoinHandle<()>>) {
     if handles.is_empty() {
@@ -291,4 +410,22 @@ fn load_and_group_csv_configs() -> io::Result<Vec<SerialPortConfig>> {
     }
 
     Ok(configs.into_values().collect())
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn instance_lock_rejects_a_second_holder_and_releases_on_drop() {
+        let dir = tempfile::tempdir().expect("创建单实例锁测试目录");
+        let path = dir.path().join("rcd_server.lock");
+
+        let first = InstanceLock::acquire_at(&path).expect("首次获取单实例锁应成功");
+        let second = InstanceLock::acquire_at(&path).expect_err("第二个实例必须被拒绝");
+        assert_eq!(second.kind(), io::ErrorKind::AlreadyExists);
+
+        drop(first);
+        InstanceLock::acquire_at(&path).expect("持有者退出后必须能重新获取锁");
+    }
 }

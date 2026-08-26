@@ -111,6 +111,7 @@ enum QueryRetryLogAction {
 struct QueryRetryLogState {
     started_at: Option<Instant>,
     last_log_at: Option<Instant>,
+    last_retry_at: Option<Instant>,
     retries_succeeded: u32,
     first_timeouts: u32,
     first_bad_frames: u32,
@@ -125,10 +126,22 @@ impl QueryRetryLogState {
         first_failure: DeviceFailureKind,
         now: Instant,
     ) -> QueryRetryLogAction {
+        // 单次查询成功不再立即结束日志周期。现场的间歇性超时通常表现为
+        // “补发成功 -> 下一轮首发成功 -> 再次补发”，若每次首发成功都重置，
+        // 限频会失效并为每次补发产生两条日志。只有连续 60 秒没有补发时，
+        // 才在下一次补发到来时开始新的诊断周期。
+        if self
+            .last_retry_at
+            .is_some_and(|last| now.saturating_duration_since(last) >= FAILURE_LOG_SUMMARY_INTERVAL)
+        {
+            *self = Self::default();
+        }
+
         if self.started_at.is_none() {
             self.started_at = Some(now);
             self.last_log_at = Some(now);
         }
+        self.last_retry_at = Some(now);
         self.retries_succeeded = self.retries_succeeded.saturating_add(1);
 
         let first_of_kind = match first_failure {
@@ -163,13 +176,6 @@ impl QueryRetryLogState {
             self.suppressed_since_summary = self.suppressed_since_summary.saturating_add(1);
             QueryRetryLogAction::Suppressed
         }
-    }
-
-    fn recover_on_first_attempt(&mut self, now: Instant) -> Option<QueryRetryEpisodeStats> {
-        self.started_at?;
-        let stats = self.stats(now);
-        *self = Self::default();
-        Some(stats)
     }
 
     fn stats(&self, now: Instant) -> QueryRetryEpisodeStats {
@@ -1084,12 +1090,7 @@ impl SerialManager {
         let started_at = Instant::now();
 
         let first_failure = match self.receive_data_attempt(1) {
-            ReceiveDataOutcome::Success => {
-                if self.current_run == RunLocation::Primary && self.index == query_index {
-                    self.log_query_first_attempt_recovery(query_index, Instant::now());
-                }
-                return;
-            }
+            ReceiveDataOutcome::Success => return,
             ReceiveDataOutcome::Retryable(failure) => failure,
             ReceiveDataOutcome::TransportHandled | ReceiveDataOutcome::UnattributedHandled => {
                 return
@@ -1934,29 +1935,6 @@ impl SerialManager {
             }
             QueryRetryLogAction::Suppressed => {}
         }
-    }
-
-    fn log_query_first_attempt_recovery(&mut self, index: usize, now: Instant) {
-        let Some(stats) = self.device_states[index]
-            .query_retry_log
-            .recover_on_first_attempt(now)
-        else {
-            return;
-        };
-        let device_id = self.port_config.devices[index].config.device_id;
-
-        info!(
-            "[串口查询恢复单次成功] port={} device_id={} index={} role={:?} duration_ms={} retries_succeeded={} first_timeouts={} first_bad_frames={} suppressed={} attempts=1 action=single_attempt_success",
-            self.serial_config.port_name,
-            device_id,
-            index,
-            self.current_run,
-            stats.duration.as_millis(),
-            stats.retries_succeeded,
-            stats.first_timeouts,
-            stats.first_bad_frames,
-            stats.suppressed,
-        );
     }
 
     fn log_device_recovery(&mut self, now: Instant, frame_len: usize) {
@@ -2839,7 +2817,7 @@ mod tests {
     }
 
     #[test]
-    fn query_retry_log_limits_repeated_successes_and_recovers() {
+    fn query_retry_log_limits_intermittent_successes_until_quiet_period() {
         let mut state = QueryRetryLogState::default();
         let started = Instant::now();
 
@@ -2872,24 +2850,39 @@ mod tests {
             })
         ));
 
+        assert_eq!(
+            state.record_retry_success(
+                DeviceFailureKind::ReadTimeout,
+                started + Duration::from_secs(30)
+            ),
+            QueryRetryLogAction::Suppressed
+        );
+
         let QueryRetryLogAction::Summary(summary) = state.record_retry_success(
             DeviceFailureKind::BadFrame,
             started + Duration::from_secs(62),
         ) else {
             panic!("60 秒后应生成查询补发持续汇总");
         };
-        assert_eq!(summary.retries_succeeded, 4);
-        assert_eq!(summary.first_timeouts, 2);
+        assert_eq!(summary.retries_succeeded, 5);
+        assert_eq!(summary.first_timeouts, 3);
         assert_eq!(summary.first_bad_frames, 2);
-        assert_eq!(summary.suppressed, 1);
+        assert_eq!(summary.suppressed, 2);
 
-        let recovered = state
-            .recover_on_first_attempt(started + Duration::from_secs(65))
-            .expect("首发恢复成功应结束补发故障周期");
-        assert_eq!(recovered.retries_succeeded, 4);
-        assert!(state
-            .recover_on_first_attempt(started + Duration::from_secs(66))
-            .is_none());
+        // 距离上次补发满 60 秒后，新的补发应开始全新的周期并立即记录。
+        assert!(matches!(
+            state.record_retry_success(
+                DeviceFailureKind::ReadTimeout,
+                started + Duration::from_secs(122)
+            ),
+            QueryRetryLogAction::Immediate(QueryRetryEpisodeStats {
+                retries_succeeded: 1,
+                first_timeouts: 1,
+                first_bad_frames: 0,
+                suppressed: 0,
+                ..
+            })
+        ));
     }
 
     #[test]

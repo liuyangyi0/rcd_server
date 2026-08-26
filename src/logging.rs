@@ -120,6 +120,35 @@ pub fn init_with_config(config: LoggingConfig) -> Option<LoggerHandle> {
     }
 }
 
+/// 在主日志初始化前记录启动失败原因。
+///
+/// 单实例锁必须先于主 logger 获取，否则第二个进程会与正在运行的实例争用
+/// `rCURRENT` 文件。这里使用独立、覆盖写的小文件保留最近一次启动失败诊断。
+pub fn write_startup_failure(message: &str) {
+    let config = load_config_from_file().unwrap_or_default();
+    let Ok(log_dir) = log_dir(config.directory.as_deref()) else {
+        eprintln!("[程序启动失败] {message}");
+        return;
+    };
+    if let Err(error) = std::fs::create_dir_all(&log_dir) {
+        eprintln!("[程序启动失败] {message}; 创建日志目录失败: {error}");
+        return;
+    }
+
+    let path = log_dir.join(format!("{}_startup_error.log", config.basename));
+    let line = format!(
+        "{} [ERROR] rcd_server [程序启动失败] {}\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+        message
+    );
+    if let Err(error) = std::fs::write(&path, line) {
+        eprintln!(
+            "[程序启动失败] {message}; 写入启动诊断 {:?} 失败: {error}",
+            path
+        );
+    }
+}
+
 fn init_console_logger() -> Option<LoggerHandle> {
     // 不再读取配置或 RUST_LOG，确保正是这些值格式错误时仍能保留诊断日志。
     match Logger::try_with_str("warn")
