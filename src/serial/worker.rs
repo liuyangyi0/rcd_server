@@ -548,6 +548,7 @@ fn run_primary_cycle(
         device_id: u32::from(device_id),
         command: frame,
     };
+    manager.prepare_automatic_query(device_id, idx);
     let sent = manager.send_command(query.clone());
 
     debug!(

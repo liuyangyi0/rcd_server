@@ -771,6 +771,54 @@ impl SerialManager {
         self.publish_port_offline_once();
     }
 
+    /// 主机自动查询发送前清除上一轮迟到数据和驱动接收状态。
+    ///
+    /// 该操作只清输入队列；当前查询尚未发送，因此不会丢弃本轮响应，也不会影响
+    /// 输出缓冲、命令下发或备机被动监听。
+    pub(crate) fn prepare_automatic_query(&mut self, device_id: u8, index: usize) {
+        let frame_diagnostics = logging::serial_frame_logs_enabled();
+        let pending_len = self.rx_pending.len();
+        let (pending_hex, pending_truncated) =
+            format_hex_preview(&self.rx_pending, BAD_FRAME_LOG_MAX_BYTES);
+        let mut queued_before = None;
+        let mut queued_after = None;
+        let mut clear_result = "port_not_open";
+
+        if let Some(port) = self.port.as_ref() {
+            if frame_diagnostics {
+                queued_before = port.bytes_to_read().ok();
+            }
+            if let Err(error) = port.clear(ClearBuffer::Input) {
+                clear_result = "failed";
+                warn!(
+                    "[串口查询前清理失败] port={} device_id={} index={} error={:?} action=continue_query",
+                    self.serial_config.port_name, device_id, index, error,
+                );
+            } else {
+                clear_result = "success";
+            }
+            if frame_diagnostics {
+                queued_after = port.bytes_to_read().ok();
+            }
+        }
+        self.rx_pending.clear();
+
+        if frame_diagnostics {
+            info!(
+                "[串口查询前清理诊断] port={} device_id={} index={} result={} kernel_bytes_before={:?} kernel_bytes_after={:?} pending_len={} pending_hex={:?} pending_truncated={} action=clear_input_before_first_send",
+                self.serial_config.port_name,
+                device_id,
+                index,
+                clear_result,
+                queued_before,
+                queued_after,
+                pending_len,
+                pending_hex,
+                pending_truncated,
+            );
+        }
+    }
+
     /// 记录一条系统日志。
     pub(crate) fn log_record(&self, msg: String) {
         let local: DateTime<Local> = Local::now();
@@ -926,6 +974,7 @@ impl SerialManager {
         pre_write_delay: Duration,
         wait_for_settle: bool,
     ) -> io::Result<()> {
+        let segment_started = Instant::now();
         let timeout = transmit_timeout(
             data.len(),
             self.serial_config.baud_rate,
@@ -938,14 +987,39 @@ impl SerialManager {
             .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "serial port is not open"))?;
 
         if let Some(parity) = parity {
-            port.set_parity(parity).map_err(serial_error_to_io)?;
+            port.set_parity(parity).map_err(|error| {
+                io::Error::other(format!(
+                    "stage=set_parity target_parity={parity:?} serial_error_kind={:?} error={error}",
+                    error.kind()
+                ))
+            })?;
         }
         if !pre_write_delay.is_zero() {
             std::thread::sleep(pre_write_delay);
         }
-        write_all_before_deadline(port.as_mut(), data, deadline)?;
+        write_all_before_deadline(port.as_mut(), data, deadline).map_err(|error| {
+            io_error_with_context(
+                error,
+                format!(
+                    "stage=write data_len={} elapsed_us={}",
+                    data.len(),
+                    segment_started.elapsed().as_micros()
+                ),
+            )
+        })?;
         if wait_for_settle {
-            wait_for_output_settle(data.len(), self.serial_config.baud_rate, deadline)?;
+            wait_for_output_settle(data.len(), self.serial_config.baud_rate, deadline).map_err(
+                |error| {
+                    io_error_with_context(
+                        error,
+                        format!(
+                            "stage=wait_output_settle data_len={} elapsed_us={}",
+                            data.len(),
+                            segment_started.elapsed().as_micros()
+                        ),
+                    )
+                },
+            )?;
         }
         Ok(())
     }
@@ -964,13 +1038,34 @@ impl SerialManager {
             return false;
         }
         let error_text = error.to_string();
+        let (port_timeout_ms, queued_rx, queued_tx, current_parity) = self
+            .port
+            .as_ref()
+            .map(|port| {
+                (
+                    Some(port.timeout().as_millis()),
+                    port.bytes_to_read().ok(),
+                    port.bytes_to_write().ok(),
+                    port.parity().ok(),
+                )
+            })
+            .unwrap_or((None, None, None, None));
         error!(
-            "[串口发送失败] port={} device_id={} phase={} error_kind={:?} error={:?} action=close_publish_all_offline_reconnect",
+            "[串口发送失败] port={} device_id={} index={} role={:?} phase={} error_kind={:?} error={:?} baud_rate={} configured_read_timeout_ms={} port_timeout_ms={:?} current_parity={:?} queued_rx={:?} queued_tx={:?} rx_pending_len={} action=close_publish_all_offline_reconnect",
             self.serial_config.port_name,
             device_id,
+            self.index,
+            self.current_run,
             phase,
             error_kind,
             error_text,
+            self.serial_config.baud_rate,
+            self.serial_config.read_timeout.as_millis(),
+            port_timeout_ms,
+            current_parity,
+            queued_rx,
+            queued_tx,
+            self.rx_pending.len(),
         );
         self.log_record(format!(
             "串口发送失败: device_id={} phase={} error_kind={:?} error={:?}",
@@ -2024,6 +2119,11 @@ fn serial_error_to_io(error: serialport::Error) -> io::Error {
     io::Error::other(error.to_string())
 }
 
+fn io_error_with_context(error: io::Error, context: String) -> io::Error {
+    let kind = error.kind();
+    io::Error::new(kind, format!("{context} error={error}"))
+}
+
 /// 在统一截止时间内执行一次 read，并在结束后恢复端口原始超时配置。
 fn read_before_deadline(
     port: &mut dyn SerialPort,
@@ -2658,6 +2758,7 @@ mod tests {
 
     fn run_auto_query(manager: &mut SerialManager) {
         let query = status_query();
+        manager.prepare_automatic_query(query.device_id as u8, manager.index);
         assert!(manager.send_command(query.clone()));
         manager.receive_query_with_retry(query);
     }
@@ -3143,6 +3244,20 @@ mod tests {
     }
 
     #[test]
+    fn send_diagnostic_context_preserves_io_error_kind() {
+        let error = io_error_with_context(
+            io::Error::new(ErrorKind::TimedOut, "driver write timed out"),
+            "stage=write data_len=7 elapsed_us=123".to_string(),
+        );
+
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert_eq!(
+            error.to_string(),
+            "stage=write data_len=7 elapsed_us=123 error=driver write timed out"
+        );
+    }
+
+    #[test]
     fn long_read_timeout_does_not_reject_a_short_transmit() {
         let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
         manager.serial_config.read_timeout = Duration::from_secs(10);
@@ -3406,7 +3521,7 @@ mod tests {
         let observations = observations.lock().unwrap();
         assert_eq!(observations.write_attempts, 2);
         assert_eq!(observations.writes[0], observations.writes[1]);
-        assert_eq!(observations.input_clears, 1);
+        assert_eq!(observations.input_clears, 2);
         drop(observations);
         assert_eq!(manager.time_out_count, 0);
         assert_eq!(manager.parse_fail_count, 0);
@@ -3586,7 +3701,7 @@ mod tests {
 
         let observations = observations.lock().unwrap();
         assert_eq!(observations.write_attempts, 1);
-        assert_eq!(observations.input_clears, 0);
+        assert_eq!(observations.input_clears, 1);
         drop(observations);
         assert_eq!(manager.time_out_count, 0);
         assert_eq!(manager.parse_fail_count, 0);
