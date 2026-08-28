@@ -644,7 +644,7 @@ fn execute_command_with_ack(
             send_ack_status(manager, ack_status_tx, ack_id, CommandAckStatus::Failed);
             return false;
         }
-        info!(
+        debug!(
             "串口 {} 下发命令 ACK 尝试 {}/{}",
             manager.serial_config.port_name, attempt, attempts
         );
@@ -670,6 +670,17 @@ fn send_ack_status(
     ack_id: Option<u64>,
     status: CommandAckStatus,
 ) {
+    match status {
+        CommandAckStatus::Received => info!(
+            "[串口命令结果] port={} ack_id={:?} result=ack_received",
+            manager.serial_config.port_name, ack_id,
+        ),
+        CommandAckStatus::Failed => warn!(
+            "[串口命令结果] port={} ack_id={:?} result=failed",
+            manager.serial_config.port_name, ack_id,
+        ),
+        CommandAckStatus::Waiting => {}
+    }
     if let Err(e) = ack_status_tx.send(CommandAckUpdate {
         com: manager.port_config.port_number.clone(),
         ack_id,

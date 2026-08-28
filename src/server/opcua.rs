@@ -29,7 +29,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bounded_vec_deque::BoundedVecDeque;
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -1324,32 +1324,34 @@ fn register_send_node_write_callbacks(
         let context = context.clone();
         let next_ack_id = next_ack_id.clone();
 
-        log_opc_write_info(format!(
+        debug!(
             "[OPC 写诊断] 回调已注册: 串口={}, NodeId={}, 属性=Value, 类型=String, 权限=CurrentRead|CurrentWrite",
             com, callback_node_id
-        ));
+        );
 
         node_manager
             .inner()
             .add_write_callback(node_id.clone(), move |data_value, range| {
                 let ack_id = next_ack_id.fetch_add(1, Ordering::Relaxed);
-                let (value_type, value_summary) =
-                    opc_write_value_diagnostic(data_value.value.as_ref());
-                log_opc_write_info(format!(
-                    "[OPC 写诊断] 回调触发: 串口={}, NodeId={}, 属性=Value, IndexRange={:?}, Variant类型={}, DataValue状态={:?}, 值摘要={}",
-                    com,
-                    callback_node_id,
-                    range,
-                    value_type,
-                    data_value.status,
-                    value_summary,
-                ));
+                if log::log_enabled!(log::Level::Debug) {
+                    let (value_type, value_summary) =
+                        opc_write_value_diagnostic(data_value.value.as_ref());
+                    debug!(
+                        "[OPC 写诊断] 回调触发: 串口={}, NodeId={}, 属性=Value, IndexRange={:?}, Variant类型={}, DataValue状态={:?}, 值摘要={}",
+                        com,
+                        callback_node_id,
+                        range,
+                        value_type,
+                        data_value.status,
+                        value_summary,
+                    );
+                }
 
                 let status = handle_send_node_write(data_value, &com, &tx, &context, ack_id);
-                log_opc_write_info(format!(
+                debug!(
                     "[OPC 写诊断] 处理完成: 串口={}, NodeId={}, ack_id={}, 返回状态={:?}",
                     com, callback_node_id, ack_id, status
-                ));
+                );
                 status
             });
     }
@@ -1379,10 +1381,10 @@ fn handle_send_node_write(
     };
     let hex_str = hex_ua.as_ref().trim();
     if is_send_node_idle_or_status(hex_str) {
-        log_opc_write_info(format!(
+        debug!(
             "[OPC 写诊断] 忽略写入: 串口={}, 值={:?}, 原因=空闲值或内部状态值(IDLE/0/1/2/3)",
             com, hex_str
-        ));
+        );
         return StatusCode::Good;
     }
 

@@ -1,0 +1,32 @@
+# 使用 Ubuntu 20.04 (与银河麒麟 V10 基础系统兼容)
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-tk \
+    python3-dev \
+    libx11-dev \
+    libxext-dev \
+    binutils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir pyserial pyinstaller
+
+WORKDIR /build
+COPY fuzz_device.py .
+
+RUN pyinstaller \
+    --onefile \
+    --name fuzz_device \
+    --hidden-import serial.tools.list_ports \
+    --hidden-import tkinter \
+    --hidden-import tkinter.ttk \
+    --hidden-import tkinter.scrolledtext \
+    --hidden-import tkinter.filedialog \
+    --hidden-import tkinter.messagebox \
+    fuzz_device.py
+
+CMD ["sh", "-c", "cp dist/fuzz_device /output/"]

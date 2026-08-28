@@ -143,11 +143,11 @@ impl TTYPort {
         unsafe { cfmakeraw(&mut termios) };
 
         // write settings to TTY
-        unsafe { tcsetattr(fd.0, libc::TCSANOW, &termios) };
+        nix::errno::Errno::result(unsafe { tcsetattr(fd.0, libc::TCSANOW, &termios) })?;
 
         // Read back settings from port and confirm they were applied correctly
         let mut actual_termios = MaybeUninit::uninit();
-        unsafe { tcgetattr(fd.0, actual_termios.as_mut_ptr()) };
+        nix::errno::Errno::result(unsafe { tcgetattr(fd.0, actual_termios.as_mut_ptr()) })?;
         let actual_termios = unsafe { actual_termios.assume_init() };
 
         if actual_termios.c_iflag != termios.c_iflag

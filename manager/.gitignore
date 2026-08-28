@@ -1,0 +1,14 @@
+/bin/
+/dist/
+/.tmp/
+/coverage/
+/data/
+/logs/
+/web/node_modules/
+/web/coverage/
+/third_party/awcullen-opcua/client/pki/
+/third_party/awcullen-opcua/server/pki/
+*.db
+*.db-shm
+*.db-wal
+*.log
