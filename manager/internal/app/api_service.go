@@ -96,7 +96,7 @@ func (r *Runtime) groupView(group domain.Group) api.GroupView {
 	view := api.GroupView{Group: group, SelectedSourceID: group.DefaultSourceID, SelectionRevision: group.Revision,
 		MemberSourceIDs: make([]string, 0), PendingCommands: r.routes.PendingCount(group.ID), Status: "Healthy"}
 	for _, source := range r.routes.Sources() {
-		if source.GroupID == group.ID {
+		if source.HasGroup(group.ID) {
 			view.MemberSourceIDs = append(view.MemberSourceIDs, source.ID)
 		}
 	}
@@ -218,6 +218,9 @@ func (r *Runtime) DeleteGroup(ctx context.Context, id string, revision uint64) e
 	removedSources := make([]domain.Source, 0)
 	candidateSources := make([]domain.Source, 0, len(oldSources))
 	for _, source := range oldSources {
+		if source.HasGroup(id) && len(source.GroupBindings) > 0 {
+			return fmt.Errorf("remove source %q device bindings before deleting this group: %w", source.ID, domain.ErrGroupInUse)
+		}
 		if source.GroupID == id {
 			removedSources = append(removedSources, source)
 			continue
@@ -306,16 +309,22 @@ func (r *Runtime) setDefault(ctx context.Context, groupID, sourceID string, revi
 	if group.Revision != revision {
 		return domain.Group{}, &domain.RevisionConflictError{Expected: revision, Actual: group.Revision}
 	}
+	// CommitConfiguration rejects changed routes while a command is pending,
+	// but an identical default would otherwise still persist a new revision.
+	// A default-source control write is locked for the entire command lifetime.
+	if r.routes.PendingCount(groupID) > 0 {
+		return domain.Group{}, domain.ErrGroupPending
+	}
 	sourceID = strings.TrimSpace(sourceID)
 	if sourceID != "" {
 		source, exists := sourceByID(oldSources, sourceID)
 		if !exists {
 			return domain.Group{}, domain.ErrNotFound
 		}
-		if source.GroupID != groupID {
+		if !source.HasGroup(groupID) {
 			return domain.Group{}, domain.ErrSourceNotInGroup
 		}
-		if !source.Enabled || !source.CatalogState.Selectable() {
+		if !source.Enabled || !source.CatalogState.Selectable() || !source.GroupAvailable(groupID) {
 			return domain.Group{}, domain.ErrSourceNotSelectable
 		}
 	}
@@ -483,7 +492,7 @@ func (r *Runtime) CreateSource(ctx context.Context, mutation api.SourceMutation)
 		}
 	}
 	r.reconcileAfterConfiguration()
-	r.audit(ctx, "source.create", created.ID, created.Revision, map[string]any{"group_id": created.GroupID})
+	r.audit(ctx, "source.create", created.ID, created.Revision, map[string]any{"group_id": created.GroupID, "group_bindings": append([]domain.GroupBinding(nil), created.GroupBindings...)})
 	r.broker.Publish(api.Event{Type: "source.status", Data: r.sourceView(created)})
 	return r.sourceView(created), nil
 }
@@ -511,22 +520,34 @@ func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, 
 	if current.Revision != revision {
 		return api.SourceView{}, &domain.RevisionConflictError{Expected: revision, Actual: current.Revision}
 	}
+	if mutation.GroupBindings == nil {
+		mutation.GroupBindings = append([]domain.GroupBinding(nil), current.GroupBindings...)
+	}
 	updatedInput := sourceFromMutation(mutation)
 	updatedInput.Revision = current.Revision
 	updatedInput.CreatedAt = current.CreatedAt
 	updatedInput.UpdatedAt = current.UpdatedAt
 	updatedInput.HasPassword = current.HasPassword
 	updatedInput.CatalogState = current.CatalogState
-	if r.routes.PendingCount(current.GroupID) > 0 ||
-		(updatedInput.GroupID != current.GroupID && r.routes.PendingCount(updatedInput.GroupID) > 0) {
+	updatedInput.AvailableGroupIDs = append([]string(nil), current.AvailableGroupIDs...)
+	bindingsChanged := !domain.SameGroupBindings(current.GroupBindings, updatedInput.GroupBindings)
+	r.mu.RLock()
+	hasTopology := r.catalogs[id].Topology != nil
+	r.mu.RUnlock()
+	ownershipChanged := bindingsChanged || (current.GroupID != updatedInput.GroupID && (hasTopology || len(current.GroupBindings) > 0 || len(updatedInput.GroupBindings) > 0))
+	if ownershipChanged && len(r.routes.Sessions()) > 0 {
+		return api.SourceView{}, domain.ErrGroupInUse
+	}
+	if r.sourceGroupsPending(current, updatedInput) {
 		return api.SourceView{}, domain.ErrGroupPending
 	}
 	resetCatalog := current.Endpoint != updatedInput.Endpoint || current.GroupID != updatedInput.GroupID ||
 		current.SecurityMode != updatedInput.SecurityMode || current.SecurityPolicy != updatedInput.SecurityPolicy
 	restartRequired := resetCatalog || current.Username != updatedInput.Username || current.Enabled != updatedInput.Enabled || mutation.Password != nil
-	group := findGroup(oldGroups, current.GroupID)
-	if group.DefaultSourceID == current.ID && (!updatedInput.Enabled || resetCatalog) {
-		return api.SourceView{}, fmt.Errorf("default source %q: %w", current.ID, domain.ErrSourceInUse)
+	for _, group := range oldGroups {
+		if group.DefaultSourceID == current.ID && (!updatedInput.Enabled || resetCatalog || !updatedInput.HasGroup(group.ID)) {
+			return api.SourceView{}, fmt.Errorf("default source %q: %w", current.ID, domain.ErrSourceInUse)
+		}
 	}
 	if resetCatalog {
 		updatedInput.CatalogState = domain.CatalogDiscovering
@@ -538,7 +559,7 @@ func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, 
 	candidateConflictCount := r.conflictCount
 	r.mu.RUnlock()
 	candidateIndex := currentIndex
-	if resetCatalog {
+	if resetCatalog || bindingsChanged {
 		previous := candidateCatalogs[id]
 		if current.GroupID != updatedInput.GroupID {
 			// Old-group nodes cannot be re-parented as tombstones in the new
@@ -546,13 +567,23 @@ func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, 
 			// upstream reconciler already retires business nodes absent from the
 			// candidate union, so a group move starts with an empty catalog.
 			previous.Nodes = nil
-		} else {
+		} else if resetCatalog {
 			for nodeIndex := range previous.Nodes {
 				previous.Nodes[nodeIndex].Retired = true
 			}
 		}
 		previous.GroupID = updatedInput.GroupID
-		previous.State = domain.CatalogDiscovering
+		if resetCatalog {
+			previous.State = domain.CatalogDiscovering
+			previous.Topology = nil
+		}
+		var topologyErr error
+		previous, topologyErr = domain.AssignCatalogGroups(updatedInput, previous)
+		if topologyErr != nil {
+			return api.SourceView{}, topologyErr
+		}
+		updatedInput.AvailableGroupIDs = domain.AvailableGroups(updatedInput, previous)
+		candidate = replaceSource(candidate, updatedInput)
 		candidateCatalogs[id] = previous
 		var states map[string]domain.CatalogState
 		var validateErr error
@@ -560,7 +591,11 @@ func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, 
 		if validateErr != nil {
 			return api.SourceView{}, validateErr
 		}
-		candidateConflictCount += r.enforceCatalogQuarantine(candidateIndex, states, id)
+		recoveringSourceID := ""
+		if resetCatalog {
+			recoveringSourceID = id
+		}
+		candidateConflictCount += r.enforceCatalogQuarantine(candidateIndex, states, recoveringSourceID)
 		for sourceIndex := range candidate {
 			if state, ok := states[candidate[sourceIndex].ID]; ok {
 				candidate[sourceIndex].CatalogState = state
@@ -602,13 +637,18 @@ func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, 
 			r.persistLowerStatusTransition(disabled, disabled, true)
 		}
 	}
-	if resetCatalog {
+	if resetCatalog || bindingsChanged {
 		r.mu.Lock()
 		r.catalogs = candidateCatalogs
 		r.index = candidateIndex
 		r.conflictCount = candidateConflictCount
-		delete(r.quarantinedSources, id)
+		if resetCatalog {
+			delete(r.quarantinedSources, id)
+		}
 		delete(r.dirtyCatalogs, id)
+		if bindingsChanged && !resetCatalog {
+			r.dirtyCatalogs[id] = candidateCatalogs[id]
+		}
 		if len(r.dirtyCatalogs) == 0 {
 			r.catalogPersistError = ""
 		}
@@ -620,8 +660,11 @@ func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, 
 			r.recordLowerStartFailure(updated, err)
 		}
 	}
+	if resetCatalog || bindingsChanged {
+		r.syncCatalogStatuses()
+	}
 	r.reconcileAfterConfiguration()
-	r.audit(ctx, "source.update", id, updated.Revision, map[string]any{"group_id": updated.GroupID})
+	r.audit(ctx, "source.update", id, updated.Revision, map[string]any{"group_id": updated.GroupID, "group_bindings": append([]domain.GroupBinding(nil), updated.GroupBindings...)})
 	r.broker.Publish(api.Event{Type: "source.status", Data: r.sourceView(updated)})
 	return r.sourceView(updated), nil
 }
@@ -751,6 +794,25 @@ func (r *Runtime) ListPoints(_ context.Context, request api.PageRequest) (api.Po
 		// large directory does not hold the hot sample/status mutex.
 		points = append(points, index.filteredPoints(request.GroupID, request.SourceID, request.Status, request.Query)...)
 	}
+	if request.PortID != "" || request.DeviceID != "" {
+		filtered := make([]indexedPoint, 0, len(points))
+		for _, point := range points {
+			node := point.Node
+			if request.SourceID != "" {
+				if sourceNode, ok := index.sourceNode(request.SourceID, node.Key.Identifier); ok {
+					node = sourceNode
+				}
+			}
+			if request.PortID != "" && node.PortID != request.PortID {
+				continue
+			}
+			if request.DeviceID != "" && node.DeviceID != request.DeviceID {
+				continue
+			}
+			filtered = append(filtered, point)
+		}
+		points = filtered
+	}
 	makeView := func(point indexedPoint) api.PointView {
 		group := findGroup(groups, point.GroupID)
 		selected := group.DefaultSourceID
@@ -758,14 +820,19 @@ func (r *Runtime) ListPoints(_ context.Context, request api.PageRequest) (api.Po
 			selected = session.Routes[point.GroupID].SourceID
 		} else if request.RouteSourceID != "" {
 			selected = request.RouteSourceID
-		} else if request.SourceID != "" {
-			selected = request.SourceID
 		}
 		sample := r.sampleForSourceAtIndex(selected, point, index)
 		copySample := sample
 		present := index.sourceHasNode(selected, point.Node.Key.Identifier)
+		viewNode := point.Node
+		if sourceNode, ok := index.sourceNode(selected, point.Node.Key.Identifier); ok {
+			viewNode = sourceNode
+		} else if selected != "" {
+			viewNode.PortID = ""
+			viewNode.DeviceID = ""
+		}
 		return api.PointView{GroupID: point.GroupID, SourceIDs: append([]string(nil), point.SourceIDs...),
-			Node: point.Node, SelectedSourceID: selected, SourcePresent: &present, Sample: &copySample}
+			Node: viewNode, SelectedSourceID: selected, SourcePresent: &present, Sample: &copySample}
 	}
 	if request.Status == "" {
 		total := len(points)
@@ -928,6 +995,14 @@ func (r *Runtime) rebuildIndexLocked() {
 }
 
 func validateSourceMutation(mutation api.SourceMutation) error {
+	if err := domain.ValidateGroupBindings(mutation.GroupBindings); err != nil {
+		return err
+	}
+	for _, binding := range mutation.GroupBindings {
+		if err := validateStableID("group_bindings.group_id", binding.GroupID); err != nil {
+			return err
+		}
+	}
 	if err := validateStableID("id", mutation.ID); err != nil {
 		return err
 	}
@@ -951,7 +1026,8 @@ func validateSourceMutation(mutation api.SourceMutation) error {
 func sourceFromMutation(mutation api.SourceMutation) domain.Source {
 	policy, mode := normalizedSecurity(mutation.SecurityPolicy, mutation.SecurityMode)
 	return domain.Source{ID: strings.TrimSpace(mutation.ID), GroupID: strings.TrimSpace(mutation.GroupID),
-		Name: strings.TrimSpace(mutation.Name), Endpoint: strings.TrimSpace(mutation.Endpoint), SecurityPolicy: policy,
+		GroupBindings: append([]domain.GroupBinding(nil), mutation.GroupBindings...),
+		Name:          strings.TrimSpace(mutation.Name), Endpoint: strings.TrimSpace(mutation.Endpoint), SecurityPolicy: policy,
 		SecurityMode: mode, Username: strings.TrimSpace(mutation.Username), Enabled: mutation.Enabled}
 }
 

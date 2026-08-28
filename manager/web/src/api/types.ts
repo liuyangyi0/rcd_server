@@ -53,6 +53,8 @@ export interface Source {
   id: string;
   name: string;
   groupId: string;
+  groupBindings?: DeviceGroupBinding[];
+  availableGroupIds?: string[];
   endpoint: string;
   securityPolicy: string;
   securityMode: string;
@@ -76,6 +78,45 @@ export interface Source {
   revision: number;
 }
 
+export interface DeviceGroupBinding {
+  groupId: string;
+  portId: string;
+  deviceId: string;
+}
+
+export interface TopologyDevice {
+  deviceId: string;
+  deviceAddress: number;
+  name: string;
+  kksPrefix: string;
+  pointCount: number;
+  calculationCount: number;
+  groupId: string;
+  bound: boolean;
+}
+
+export interface TopologyPort {
+  portId: string;
+  portName: string;
+  sendNodeId: string;
+  sendMethodId: string;
+  pointCount: number;
+  devices: TopologyDevice[];
+}
+
+export interface SourceTopology {
+  sourceId: string;
+  groupId: string;
+  supported: boolean;
+  catalogState: string;
+  revision: number;
+  schemaVersion: number;
+  ports: TopologyPort[];
+  calculationCount: number;
+  crossDeviceCalculationCount: number;
+  unassignedPointCount: number;
+}
+
 export interface UaSession {
   id: string;
   clientName: string;
@@ -92,6 +133,9 @@ export interface Point {
   browseName: string;
 	nodeClass: string;
   groupId: string;
+  portId?: string;
+  deviceId?: string;
+  kind?: string;
   selectedSourceId?: string;
   dataType: string;
   value?: unknown;
@@ -133,6 +177,8 @@ export interface ListParams {
   sessionId?: string;
   status?: string;
   kind?: string;
+  portId?: string;
+  deviceId?: string;
 }
 
 export interface Alarm {
@@ -247,6 +293,7 @@ export interface ConfigurationDocument {
   sources: Array<{
     id: string;
     group_id: string;
+    group_bindings?: Array<{ group_id: string; port_id: string; device_id: string }>;
     name: string;
     endpoint: string;
     security_policy: string;
@@ -281,6 +328,7 @@ export interface SourceInput {
   id: string;
   name?: string;
   groupId: string;
+  groupBindings?: DeviceGroupBinding[];
   endpoint: string;
   username?: string;
   password?: string;

@@ -73,14 +73,15 @@ func (r *Runtime) SystemInfo(ctx context.Context) (api.SystemInfo, error) {
 func (r *Runtime) ExportConfiguration(_ context.Context) (api.ConfigurationDocument, error) {
 	groups := r.routes.Groups()
 	sources := r.routes.Sources()
-	document := api.ConfigurationDocument{SchemaVersion: 1, ExportedAt: time.Now().UTC(),
+	document := api.ConfigurationDocument{SchemaVersion: 2, ExportedAt: time.Now().UTC(),
 		Groups: make([]api.GroupMutation, 0, len(groups)), Sources: make([]api.ExportSource, 0, len(sources))}
 	for _, group := range groups {
 		document.Groups = append(document.Groups, api.GroupMutation{ID: group.ID, Name: group.Name, DefaultSourceID: group.DefaultSourceID})
 	}
 	for _, source := range sources {
 		document.Sources = append(document.Sources, api.ExportSource{ID: source.ID, GroupID: source.GroupID, Name: source.Name,
-			Endpoint: source.Endpoint, SecurityPolicy: source.SecurityPolicy, SecurityMode: source.SecurityMode,
+			GroupBindings: append([]domain.GroupBinding(nil), source.GroupBindings...),
+			Endpoint:      source.Endpoint, SecurityPolicy: source.SecurityPolicy, SecurityMode: source.SecurityMode,
 			Username: source.Username, Enabled: source.Enabled})
 	}
 	return document, nil
@@ -159,8 +160,8 @@ func lowerDisconnectedStatus(source domain.Source, now time.Time) opc.LowerStatu
 }
 
 func (r *Runtime) validateConfigurationDocument(document api.ConfigurationDocument) ([]domain.Group, []domain.Source, []string, error) {
-	if document.SchemaVersion != 1 {
-		return nil, nil, nil, &domain.FieldError{Field: "schema_version", Message: "must be 1"}
+	if document.SchemaVersion != 1 && document.SchemaVersion != 2 {
+		return nil, nil, nil, &domain.FieldError{Field: "schema_version", Message: "must be 1 or 2"}
 	}
 	if len(document.Groups) == 0 {
 		return nil, nil, nil, &domain.FieldError{Field: "groups", Message: "must contain at least one group"}
@@ -190,6 +191,7 @@ func (r *Runtime) validateConfigurationDocument(document api.ConfigurationDocume
 	warnings := make([]string, 0)
 	for _, exported := range document.Sources {
 		mutation := api.SourceMutation{ID: exported.ID, GroupID: exported.GroupID, Name: exported.Name, Endpoint: exported.Endpoint,
+			GroupBindings:  append([]domain.GroupBinding(nil), exported.GroupBindings...),
 			SecurityPolicy: exported.SecurityPolicy, SecurityMode: exported.SecurityMode, Username: exported.Username, Enabled: exported.Enabled}
 		if err := validateSourceMutation(mutation); err != nil {
 			return nil, nil, nil, err
@@ -201,8 +203,14 @@ func (r *Runtime) validateConfigurationDocument(document api.ConfigurationDocume
 			return nil, nil, nil, &domain.FieldError{Field: "sources.group_id", Message: exported.GroupID + " does not exist"}
 		}
 		sourceGroups[exported.ID] = exported.GroupID
+		for _, binding := range exported.GroupBindings {
+			if _, exists := groupIDs[binding.GroupID]; !exists {
+				return nil, nil, nil, &domain.FieldError{Field: "sources.group_bindings", Message: "unknown group " + binding.GroupID}
+			}
+		}
 		sources = append(sources, domain.Source{ID: exported.ID, GroupID: exported.GroupID, Name: exported.Name,
-			Endpoint: exported.Endpoint, SecurityPolicy: exported.SecurityPolicy, SecurityMode: exported.SecurityMode,
+			GroupBindings: append([]domain.GroupBinding(nil), exported.GroupBindings...),
+			Endpoint:      exported.Endpoint, SecurityPolicy: exported.SecurityPolicy, SecurityMode: exported.SecurityMode,
 			Username: exported.Username, Enabled: exported.Enabled, CatalogState: domain.CatalogDiscovering, Revision: 1})
 		if exported.Username != "" {
 			warnings = append(warnings, fmt.Sprintf("来源 %s 的密码不会包含在导出文件中，导入后需要重新填写", exported.ID))
@@ -212,7 +220,8 @@ func (r *Runtime) validateConfigurationDocument(document api.ConfigurationDocume
 		if sourceID == "" {
 			continue
 		}
-		if sourceGroups[sourceID] != groupID {
+		defaultSource, _ := sourceByID(sources, sourceID)
+		if !defaultSource.HasGroup(groupID) {
 			return nil, nil, nil, &domain.FieldError{Field: "groups.default_source_id", Message: sourceID + " is not a member of " + groupID}
 		}
 		// Imported sources have no cached catalog and are Discovering. Keeping

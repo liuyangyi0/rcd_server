@@ -78,6 +78,8 @@ type PointView struct {
 }
 
 type PageRequest struct {
+	PortID        string
+	DeviceID      string
 	Limit         int
 	Offset        int
 	GroupID       string
@@ -199,14 +201,15 @@ type SystemInfo struct {
 }
 
 type ExportSource struct {
-	ID             string `json:"id"`
-	GroupID        string `json:"group_id"`
-	Name           string `json:"name"`
-	Endpoint       string `json:"endpoint"`
-	SecurityPolicy string `json:"security_policy"`
-	SecurityMode   string `json:"security_mode"`
-	Username       string `json:"username,omitempty"`
-	Enabled        bool   `json:"enabled"`
+	ID             string                `json:"id"`
+	GroupID        string                `json:"group_id"`
+	GroupBindings  []domain.GroupBinding `json:"group_bindings,omitempty"`
+	Name           string                `json:"name"`
+	Endpoint       string                `json:"endpoint"`
+	SecurityPolicy string                `json:"security_policy"`
+	SecurityMode   string                `json:"security_mode"`
+	Username       string                `json:"username,omitempty"`
+	Enabled        bool                  `json:"enabled"`
 }
 
 type ConfigurationDocument struct {
@@ -237,15 +240,16 @@ type GroupMutation struct {
 }
 
 type SourceMutation struct {
-	ID             string  `json:"id,omitempty"`
-	GroupID        string  `json:"group_id"`
-	Name           string  `json:"name"`
-	Endpoint       string  `json:"endpoint"`
-	SecurityPolicy string  `json:"security_policy"`
-	SecurityMode   string  `json:"security_mode"`
-	Username       string  `json:"username,omitempty"`
-	Password       *string `json:"password,omitempty"`
-	Enabled        bool    `json:"enabled"`
+	ID             string                `json:"id,omitempty"`
+	GroupID        string                `json:"group_id"`
+	GroupBindings  []domain.GroupBinding `json:"group_bindings"`
+	Name           string                `json:"name"`
+	Endpoint       string                `json:"endpoint"`
+	SecurityPolicy string                `json:"security_policy"`
+	SecurityMode   string                `json:"security_mode"`
+	Username       string                `json:"username,omitempty"`
+	Password       *string               `json:"password,omitempty"`
+	Enabled        bool                  `json:"enabled"`
 }
 
 type HealthStatus struct {

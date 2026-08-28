@@ -6,6 +6,8 @@
 pub const OPCUA_BIND_HOST: &str = "0.0.0.0";
 /// OPC UA 默认监听端口。
 pub const OPCUA_BIND_PORT: u16 = 4840;
+/// 独立部署/联调可覆盖监听端口，未设置时保留原来的 4840。
+pub const OPCUA_PORT_ENV: &str = "RCD_OPCUA_PORT";
 /// 命令 ACK 状态回写检查间隔。
 pub const ACK_STATUS_DRAIN_INTERVAL_MS: u64 = 50;
 /// OPC UA 大批量 Browse / 订阅的变量数余量。
@@ -33,6 +35,7 @@ use log::{debug, info, warn};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+use super::topology::{publish_topology, TopologyManifest, TOPOLOGY_NAMESPACE_URI};
 use crate::broadcast::Broadcaster;
 use crate::calc_engine::config::{normalize_data_type, CalcDataType};
 use crate::calc_engine::engine::CalcEngine;
@@ -413,9 +416,11 @@ pub async fn run_opcua_server(
     cancel: CancellationToken,
 ) -> io::Result<()> {
     validate_opcua_kks_namespace(&serial_ports, &calc_engine)?;
+    let topology = TopologyManifest::build(&serial_ports, &calc_engine)?;
+    let topology_json = topology.to_json()?;
     let variable_counts = count_opcua_variables(&serial_ports, &calc_engine);
 
-    let port: u16 = OPCUA_BIND_PORT;
+    let port = parse_opcua_bind_port(std::env::var_os(OPCUA_PORT_ENV).as_deref())?;
     let base = format!("opc.tcp://{}:{}/", advertised_host, port);
 
     // ---- 构建 OPC UA 服务器 ----
@@ -456,10 +461,27 @@ pub async fn run_opcua_server(
             },
             "simple",
         ))
+        // 追加注册，保持原 ns=0/1/2 的顺序和所有业务 NodeId 不变。
+        .with_node_manager(simple_node_manager(
+            NamespaceMetadata {
+                namespace_uri: TOPOLOGY_NAMESPACE_URI.to_owned(),
+                namespace_version: Some("1".into()),
+                ..Default::default()
+            },
+            "topology",
+        ))
         .trust_client_certs(true)
         .diagnostics_enabled(true);
 
-    let limit_target = configure_opcua_limits(&mut builder, variable_counts.total());
+    let limit_target = configure_opcua_limits(
+        &mut builder,
+        variable_counts
+            .total()
+            .saturating_add(topology.metadata_variable_count()),
+    );
+    // Manifest 是一个原子 JSON String，正常的大点表可能超过库默认的 64 KiB。
+    let limits = builder.limits_mut();
+    limits.max_string_length = limits.max_string_length.max(topology_json.len());
     info!(
         "[OPC UA] 变量规划: 设备变量={}, 写命令变量={}, 计算变量={}, 总变量={}, 动态限制={}, min_sampling_interval_ms={}",
         variable_counts.device_variables,
@@ -488,12 +510,19 @@ pub async fn run_opcua_server(
 
     let node_manager: Arc<SimpleNodeManager> = handle
         .node_managers()
-        .get_of_type::<SimpleNodeManager>()
+        .get_by_name::<SimpleNodeManager>("simple")
         .expect("获取节点管理器失败");
+    let topology_manager: Arc<SimpleNodeManager> = handle
+        .node_managers()
+        .get_by_name::<SimpleNodeManager>("topology")
+        .expect("获取拓扑节点管理器失败");
     let subscriptions: Arc<SubscriptionCache> = handle.subscriptions().clone();
     let ns = handle
         .get_namespace_index("urn:SerialServer")
         .expect("自定义命名空间未注册");
+    let topology_ns = handle
+        .get_namespace_index(TOPOLOGY_NAMESPACE_URI)
+        .expect("拓扑命名空间未注册");
 
     // 先建立广播接收器，再创建节点。节点创建期间的状态由最新值缓存承接；
     // 节点就绪后会把接收游标切到通道尾部，再用缓存快照完成一致的初始同步。
@@ -529,6 +558,22 @@ pub async fn run_opcua_server(
 
     // ---- 注册 Method 回调 ----
     register_send_methods(&node_manager, ns, &serial_ports, &txs)?;
+    publish_topology(
+        &topology_manager,
+        &node_manager,
+        topology_ns,
+        ns,
+        &topology,
+        &topology_json,
+    )?;
+    info!(
+        "[OPC UA] 拓扑发布完成: namespace={} ports={} devices={} calculations={} manifest_bytes={}",
+        TOPOLOGY_NAMESPACE_URI,
+        topology.ports.len(),
+        topology.device_count(),
+        topology.calculations.len(),
+        topology_json.len(),
+    );
     register_send_node_write_callbacks(
         &node_manager,
         &send_node_ids,
@@ -958,19 +1003,36 @@ fn validate_opcua_kks_namespace(
 ///
 /// Linux 的 `/dev/ttyAP0` 和 Windows 的 `\\.\COM3` 分别映射为
 /// `ttyAP0`、`COM3`，避免路径分隔符被 OPC 客户端解释为额外层级。
-fn opc_port_stem(port_number: &str) -> &str {
+pub(super) fn opc_port_stem(port_number: &str) -> &str {
     port_number
         .rsplit(['/', '\\'])
         .find(|segment| !segment.is_empty())
         .unwrap_or(port_number)
 }
 
-fn opc_send_node_name(port_number: &str) -> String {
+pub(super) fn opc_send_node_name(port_number: &str) -> String {
     format!("{}_Send", opc_port_stem(port_number))
 }
 
-fn opc_send_method_name(port_number: &str) -> String {
+pub(super) fn opc_send_method_name(port_number: &str) -> String {
     format!("{}_SendCommand", opc_port_stem(port_number))
+}
+
+fn parse_opcua_bind_port(value: Option<&std::ffi::OsStr>) -> io::Result<u16> {
+    let Some(value) = value else {
+        return Ok(OPCUA_BIND_PORT);
+    };
+    let parsed = value
+        .to_str()
+        .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|text| text.parse::<u16>().ok())
+        .filter(|port| *port != 0);
+    parsed.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{OPCUA_PORT_ENV} 必须是 1..65535 的十进制端口，实际值: {value:?}"),
+        )
+    })
 }
 
 /// 计算所有 OPC UA 节点的 browse_name（纯逻辑，便于单元测试）。
@@ -1841,6 +1903,23 @@ mod tests {
         assert_eq!(opc_port_stem("COM4"), "COM4");
         assert_eq!(opc_send_node_name("/dev/ttyAP0"), "ttyAP0_Send");
         assert_eq!(opc_send_method_name("/dev/ttyAP0"), "ttyAP0_SendCommand");
+    }
+
+    #[test]
+    fn opcua_bind_port_override_is_strict_and_default_stays_4840() {
+        use std::ffi::OsStr;
+        assert_eq!(parse_opcua_bind_port(None).unwrap(), 4840);
+        for (text, expected) in [("1", 1), ("4845", 4845), ("65535", 65535)] {
+            assert_eq!(
+                parse_opcua_bind_port(Some(OsStr::new(text))).unwrap(),
+                expected
+            );
+        }
+        for text in ["", "0", "65536", "-1", "+4840", " 4840", "4840 ", "abc"] {
+            let error = parse_opcua_bind_port(Some(OsStr::new(text))).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains(OPCUA_PORT_ENV));
+        }
     }
 
     #[test]

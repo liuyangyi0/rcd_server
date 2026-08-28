@@ -12,6 +12,7 @@ import type {
   Source,
   SourceEvent,
   SourceProbeResult,
+  SourceTopology,
   SystemInfo,
   UaSession,
 } from './types';
@@ -136,6 +137,8 @@ export function normalizeSource(payload: unknown): Source {
   const body = record(payload);
   const points = record(first(body, 'points', 'point_quality', 'pointQuality'));
   const rawConflicts = first(body, 'catalog_conflicts', 'catalogConflicts');
+  const rawBindings = first(body, 'group_bindings', 'groupBindings');
+  const availableGroups = first(body, 'available_group_ids', 'availableGroupIds');
   const catalogConflicts = Array.isArray(rawConflicts) ? rawConflicts.map((value) => {
     const conflict = record(value);
     const sourceIds = first(conflict, 'source_ids', 'sourceIds');
@@ -151,6 +154,11 @@ export function normalizeSource(payload: unknown): Source {
     id: text(first(body, 'id', 'source_id', 'sourceId')),
     name: text(first(body, 'name', 'display_name', 'displayName'), text(first(body, 'id', 'source_id', 'sourceId'))),
     groupId: text(first(body, 'group_id', 'groupId')),
+    groupBindings: Array.isArray(rawBindings) ? rawBindings.map((value) => {
+      const binding = record(value);
+      return { groupId: text(first(binding, 'group_id', 'groupId')), portId: text(first(binding, 'port_id', 'portId')), deviceId: text(first(binding, 'device_id', 'deviceId')) };
+    }) : [],
+    availableGroupIds: Array.isArray(availableGroups) ? availableGroups.map((value) => text(value)) : undefined,
     endpoint: text(first(body, 'endpoint', 'endpoint_url', 'endpointUrl')),
     securityPolicy: text(first(body, 'security_policy', 'securityPolicy'), 'None'),
     securityMode: text(first(body, 'security_mode', 'securityMode'), 'None'),
@@ -197,6 +205,47 @@ export function normalizeSession(payload: unknown): UaSession {
   };
 }
 
+export function normalizeSourceTopology(payload: unknown): SourceTopology {
+  const body = record(unwrap(payload));
+  const rawPorts = first(body, 'ports');
+  const groupId = text(first(body, 'group_id', 'groupId', 'default_group_id', 'defaultGroupId'));
+  return {
+    sourceId: text(first(body, 'source_id', 'sourceId')),
+    groupId,
+    supported: bool(first(body, 'supported')),
+    catalogState: text(first(body, 'catalog_state', 'catalogState'), 'Unknown'),
+    revision: number(first(body, 'revision')),
+    schemaVersion: number(first(body, 'schema_version', 'schemaVersion')),
+    calculationCount: number(first(body, 'calculation_count', 'calculationCount')),
+    crossDeviceCalculationCount: number(first(body, 'cross_device_calculation_count', 'crossDeviceCalculationCount')),
+    unassignedPointCount: number(first(body, 'unassigned_point_count', 'unassignedPointCount')),
+    ports: Array.isArray(rawPorts) ? rawPorts.map((value) => {
+      const port = record(value);
+      const rawDevices = first(port, 'devices');
+      return {
+        portId: text(first(port, 'port_id', 'portId')),
+        portName: text(first(port, 'port_name', 'portName')),
+        sendNodeId: text(first(port, 'send_node_id', 'sendNodeId')),
+        sendMethodId: text(first(port, 'send_method_id', 'sendMethodId')),
+        pointCount: number(first(port, 'point_count', 'pointCount')),
+        devices: Array.isArray(rawDevices) ? rawDevices.map((item) => {
+          const device = record(item);
+          return {
+            deviceId: text(first(device, 'device_id', 'deviceId')),
+            deviceAddress: number(first(device, 'device_address', 'deviceAddress')),
+            name: text(first(device, 'name')),
+            kksPrefix: text(first(device, 'kks_prefix', 'kksPrefix')),
+            pointCount: number(first(device, 'point_count', 'pointCount')),
+            calculationCount: number(first(device, 'calculation_count', 'calculationCount')),
+            groupId: text(first(device, 'group_id', 'groupId'), groupId),
+            bound: bool(first(device, 'bound')),
+          };
+        }) : [],
+      };
+    }) : [],
+  };
+}
+
 export function normalizePoint(payload: unknown): Point {
   const body = record(payload);
   const node = record(first(body, 'node'));
@@ -208,7 +257,10 @@ export function normalizePoint(payload: unknown): Point {
     nodeId: text(first(body, 'node_id', 'nodeId', 'kks', 'id'), identifier),
     browseName: text(first(body, 'browse_name', 'browseName', 'name'), text(first(node, 'browse_name', 'browseName'), identifier)),
 		nodeClass: text(first(body, 'node_class', 'nodeClass'), text(first(node, 'class', 'node_class', 'nodeClass'), 'Variable')),
-    groupId: text(first(body, 'group_id', 'groupId')),
+    groupId: text(first(body, 'group_id', 'groupId'), text(first(node, 'group_id', 'groupId'))),
+    portId: text(first(body, 'port_id', 'portId') ?? first(node, 'port_id', 'portId')) || undefined,
+    deviceId: text(first(body, 'device_id', 'deviceId') ?? first(node, 'device_id', 'deviceId')) || undefined,
+    kind: text(first(body, 'kind') ?? first(node, 'kind')) || undefined,
     selectedSourceId: text(first(body, 'selected_source_id', 'selectedSourceId', 'source_id', 'sourceId')) || undefined,
     dataType: text(first(body, 'data_type', 'dataType'), text(first(node, 'data_type', 'dataType'), text(first(sample, 'type'), 'Unknown'))),
     value: first(sample, 'value') ?? first(body, 'value', 'display_value', 'displayValue'),

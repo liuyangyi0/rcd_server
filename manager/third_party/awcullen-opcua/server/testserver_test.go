@@ -7,6 +7,7 @@ import (
 	_ "embed"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/awcullen/opcua/server"
 	"github.com/awcullen/opcua/ua"
@@ -14,8 +15,10 @@ import (
 )
 
 var (
-	host, _         = os.Hostname()
-	port            = 46010
+	host, _ = os.Hostname()
+	// Keep the server suite independent of the client suite's example port.
+	port            = 46011
+	testServerName  = fmt.Sprintf("testserver@%s-test-%d-%d", host, os.Getpid(), time.Now().UnixNano())
 	SoftwareVersion = "1.0.0"
 	//go:embed testnodeset_test.xml
 	testnodeset []byte
@@ -40,7 +43,7 @@ func NewTestServer() (*server.Server, error) {
 			ApplicationURI: fmt.Sprintf("urn:%s:testserver", host),
 			ProductURI:     "http://github.com/awcullen/opcua",
 			ApplicationName: ua.LocalizedText{
-				Text:   fmt.Sprintf("testserver@%s", host),
+				Text:   testServerName,
 				Locale: "en",
 			},
 			ApplicationType:     ua.ApplicationTypeServer,

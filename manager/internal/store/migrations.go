@@ -103,6 +103,16 @@ var migrations = []string{
 	);
 	CREATE UNIQUE INDEX alarms_open_source_kind_idx ON alarms(source_id, kind) WHERE state = 'Open';
 	CREATE INDEX alarms_state_updated_idx ON alarms(state, updated_at DESC);`,
+	`ALTER TABLE sources ADD COLUMN group_bindings TEXT NOT NULL DEFAULT '[]';
+	ALTER TABLE catalog_nodes ADD COLUMN group_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE catalog_nodes ADD COLUMN port_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE catalog_nodes ADD COLUMN device_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE catalog_nodes ADD COLUMN kind TEXT NOT NULL DEFAULT '';
+	CREATE TABLE source_topology (
+		source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+		manifest TEXT NOT NULL,
+		discovered_at TEXT NOT NULL
+	);`,
 }
 
 func migrate(ctx context.Context, db *sql.DB) error {

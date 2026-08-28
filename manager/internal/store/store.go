@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -161,6 +162,28 @@ func (r *Repository) DeleteGroupCascade(ctx context.Context, id string, expected
 	if actual != expectedRevision {
 		return &domain.RevisionConflictError{Expected: expectedRevision, Actual: actual}
 	}
+	sourceRows, err := tx.QueryContext(ctx, sourceSelect)
+	if err != nil {
+		return err
+	}
+	for sourceRows.Next() {
+		source, scanErr := scanSource(sourceRows)
+		if scanErr != nil {
+			sourceRows.Close()
+			return scanErr
+		}
+		if len(source.GroupBindings) > 0 && source.HasGroup(id) {
+			sourceRows.Close()
+			return domain.ErrGroupInUse
+		}
+	}
+	if err := sourceRows.Err(); err != nil {
+		sourceRows.Close()
+		return err
+	}
+	if err := sourceRows.Close(); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM sources WHERE group_id = ?`, id); err != nil {
 		return fmt.Errorf("delete group sources: %w", err)
 	}
@@ -185,6 +208,11 @@ func (r *Repository) CreateSource(ctx context.Context, source domain.Source, pas
 	if err := validateSource(source); err != nil {
 		return domain.Source{}, err
 	}
+	for _, binding := range source.GroupBindings {
+		if _, err := r.GetGroup(ctx, binding.GroupID); err != nil {
+			return domain.Source{}, fmt.Errorf("binding group %q does not exist: %w", binding.GroupID, domain.ErrInvalid)
+		}
+	}
 	cipher, err := r.protectPassword(ctx, password)
 	if err != nil {
 		return domain.Source{}, err
@@ -198,10 +226,10 @@ func (r *Repository) CreateSource(ctx context.Context, source domain.Source, pas
 		source.CatalogState = domain.CatalogDiscovering
 	}
 	_, err = r.db.ExecContext(ctx, `INSERT INTO sources
-		(id, group_id, name, endpoint, security_policy, security_mode, username, password_cipher, enabled, catalog_state, revision, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(id, group_id, name, endpoint, security_policy, security_mode, username, password_cipher, enabled, catalog_state, revision, created_at, updated_at, group_bindings)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		source.ID, source.GroupID, source.Name, source.Endpoint, source.SecurityPolicy, source.SecurityMode,
-		source.Username, nullableBytes(cipher), boolInt(source.Enabled), source.CatalogState, source.Revision, encodeTime(now), encodeTime(now))
+		source.Username, nullableBytes(cipher), boolInt(source.Enabled), source.CatalogState, source.Revision, encodeTime(now), encodeTime(now), encodeBindings(source.GroupBindings))
 	if isConstraint(err) {
 		if _, lookupErr := r.GetSource(ctx, source.ID); lookupErr == nil {
 			return domain.Source{}, domain.ErrAlreadyExists
@@ -241,6 +269,12 @@ func (r *Repository) updateSource(ctx context.Context, source domain.Source, pas
 		return domain.Source{}, fmt.Errorf("begin source update: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	for _, binding := range source.GroupBindings {
+		var id string
+		if err := tx.QueryRowContext(ctx, `SELECT id FROM groups WHERE id=?`, binding.GroupID).Scan(&id); err != nil {
+			return domain.Source{}, fmt.Errorf("binding group %q does not exist: %w", binding.GroupID, domain.ErrInvalid)
+		}
+	}
 	var result sql.Result
 	if password == nil {
 		result, err = tx.ExecContext(ctx, `UPDATE sources SET group_id = ?, name = ?, endpoint = ?, security_policy = ?, security_mode = ?, username = ?, enabled = ?, revision = revision + 1, updated_at = ? WHERE id = ? AND revision = ?`,
@@ -264,7 +298,13 @@ func (r *Repository) updateSource(ctx context.Context, source domain.Source, pas
 	if err := requireMutationTx(ctx, tx, result, "sources", source.ID, expectedRevision); err != nil {
 		return domain.Source{}, err
 	}
+	if _, err := tx.ExecContext(ctx, `UPDATE sources SET group_bindings = ? WHERE id = ?`, encodeBindings(source.GroupBindings), source.ID); err != nil {
+		return domain.Source{}, err
+	}
 	if resetCatalog {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM source_topology WHERE source_id = ?`, source.ID); err != nil {
+			return domain.Source{}, err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM catalog_nodes WHERE source_id = ?`, source.ID); err != nil {
 			return domain.Source{}, fmt.Errorf("clear source catalog: %w", err)
 		}
@@ -333,7 +373,7 @@ func (r *Repository) SourceCredential(ctx context.Context, id string) (username,
 
 const sourceSelect = `SELECT id, group_id, name, endpoint, security_policy, security_mode, username,
 	CASE WHEN password_cipher IS NULL OR length(password_cipher) = 0 THEN 0 ELSE 1 END,
-	enabled, catalog_state, revision, created_at, updated_at FROM sources`
+	enabled, catalog_state, revision, created_at, updated_at, group_bindings FROM sources`
 
 type scanner interface{ Scan(...any) error }
 
@@ -360,15 +400,19 @@ func scanSource(row scanner) (domain.Source, error) {
 	var source domain.Source
 	var hasPassword, enabled int
 	var created, updated string
+	var bindings string
 	if err := row.Scan(&source.ID, &source.GroupID, &source.Name, &source.Endpoint, &source.SecurityPolicy,
 		&source.SecurityMode, &source.Username, &hasPassword, &enabled, &source.CatalogState,
-		&source.Revision, &created, &updated); err != nil {
+		&source.Revision, &created, &updated, &bindings); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return domain.Source{}, domain.ErrNotFound
 		}
 		return domain.Source{}, fmt.Errorf("scan source: %w", err)
 	}
 	source.HasPassword = hasPassword != 0
+	if err := json.Unmarshal([]byte(bindings), &source.GroupBindings); err != nil {
+		return domain.Source{}, fmt.Errorf("decode source bindings: %w", err)
+	}
 	source.Enabled = enabled != 0
 	var err error
 	if source.CreatedAt, err = decodeTime(created); err != nil {
@@ -445,7 +489,15 @@ func validateSource(source domain.Source) error {
 			return &domain.FieldError{Field: field, Message: "must not be empty"}
 		}
 	}
-	return nil
+	return domain.ValidateGroupBindings(source.GroupBindings)
+}
+
+func encodeBindings(bindings []domain.GroupBinding) string {
+	if len(bindings) == 0 {
+		return "[]"
+	}
+	encoded, _ := json.Marshal(bindings)
+	return string(encoded)
 }
 
 func boolInt(value bool) int {

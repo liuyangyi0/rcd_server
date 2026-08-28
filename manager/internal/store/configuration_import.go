@@ -46,10 +46,10 @@ func (r *Repository) ImportEmptyConfiguration(ctx context.Context, groups []doma
 		sources[index].HasPassword = false
 		if _, err := tx.ExecContext(ctx, `INSERT INTO sources
 			(id, group_id, name, endpoint, security_policy, security_mode, username, password_cipher, enabled,
-			catalog_state, revision, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 1, ?, ?)`,
+			catalog_state, revision, created_at, updated_at, group_bindings) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 1, ?, ?, ?)`,
 			sources[index].ID, sources[index].GroupID, sources[index].Name, sources[index].Endpoint,
 			sources[index].SecurityPolicy, sources[index].SecurityMode, sources[index].Username, boolInt(sources[index].Enabled),
-			domain.CatalogDiscovering, encodeTime(now), encodeTime(now)); err != nil {
+			domain.CatalogDiscovering, encodeTime(now), encodeTime(now), encodeBindings(sources[index].GroupBindings)); err != nil {
 			return nil, nil, fmt.Errorf("import source %s: %w", sources[index].ID, err)
 		}
 	}

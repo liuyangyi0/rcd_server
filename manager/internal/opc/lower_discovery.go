@@ -57,9 +57,13 @@ func discoverCatalog(
 	}
 	nodes := append(variables, methods...)
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Key.Identifier < nodes[j].Key.Identifier })
+	topology, err := discoverTopology(ctx, client, namespaces, nodes)
+	if err != nil {
+		return domain.SourceCatalog{}, nil, err
+	}
 	return domain.SourceCatalog{
 		SourceID: source.ID, GroupID: source.GroupID, State: domain.CatalogReady,
-		DiscoveredAt: time.Now().UTC(), Nodes: nodes,
+		DiscoveredAt: time.Now().UTC(), Nodes: nodes, Topology: topology,
 	}, observed, nil
 }
 

@@ -1,4 +1,7 @@
 import type { Alarm, CommandAudit, ConfigurationDocument, Group, ManagementAudit, Overview, Point, Source, SourceEvent, SystemInfo, UaSession } from './types';
+import { ApiError } from './client';
+import { normalizeSource } from './normalizers';
+import { sameBindings, sourceGroupIds, sourceHasGroup } from '../lib/sourceGroups';
 
 const groups: Group[] = [
   { id: 'fire-panel-a', name: 'fire-panel-a', defaultSourceId: 'rcd-a-01', selectedSourceId: 'rcd-a-01', selectionRevision: 6, sourceCount: 3, goodPoints: 10609, badPoints: 24, totalPoints: 10633, pendingCommandCount: 0, lastSelectedAt: new Date(Date.now() - 120000).toISOString(), status: 'bad' },
@@ -21,11 +24,20 @@ const sessions: UaSession[] = [
   { id: 'session-a14c', clientName: 'Historian', remoteAddress: '10.20.0.42:60901', connectedAt: new Date(Date.now() - 7200000).toISOString(), lastSeenAt: new Date().toISOString(), selectionRevision: 2, selectedSources: { 'fire-panel-a': 'rcd-a-02', 'fire-panel-b': 'rcd-b-01', 'pump-station-1': 'rcd-p-01', 'ahu-system': 'rcd-h-02' }, routeRevisions: { 'fire-panel-a': 2, 'fire-panel-b': 1, 'pump-station-1': 1, 'ahu-system': 1 } },
 ];
 
+for (const source of sources.slice(0, 3)) {
+  const portId = source.id === 'rcd-a-02' ? '/dev/ttyUSB1' : '/dev/ttyS0';
+  source.groupBindings = [{ groupId: 'fire-panel-a', portId, deviceId: '1' }, { groupId: 'fire-panel-b', portId, deviceId: '2' }];
+  source.availableGroupIds = sourceGroupIds(source);
+}
+
 const points: Point[] = Array.from({ length: 126 }, (_, index) => ({
   nodeId: `KKS-${String(index + 1).padStart(5, '0')}`,
   browseName: `KKS-${String(index + 1).padStart(5, '0')}`,
 	nodeClass: 'Variable',
   groupId: groups[index % groups.length].id,
+  portId: '/dev/ttyS0',
+  deviceId: String(index % 2 + 1),
+  kind: index % 13 === 0 ? 'calculation' : 'point',
   selectedSourceId: groups[index % groups.length].defaultSourceId,
   dataType: index % 7 === 0 ? 'Boolean' : index % 3 === 0 ? 'Double' : 'UInt32',
   value: index % 7 === 0 ? index % 2 === 0 : Number((index * 1.73).toFixed(2)),
@@ -56,7 +68,7 @@ const managementAudit: ManagementAudit[] = [{ id: 1, kind: 'source.update', acto
 const configuration: ConfigurationDocument = {
   schema_version: 1,
   groups: groups.map((group) => ({ id: group.id, name: group.name, default_source_id: group.defaultSourceId })),
-  sources: sources.map((source) => ({ id: source.id, group_id: source.groupId, name: source.name, endpoint: source.endpoint, security_policy: source.securityPolicy, security_mode: source.securityMode, username: source.username, enabled: source.enabled })),
+  sources: sources.map((source) => ({ id: source.id, group_id: source.groupId, group_bindings: source.groupBindings?.map((binding) => ({ group_id: binding.groupId, port_id: binding.portId, device_id: binding.deviceId })), name: source.name, endpoint: source.endpoint, security_policy: source.securityPolicy, security_mode: source.securityMode, username: source.username, enabled: source.enabled })),
 };
 const systemInfo: SystemInfo = {
   opcEndpoint: 'opc.tcp://127.0.0.1:4840', httpListen: '0.0.0.0:8080', dataDirectory: 'C:\\ProgramData\\RcdManager', databasePath: 'C:\\ProgramData\\RcdManager\\manager.db', logDirectory: 'C:\\ProgramData\\RcdManager\\logs',
@@ -89,16 +101,35 @@ export async function mockRequest(path: string, init: RequestInit): Promise<unkn
   const segments = url.pathname.split('/').filter(Boolean);
 
   if (method === 'GET' && url.pathname === '/overview') return overview;
-  if (method === 'GET' && url.pathname === '/groups') return { items: groups };
+  if (method === 'GET' && url.pathname === '/groups') return { items: groups.map((group) => ({ ...group, sourceCount: sources.filter((source) => sourceHasGroup(source, group.id)).length })) };
   if (method === 'GET' && url.pathname === '/sources') {
     const groupId = url.searchParams.get('group_id');
-    return { items: groupId ? sources.filter((source) => source.groupId === groupId) : sources };
+    return { items: groupId ? sources.filter((source) => sourceHasGroup(source, groupId)) : sources };
+  }
+  if (method === 'GET' && segments[0] === 'sources' && segments[2] === 'topology') {
+    const source = sources.find((item) => item.id === decodeURIComponent(segments[1]));
+    if (!source) throw new ApiError(404, { message: '来源不存在' }, '来源不存在');
+    const supported = source.id.startsWith('rcd-a-');
+    const portId = source.id === 'rcd-a-02' ? '/dev/ttyUSB1' : '/dev/ttyS0';
+    const portName = portId.split('/').pop()!;
+    return {
+      source_id: source.id, group_id: source.groupId, revision: source.revision, supported, schema_version: supported ? 1 : 0,
+      catalog_state: source.catalogState, calculation_count: 3, cross_device_calculation_count: 1, unassigned_point_count: 3,
+      ports: supported ? [{ port_id: portId, port_name: portName, send_node_id: `${portName}_Send`, send_method_id: `${portName}_SendCommand`, point_count: 12, devices: [1, 2].map((id) => {
+        const binding = source.groupBindings?.find((item) => item.portId === portId && item.deviceId === String(id));
+        return { device_id: String(id), device_address: id, name: `设备 ${id}`, kks_prefix: `UNIT${id}`, point_count: 6, calculation_count: 1, group_id: binding?.groupId ?? source.groupId, bound: Boolean(binding) };
+      }) }] : [],
+    };
   }
   if (method === 'GET' && url.pathname === '/sessions') return { items: sessions };
   if (method === 'GET' && url.pathname === '/points') {
     const query = (url.searchParams.get('q') ?? '').toLowerCase();
     const groupId = url.searchParams.get('group_id');
-    const filtered = points.filter((point) => (!query || point.nodeId.toLowerCase().includes(query)) && (!groupId || point.groupId === groupId));
+    const portId = url.searchParams.get('port_id');
+    const deviceId = url.searchParams.get('device_id');
+    const catalogSource = sources.find((source) => source.id === url.searchParams.get('source_id'));
+    const filtered = points.filter((point) => (!query || point.nodeId.toLowerCase().includes(query)) && (!groupId || point.groupId === groupId) &&
+      (!catalogSource || sourceHasGroup(catalogSource, point.groupId)) && (!portId || point.portId === portId) && (!deviceId || point.deviceId === deviceId));
     return page(filtered, url);
   }
   if (method === 'GET' && url.pathname === '/commands') return page(commands, url);
@@ -121,6 +152,18 @@ export async function mockRequest(path: string, init: RequestInit): Promise<unkn
     source.subscriptionState = 'Inactive';
     source.reconnectCount += 1;
     return source;
+  }
+  if (method === 'PUT' && segments[0] === 'sources' && segments.length === 2) {
+    const index = sources.findIndex((item) => item.id === decodeURIComponent(segments[1]));
+    if (index < 0) throw new ApiError(404, { message: '来源不存在' }, '来源不存在');
+    const previous = sources[index];
+    if (new Headers(init.headers).get('If-Match') !== `"${previous.revision}"`) throw new ApiError(409, { message: '配置版本冲突' }, '配置版本冲突');
+    const body = bodyOf(init);
+    const next = normalizeSource({ ...previous, ...body, has_password: body.password === undefined ? previous.hasPassword : Boolean(body.password), revision: previous.revision + 1 });
+    if (sessions.length > 0 && (next.groupId !== previous.groupId || !sameBindings(next.groupBindings ?? [], previous.groupBindings ?? []))) throw new ApiError(409, { message: '存在在线 Session，不能修改设备映射' }, '设备映射已锁定');
+    next.availableGroupIds = sourceGroupIds(next);
+    sources[index] = next;
+    return next;
   }
   if (method === 'POST' && url.pathname === '/configuration/import') {
     const input = bodyOf(init);

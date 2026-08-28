@@ -218,6 +218,12 @@ func (s *LowerSupervisor) runConnection(parent context.Context, epoch uint64) er
 	catalog, nodes, err := discoverCatalog(discoveryCtx, client, s.cfg.Source, namespaces)
 	cancelDiscovery()
 	if err != nil {
+		if errors.Is(err, ErrInvalidTopology) {
+			s.updateStatus(func(st *LowerStatus) {
+				st.Catalog = domain.CatalogConflict
+				st.LastError = err.Error()
+			})
+		}
 		return fmt.Errorf("discover source %s: %w", s.cfg.Source.ID, err)
 	}
 	s.sink.OnCatalog(catalog)

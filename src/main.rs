@@ -390,31 +390,77 @@ async fn init_serial_ports(
 fn load_and_group_csv_configs() -> io::Result<Vec<SerialPortConfig>> {
     let config_dir =
         config::config_dir().map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
+    load_and_group_csv_configs_from_dir(&config_dir)
+}
 
-    let csv_files = file_scanner::read_and_process_files(&config_dir, r"^rcd.*\.csv$")?;
+fn load_and_group_csv_configs_from_dir(config_dir: &Path) -> io::Result<Vec<SerialPortConfig>> {
+    let mut csv_files = file_scanner::read_and_process_files(config_dir, r"^rcd.*\.csv$")?;
+    csv_files.sort();
 
     let mut configs: HashMap<String, SerialPortConfig> = HashMap::new();
 
     for file in &csv_files {
-        match csv_parser::parse_csv(file) {
-            Ok((conf, recs)) => {
-                let device = DeviceConfig::new(conf.clone(), recs);
-                configs
-                    .entry(conf.com.clone())
-                    .or_insert_with(|| SerialPortConfig::from_csv_config(&conf))
-                    .devices
-                    .push(device);
-            }
-            Err(e) => warn!("解析 CSV {:?} 失败: {}", file, e),
-        }
+        // 不允许跳过坏文件后发布一份看似成功但实际漏设备的拓扑。
+        // 该阶段尚未打开串口；先校验全部 CSV，再启动采集。
+        let (conf, recs) = csv_parser::parse_csv(file).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("解析设备配置 CSV {file:?} 失败，拒绝启动: {error}"),
+            )
+        })?;
+        let device = DeviceConfig::new(conf.clone(), recs);
+        configs
+            .entry(conf.com.clone())
+            .or_insert_with(|| SerialPortConfig::from_csv_config(&conf))
+            .devices
+            .push(device);
     }
 
-    Ok(configs.into_values().collect())
+    let mut ports: Vec<_> = configs.into_values().collect();
+    ports.sort_by(|left, right| left.port_number.cmp(&right.port_number));
+    Ok(ports)
 }
 
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+
+    fn device_csv(address: &str) -> String {
+        format!(
+            "com,COM1,,,,,,,\n\
+             baud_rate,115200,,,,,,,\n\
+             is_special,false,,,,,,,\n\
+             com_index,1,,,,,,,\n\
+             device_id,{address},,,,,,,\n\
+             data_len,8,,,,,,,\n\
+             kks_prefix,DEV{address}_,,,,,,,\n\
+             kks,type_,f_type,byte_index,bit_index,def,max,min,lh\n\
+             TEMP,uint,status,1,0,0,255,0,0\n"
+        )
+    }
+
+    #[test]
+    fn csv_loading_rejects_invalid_device_address_instead_of_omitting_device() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rcd_a.csv"), device_csv("1")).unwrap();
+        std::fs::write(dir.path().join("rcd_b.csv"), device_csv("256")).unwrap();
+        let error = load_and_group_csv_configs_from_dir(dir.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("rcd_b.csv"));
+        assert!(error.to_string().contains("device_id"));
+    }
+
+    #[test]
+    fn csv_loading_groups_all_valid_devices_and_preserves_rcd_address_range() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rcd_a.csv"), device_csv("0")).unwrap();
+        std::fs::write(dir.path().join("rcd_b.csv"), device_csv("255")).unwrap();
+        let ports = load_and_group_csv_configs_from_dir(dir.path()).unwrap();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].devices.len(), 2);
+        assert_eq!(ports[0].devices[0].config.device_id, 0);
+        assert_eq!(ports[0].devices[1].config.device_id, 255);
+    }
 
     #[test]
     fn instance_lock_rejects_a_second_holder_and_releases_on_drop() {

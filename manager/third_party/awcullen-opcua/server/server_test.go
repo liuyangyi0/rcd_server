@@ -30,33 +30,126 @@ var (
 	endpointURL = fmt.Sprintf("opc.tcp://%s:%d", host, port) // our testserver
 )
 
-// TestMain is run at the start of client testing. If an opcua server is not already running,
-// then testserver is started.
+// TestMain owns a package-local server unless OPCUA_TEST_ENDPOINT explicitly
+// selects an external one. External servers are never started or stopped here.
+// The client examples retain their documented localhost:46010 endpoint; use
+// -run '^Test' when selecting an external endpoint on another host or port.
 func TestMain(m *testing.M) {
+	os.Exit(runTestSuite(m))
+}
+
+func runTestSuite(m *testing.M) (result int) {
 	if err := ensurePKI(); err != nil {
-		fmt.Println(errors.Wrap(err, "Error creating pki"))
-		os.Exit(1)
+		fmt.Fprintln(os.Stderr, errors.Wrap(err, "Error creating pki"))
+		return 1
 	}
-	// check if server is listening at endpointURL
-	_, err := client.FindServers(context.Background(), &ua.FindServersRequest{EndpointURL: endpointURL})
-	if err != nil {
-		// if a server is not listening, start our TestServer.
-		srv, err := NewTestServer()
-		if err != nil {
-			fmt.Println(errors.Wrap(err, "Error constructing server"))
-			os.Exit(2)
+	if external := strings.TrimSpace(os.Getenv("OPCUA_TEST_ENDPOINT")); external != "" {
+		endpointURL = external
+		if err := waitForTestServer(endpointURL, "", nil); err != nil {
+			fmt.Fprintln(os.Stderr, errors.Wrap(err, "External test server is not ready"))
+			return 2
 		}
-		defer srv.Close()
-		go func() {
-			if err := srv.ListenAndServe(); err != ua.BadServerHalted {
-				fmt.Println(errors.Wrap(err, "Error starting server"))
-				os.Exit(3)
-			}
-		}()
+		return m.Run()
 	}
-	// run the tests
-	res := m.Run()
-	defer os.Exit(res)
+
+	srv, err := NewTestServer()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, errors.Wrap(err, "Error constructing server"))
+		return 2
+	}
+	var serveErr error
+	serveDone := make(chan struct{})
+	go func() {
+		serveErr = srv.ListenAndServe()
+		close(serveDone)
+	}()
+	defer func() {
+		// Close must run before TestMain calls os.Exit. It also releases the
+		// namespace/session workers when startup failed before tests began.
+		if err := srv.Close(); err != nil {
+			fmt.Fprintln(os.Stderr, errors.Wrap(err, "Error closing test server"))
+			result = 3
+		}
+		select {
+		case <-serveDone:
+			if serveErr != ua.BadServerHalted {
+				fmt.Fprintln(os.Stderr, errors.Wrap(serveErr, "Test server stopped unexpectedly"))
+				result = 3
+			}
+		case <-time.After(10 * time.Second):
+			fmt.Fprintln(os.Stderr, "Timed out waiting for test server to stop")
+			result = 3
+		}
+	}()
+
+	if err := waitForTestServer(endpointURL, testServerName, serveDone); err != nil {
+		fmt.Fprintln(os.Stderr, errors.Wrap(err, "Test server is not ready"))
+		return 3
+	}
+	return m.Run()
+}
+
+func waitForTestServer(endpoint, expectedName string, serveDone <-chan struct{}) error {
+	select {
+	case <-serveDone:
+		return errors.New("test server exited before becoming ready")
+	default:
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ready := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(25 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			response, err := client.FindServers(ctx, &ua.FindServersRequest{EndpointURL: endpoint})
+			if err == nil && response != nil {
+				for _, application := range response.Servers {
+					if expectedName == "" || application.ApplicationName.Text == expectedName {
+						ready <- nil
+						return
+					}
+				}
+				ready <- fmt.Errorf("endpoint %s belongs to another server; refusing to borrow it", endpoint)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				ready <- ctx.Err()
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	// The outer deadline also bounds the legacy discovery client's TCP
+	// handshake, which does not honor context cancellation at every step.
+	select {
+	case <-serveDone:
+		return errors.New("test server exited before becoming ready")
+	case err := <-ready:
+		select {
+		case <-serveDone:
+			return errors.New("test server exited before becoming ready")
+		default:
+			return err
+		}
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for %s: %w", endpoint, ctx.Err())
+	}
+}
+
+func TestWaitForTestServerRejectsAnotherApplication(t *testing.T) {
+	if err := waitForTestServer(endpointURL, testServerName+"-not-this-server", nil); err == nil {
+		t.Fatal("readiness accepted a server owned by another test process")
+	}
+}
+
+func TestWaitForTestServerRejectsExitedServer(t *testing.T) {
+	stopped := make(chan struct{})
+	close(stopped)
+	if err := waitForTestServer(endpointURL, testServerName, stopped); err == nil {
+		t.Fatal("readiness accepted an exited server")
+	}
 }
 
 // TestDiscoveryClient discovers connection information about a server.

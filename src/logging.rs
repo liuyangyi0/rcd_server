@@ -389,28 +389,28 @@ mod tests {
 
     #[test]
     fn log_dir_is_next_to_exe() {
-        let exe = PathBuf::from(r"C:\deploy\rcd_server.exe");
-        assert_eq!(
-            log_dir_for_exe(&exe, None),
-            PathBuf::from(r"C:\deploy\logs")
-        );
+        let deploy: PathBuf = std::env::temp_dir().join("rcd-path-tests");
+        let exe = deploy.join("rcd_server.exe");
+        assert_eq!(log_dir_for_exe(&exe, None), deploy.join("logs"));
     }
 
     #[test]
     fn relative_log_dir_is_next_to_exe() {
-        let exe = PathBuf::from(r"C:\deploy\rcd_server.exe");
+        let deploy: PathBuf = std::env::temp_dir().join("rcd-path-tests");
+        let exe = deploy.join("rcd_server.exe");
         assert_eq!(
             log_dir_for_exe(&exe, Some("runtime_logs")),
-            PathBuf::from(r"C:\deploy\runtime_logs")
+            deploy.join("runtime_logs")
         );
     }
 
     #[test]
     fn config_path_is_next_to_exe() {
-        let exe = PathBuf::from(r"C:\deploy\rcd_server.exe");
+        let deploy: PathBuf = std::env::temp_dir().join("rcd-path-tests");
+        let exe = deploy.join("rcd_server.exe");
         assert_eq!(
             config_path_for_exe(&exe),
-            PathBuf::from(r"C:\deploy\config\config.toml")
+            deploy.join("config").join("config.toml")
         );
     }
 

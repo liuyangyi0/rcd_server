@@ -17,8 +17,10 @@ import (
 )
 
 var (
-	host, _         = os.Hostname()
+	host, _ = os.Hostname()
+	// The executable client examples use localhost:46010.
 	port            = 46010
+	testServerName  = fmt.Sprintf("testserver@%s-test-%d-%d", host, os.Getpid(), time.Now().UnixNano())
 	SoftwareVersion = "1.0.0"
 	//go:embed testnodeset_test.xml
 	testnodeset []byte
@@ -52,7 +54,7 @@ func NewTestServer() (*server.Server, error) {
 			ApplicationURI: fmt.Sprintf("urn:%s:testserver", host),
 			ProductURI:     "http://github.com/awcullen/opcua",
 			ApplicationName: ua.LocalizedText{
-				Text:   fmt.Sprintf("testserver@%s", host),
+				Text:   testServerName,
 				Locale: "en",
 			},
 			ApplicationType:     ua.ApplicationTypeServer,

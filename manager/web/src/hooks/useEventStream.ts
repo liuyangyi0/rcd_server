@@ -32,7 +32,8 @@ export function useEventStream(): StreamState {
     const invalidate = (event: MessageEvent<string>) => {
       let envelope: EventEnvelope = { type: event.type || 'message' };
       try {
-        envelope = { ...envelope, ...(JSON.parse(event.data) as EventEnvelope) };
+        const raw = JSON.parse(event.data) as EventEnvelope & { source_id?: string; group_id?: string; session_id?: string };
+        envelope = { ...envelope, ...raw, sourceId: raw.sourceId ?? raw.source_id, groupId: raw.groupId ?? raw.group_id, sessionId: raw.sessionId ?? raw.session_id };
       } catch {
         // Event name is still enough to choose the affected query families.
       }
@@ -48,6 +49,9 @@ export function useEventStream(): StreamState {
         void queryClient.invalidateQueries({ queryKey: queryKeys.groups });
         void queryClient.invalidateQueries({ queryKey: queryKeys.allAlarms });
       }
+      if (type.includes('catalog')) {
+        void queryClient.invalidateQueries({ queryKey: envelope.sourceId ? queryKeys.sourceTopology(envelope.sourceId) : queryKeys.allTopologies });
+      }
       if (eventInvalidatesSourceEvents(type)) void queryClient.invalidateQueries({ queryKey: queryKeys.allSourceEvents });
       // Connection state changes alter every affected point's synthesized
       // quality (for example Good -> BadNoCommunication), while a group change
@@ -60,8 +64,10 @@ export function useEventStream(): StreamState {
         void queryClient.invalidateQueries({ queryKey: queryKeys.groups });
       }
       if (type === 'group.changed') {
-        // Group deletion cascades its sources in the backend.
+        // Membership includes device mappings; group changes refresh the
+        // source list without assuming that physical sources are deleted.
         void queryClient.invalidateQueries({ queryKey: queryKeys.allSources });
+        void queryClient.invalidateQueries({ queryKey: queryKeys.allTopologies });
       }
       if (type.includes('session') || type.includes('selection')) {
         void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });

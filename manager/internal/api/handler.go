@@ -58,6 +58,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /api/v1/sources", h.listSources)
 	h.mux.HandleFunc("POST /api/v1/sources", h.createSource)
 	h.mux.HandleFunc("GET /api/v1/sources/{id}", h.getSource)
+	h.mux.HandleFunc("GET /api/v1/sources/{id}/topology", h.getSourceTopology)
 	h.mux.HandleFunc("PUT /api/v1/sources/{id}", h.updateSource)
 	h.mux.HandleFunc("DELETE /api/v1/sources/{id}", h.deleteSource)
 	h.mux.HandleFunc("POST /api/v1/sources/{id}/probe", h.probeSource)
@@ -665,6 +666,7 @@ func setETag(w http.ResponseWriter, revision uint64) {
 
 func parsePage(r *http.Request) (PageRequest, error) {
 	request := PageRequest{
+		PortID: r.URL.Query().Get("port_id"), DeviceID: r.URL.Query().Get("device_id"),
 		Limit: 100, GroupID: r.URL.Query().Get("group_id"), SourceID: r.URL.Query().Get("source_id"),
 		RouteSourceID: r.URL.Query().Get("route_source_id"), SessionID: r.URL.Query().Get("session_id"),
 		Status: r.URL.Query().Get("status"), Kind: r.URL.Query().Get("kind"), Query: r.URL.Query().Get("q"),

@@ -63,4 +63,18 @@ describe('SourceFormModal', () => {
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(String(init.body))).toMatchObject({ username: 'operator', password: '' });
   });
+
+  it('preserves mappings and the editing revision across background source refreshes', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ...source, revision: 4 }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const mapped = { ...source, groupBindings: [{ portId: '/dev/ttyS0', deviceId: '1', groupId: 'fire' }] };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const view = render(<QueryClientProvider client={client}><SourceFormModal open source={mapped} groups={[group]} onClose={() => undefined} onSaved={() => undefined} /></QueryClientProvider>);
+    view.rerender(<QueryClientProvider client={client}><SourceFormModal open source={{ ...mapped, revision: 3, groupBindings: [] }} groups={[group]} onClose={() => undefined} onSaved={() => undefined} /></QueryClientProvider>);
+    await userEvent.setup().click(screen.getByRole('button', { name: '保存并应用' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(init.headers).toMatchObject({ 'If-Match': '"2"' });
+    expect(JSON.parse(String(init.body))).toHaveProperty('group_bindings', [{ port_id: '/dev/ttyS0', device_id: '1', group_id: 'fire' }]);
+  });
 });

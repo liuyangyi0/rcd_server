@@ -25,6 +25,12 @@ import (
 	"github.com/google/uuid"
 )
 
+// RSA ciphertext is padded to the modulus size. The private exponent may be
+// shorter, so its encoded length must never determine username-token blocks.
+func rsaCiphertextBlockSize(key *rsa.PrivateKey) int {
+	return key.Size()
+}
+
 // FindServers returns the Servers known to a Server or Discovery Server.
 func (srv *Server) findServers(ch *serverSecureChannel, requestid uint32, req *ua.FindServersRequest) error {
 	srvs := make([]ua.ApplicationDescription, 0, 1)
@@ -588,7 +594,7 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 			plainBuf := buffer.NewPartitionAt(ch.bufferPool)
 			cipherBuf := buffer.NewPartitionAt(ch.bufferPool)
 			cipherBuf.Write(cipherBytes)
-			cipherText := make([]byte, int32(len(srv.localPrivateKey.D.Bytes())))
+			cipherText := make([]byte, rsaCiphertextBlockSize(srv.localPrivateKey))
 			for cipherBuf.Len() > 0 {
 				cipherBuf.Read(cipherText)
 				// decrypt with local private key.
@@ -648,7 +654,7 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 			plainBuf := buffer.NewPartitionAt(ch.bufferPool)
 			cipherBuf := buffer.NewPartitionAt(ch.bufferPool)
 			cipherBuf.Write(cipherBytes)
-			cipherText := make([]byte, int32(len(srv.localPrivateKey.D.Bytes())))
+			cipherText := make([]byte, rsaCiphertextBlockSize(srv.localPrivateKey))
 			for cipherBuf.Len() > 0 {
 				cipherBuf.Read(cipherText)
 				// decrypt with local private key.
@@ -708,7 +714,7 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 			plainBuf := buffer.NewPartitionAt(ch.bufferPool)
 			cipherBuf := buffer.NewPartitionAt(ch.bufferPool)
 			cipherBuf.Write(cipherBytes)
-			cipherText := make([]byte, int32(len(srv.localPrivateKey.D.Bytes())))
+			cipherText := make([]byte, rsaCiphertextBlockSize(srv.localPrivateKey))
 			for cipherBuf.Len() > 0 {
 				cipherBuf.Read(cipherText)
 				// decrypt with local private key.

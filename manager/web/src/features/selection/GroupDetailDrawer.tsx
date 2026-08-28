@@ -7,6 +7,7 @@ import { InlineNotice } from '../../components/InlineNotice';
 import { StatusBadge } from '../../components/StatusBadge';
 import { formatNumber, formatRelativeTime, shortSessionId } from '../../lib/format';
 import { sourceHealth, statusLabel } from '../../lib/status';
+import { groupDeviceLabel, sourceHasGroup } from '../../lib/sourceGroups';
 import { SourceSwitchDialog } from './SourceSwitchDialog';
 
 interface GroupDetailDrawerProps {
@@ -23,7 +24,7 @@ export function GroupDetailDrawer({ group, sources, sessions, onClose }: GroupDe
   const [success, setSuccess] = useState('');
   const effectiveSessionId = sessionId || sessions[0]?.id || '';
   const session = sessions.find((item) => item.id === effectiveSessionId);
-  const groupSources = useMemo(() => sources.filter((source) => source.groupId === group?.id), [group?.id, sources]);
+  const groupSources = useMemo(() => sources.filter((source) => group && sourceHasGroup(source, group.id)), [group?.id, sources]);
   const selectedSourceId = group ? (session?.selectedSources[group.id] ?? group.defaultSourceId) : '';
   const selectedSource = groupSources.find((source) => source.id === selectedSourceId);
   const health = sourceHealth(selectedSource);
@@ -34,7 +35,7 @@ export function GroupDetailDrawer({ group, sources, sessions, onClose }: GroupDe
       <Drawer open={Boolean(group)} title={group?.name || group?.id || ''} onClose={onClose}>
         {group ? (
           <>
-            <div className="drawer-group-id">{group.id} · {group.sourceCount} 个来源</div>
+            <div className="drawer-group-id">逻辑组 {group.id} · {group.sourceCount} 个来源 · {formatNumber(group.totalPoints)} 个并集点位</div>
             <label className="field drawer-session-field">
               <span>查看上级会话</span>
               <select value={effectiveSessionId} onChange={(event) => setSessionId(event.target.value)} disabled={sessions.length === 0}>
@@ -59,10 +60,11 @@ export function GroupDetailDrawer({ group, sources, sessions, onClose }: GroupDe
                   <div className="member-card" key={source.id}>
                     <div className="member-title"><StatusBadge state={sourceState} label={`${source.id}${source.id === selectedSourceId ? '（当前）' : sourceState === 'good' ? '（可用）' : ''}`} /></div>
                     <div className="member-endpoint">{source.endpoint}</div>
+                    <div className="member-endpoint">本组设备：{groupDeviceLabel(source, group.id)}</div>
                     <dl>
                       <div><dt>状态</dt><dd className={sourceState === 'bad' ? 'text-bad' : 'text-good'}>{sourceState === 'good' ? '正常' : source.lastError || source.connectionState}</dd></div>
                       <div><dt>连接 / 会话 / 订阅</dt><dd>{source.connectionState} / {source.sessionState} / {source.subscriptionState}<br /><span>{formatNumber(source.monitoredCount)} 个监控点</span></dd></div>
-                      <div><dt>Good / Bad</dt><dd>{source.qualityKnown ? <><span className="text-good">{formatNumber(source.goodPoints)}</span> / <span className={source.badPoints ? 'text-bad' : ''}>{formatNumber(source.badPoints)}</span></> : '实时质量未提供'}<span className="sub-cell">最近数据 {formatRelativeTime(source.lastDataAt)}</span></dd></div>
+                      <div><dt>来源整体 Good / Bad</dt><dd>{source.qualityKnown ? <><span className="text-good">{formatNumber(source.goodPoints)}</span> / <span className={source.badPoints ? 'text-bad' : ''}>{formatNumber(source.badPoints)}</span></> : '实时质量未提供'}<span className="sub-cell">包括该来源所有组 · 最近数据 {formatRelativeTime(source.lastDataAt)}</span></dd></div>
                     </dl>
                   </div>
                 );
@@ -71,20 +73,21 @@ export function GroupDetailDrawer({ group, sources, sessions, onClose }: GroupDe
             </div>
 
             <dl className="drawer-metrics">
-              <div><dt>点位质量</dt><dd className={(selectedSource?.badPoints ?? 0) > 0 ? 'text-bad' : ''}>{selectedSource?.qualityKnown ? ((selectedSource.badPoints ?? 0) > 0 ? selectedSource.lastError || 'Bad' : 'Good') : '实时质量未提供'}<br /><span>{selectedSource?.qualityKnown ? `${formatNumber(selectedSource.goodPoints)} / ${formatNumber(selectedSource.totalPoints)}` : `${formatNumber(selectedSource?.totalPoints ?? 0)} 个目录点`}</span></dd></div>
+              <div><dt>本组默认源质量</dt><dd className={group.badPoints > 0 ? 'text-bad' : ''}>{group.qualityKnown ? (group.badPoints > 0 ? '含坏质量点位' : 'Good') : '实时质量未提供'}<br /><span>{group.qualityKnown ? `${formatNumber(group.goodPoints)} / ${formatNumber(group.totalPoints)}` : `${formatNumber(group.totalPoints)} 个目录点`}</span></dd></div>
               <div><dt>最近更新</dt><dd>{formatRelativeTime(selectedSource?.lastDataAt)}</dd></div>
             </dl>
 
             <InlineNotice tone="warning"><p>管理程序不会自动切换数据源。选中源异常时将继续发布 Bad 质量，由上层 OPC 或操作员决定何时切换。</p></InlineNotice>
             <InlineNotice><p>执行中的命令固定在原始下级，直至完成或超时；新命令发往切换后的数据源。</p></InlineNotice>
+            <InlineNotice><p>切换范围是当前 Session 的整逻辑组，不是整个下级，也不是单个变量。同一个下级提供的其他组保持原选源；跨设备计算不会按设备选源重新混算。</p></InlineNotice>
             {success ? <div className="drawer-success"><Info aria-hidden="true" size={16} />{success}</div> : null}
 
             <div className="drawer-actions">
               <button className="button button-primary button-block" type="button" disabled={sessions.length === 0 || group.pendingCommandCount > 0} onClick={() => setSwitchMode('session')}>
-                <ArrowLeftRight aria-hidden="true" size={17} />切换数据源
+                <ArrowLeftRight aria-hidden="true" size={17} />切换当前 Session 的整组来源
               </button>
               <button className="button button-outline button-block" type="button" disabled={group.pendingCommandCount > 0} onClick={() => setSwitchMode('default')}>设置新 Session 默认源</button>
-              <button className="button button-secondary button-block" type="button" onClick={() => navigate(`/points?group=${encodeURIComponent(group.id)}`)}>
+              <button className="button button-secondary button-block" type="button" onClick={() => navigate(`/points?group=${encodeURIComponent(group.id)}${session ? `&view=session&session=${encodeURIComponent(session.id)}` : ''}`)}>
                 <ChartNoAxesColumn aria-hidden="true" size={17} />查看点位质量
               </button>
             </div>

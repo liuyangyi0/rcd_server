@@ -144,6 +144,17 @@ impl CalcEngine {
             .collect()
     }
 
+    /// 返回按求值顺序排列的输出及其直接依赖。
+    ///
+    /// 保持编译后 DAG 的顺序，使拓扑发布者能递归合并设备归属。依赖是静态
+    /// 表达式中的全部变量，不随 IF 的运行时分支改变；不修改计算结果或质量。
+    pub fn output_dependencies(&self) -> Vec<(&str, &[String])> {
+        self.rules
+            .iter()
+            .map(|rule| (rule.kks_calc.as_str(), rule.variables.as_slice()))
+            .collect()
+    }
+
     /// 是否为空引擎（无规则）。
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
@@ -782,6 +793,20 @@ mod tests {
         let names = engine.output_names();
         assert!(names.contains(&"x"));
         assert!(names.contains(&"y"));
+    }
+
+    #[test]
+    fn engine_output_dependencies_are_direct_deduplicated_and_topological() {
+        let engine = CalcEngine::new(vec![
+            make_rule("last", "uint", "first + c", 0.0),
+            make_rule("first", "uint", "b + a + b", 0.0),
+        ])
+        .unwrap();
+        let dependencies = engine.output_dependencies();
+        assert_eq!(dependencies[0].0, "first");
+        assert_eq!(dependencies[0].1, &["a".to_string(), "b".to_string()]);
+        assert_eq!(dependencies[1].0, "last");
+        assert_eq!(dependencies[1].1, &["c".to_string(), "first".to_string()]);
     }
 
     #[test]

@@ -290,7 +290,11 @@ func (s *UpstreamServer) reconcileManagementLocked(groups []domain.Group, source
 	desiredGroups := make(map[string]struct{}, len(groups))
 	desiredSources := make(map[string]struct{}, len(sources))
 	for _, source := range sources {
-		sourcesByGroup[source.GroupID] = append(sourcesByGroup[source.GroupID], source.ID)
+		for _, group := range groups {
+			if source.HasGroup(group.ID) {
+				sourcesByGroup[group.ID] = append(sourcesByGroup[group.ID], source.ID)
+			}
+		}
 		desiredSources[source.ID] = struct{}{}
 	}
 	for groupID := range sourcesByGroup {
@@ -420,7 +424,7 @@ func (s *UpstreamServer) addGroupManagementLocked(group domain.Group, members []
 			read: func(_ string) (any, awu.StatusCode) {
 				current := make([]string, 0, len(members))
 				for _, source := range s.backend.Sources() {
-					if source.GroupID == group.ID {
+					if source.HasGroup(group.ID) {
 						current = append(current, source.ID)
 					}
 				}
@@ -435,7 +439,7 @@ func (s *UpstreamServer) addGroupManagementLocked(group domain.Group, members []
 			return err
 		}
 	}
-	return nil
+	return s.addGroupCommandNodesLocked(group.ID, objectID)
 }
 
 func (s *UpstreamServer) addSourceManagementLocked(source domain.Source) error {

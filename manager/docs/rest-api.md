@@ -24,6 +24,7 @@ JSON 写请求必须满足：
 | PUT | `/api/v1/groups/{id}/default-source` | 修改默认源 |
 | GET/POST | `/api/v1/sources` | 来源列表/创建来源 |
 | GET/PUT/DELETE | `/api/v1/sources/{id}` | 读取/更新/删除来源 |
+| GET | `/api/v1/sources/{id}/topology` | 读取已发现或缓存的串口/设备拓扑摘要、实际归组和来源配置 revision |
 | POST | `/api/v1/sources/{id}/probe` | 独立执行 Endpoint、登录、Namespace 和目录浏览测试，不修改在线连接 |
 | POST | `/api/v1/sources/{id}/reconnect` | 立即重启该来源连接监督器；重连过程也会重新浏览目录 |
 | POST | `/api/v1/sources/{id}/rediscover` | 立即重连并重新发现目录；保留用于脚本表达操作意图 |
@@ -147,6 +148,10 @@ Invoke-RestMethod -Method Put `
 {
   "id": "line-a-secure",
   "group_id": "line-a",
+  "group_bindings": [
+    {"group_id": "device-a", "port_id": "COM1", "device_id": "1"},
+    {"group_id": "device-b", "port_id": "COM1", "device_id": "2"}
+  ],
   "name": "一号线安全端点",
   "endpoint": "opc.tcp://10.10.1.22:4840",
   "security_policy": "Basic256Sha256",
@@ -157,9 +162,82 @@ Invoke-RestMethod -Method Put `
 }
 ```
 
+`group_id` 是默认归属组，不再表示整个来源只能属于一个组。上例需要预先创建 `line-a`、`device-a`、`device-b` 三个逻辑组；`port_id` 和 `device_id` 应使用该来源拓扑返回的原始字符串，不从 KKS 名称推断。
+
+- `group_bindings` 按来源内的 `(port_id, device_id)` 将整台设备绑定到已有逻辑组；同一设备最多出现一次，三个字段都不能是空白字符串。
+- 未显式绑定的设备沿用 `group_id`。单设备计算点跟随设备归组；跨设备计算、常量等无设备计算以及共享串口 `_Send` / `_SendCommand` 留在默认归属组。管理器不会把不同下级的设备值重新混算。
+- 更新来源时，省略 `group_bindings` 或传 `null` 保留原绑定；传 `[]` 清空全部显式绑定，使设备回到默认归属组。响应中空绑定数组可能省略。
+- 来源响应的 `available_group_ids` 是只读派生字段：包含默认归属组和已发现/缓存设备当前映射到的组。仅配置了一个尚未发现的设备绑定，不表示其逻辑组已经可选。选源还要求来源启用且目录为 `Ready` 或 `Cached`；有缓存的离线来源允许被选择，但输出坏质量，不自动切到别的来源。
+- 来源 `PUT` 是完整配置更新，不是 PATCH。仅修改绑定时仍应保留并提交其余配置字段；不要把 GET 响应中的状态、`revision`、`available_group_ids`、`has_password` 等只读字段直接回写。密码保留规则见上文。
+
 修改 endpoint、group、安全策略或安全模式会清除该来源的持久目录并重新发现；当前进程内旧点保留为 retired，直到重启清理。修改用户名、密码或启用状态会重启连接但保留缓存目录；仅修改显示名称不会中断现有连接或重建 5900 点订阅。
 
-删除来源前必须保证它不是任何组的默认源、没有被在线 Session 选择、也没有 pending 命令。删除整个组要求没有在线 Session、没有 pending 命令；提交后会在同一事务内删除组内来源和目录缓存。
+设备映射通过同一个 `PUT /api/v1/sources/{id}` 保存，不存在拓扑写接口。必须使用来源当前配置 `revision` 对应的 `If-Match`；成功后来源 revision 递增。实际改变绑定，或在已有拓扑/设备绑定的来源上改变默认归属 `group_id`，有以下限制：
+
+- 全管理器不能存在在线 OPC Session，不仅是选中此来源的 Session；否则返回 409 `resource_in_use`。
+- 来源变更前、变更后关联的任何组都不能有 pending 命令；否则返回 409 `pending_command`。
+- 不能移除某组当前默认源与该组的归属关系；先显式调整或清除该组默认源，否则返回 409 `resource_in_use`。版本过期仍返回 409 `revision_conflict`。
+
+冗余来源的同名 KKS 必须归到同一逻辑组。分步修改两个来源时，第一个 PUT 可以成功保存，但相关来源可能暂时成为 `CatalogConflict`、不可选；继续完成另一来源的对应映射后，若无其他冲突，目录可恢复为 `Ready` / `Cached`。成功保存不等于目录已就绪，应重新读取来源状态。建议在无上级 Session、无命令的维护窗口完成整套映射。
+
+删除来源前必须保证它不是任何组的默认源、没有被在线 Session 选择、也没有 pending 命令。删除整个组要求没有在线 Session、没有 pending 命令；如果任何带设备绑定的来源通过默认归属或设备绑定关联该组，还会返回 409 `resource_in_use`，须先调整归属/绑定解除关联，不会级联删除共享来源。只有无设备绑定且默认归属为被删组的旧式来源，才会随组在同一事务内删除配置和目录缓存。
+
+## 串口/设备拓扑摘要
+
+`GET /api/v1/sources/{id}/topology` 只读取当前已发现或缓存的拓扑，不主动重连或发现目录；重新发现使用上表的 `rediscover` 接口。来源不存在返回 404。响应示例：
+
+```json
+{
+  "source_id": "line-a-secure",
+  "group_id": "line-a",
+  "revision": 7,
+  "supported": true,
+  "catalog_state": "Ready",
+  "schema_version": 1,
+  "ports": [
+    {
+      "port_id": "COM1",
+      "port_name": "COM1",
+      "send_node_id": "COM1_Send",
+      "send_method_id": "COM1_SendCommand",
+      "point_count": 3,
+      "devices": [
+        {
+          "device_id": "1",
+          "device_address": 1,
+          "name": "设备 A",
+          "kks_prefix": "A_",
+          "point_count": 1,
+          "calculation_count": 1,
+          "group_id": "device-a",
+          "bound": true
+        },
+        {
+          "device_id": "2",
+          "device_address": 2,
+          "name": "设备 B",
+          "kks_prefix": "B_",
+          "point_count": 1,
+          "calculation_count": 0,
+          "group_id": "device-b",
+          "bound": true
+        }
+      ]
+    }
+  ],
+  "calculation_count": 3,
+  "unassigned_point_count": 2,
+  "cross_device_calculation_count": 1
+}
+```
+
+- 顶层 `group_id` 是来源默认归属；设备上的 `group_id` 是应用当前绑定后的实际逻辑组。`bound=true` 表示命中了显式绑定，即使绑定目标恰好也是默认归属组。
+- `revision` 及响应 `ETag` 都是来源配置版本，不是拓扑 schema 版本或数据采样版本；保存绑定时可用它作 `If-Match`。
+- 设备 `point_count` 是直接采集点数，`calculation_count` 是单独归属该设备的计算点数。串口 `point_count` 是其设备上述两种计数之和，不包括共享命令或跨设备/无设备计算。
+- 顶层 `calculation_count` 包含全部计算点；`cross_device_calculation_count` 仅统计依赖多个设备的计算点，不包括常量。`unassigned_point_count` 统计未命中显式设备绑定的有效业务变量，包括跨设备/无设备计算，不包含命令和退役节点；它不等同于错误点数。
+- 暂无可用拓扑时返回 `supported=false`、`schema_version=0`、`ports=[]`，可能是旧版下级，也可能尚未完成发现；应结合 `catalog_state` 判断，不能据此认定下级离线。
+
+此接口不返回设备 `node_ids`、计算依赖列表或实时值。查看具体点位应使用下面的服务端分页接口，不要为设备映射一次拉取约 10 万个节点。
 
 ## Session 选源示例
 
@@ -182,7 +260,7 @@ Session 已结束时返回 404。成功后仅刷新该 Session 对应组的已�
 
 ## 分页与筛选
 
-所有列表接口使用 `limit`/`offset`，默认 `limit=100`，最大 1000。响应结构为：
+点位、命令、告警、来源状态历史和管理审计等分页列表接口使用 `limit`/`offset`，默认 `limit=100`，最大 1000。响应结构为：
 
 ```json
 {
@@ -196,7 +274,8 @@ Session 已结束时返回 404。成功后仅刷新该 Session 对应组的已�
 支持的 query 参数：
 
 - `group_id`：组筛选；
-- `source_id`：来源筛选；
+- `source_id`：来源筛选；对点位接口只限制目录成员，不改变样本路由；
+- `port_id`、`device_id`：只对点位接口有效，按串口/设备归属过滤目录；建议同时指定 `source_id`，使用该来源拓扑中的 ID，避免不同下级串口命名不同产生歧义；
 - `route_source_id`：只对点位接口有效；用该来源生成样本视图，不修改任何路由；
 - `session_id`：只对点位接口有效；按该在线 OPC Session 的真实路由生成样本视图，Session 结束返回 404；
 - `status`：点位可用 `good`、`bad` 或十六进制 StatusCode；命令按状态文本筛选；
@@ -204,7 +283,26 @@ Session 已结束时返回 404。成功后仅刷新该 Session 对应组的已�
 - `q`：点位 identifier/BrowseName 或命令文本搜索；
 - `limit`、`offset`：分页。
 
-点位路由优先级为 `session_id`、`route_source_id`、`source_id`、组默认源。`source_id` 同时把目录限制为该来源实际提供的成员；需要只改变样本路由而仍查看组并集时，应使用 `route_source_id`。诊断视图只读，不会修改默认源或 Session 路由。
+点位样本路由优先级为 `session_id`、`route_source_id`、组默认源。`source_id` **不参与选源**：例如按来源 A 的串口/设备筛目录，仍可读取默认源 B、指定来源 B 或指定 Session 的样本。只改变样本路由而仍查看组并集时，使用 `route_source_id` 并省略 `source_id`。这些视图只读，不会修改默认源或 Session 路由。
+
+Web 点位页使用 HashRouter，地址栏参数与 REST 查询名不同，不能直接复制为 API 参数：
+
+| Web `/#/points` 参数 | REST `/api/v1/points` 参数 | 含义 |
+|---|---|---|
+| `group` | `group_id` | 逻辑组 |
+| `catalog_source` | `source_id` | 提供目录成员和物理归属的来源 |
+| `port` | `port_id` | 目录串口 |
+| `device` | `device_id` | 目录设备 |
+| `view=source` + `source` | `route_source_id` | 指定样本来源 |
+| `view=session` + `session` | `session_id` | 按指定 Session 的真实组选源读取 |
+
+例如读取来源 `line-a-secure` 的 `COM1` / 设备 `1` 在逻辑组 `device-a` 的前 50 个目录成员，并按该组默认源生成样本：
+
+```http
+GET /api/v1/points?group_id=device-a&source_id=line-a-secure&port_id=COM1&device_id=1&limit=50&offset=0
+```
+
+响应每行的外层 `group_id` 是逻辑组；`selected_source_id` / `source_present` 说明实际读取源及其是否具有该点。当所选源具有该点时，`node.group_id`、`node.port_id`、`node.device_id`、`node.kind` 描述的是所选源的实际归属，因此返回的串口可能不同于目录筛选来源的串口。`node.kind` 可为 `point`、`calculation`、`command`；无设备归属时相关字段可能省略，不能把跨设备计算伪装成某个设备。`/points/export` 使用相同筛选和路由规则。
 
 浏览器可在请求头发送最多 64 字符的 `X-RCD-Operator`。服务把它与远端 IP 一起写入后续管理审计；该字段只用于内网追溯，不是身份认证，客户端不得把它当作权限凭证。
 

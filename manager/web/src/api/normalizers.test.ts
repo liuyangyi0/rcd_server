@@ -1,7 +1,28 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeAlarm, normalizeCommand, normalizeOverview, normalizePage, normalizePoint, normalizeSession, normalizeSource, normalizeSourceProbe, normalizeSystemInfo } from './normalizers';
+import { normalizeAlarm, normalizeCommand, normalizeOverview, normalizePage, normalizePoint, normalizeSession, normalizeSource, normalizeSourceProbe, normalizeSourceTopology, normalizeSystemInfo } from './normalizers';
 
 describe('API normalizers', () => {
+  it('maps device bindings and distinguishes configured from discovered group membership', () => {
+    const source = normalizeSource({ id: 'lower-1', group_id: 'fallback', group_bindings: [{ group_id: 'device-a', port_id: '/dev/ttyS0', device_id: '1' }], available_group_ids: ['fallback', 'device-a'] });
+    expect(source.groupId).toBe('fallback');
+    expect(source.groupBindings).toEqual([{ groupId: 'device-a', portId: '/dev/ttyS0', deviceId: '1' }]);
+    expect(source.availableGroupIds).toEqual(['fallback', 'device-a']);
+    expect(normalizeSource({ group_id: 'legacy' }).groupBindings).toEqual([]);
+    expect(normalizeSource({ available_group_ids: [] }).availableGroupIds).toEqual([]);
+  });
+
+  it('normalizes topology summaries without copying full node collections', () => {
+    const topology = normalizeSourceTopology({ source_id: 'lower-1', group_id: 'fallback', revision: 8, schema_version: 1, supported: true, catalog_state: 'Cached', calculation_count: 3, cross_device_calculation_count: 1, unassigned_point_count: 2, ports: [{ port_id: '/dev/ttyS0', port_name: 'ttyS0', point_count: 5300, devices: [{ device_id: '1', device_address: 1, name: '设备 A', group_id: 'device-a', bound: true, point_count: 5300, calculation_count: 1, node_ids: ['ignored'] }] }] });
+    expect(topology).toMatchObject({ sourceId: 'lower-1', groupId: 'fallback', revision: 8, supported: true, catalogState: 'Cached', crossDeviceCalculationCount: 1 });
+    expect(topology.ports[0].devices[0]).toMatchObject({ deviceId: '1', deviceAddress: 1, groupId: 'device-a', bound: true, pointCount: 5300 });
+    expect(topology.ports[0].devices[0]).not.toHaveProperty('node_ids');
+  });
+
+  it('reads source-specific point ownership from the returned catalog node', () => {
+    const point = normalizePoint({ group_id: 'device-a', selected_source_id: 'lower-b', source_present: true, node: { key: { identifier: 'TEMP' }, group_id: 'device-a', port_id: '/dev/ttyUSB4', device_id: '2', kind: 'calculation' } });
+    expect(point).toMatchObject({ groupId: 'device-a', portId: '/dev/ttyUSB4', deviceId: '2', kind: 'calculation' });
+  });
+
   it('maps the concrete Go session route shape', () => {
     const session = normalizeSession({
       id: 's-1', activated_at: '2026-08-24T01:00:00Z', last_seen_at: '2026-08-24T01:01:00Z',

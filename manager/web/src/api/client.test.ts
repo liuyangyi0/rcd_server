@@ -12,6 +12,26 @@ afterEach(() => {
 });
 
 describe('API client contract', () => {
+  it('serializes device mappings while preserving the explicit empty-array removal', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse({ id: 'rcd-1', group_id: 'fallback', revision: 4 })));
+    vi.stubGlobal('fetch', fetchMock);
+    await api.updateSource('rcd-1', { id: 'rcd-1', groupId: 'fallback', endpoint: 'opc.tcp://lower:4840', groupBindings: [{ portId: '/dev/ttyS0', deviceId: '1', groupId: 'device-a' }], revision: 3 });
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(init.headers).toMatchObject({ 'If-Match': '"3"' });
+    expect(JSON.parse(String(init.body))).toMatchObject({ group_id: 'fallback', group_bindings: [{ port_id: '/dev/ttyS0', device_id: '1', group_id: 'device-a' }] });
+    await api.updateSource('rcd-1', { id: 'rcd-1', groupId: 'fallback', endpoint: 'opc.tcp://lower:4840', groupBindings: [], revision: 4 });
+    expect(JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body))).toHaveProperty('group_bindings', []);
+  });
+
+  it('requests topology summaries and paginates physical ownership filters', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse({ ports: [], items: [] })));
+    vi.stubGlobal('fetch', fetchMock);
+    await api.sourceTopology('lower-1');
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/sources/lower-1/topology');
+    await api.points({ page: 2, pageSize: 50, sourceId: 'lower-1', portId: '/dev/ttyS0', deviceId: '2' });
+    expect(fetchMock.mock.calls[1][0]).toBe('/api/v1/points?limit=50&offset=50&source_id=lower-1&port_id=%2Fdev%2FttyS0&device_id=2');
+  });
+
   it('uses If-Match and snake_case without a body revision', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ id: 'fire', name: 'Fire', default_source_id: 'rcd-1', revision: 8 }));
     vi.stubGlobal('fetch', fetchMock);

@@ -1,7 +1,7 @@
 import { useEffect, useId, type ReactNode } from 'react';
 import { X } from 'lucide-react';
 
-export function Drawer({ open, title, onClose, children }: { open: boolean; title: string; onClose: () => void; children: ReactNode }) {
+export function Drawer({ open, title, onClose, children, className = '' }: { open: boolean; title: string; onClose: () => void; children: ReactNode; className?: string }) {
   const titleId = useId();
 
   useEffect(() => {
@@ -12,7 +12,7 @@ export function Drawer({ open, title, onClose, children }: { open: boolean; titl
   }, [onClose, open]);
 
   return (
-    <aside className={`detail-drawer${open ? ' is-open' : ''}`} aria-hidden={!open} aria-labelledby={titleId}>
+    <aside className={`detail-drawer${open ? ' is-open' : ''} ${className}`} aria-hidden={!open} aria-labelledby={titleId}>
       <div className="drawer-header">
         <h2 id={titleId}>{title}</h2>
         <button className="icon-button" type="button" onClick={onClose} aria-label="关闭详情">

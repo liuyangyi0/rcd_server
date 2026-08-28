@@ -14,6 +14,7 @@ import { StatusBadge } from '../components/StatusBadge';
 import { formatNumber, formatRelativeTime, shortSessionId } from '../lib/format';
 import { stateLabel } from '../lib/labels';
 import { sourceHealth } from '../lib/status';
+import { sourceHasGroup } from '../lib/sourceGroups';
 
 export default function GroupsPage() {
   const client = useQueryClient();
@@ -53,7 +54,7 @@ export default function GroupsPage() {
 
   return (
     <div className="page groups-workbench">
-      <PageHeader title="分组与选源" description="按上级 OPC Session 独立选择来源；管理程序不会自动故障转移。" actions={<button className="button button-primary" type="button" onClick={() => setFormGroup('new')}><Plus aria-hidden="true" size={17} />新建分组</button>} />
+      <PageHeader title="分组与选源" description="每个 OPC Session 按整逻辑设备组独立选源；一个下级可提供多个组，不自动故障转移。" actions={<button className="button button-primary" type="button" onClick={() => setFormGroup('new')}><Plus aria-hidden="true" size={17} />新建分组</button>} />
 
       <section className="session-context-bar" aria-label="当前查看会话">
         <label className="field session-context-picker"><span>当前查看会话</span><select value={effectiveSession?.id ?? ''} onChange={(event) => setSessionId(event.target.value)} disabled={sessions.length === 0}>{sessions.length === 0 ? <option value="">暂无在线会话</option> : sessions.map((session) => <option key={session.id} value={session.id}>{session.clientName} · {shortSessionId(session.id)} · {session.remoteAddress}</option>)}</select></label>
@@ -67,11 +68,11 @@ export default function GroupsPage() {
 
       <section className="table-panel content-panel groups-route-panel">
         {loading ? <LoadingState /> : firstError ? <ErrorState error={firstError} onRetry={() => void Promise.all([groupsQuery.refetch(), sourcesQuery.refetch(), sessionsQuery.refetch()])} /> : groups.length === 0 ? <EmptyState title="尚未配置分组" description="创建第一个分组后，可在“下级 OPC”中添加来源。" action={<button className="button button-primary" type="button" onClick={() => setFormGroup('new')}><Plus aria-hidden="true" size={16} />新建分组</button>} /> : (
-          <div className="table-scroll"><table className="data-table groups-route-table"><thead><tr><th>分组</th><th>此 Session 选中源</th><th>新 Session 默认源</th><th>选中源健康</th><th>点位质量</th><th>来源成员</th><th>待处理命令</th><th>选源版本</th><th className="align-right">操作</th></tr></thead><tbody>{groups.map((group) => {
+          <div className="table-scroll"><table className="data-table groups-route-table"><thead><tr><th>逻辑设备组</th><th>此 Session 选中源</th><th>新 Session 默认源</th><th>选中源健康</th><th>本组默认源质量</th><th>来源成员</th><th>待处理命令</th><th>选源版本</th><th className="align-right">操作</th></tr></thead><tbody>{groups.map((group) => {
             const selectedId = effectiveSession?.selectedSources[group.id] ?? group.defaultSourceId;
             const source = sourceMap.get(selectedId);
             const health = sourceHealth(source);
-            const quality = effectiveSession ? source : group;
+            const quality = group;
             const deviated = Boolean(effectiveSession && selectedId !== group.defaultSourceId);
             return <tr key={group.id} className={`${detailGroupId === group.id ? 'selected-row ' : ''}health-row health-row-${health}`}>
               <td><button className="group-name-button" type="button" onClick={() => setDetailGroupId(group.id)}><strong>{group.name || group.id}</strong><span>{group.id}</span></button></td>
@@ -79,7 +80,7 @@ export default function GroupsPage() {
               <td><span className="default-route-value">{group.defaultSourceId || '未设置'}</span><span className="sub-cell">仅影响之后的新 Session</span></td>
               <td><StatusBadge state={health} label={source ? stateLabel(source.connectionState) : '未知'} /><span className="sub-cell">{source ? `${stateLabel(source.sessionState)} · ${stateLabel(source.subscriptionState)}` : '未找到来源'}</span></td>
               <td>{quality?.qualityKnown ? <span className="quality-pair"><span className="text-good">Good {formatNumber(quality.goodPoints)}</span><span className={quality.badPoints ? 'text-bad' : 'text-muted'}>Bad {formatNumber(quality.badPoints)}</span></span> : <span className="text-muted">目录 {formatNumber(quality?.totalPoints ?? 0)} 点</span>}</td>
-              <td>{group.sourceCount} 个<span className="sub-cell">{sources.filter((item) => item.groupId === group.id && sourceHealth(item) === 'good').length} 个健康</span></td>
+              <td>{group.sourceCount} 个<span className="sub-cell">{sources.filter((item) => sourceHasGroup(item, group.id) && sourceHealth(item) === 'good').length} 个健康</span></td>
               <td className={group.pendingCommandCount ? 'text-warning' : ''}>{group.pendingCommandCount ? `${group.pendingCommandCount} · 选源锁定` : '0'}</td>
               <td>{effectiveSession?.routeRevisions[group.id] ?? group.selectionRevision}<span className="sub-cell">{formatRelativeTime(group.lastSelectedAt)}</span></td>
               <td className="align-right table-actions"><button className="button button-small button-outline" type="button" disabled={!effectiveSession || group.pendingCommandCount > 0} onClick={() => setSwitchState({ group, mode: 'session' })}><ArrowLeftRight size={15} />切源</button><button className="icon-button" type="button" title="查看详情" aria-label={`查看 ${group.id}`} onClick={() => setDetailGroupId(group.id)}><ChevronDown size={16} /></button><button className="icon-button" type="button" title="编辑分组" aria-label={`编辑 ${group.id}`} onClick={() => setFormGroup(group)}><Pencil size={16} /></button><button className="icon-button danger-icon" type="button" title="删除分组" aria-label={`删除 ${group.id}`} onClick={() => { removeMutation.reset(); setDeleteGroup(group); }}><Trash2 size={16} /></button></td>
@@ -92,7 +93,7 @@ export default function GroupsPage() {
 
       <GroupDetailDrawer group={detailGroup} sources={sources} sessions={sessions} onClose={() => setDetailGroupId(undefined)} />
       <GroupFormModal open={Boolean(formGroup)} group={formGroup === 'new' ? undefined : formGroup} onClose={() => setFormGroup(undefined)} onSaved={setMessage} />
-      {switchState ? <SourceSwitchDialog open mode={switchState.mode} group={switchState.group} sources={sources.filter((source) => source.groupId === switchState.group.id)} sessions={sessions} initialSessionId={effectiveSession?.id} onClose={() => setSwitchState(undefined)} onSuccess={setMessage} /> : null}
+      {switchState ? <SourceSwitchDialog open mode={switchState.mode} group={groups.find((group) => group.id === switchState.group.id) ?? switchState.group} sources={sources.filter((source) => sourceHasGroup(source, switchState.group.id))} sessions={sessions} initialSessionId={effectiveSession?.id} onClose={() => setSwitchState(undefined)} onSuccess={setMessage} /> : null}
       <DeleteConfirmModal open={Boolean(deleteGroup)} title="删除分组" subject={deleteGroup?.id ?? ''} pending={removeMutation.isPending} error={removeMutation.error ? apiErrorMessage(removeMutation.error) : undefined} onClose={() => setDeleteGroup(undefined)} onConfirm={() => deleteGroup && removeMutation.mutate(deleteGroup)} />
     </div>
   );

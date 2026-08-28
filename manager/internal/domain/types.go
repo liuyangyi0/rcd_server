@@ -68,19 +68,23 @@ type Group struct {
 }
 
 type Source struct {
-	ID             string       `json:"id"`
-	GroupID        string       `json:"group_id"`
-	Name           string       `json:"name"`
-	Endpoint       string       `json:"endpoint"`
-	SecurityPolicy string       `json:"security_policy"`
-	SecurityMode   string       `json:"security_mode"`
-	Username       string       `json:"username,omitempty"`
-	HasPassword    bool         `json:"has_password"`
-	Enabled        bool         `json:"enabled"`
-	CatalogState   CatalogState `json:"catalog_state"`
-	Revision       uint64       `json:"revision"`
-	CreatedAt      time.Time    `json:"created_at"`
-	UpdatedAt      time.Time    `json:"updated_at"`
+	ID            string         `json:"id"`
+	GroupID       string         `json:"group_id"`
+	GroupBindings []GroupBinding `json:"group_bindings,omitempty"`
+	// AvailableGroupIDs is derived from a discovered or cached topology, never
+	// accepted as configuration. Nil keeps legacy sources backwards compatible.
+	AvailableGroupIDs []string     `json:"available_group_ids,omitempty"`
+	Name              string       `json:"name"`
+	Endpoint          string       `json:"endpoint"`
+	SecurityPolicy    string       `json:"security_policy"`
+	SecurityMode      string       `json:"security_mode"`
+	Username          string       `json:"username,omitempty"`
+	HasPassword       bool         `json:"has_password"`
+	Enabled           bool         `json:"enabled"`
+	CatalogState      CatalogState `json:"catalog_state"`
+	Revision          uint64       `json:"revision"`
+	CreatedAt         time.Time    `json:"created_at"`
+	UpdatedAt         time.Time    `json:"updated_at"`
 }
 
 type NodeClass string
@@ -97,6 +101,10 @@ type Argument struct {
 }
 
 type CatalogNode struct {
+	GroupID         string     `json:"group_id,omitempty"`
+	PortID          string     `json:"port_id,omitempty"`
+	DeviceID        string     `json:"device_id,omitempty"`
+	Kind            string     `json:"kind,omitempty"`
 	Key             NodeKey    `json:"key"`
 	BrowseName      string     `json:"browse_name"`
 	ParentPath      string     `json:"parent_path"`
@@ -110,11 +118,12 @@ type CatalogNode struct {
 }
 
 type SourceCatalog struct {
-	SourceID     string        `json:"source_id"`
-	GroupID      string        `json:"group_id"`
-	State        CatalogState  `json:"state"`
-	DiscoveredAt time.Time     `json:"discovered_at"`
-	Nodes        []CatalogNode `json:"nodes"`
+	SourceID     string          `json:"source_id"`
+	GroupID      string          `json:"group_id"`
+	State        CatalogState    `json:"state"`
+	DiscoveredAt time.Time       `json:"discovered_at"`
+	Nodes        []CatalogNode   `json:"nodes"`
+	Topology     *SourceTopology `json:"topology,omitempty"`
 }
 
 type GroupRoute struct {

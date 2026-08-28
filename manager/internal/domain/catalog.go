@@ -75,23 +75,40 @@ func BuildCatalogUnion(catalogs []SourceCatalog) (CatalogUnion, error) {
 		}
 
 		seen := make(map[string]CatalogNode)
+		commandVariables := make(map[string]bool)
+		if catalog.Topology != nil {
+			for _, port := range catalog.Topology.Ports {
+				commandVariables[port.SendNodeID] = true
+			}
+		} else {
+			for _, node := range catalog.Nodes {
+				if node.Class == NodeClassMethod && strings.HasSuffix(node.Key.Identifier, "_SendCommand") {
+					commandVariables[strings.TrimSuffix(node.Key.Identifier, "_SendCommand")+"_Send"] = true
+				}
+			}
+		}
 		nodes := append([]CatalogNode(nil), catalog.Nodes...)
 		sort.SliceStable(nodes, func(i, j int) bool { return nodes[i].Key.Identifier < nodes[j].Key.Identifier })
 		for _, node := range nodes {
+			groupID := catalog.NodeGroup(node)
+			if result.Groups[groupID] == nil {
+				result.Groups[groupID] = make(map[string]CatalogNode)
+				owners[groupID] = make(map[string]*nodeOwner)
+			}
 			identifier := strings.TrimSpace(node.Key.Identifier)
 			if identifier == "" {
 				markConflict(&result, CatalogConflictDetail{
-					Kind: ConflictDuplicateNode, GroupID: catalog.GroupID,
+					Kind: ConflictDuplicateNode, GroupID: groupID,
 					SourceIDs: []string{catalog.SourceID}, Message: "empty node identifier",
 				})
 				continue
 			}
-			if otherGroup, ok := groupByIdentifier[identifier]; ok && otherGroup != catalog.GroupID {
+			if otherGroup, ok := groupByIdentifier[identifier]; ok && otherGroup != groupID {
 				return CatalogUnion{}, &CrossGroupDuplicateError{
-					Identifier: identifier, FirstGroup: otherGroup, OtherGroup: catalog.GroupID,
+					Identifier: identifier, FirstGroup: otherGroup, OtherGroup: groupID,
 				}
 			}
-			groupByIdentifier[identifier] = catalog.GroupID
+			groupByIdentifier[identifier] = groupID
 
 			if previous, duplicate := seen[identifier]; duplicate {
 				kind := ConflictDuplicateNode
@@ -99,7 +116,7 @@ func BuildCatalogUnion(catalogs []SourceCatalog) (CatalogUnion, error) {
 					kind = ConflictTypeMismatch
 				}
 				markConflict(&result, CatalogConflictDetail{
-					Kind: kind, GroupID: catalog.GroupID, Identifier: identifier,
+					Kind: kind, GroupID: groupID, Identifier: identifier,
 					SourceIDs: []string{catalog.SourceID}, Message: "source contains duplicate node identifier",
 				})
 				continue
@@ -108,23 +125,23 @@ func BuildCatalogUnion(catalogs []SourceCatalog) (CatalogUnion, error) {
 
 			if node.Class == NodeClassMethod && !validCommandMethod(node) {
 				markConflict(&result, CatalogConflictDetail{
-					Kind: ConflictMethodSignature, GroupID: catalog.GroupID, Identifier: identifier,
+					Kind: ConflictMethodSignature, GroupID: groupID, Identifier: identifier,
 					SourceIDs: []string{catalog.SourceID}, Message: "method must have HexData String input and Result String output",
 				})
 				continue
 			}
-			if node.Class == NodeClassVariable && strings.HasSuffix(identifier, "_Send") && !validCommandVariable(node) {
+			if node.Class == NodeClassVariable && (commandVariables[identifier] || node.Kind == "command" || (node.Writable && strings.HasSuffix(identifier, "_Send"))) && !validCommandVariable(node) {
 				markConflict(&result, CatalogConflictDetail{
-					Kind: ConflictCommandVariable, GroupID: catalog.GroupID, Identifier: identifier,
+					Kind: ConflictCommandVariable, GroupID: groupID, Identifier: identifier,
 					SourceIDs: []string{catalog.SourceID}, Message: "_Send variable must be a writable scalar String",
 				})
 				continue
 			}
 
-			owner := owners[catalog.GroupID][identifier]
+			owner := owners[groupID][identifier]
 			if owner == nil {
-				owners[catalog.GroupID][identifier] = &nodeOwner{node: node, sourceIDs: []string{catalog.SourceID}, conflictIndex: -1}
-				result.Groups[catalog.GroupID][identifier] = node
+				owners[groupID][identifier] = &nodeOwner{node: node, sourceIDs: []string{catalog.SourceID}, conflictIndex: -1}
+				result.Groups[groupID][identifier] = node
 				continue
 			}
 			if owner.conflictIndex >= 0 {
@@ -133,7 +150,7 @@ func BuildCatalogUnion(catalogs []SourceCatalog) (CatalogUnion, error) {
 				ids := append(append([]string{}, owner.sourceIDs...), catalog.SourceID)
 				owner.conflictIndex = len(result.Conflicts)
 				markConflict(&result, CatalogConflictDetail{
-					Kind: ConflictTypeMismatch, GroupID: catalog.GroupID, Identifier: identifier,
+					Kind: ConflictTypeMismatch, GroupID: groupID, Identifier: identifier,
 					SourceIDs: ids, Message: "same-name nodes have incompatible class, type, rank, or method signature",
 				})
 			}

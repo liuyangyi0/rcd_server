@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"rcd_manager/internal/domain"
@@ -37,8 +39,8 @@ func (r *Repository) ReplaceSourceCatalog(ctx context.Context, catalog domain.So
 	}
 	statement, err := tx.PrepareContext(ctx, `INSERT INTO catalog_nodes
 		(source_id, namespace_uri, identifier, browse_name, parent_path, node_class, data_type, value_rank,
-		 writable, input_arguments, output_arguments, retired, discovered_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		 writable, input_arguments, output_arguments, retired, discovered_at, group_id, port_id, device_id, kind)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("prepare catalog insert: %w", err)
 	}
@@ -54,9 +56,17 @@ func (r *Repository) ReplaceSourceCatalog(ctx context.Context, catalog domain.So
 		}
 		if _, err := statement.ExecContext(ctx, catalog.SourceID, node.Key.NamespaceURI, node.Key.Identifier,
 			node.BrowseName, node.ParentPath, node.Class, node.DataType, node.ValueRank, boolInt(node.Writable),
-			string(inputs), string(outputs), boolInt(node.Retired), encodeTime(catalog.DiscoveredAt)); err != nil {
+			string(inputs), string(outputs), boolInt(node.Retired), encodeTime(catalog.DiscoveredAt), node.GroupID, node.PortID, node.DeviceID, node.Kind); err != nil {
 			return fmt.Errorf("insert catalog node %q: %w", node.Key.Identifier, err)
 		}
+	}
+	topologyJSON, err := json.Marshal(catalog.Topology)
+	if err != nil {
+		return fmt.Errorf("encode source topology: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO source_topology (source_id,manifest,discovered_at) VALUES (?,?,?)
+		ON CONFLICT(source_id) DO UPDATE SET manifest=excluded.manifest,discovered_at=excluded.discovered_at`, catalog.SourceID, string(topologyJSON), encodeTime(catalog.DiscoveredAt)); err != nil {
+		return err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE sources SET catalog_state = ? WHERE id = ?`, catalog.State, catalog.SourceID)
 	if err != nil {
@@ -81,7 +91,7 @@ func (r *Repository) LoadSourceCatalog(ctx context.Context, sourceID string) (do
 		return domain.SourceCatalog{}, err
 	}
 	rows, err := r.db.QueryContext(ctx, `SELECT namespace_uri, identifier, browse_name, parent_path, node_class,
-		data_type, value_rank, writable, input_arguments, output_arguments, retired, discovered_at
+		data_type, value_rank, writable, input_arguments, output_arguments, retired, discovered_at, group_id, port_id, device_id, kind
 		FROM catalog_nodes WHERE source_id = ? ORDER BY identifier`, sourceID)
 	if err != nil {
 		return domain.SourceCatalog{}, fmt.Errorf("load source catalog: %w", err)
@@ -93,7 +103,7 @@ func (r *Repository) LoadSourceCatalog(ctx context.Context, sourceID string) (do
 		var writable, retired int
 		var inputs, outputs, discovered string
 		if err := rows.Scan(&node.Key.NamespaceURI, &node.Key.Identifier, &node.BrowseName, &node.ParentPath,
-			&node.Class, &node.DataType, &node.ValueRank, &writable, &inputs, &outputs, &retired, &discovered); err != nil {
+			&node.Class, &node.DataType, &node.ValueRank, &writable, &inputs, &outputs, &retired, &discovered, &node.GroupID, &node.PortID, &node.DeviceID, &node.Kind); err != nil {
 			return domain.SourceCatalog{}, fmt.Errorf("scan catalog node: %w", err)
 		}
 		node.Writable = writable != 0
@@ -114,6 +124,19 @@ func (r *Repository) LoadSourceCatalog(ctx context.Context, sourceID string) (do
 	}
 	if err := rows.Err(); err != nil {
 		return domain.SourceCatalog{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return domain.SourceCatalog{}, err
+	}
+	var manifest string
+	err = r.db.QueryRowContext(ctx, `SELECT manifest FROM source_topology WHERE source_id=?`, sourceID).Scan(&manifest)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return domain.SourceCatalog{}, err
+	}
+	if err == nil {
+		if err := json.Unmarshal([]byte(manifest), &catalog.Topology); err != nil {
+			return domain.SourceCatalog{}, fmt.Errorf("decode cached topology: %w", err)
+		}
 	}
 	return catalog, nil
 }
@@ -145,16 +168,16 @@ func (r *Repository) ListCatalogRecordsFiltered(ctx context.Context, filter Cata
 	if filter.Offset < 0 {
 		filter.Offset = 0
 	}
-	where := ` WHERE (? = '' OR s.group_id = ?) AND (? = '' OR n.source_id = ?)
+	where := ` WHERE (? = '' OR COALESCE(NULLIF(n.group_id,''),s.group_id) = ?) AND (? = '' OR n.source_id = ?)
 		AND (? = '' OR n.identifier LIKE '%' || ? || '%' OR n.browse_name LIKE '%' || ? || '%')`
 	args := []any{filter.GroupID, filter.GroupID, filter.SourceID, filter.SourceID, filter.Query, filter.Query, filter.Query}
 	var total int
 	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM catalog_nodes n JOIN sources s ON s.id = n.source_id`+where, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count catalog records: %w", err)
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT n.source_id, s.group_id, n.namespace_uri, n.identifier, n.browse_name,
+	rows, err := r.db.QueryContext(ctx, `SELECT n.source_id, COALESCE(NULLIF(n.group_id,''),s.group_id), n.namespace_uri, n.identifier, n.browse_name,
 		n.parent_path, n.node_class, n.data_type, n.value_rank, n.writable, n.input_arguments,
-		n.output_arguments, n.retired FROM catalog_nodes n JOIN sources s ON s.id = n.source_id`+where+
+		n.output_arguments, n.retired, n.group_id,n.port_id,n.device_id,n.kind FROM catalog_nodes n JOIN sources s ON s.id = n.source_id`+where+
 		` ORDER BY s.group_id, n.identifier, n.source_id LIMIT ? OFFSET ?`, append(args, filter.Limit, filter.Offset)...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("list catalog records: %w", err)
@@ -167,7 +190,7 @@ func (r *Repository) ListCatalogRecordsFiltered(ctx context.Context, filter Cata
 		var inputs, outputs string
 		if err := rows.Scan(&record.SourceID, &record.GroupID, &record.Node.Key.NamespaceURI,
 			&record.Node.Key.Identifier, &record.Node.BrowseName, &record.Node.ParentPath, &record.Node.Class,
-			&record.Node.DataType, &record.Node.ValueRank, &writable, &inputs, &outputs, &retired); err != nil {
+			&record.Node.DataType, &record.Node.ValueRank, &writable, &inputs, &outputs, &retired, &record.Node.GroupID, &record.Node.PortID, &record.Node.DeviceID, &record.Node.Kind); err != nil {
 			return nil, 0, err
 		}
 		record.Node.Writable = writable != 0

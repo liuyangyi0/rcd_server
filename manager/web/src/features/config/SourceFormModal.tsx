@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import type { Group, Source } from '../../api/types';
+import type { DeviceGroupBinding, Group, Source } from '../../api/types';
 import { api, apiErrorMessage } from '../../api/client';
 import { queryKeys } from '../../api/queries';
 import { Modal } from '../../components/Modal';
@@ -11,6 +11,8 @@ export function SourceFormModal({ open, source, groups, onClose, onSaved }: { op
   const [id, setId] = useState('');
   const [name, setName] = useState('');
   const [groupId, setGroupId] = useState('');
+  const [groupBindings, setGroupBindings] = useState<DeviceGroupBinding[]>([]);
+  const [editRevision, setEditRevision] = useState<number>();
   const [endpoint, setEndpoint] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -22,7 +24,7 @@ export function SourceFormModal({ open, source, groups, onClose, onSaved }: { op
     mutationFn: () => {
       const input = {
         id: id.trim(), name: name.trim() || id.trim(), groupId, endpoint: endpoint.trim(), username: username.trim() || undefined,
-        password: clearPassword ? '' : (password || undefined), securityPolicy, securityMode, enabled, revision: source?.revision,
+        password: clearPassword ? '' : (password || undefined), securityPolicy, securityMode, enabled, groupBindings, revision: editRevision,
       };
       return source ? api.updateSource(source.id, input) : api.createSource(input);
     },
@@ -31,6 +33,8 @@ export function SourceFormModal({ open, source, groups, onClose, onSaved }: { op
         client.invalidateQueries({ queryKey: queryKeys.allSources }),
         client.invalidateQueries({ queryKey: queryKeys.groups }),
         client.invalidateQueries({ queryKey: queryKeys.overview }),
+        client.invalidateQueries({ queryKey: queryKeys.allTopologies }),
+        client.invalidateQueries({ queryKey: queryKeys.allPoints }),
       ]);
       onSaved(`来源 ${saved.id} 已${source ? '更新' : '创建'}，目录发现将在后台执行`);
       onClose();
@@ -42,6 +46,8 @@ export function SourceFormModal({ open, source, groups, onClose, onSaved }: { op
     setId(source?.id ?? '');
     setName(source?.name ?? '');
     setGroupId(source?.groupId ?? groups[0]?.id ?? '');
+    setGroupBindings(source?.groupBindings ?? []);
+    setEditRevision(source?.revision);
     setEndpoint(source?.endpoint ?? 'opc.tcp://');
     setUsername(source?.username ?? '');
     setPassword('');
@@ -72,7 +78,7 @@ export function SourceFormModal({ open, source, groups, onClose, onSaved }: { op
       <div className="form-grid">
         <label className="field"><span>Source ID</span><input value={id} disabled={Boolean(source)} maxLength={64} placeholder="例如 rcd-a-01" onChange={(event) => setId(event.target.value)} /></label>
         <label className="field"><span>显示名称</span><input value={name} maxLength={80} placeholder="默认与 Source ID 相同" onChange={(event) => setName(event.target.value)} /></label>
-        <label className="field"><span>所属分组</span><select value={groupId} onChange={(event) => setGroupId(event.target.value)}>{groups.map((group) => <option key={group.id} value={group.id}>{group.name || group.id}</option>)}</select></label>
+        <label className="field"><span>默认归属组（未映射点）</span><select value={groupId} onChange={(event) => setGroupId(event.target.value)}>{groups.map((group) => <option key={group.id} value={group.id}>{group.name || group.id}</option>)}</select></label>
         <label className="field field-full"><span>OPC UA Endpoint</span><input value={endpoint} placeholder="opc.tcp://10.10.1.21:4840/" onChange={(event) => setEndpoint(event.target.value)} /></label>
         <label className="field"><span>安全策略</span><select value={securityPolicy} onChange={(event) => { const value = event.target.value; setSecurityPolicy(value); setSecurityMode(value === 'None' ? 'None' : 'SignAndEncrypt'); }}><option value="None">None</option><option value="Basic256Sha256">Basic256Sha256</option></select></label>
         <label className="field"><span>消息安全模式</span><select value={securityMode} disabled={securityPolicy === 'None'} onChange={(event) => setSecurityMode(event.target.value)}><option value="None">None</option><option value="SignAndEncrypt">SignAndEncrypt</option></select></label>
@@ -82,6 +88,8 @@ export function SourceFormModal({ open, source, groups, onClose, onSaved }: { op
         <label className="confirm-check field-full"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span className="checkbox-visual" /><span>启用该下级连接</span></label>
       </div>
       {!validEndpoint && endpoint !== 'opc.tcp://' ? <p className="field-error">请输入合法的 opc.tcp Endpoint。</p> : null}
+      <InlineNotice><p>一个下级可以提供多个逻辑设备组。保存并完成发现后，在“串口 / 设备映射”中为各设备分组；这里的默认归属组接收未映射点、跨设备计算与共享命令节点，不会覆盖已有设备映射。</p></InlineNotice>
+      {source ? <InlineNotice tone="warning"><p>修改默认归属或设备映射前，须结束在线 OPC Session 并等待相关命令完成；普通 Session 选源不需要断开连接。</p></InlineNotice> : null}
       <InlineNotice><p>凭据由后端使用 Windows DPAPI machine scope 加密，API 不会回传明文密码。</p></InlineNotice>
       {mutation.error ? <div className="form-error" role="alert">{apiErrorMessage(mutation.error)}</div> : null}
     </Modal>

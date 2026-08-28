@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -223,6 +224,36 @@ func (s *UpstreamServer) ReconcileCatalog(catalog domain.CatalogUnion, groups []
 			s.groupNodeIDs[groupID] = append(s.groupNodeIDs[groupID], entry.node.NodeID())
 		}
 	}
+	for _, group := range groups {
+		for _, name := range []string{"SelectedSourceId", "SelectionRevision", "Send"} {
+			s.groupNodeIDs[group.ID] = append(s.groupNodeIDs[group.ID], awu.NewNodeIDString(s.managementNS, "Groups/"+group.ID+"/"+name))
+		}
+	}
+	// A legacy command variable is shared by the devices on its physical port.
+	// Its ACK view can become ambiguous when any of those device routes changes.
+	commandsByPort := make(map[string][]awu.NodeID)
+	for identifier, spec := range desired {
+		if spec.Kind == "command" && spec.Class == domain.NodeClassVariable {
+			commandsByPort[spec.PortID] = append(commandsByPort[spec.PortID], s.business[identifier].node.NodeID())
+		}
+	}
+	for _, source := range sources {
+		for _, binding := range source.GroupBindings {
+			s.groupNodeIDs[binding.GroupID] = append(s.groupNodeIDs[binding.GroupID], commandsByPort[binding.PortID]...)
+		}
+	}
+	for groupID, nodes := range s.groupNodeIDs {
+		unique := make(map[awu.NodeID]struct{}, len(nodes))
+		filtered := nodes[:0]
+		for _, node := range nodes {
+			if _, exists := unique[node]; !exists {
+				unique[node] = struct{}{}
+				filtered = append(filtered, node)
+			}
+		}
+		sort.Slice(filtered, func(i, j int) bool { return fmt.Sprint(filtered[i]) < fmt.Sprint(filtered[j]) })
+		s.groupNodeIDs[groupID] = filtered
+	}
 	return nil
 }
 
@@ -289,6 +320,11 @@ func (s *UpstreamServer) validateCatalog(catalog domain.CatalogUnion, groups []d
 	for _, source := range sources {
 		if _, exists := groupIDs[source.GroupID]; !exists {
 			return upstreamCatalogPlan{}, fmt.Errorf("source %q references missing group %q", source.ID, source.GroupID)
+		}
+		for _, binding := range source.GroupBindings {
+			if _, exists := groupIDs[binding.GroupID]; !exists {
+				return upstreamCatalogPlan{}, fmt.Errorf("source %q device binding references missing group %q", source.ID, binding.GroupID)
+			}
 		}
 		if _, exists := sourceIDs[source.ID]; exists {
 			return upstreamCatalogPlan{}, fmt.Errorf("duplicate management source %q", source.ID)

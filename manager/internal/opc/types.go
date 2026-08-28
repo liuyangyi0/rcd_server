@@ -10,6 +10,7 @@ import (
 
 const (
 	BusinessNamespaceURI    = "urn:SerialServer"
+	TopologyNamespaceURI    = "urn:SerialServer:topology"
 	ApplicationNamespaceURI = "urn:RcdManager:rcd_manager"
 	ManagementNamespaceURI  = "urn:RcdManager:management"
 	DefaultMonitorBatchSize = 500
@@ -144,4 +145,13 @@ type UpstreamBackend interface {
 	SourcePointStatistics(sourceID string) PointStatistics
 	GroupForNode(identifier string) (string, bool)
 	PendingCount(groupID string) int
+}
+
+// GroupCommandBackend exposes unambiguous logical-device commands without
+// changing the legacy physical-port NodeIds. Implementations must retain the
+// same per-source physical-port lock used by the legacy command handlers.
+type GroupCommandBackend interface {
+	ReadGroupCommand(sessionID, groupID string) domain.Sample
+	WriteGroupCommand(ctx context.Context, sessionID, groupID string, value any) (domain.StatusCode, error)
+	CallGroupCommand(ctx context.Context, sessionID, groupID, hexData string) (string, domain.StatusCode, error)
 }

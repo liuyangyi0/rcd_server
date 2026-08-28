@@ -16,6 +16,31 @@ const sessions: UaSession[] = [{ id: 'session-1', clientName: 'SCADA', remoteAdd
 afterEach(() => vi.unstubAllGlobals());
 
 describe('SourceSwitchDialog', () => {
+  it('does not rebase an open selection draft onto a newer background revision', async () => {
+    const client = new QueryClient();
+    const view = render(<QueryClientProvider client={client}><SourceSwitchDialog open mode="session" group={group} sources={sources} sessions={sessions} onClose={() => undefined} /></QueryClientProvider>);
+    await userEvent.setup().click(screen.getByRole('checkbox', { name: '确认已核对目标下级状态' }));
+    view.rerender(<QueryClientProvider client={client}><SourceSwitchDialog open mode="session" group={group} sources={sources} sessions={[{ ...sessions[0], routeRevisions: { fire: 10 } }]} onClose={() => undefined} /></QueryClientProvider>);
+    expect(screen.getByRole('button', { name: '确认切换' })).toBeDisabled();
+    expect(screen.getByText(/该逻辑组的选源版本已变化/)).toBeInTheDocument();
+  });
+
+  it('includes mapped members but never offers a source from an unrelated group', () => {
+    const mapped = { ...sources[1], groupId: 'fallback', groupBindings: [{ groupId: 'fire', portId: '/dev/ttyS1', deviceId: '1' }], availableGroupIds: ['fire'] };
+    const unrelated = { ...sources[1], id: 'unrelated', groupId: 'other' };
+    render(<QueryClientProvider client={new QueryClient()}><SourceSwitchDialog open mode="session" group={group} sources={[sources[0], mapped, unrelated]} sessions={sessions} onClose={() => undefined} /></QueryClientProvider>);
+    expect(screen.getByRole('radio', { name: /rcd-2/ })).toBeEnabled();
+    expect(screen.queryByRole('radio', { name: /unrelated/ })).not.toBeInTheDocument();
+    expect(screen.getByText(/不是单点切换/)).toBeInTheDocument();
+  });
+
+  it('rejects a mapped group until that group has been discovered', () => {
+    const mapped = { ...sources[1], availableGroupIds: ['another-group'] };
+    render(<QueryClientProvider client={new QueryClient()}><SourceSwitchDialog open mode="session" group={group} sources={[sources[0], mapped]} sessions={sessions} onClose={() => undefined} /></QueryClientProvider>);
+    expect(screen.getByRole('radio', { name: /rcd-2/ })).toBeDisabled();
+    expect(screen.getByText(/未发现本组目录/)).toBeInTheDocument();
+  });
+
   it('keeps the original target and disables submit when that Session ends', async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);

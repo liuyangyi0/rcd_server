@@ -52,10 +52,18 @@ func NewRouteTable(groups []Group, sources []Source) (*RouteTable, error) {
 		if _, ok := t.groups[source.GroupID]; !ok {
 			return nil, fmt.Errorf("source %q group %q: %w", source.ID, source.GroupID, ErrNotFound)
 		}
+		if err := ValidateGroupBindings(source.GroupBindings); err != nil {
+			return nil, err
+		}
+		for _, groupID := range source.GroupIDs() {
+			if _, ok := t.groups[groupID]; !ok {
+				return nil, fmt.Errorf("source %q group %q: %w", source.ID, groupID, ErrNotFound)
+			}
+		}
 		if _, ok := t.sources[source.ID]; ok {
 			return nil, fmt.Errorf("source %q: %w", source.ID, ErrAlreadyExists)
 		}
-		t.sources[source.ID] = source
+		t.sources[source.ID] = source.Clone()
 	}
 	for _, group := range t.groups {
 		if group.DefaultSourceID == "" {
@@ -169,7 +177,7 @@ func (t *RouteTable) Sources() []Source {
 	defer t.mu.RUnlock()
 	out := make([]Source, 0, len(t.sources))
 	for _, source := range t.sources {
-		out = append(out, source)
+		out = append(out, source.Clone())
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
@@ -269,8 +277,21 @@ func (t *RouteTable) validateConfigurationTransitionLocked(candidate *RouteTable
 	}
 	for sourceID, oldSource := range t.sources {
 		newSource, retained := candidate.sources[sourceID]
-		if retained && newSource.GroupID == oldSource.GroupID {
+		if retained && newSource.GroupID == oldSource.GroupID && SameGroupBindings(newSource.GroupBindings, oldSource.GroupBindings) {
 			continue
+		}
+		if retained && !SameGroupBindings(newSource.GroupBindings, oldSource.GroupBindings) {
+			if len(t.sessions) > 0 {
+				return fmt.Errorf("source %q bindings: %w", sourceID, ErrGroupInUse)
+			}
+			for _, groupID := range append(oldSource.GroupIDs(), newSource.GroupIDs()...) {
+				if t.pendingByGroup[groupID] > 0 {
+					return ErrGroupPending
+				}
+			}
+			if newSource.GroupID == oldSource.GroupID {
+				continue
+			}
 		}
 		if _, groupRemoved := candidate.groups[oldSource.GroupID]; !groupRemoved {
 			// The source is removed as part of an already validated whole-group
@@ -609,7 +630,7 @@ func (t *RouteTable) validateSourceLocked(groupID, sourceID string) error {
 		return err
 	}
 	source := t.sources[sourceID]
-	if !source.Enabled || !source.CatalogState.Selectable() {
+	if !source.Enabled || !source.CatalogState.Selectable() || !source.GroupAvailable(groupID) {
 		return ErrSourceNotSelectable
 	}
 	return nil
@@ -620,7 +641,7 @@ func (t *RouteTable) validateSourceMembershipLocked(groupID, sourceID string) er
 	if !ok {
 		return ErrNotFound
 	}
-	if source.GroupID != groupID {
+	if !source.HasGroup(groupID) {
 		return ErrSourceNotInGroup
 	}
 	return nil

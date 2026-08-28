@@ -9,6 +9,24 @@
 
 面向现场运维，Web 还提供来源独立连接测试、重新连接并发现目录、持久告警与状态历史、管理操作审计、默认源/Session/指定来源点位视图、同组双来源值比较、CSV 导出、配置备份预检恢复、证书/磁盘/队列状态、Prometheus 指标和脱敏诊断包。上述操作都不会启用自动故障转移。
 
+## 新版设备分组
+
+Rust 下级新增“串口 → 设备 → 点位”拓扑，旧点位和命令 NodeId 不变。一个下级仍只建立
+一条连接，但可以服务多个逻辑组。切换作用于当前 OPC Session 的整组点位，不是单个变量，
+也不影响其他设备组或其他 Session。
+
+先创建各设备的逻辑组和一个共享兼容组，再添加下级。冗余下级使用同一共享兼容组；在
+“下级 OPC → 串口 / 设备映射”把两边对应设备绑定到相同逻辑组，完成发现后设置默认来源。
+两边串口名可以不同。逐台保存时可能暂时出现目录冲突，两边映射一致后重新校验恢复。
+修改映射前须关闭在线 Session 并清空相关待处理命令。
+
+单设备计算点随该设备组切换；跨设备、常量及归属未知的计算点留在共享兼容组，不在管理器
+内重新计算。命令按报文设备地址路由，同一物理串口互斥；新增管理节点
+`Groups/<group>/Send` / `SendCommand` 可明确指定逻辑组。老下级无拓扑时仍按原单组模式工作。
+
+协议详见 [设备拓扑与多逻辑组选源](docs/device-groups.md)，本轮结果见
+[远端验证记录](docs/device-groups-validation.md)。本次构建及测试仅在远端执行。
+
 ## 快速开始
 
 开发机需要 Go 1.26、Node.js/npm 和 PowerShell。Windows 发布构建：
@@ -58,6 +76,8 @@ Web 首页会在空配置时显示首次配置向导。日常排障建议先在�
 ## 文档
 
 - [架构与 OPC 行为](docs/architecture.md)
+- [设备拓扑与多逻辑组选源](docs/device-groups.md)
+- [设备分组新版远端验证记录](docs/device-groups-validation.md)
 - [REST 与 SSE 接口](docs/rest-api.md)
 - [Windows 部署、配置与 PKI](docs/windows-deployment.md)
 - [安全边界](docs/security.md)
@@ -67,7 +87,11 @@ Web 首页会在空配置时显示首次配置向导。日常排障建议先在�
 
 仓库内自动测试已经覆盖：两种上级安全端点和匿名/用户名身份、Browse/Read/Write/Call、双 Session 选源隔离、固定命名空间、旧点表黄金元数据、目录冲突与热增删、命令锁和 epoch、SQLite 恢复、REST/SSE 以及浏览器端主要流程。发布脚本也会从生产前端资源生成单一 EXE。具体执行口径见 [验证文档](docs/validation.md)。
 
-仓库内还使用当前 Rust 项目完成了本地真实互操作：None/None + Anonymous、Basic256Sha256/SignAndEncrypt + Anonymous/Username 均已完成发现、Browse、Read/Subscribe、Write/Call 和断线重订阅；详细限制见验证文档。该结果仍不能代替目标环境验收。当前不得宣称以下项目已经通过：
+本轮在远端 Linux 主机使用两套真实 Rust 进程和隔离 PTY 完成了设备分组互操作，
+包括旧节点对比、None/匿名下的 Read/Subscribe/Write/Call、断线恢复，以及
+Basic256Sha256/SignAndEncrypt 下匿名/用户名读取；另通过双 Session 的浏览器定向选源验收。
+详细日志和限制见新版远端验证记录。该结果仍不能代替现场硬件及目标环境验收。
+当前不得宣称以下项目已经通过：
 
 - 目标现场证书链、Namespace index 变化和 SecureChannel 原 Session 重附着的完整互操作矩阵；
 - 从现场版本 Rust 下级导出的点表与仓库黄金约束之间的逐项差异审批；

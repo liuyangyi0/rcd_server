@@ -53,6 +53,16 @@ func (b OPCBackend) GroupForNode(identifier string) (string, bool) {
 }
 func (b OPCBackend) PendingCount(groupID string) int { return b.Runtime.routes.PendingCount(groupID) }
 
+func (b OPCBackend) ReadGroupCommand(sessionID, groupID string) domain.Sample {
+	return b.Runtime.ReadGroupCommand(sessionID, groupID)
+}
+func (b OPCBackend) WriteGroupCommand(ctx context.Context, sessionID, groupID string, value any) (domain.StatusCode, error) {
+	return b.Runtime.writeCommand(ctx, sessionID, domain.NodeKey{}, value, groupID)
+}
+func (b OPCBackend) CallGroupCommand(ctx context.Context, sessionID, groupID, hexData string) (string, domain.StatusCode, error) {
+	return b.Runtime.callCommand(ctx, sessionID, domain.NodeKey{}, hexData, groupID)
+}
+
 var _ opc.UpstreamBackend = OPCBackend{}
 
 func (r *Runtime) openSession(sessionID string) error {
@@ -77,6 +87,13 @@ func (r *Runtime) openSession(sessionID string) error {
 
 func (r *Runtime) closeSession(sessionID string) {
 	r.routes.CloseSession(sessionID)
+	r.mu.Lock()
+	for key := range r.commandHistory {
+		if strings.HasPrefix(key, sessionID+"\x00") {
+			delete(r.commandHistory, key)
+		}
+	}
+	r.mu.Unlock()
 	r.broker.Publish(api.Event{Type: "session.changed", Data: map[string]string{"closed_id": sessionID}})
 }
 
@@ -105,6 +122,11 @@ func (r *Runtime) selectSourceWithContext(ctx context.Context, sessionID, groupI
 }
 
 func (r *Runtime) ReadSample(sessionID string, key domain.NodeKey) domain.Sample {
+	if strings.HasSuffix(key.Identifier, "_Send") {
+		if sample, handled := r.readLegacyCommand(sessionID, key.Identifier); handled {
+			return sample
+		}
+	}
 	point, ok := r.pointForIdentifier(key.Identifier)
 	if !ok {
 		return domain.Sample{StatusCode: domain.StatusBadConfigurationError}
@@ -133,6 +155,9 @@ func (r *Runtime) sampleForSourceAtIndex(sourceID string, point indexedPoint, in
 	r.mu.RLock()
 	status := r.statuses[sourceID]
 	r.mu.RUnlock()
+	if status.Catalog == domain.CatalogConflict {
+		return domain.Sample{Type: point.Node.DataType, Value: zeroValue(point.Node.DataType, point.Node.ValueRank), StatusCode: domain.StatusBadConfigurationError}
+	}
 	if index == nil {
 		return domain.Sample{Type: point.Node.DataType, Value: zeroValue(point.Node.DataType, point.Node.ValueRank), StatusCode: domain.StatusBadConfigurationError}
 	}
@@ -172,7 +197,11 @@ func (r *Runtime) pointForIdentifier(identifier string) (indexedPoint, bool) {
 }
 
 func (r *Runtime) WriteCommand(ctx context.Context, sessionID string, key domain.NodeKey, value any) (domain.StatusCode, error) {
-	if !strings.HasSuffix(key.Identifier, "_Send") || strings.HasSuffix(key.Identifier, "_SendCommand") {
+	return r.writeCommand(ctx, sessionID, key, value, "")
+}
+
+func (r *Runtime) writeCommand(ctx context.Context, sessionID string, key domain.NodeKey, value any, groupHint string) (domain.StatusCode, error) {
+	if groupHint == "" && (!strings.HasSuffix(key.Identifier, "_Send") || strings.HasSuffix(key.Identifier, "_SendCommand")) {
 		return domain.StatusBadConfigurationError, domain.ErrInvalid
 	}
 	payload, ok := value.(string)
@@ -180,20 +209,20 @@ func (r *Runtime) WriteCommand(ctx context.Context, sessionID string, key domain
 		return domain.StatusBadConfigurationError, &domain.FieldError{Field: "value", Message: "must be a string"}
 	}
 	if passiveSendValue(payload) {
-		return r.writePassiveSendValue(ctx, sessionID, key, payload)
+		return r.writePassiveSendValue(ctx, sessionID, key, payload, groupHint)
 	}
 	r.configMu.Lock()
 	if r.closing.Load() {
 		r.configMu.Unlock()
 		return domain.StatusBadOutOfService, domain.ErrShuttingDown
 	}
-	point, err := r.commandPointForSessionLocked(sessionID, key.Identifier)
+	route, err := r.resolveCommandRouteLocked(sessionID, key.Identifier, payload, groupHint, "Write")
 	if err != nil {
 		r.configMu.Unlock()
 		return commandErrorStatus(err), err
 	}
-	port := strings.TrimSuffix(key.Identifier, "_Send")
-	command, err := r.routes.BeginCommand(sessionID, point.GroupID, port, "Write")
+	port := route.Port
+	command, err := r.routes.BeginCommand(sessionID, route.GroupID, port, "Write")
 	if err != nil {
 		r.configMu.Unlock()
 		return commandErrorStatus(err), err
@@ -204,6 +233,7 @@ func (r *Runtime) WriteCommand(ctx context.Context, sessionID string, key domain
 		return domain.StatusCode(0x80010000), fmt.Errorf("persist command before dispatch: %w", err)
 	}
 	target, targetOK := r.captureLowerCommandTarget(command.SourceID, port, true)
+	r.rememberCommandRoute(sessionID, key.Identifier, route, command, target.globalEpoch)
 	if targetOK {
 		r.commandMu.Lock()
 		r.pendingCommandMeta[command.ID] = pendingCommandMeta{
@@ -221,7 +251,7 @@ func (r *Runtime) WriteCommand(ctx context.Context, sessionID string, key domain
 	}
 	operationContext, cancel := context.WithTimeout(ctx, r.options.CommandTimeout)
 	defer cancel()
-	status, err := writePinned(operationContext, target, key, payload)
+	status, err := writePinned(operationContext, target, route.Key, payload)
 	if err != nil || !statusIsGood(status) {
 		if errors.Is(operationContext.Err(), context.DeadlineExceeded) {
 			status = domain.StatusBadTimeout
@@ -239,7 +269,11 @@ func (r *Runtime) WriteCommand(ctx context.Context, sessionID string, key domain
 }
 
 func (r *Runtime) CallCommand(ctx context.Context, sessionID string, key domain.NodeKey, hexData string) (string, domain.StatusCode, error) {
-	if !strings.HasSuffix(key.Identifier, "_SendCommand") {
+	return r.callCommand(ctx, sessionID, key, hexData, "")
+}
+
+func (r *Runtime) callCommand(ctx context.Context, sessionID string, key domain.NodeKey, hexData, groupHint string) (string, domain.StatusCode, error) {
+	if groupHint == "" && !strings.HasSuffix(key.Identifier, "_SendCommand") {
 		return "", domain.StatusBadConfigurationError, domain.ErrInvalid
 	}
 	r.configMu.Lock()
@@ -247,13 +281,13 @@ func (r *Runtime) CallCommand(ctx context.Context, sessionID string, key domain.
 		r.configMu.Unlock()
 		return "", domain.StatusBadOutOfService, domain.ErrShuttingDown
 	}
-	point, err := r.commandPointForSessionLocked(sessionID, key.Identifier)
+	route, err := r.resolveCommandRouteLocked(sessionID, key.Identifier, hexData, groupHint, "Call")
 	if err != nil {
 		r.configMu.Unlock()
 		return "", commandErrorStatus(err), err
 	}
-	port := strings.TrimSuffix(key.Identifier, "_SendCommand")
-	command, err := r.routes.BeginCommand(sessionID, point.GroupID, port, "Call")
+	port := route.Port
+	command, err := r.routes.BeginCommand(sessionID, route.GroupID, port, "Call")
 	if err != nil {
 		r.configMu.Unlock()
 		return "", commandErrorStatus(err), err
@@ -264,6 +298,7 @@ func (r *Runtime) CallCommand(ctx context.Context, sessionID string, key domain.
 		return "", domain.StatusCode(0x80010000), fmt.Errorf("persist command before dispatch: %w", err)
 	}
 	target, targetOK := r.captureLowerCommandTarget(command.SourceID, port, false)
+	r.rememberCommandRoute(sessionID, key.Identifier, route, command, target.globalEpoch)
 	r.configMu.Unlock()
 	r.broker.Publish(api.Event{Type: "command.changed", Data: command})
 	if !targetOK {
@@ -272,7 +307,7 @@ func (r *Runtime) CallCommand(ctx context.Context, sessionID string, key domain.
 	}
 	operationContext, cancel := context.WithTimeout(ctx, r.options.CommandTimeout)
 	defer cancel()
-	result, status, err := callPinned(operationContext, target, key, hexData)
+	result, status, err := callPinned(operationContext, target, route.Key, hexData)
 	state := domain.CommandReceived
 	message := ""
 	if err != nil || !statusIsGood(status) {
@@ -336,33 +371,43 @@ func passiveSendValue(value string) bool {
 	}
 }
 
-func (r *Runtime) writePassiveSendValue(ctx context.Context, sessionID string, key domain.NodeKey, payload string) (domain.StatusCode, error) {
+func (r *Runtime) writePassiveSendValue(ctx context.Context, sessionID string, key domain.NodeKey, payload, groupHint string) (domain.StatusCode, error) {
 	r.configMu.Lock()
 	if r.closing.Load() {
 		r.configMu.Unlock()
 		return domain.StatusBadOutOfService, domain.ErrShuttingDown
 	}
-	point, err := r.commandPointForSessionLocked(sessionID, key.Identifier)
+	route, handled, err := r.resolveReadCommandRoute(sessionID, key.Identifier, groupHint)
+	if !handled && err == nil {
+		var point indexedPoint
+		point, err = r.commandPointForSessionLocked(sessionID, key.Identifier)
+		if err == nil {
+			selected, routeErr := r.routes.Route(sessionID, point.GroupID)
+			err = routeErr
+			route = commandRoute{GroupID: point.GroupID, SourceID: selected.SourceID, Port: strings.TrimSuffix(key.Identifier, "_Send"), Key: key}
+		}
+	}
 	if err != nil {
 		r.configMu.Unlock()
 		return commandErrorStatus(err), err
 	}
-	session, err := r.routes.Session(sessionID)
-	if err != nil {
+	if _, pending := r.routes.PendingCommand(route.SourceID, route.Port); pending {
 		r.configMu.Unlock()
-		return commandErrorStatus(err), err
+		return domain.StatusBadWaitingForResponse, domain.ErrCommandPending
 	}
-	target, targetOK := r.captureLowerCommandTarget(session.Routes[point.GroupID].SourceID,
-		strings.TrimSuffix(key.Identifier, "_Send"), false)
+	target, targetOK := r.captureLowerCommandTarget(route.SourceID, route.Port, false)
 	r.configMu.Unlock()
 	if !targetOK {
 		return domain.StatusBadNoCommunication, opc.ErrLowerUnavailable
 	}
 	operationContext, cancel := context.WithTimeout(ctx, r.options.CommandTimeout)
 	defer cancel()
-	status, err := writePinned(operationContext, target, key, payload)
+	status, err := writePinned(operationContext, target, route.Key, payload)
 	if errors.Is(operationContext.Err(), context.DeadlineExceeded) {
 		return domain.StatusBadTimeout, operationContext.Err()
+	}
+	if err == nil && status.IsGood() {
+		r.rememberPassiveCommand(sessionID, key.Identifier, groupHint, route, payload)
 	}
 	return status, err
 }
@@ -415,6 +460,7 @@ func (r *Runtime) finishCommand(id string, state domain.CommandState, status dom
 		r.setCommandPersistError(nil)
 	}
 	r.commandMu.Unlock()
+	r.finishCommandHistory(command)
 	for _, change := range routeChanges {
 		r.queueSessionRefresh(change.SessionID, change.Route.GroupID)
 		r.broker.Publish(api.Event{Type: "selection.changed", Data: change})

@@ -8,6 +8,7 @@ import { PageHeader } from '../components/PageHeader';
 import { Pagination } from '../components/Pagination';
 import { formatDateTime, shortSessionId } from '../lib/format';
 import { stateLabel, statusCodeLabel } from '../lib/labels';
+import { sourceHasGroup } from '../lib/sourceGroups';
 
 const PAGE_SIZE = 50;
 
@@ -21,7 +22,7 @@ export default function CommandsPage() {
   const [draft, setDraft] = useState(query);
   const groups = useGroups();
   const sources = useSources();
-  const groupSources = useMemo(() => (sources.data ?? []).filter((source) => !groupId || source.groupId === groupId), [groupId, sources.data]);
+  const groupSources = useMemo(() => (sources.data ?? []).filter((source) => !groupId || sourceHasGroup(source, groupId)), [groupId, sources.data]);
   const listParams = { page, pageSize: PAGE_SIZE, query, groupId, sourceId, status };
   const commandsQuery = useCommands(listParams);
   const commands = commandsQuery.data?.items ?? [];

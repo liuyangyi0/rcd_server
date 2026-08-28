@@ -7,6 +7,8 @@ export const queryKeys = {
   groups: ['groups'] as const,
   sources: (params: ListParams = {}) => ['sources', params] as const,
   allSources: ['sources'] as const,
+  sourceTopology: (sourceId: string) => ['source-topology', sourceId] as const,
+  allTopologies: ['source-topology'] as const,
   sessions: ['sessions'] as const,
   points: (params: ListParams) => ['points', params] as const,
   allPoints: ['points'] as const,
@@ -35,6 +37,10 @@ export function useSources(params: ListParams = {}) {
 
 export function useSessions() {
   return useQuery({ queryKey: queryKeys.sessions, queryFn: api.sessions, refetchInterval: 30_000 });
+}
+
+export function useSourceTopology(sourceId: string) {
+  return useQuery({ queryKey: queryKeys.sourceTopology(sourceId), queryFn: () => api.sourceTopology(sourceId), enabled: Boolean(sourceId) });
 }
 
 export function usePoints(params: ListParams, enabled = true) {

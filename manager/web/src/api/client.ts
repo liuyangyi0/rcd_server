@@ -12,6 +12,7 @@ import {
   normalizeSource,
   normalizeSourceEvent,
   normalizeSourceProbe,
+  normalizeSourceTopology,
   normalizeSystemInfo,
 } from './normalizers';
 import type {
@@ -32,6 +33,7 @@ import type {
   SourceEvent,
   SourceInput,
   SourceProbeResult,
+  SourceTopology,
   SystemInfo,
   UaSession,
 } from './types';
@@ -67,6 +69,8 @@ export function queryString(params: ListParams): string {
   if (params.sessionId) query.set('session_id', params.sessionId);
   if (params.status) query.set('status', params.status);
   if (params.kind) query.set('kind', params.kind);
+  if (params.portId) query.set('port_id', params.portId);
+  if (params.deviceId) query.set('device_id', params.deviceId);
   const value = query.toString();
   return value ? `?${value}` : '';
 }
@@ -167,6 +171,10 @@ export const api = {
     return normalizeSourceProbe(await request(`/sources/${encodeSegment(sourceId)}/probe`, { method: 'POST' }));
   },
 
+  async sourceTopology(sourceId: string): Promise<SourceTopology> {
+    return normalizeSourceTopology(await request(`/sources/${encodeSegment(sourceId)}/topology`));
+  },
+
   async restartSource(sourceId: string, revision: number, rediscover = false): Promise<Source> {
     const operation = rediscover ? 'rediscover' : 'reconnect';
     return normalizeSource(await request(`/sources/${encodeSegment(sourceId)}/${operation}`, {
@@ -247,6 +255,7 @@ function sourceMutation(input: SourceInput) {
   return {
     id: input.id,
     group_id: input.groupId,
+    group_bindings: input.groupBindings?.map((binding) => ({ group_id: binding.groupId, port_id: binding.portId, device_id: binding.deviceId })),
     name: input.name ?? input.id,
     endpoint: input.endpoint,
     security_policy: input.securityPolicy ?? 'None',
