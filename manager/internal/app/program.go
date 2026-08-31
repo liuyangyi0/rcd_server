@@ -55,6 +55,7 @@ func RunProgram(ctx context.Context, cfg config.Config) error {
 		CertificateFile: pair.CertificatePath, PrivateKeyFile: pair.PrivateKeyPath,
 		Version: build.Version, GitSHA: build.Commit, MaxSources: cfg.MaxSources, MaxSessions: cfg.MaxUpstreamSessions,
 		CommandTimeout: cfg.CommandTimeout, CommandPendingTTL: cfg.CommandPendingTTL,
+		PublishingInterval: cfg.LowerPublishingInterval, SamplingInterval: cfg.LowerSamplingInterval,
 		AuditRetention: cfg.AuditRetention, MaxAuditRows: cfg.MaxAuditRows,
 	})
 	if err != nil {

@@ -17,9 +17,9 @@ listeners and actual serial polling, not the OPC test assertions themselves.
 Change ``control.json`` atomically while running; missing fields keep defaults::
 
     {
-      "a": {"server_mode": "running", "ack_mode": "success", "delay_ms": 300,
+      "a": {"server_mode": "running", "ack_mode": "success", "delay_ms": 20,
             "values": {"1": 11, "2": 22}, "poll_mode": "respond"},
-      "b": {"ack_mode": "drop", "delay_ms": 300,
+      "b": {"ack_mode": "drop", "delay_ms": 20,
             "values": {"1": 101, "2": 202}, "poll_mode": "respond"}
     }
 
@@ -68,11 +68,12 @@ import tty
 POLL_PREFIX = b"\x08\x02\x30\x10\x01"
 ACK_SUCCESS = b"\x00\x50\x50"
 COMMAND_IDLE_SECONDS = 0.010
-SERIAL_TIMEOUT_MS = 1500
+SERIAL_TIMEOUT_MS = 50
 SUMMARY_INTERVAL_SECONDS = 10.0
 CONTROL_INTERVAL_SECONDS = 0.10
 MAX_COMMAND_BYTES = 65536
 DEFAULT_VALUES = {"a": {1: 11, 2: 22}, "b": {1: 101, 2: 202}}
+DEFAULT_ACK_DELAY_MS = 20
 
 
 def timestamp():
@@ -131,8 +132,11 @@ flow_control = "none"
 
 [settings]
 timeout = %d
-poll_interval_ms = 20
+poll_interval_ms = 1
 command_retry_count = 1
+query_retry_count = 0
+parity_switch_delay_ms = 1
+transmit_settle_guard_ms = 1
 
 [logging]
 level = "warn,rcd_server=info"
@@ -231,7 +235,7 @@ class Source:
         self.secondary_port = None
 
     def default_control(self):
-        return {"server_mode": "running", "ack_mode": "success", "delay_ms": 300,
+        return {"server_mode": "running", "ack_mode": "success", "delay_ms": DEFAULT_ACK_DELAY_MS,
                 "poll_mode": "respond", "values": dict(DEFAULT_VALUES[self.name])}
 
     def prepare(self, binary, primary_port, secondary_port):
@@ -540,15 +544,27 @@ class Fixture:
 
     def consume(self, source, flush=False):
         # Poll packets have an exact seven-byte shape. Commands intentionally
-        # use a different opcode and are extracted only after an idle gap.
+        # use a different opcode. Structured commands carry their payload length
+        # at byte 5 and can therefore be split immediately even when the next
+        # 1 ms poll is already buffered. Arbitrary short commands retain the
+        # idle-gap fallback below.
         while len(source.buffer) >= 7:
             candidate = bytes(source.buffer[:7])
             if (candidate[0] in (1, 2) and candidate[1:6] == POLL_PREFIX
                     and (sum(candidate[:-1]) & 0xFF) == candidate[-1]):
                 del source.buffer[:7]
                 self.poll(source, candidate)
-            else:
-                break
+                continue
+
+            command_len = 7 + source.buffer[5]
+            if command_len <= MAX_COMMAND_BYTES and len(source.buffer) >= command_len:
+                candidate = bytes(source.buffer[:command_len])
+                if ((sum(candidate[:-1]) & 0xFF) == candidate[-1]
+                        and candidate[0] in (1, 2)):
+                    del source.buffer[:command_len]
+                    self.command(source, candidate)
+                    continue
+            break
         if flush and source.buffer:
             frame = bytes(source.buffer)
             source.buffer.clear()

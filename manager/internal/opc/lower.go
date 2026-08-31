@@ -67,10 +67,10 @@ func NewLowerSupervisor(cfg LowerConfig, sink LowerSink) (*LowerSupervisor, erro
 		return nil, fmt.Errorf("monitor batch size must be in [1,%d]", DefaultMonitorBatchSize)
 	}
 	if cfg.PublishingInterval <= 0 {
-		cfg.PublishingInterval = 250 * time.Millisecond
+		cfg.PublishingInterval = 50 * time.Millisecond
 	}
 	if cfg.SamplingInterval <= 0 {
-		cfg.SamplingInterval = 250 * time.Millisecond
+		cfg.SamplingInterval = 50 * time.Millisecond
 	}
 	if cfg.ConnectTimeout <= 0 {
 		cfg.ConnectTimeout = 10 * time.Second

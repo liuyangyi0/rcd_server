@@ -159,10 +159,10 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 		options.MaxAuditRows = 100000
 	}
 	if options.PublishingInterval <= 0 {
-		options.PublishingInterval = 250 * time.Millisecond
+		options.PublishingInterval = 50 * time.Millisecond
 	}
 	if options.SamplingInterval <= 0 {
-		options.SamplingInterval = 250 * time.Millisecond
+		options.SamplingInterval = 50 * time.Millisecond
 	}
 	if options.LowerFactory == nil {
 		options.LowerFactory = func(cfg opc.LowerConfig, sink opc.LowerSink) (opc.LowerClient, error) {

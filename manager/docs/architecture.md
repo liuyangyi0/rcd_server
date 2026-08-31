@@ -44,7 +44,7 @@ NodeKey { NamespaceURI, Identifier }
 - `Objects/Devices` 下的变量；
 - `Objects/Methods` 下的方法。
 
-当前支持的变量类型为 `Boolean`、`UInt32`、`Float`、`Double` 和 `String`。`_Send` 必须是可写标量 String；`_SendCommand` 必须严格为 `HexData String -> Result String` 的标量方法。目录属性按最多 100 个节点一批读取；每个来源只创建一个 Subscription，再按最多 500 个一批加入 MonitoredItem，避免真实大点表同时触发消息尺寸和下级 Subscription 数量限制。默认 sampling/publishing interval 为 250 ms。
+当前支持的变量类型为 `Boolean`、`UInt32`、`Float`、`Double` 和 `String`。`_Send` 必须是可写标量 String；`_SendCommand` 必须严格为 `HexData String -> Result String` 的标量方法。目录属性按最多 100 个节点一批读取；每个来源只创建一个 Subscription，再按最多 500 个一批加入 MonitoredItem，避免真实大点表同时触发消息尺寸和下级 Subscription 数量限制。默认 sampling/publishing interval 为 50 ms。
 
 同组目录采用并集。同名节点只有 class、data type、value rank，以及方法签名一致时才能合并。以下情况会使涉及的来源进入 `CatalogConflict` 并不可选：
 
@@ -179,7 +179,7 @@ Web 面板按来源和版本缓存，按标签按需请求，退出后释放配�
 
 `_Send` 写成功后等待同一来源同一端口的 ACK：`2` 表示仍在等待，`1` 完成，`3` 失败。每次建立或重建订阅后，该端口必须先有一个当前 connection epoch 的 `_Send` 样本通过运行时，写命令才允许下发；这使异步到达的保留值只成为 sequence baseline，而不会被认作新命令的 ACK。成功 `1` 必须跟随本次命令的新 `2`；真实下级在派发立即失败时可能直接给出 `3`，管理程序会接受同 epoch、post-baseline 的直接失败 ACK。
 
-为处理下级在一个 250 ms 采样周期内快速完成 `2 → 1/3`、且最终字符串与上一条命令相同而导致订阅合并通知的情况，写前会读取 `_Send` 的 ServerTimestamp 作为基线，写成功后启动短时、仅针对该端口的 50 ms Read 探针。只有 ServerTimestamp 严格晚于写前基线且 connection epoch 仍匹配的 `1/2/3` 才会送入 ACK 状态机；旧终态不会被复用。探针遇到终态或上下文结束即停止，不替代常规订阅。超过 pending timeout 后记为 `TimedOut`。`_SendCommand` 在短超时内同步 Call，并在返回时结束命令记录。
+为处理下级在一个 50 ms 采样周期内快速完成 `2 → 1/3`、且最终字符串与上一条命令相同而导致订阅合并通知的情况，写前会读取 `_Send` 的 ServerTimestamp 作为基线，写成功后启动短时、仅针对该端口的 50 ms Read 探针。只有 ServerTimestamp 严格晚于写前基线且 connection epoch 仍匹配的 `1/2/3` 才会送入 ACK 状态机；旧终态不会被复用。探针遇到终态或上下文结束即停止，不替代常规订阅。超过 pending timeout 后记为 `TimedOut`。`_SendCommand` 在短超时内同步 Call，并在返回时结束命令记录。
 
 ## 持久化边界
 

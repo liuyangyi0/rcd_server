@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -282,6 +283,218 @@ func TestLiveDeviceGroupsReadSubscribeWebAndCommands(t *testing.T) {
 	t.Log("CloseSession removes the REST selection target and a replacement Session starts with default device-a")
 }
 
+// Opt-in only: changes one value in the disposable PTY fixture and measures the
+// complete fixture-control -> Rust serial poll -> lower OPC -> manager -> upper
+// OPC notification path. The fixture's 100 ms control-file scan is deliberately
+// included, so this is a conservative end-to-end measurement.
+func TestLiveDeviceGroupsFastUpdateLatency(t *testing.T) {
+	endpoint := os.Getenv("RCD_DEVICE_GROUPS_ENDPOINT")
+	controlPath := os.Getenv("RCD_DEVICE_GROUPS_CONTROL")
+	if endpoint == "" || controlPath == "" {
+		t.Skip("set RCD_DEVICE_GROUPS_ENDPOINT and RCD_DEVICE_GROUPS_CONTROL for the isolated PTY deployment")
+	}
+	original, err := os.ReadFile(controlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { liveGroupsWriteAtomic(t, controlPath, original) })
+	var control map[string]any
+	if err := json.Unmarshal(original, &control); err != nil {
+		t.Fatal(err)
+	}
+	source, ok := control["a"].(map[string]any)
+	if !ok {
+		t.Fatalf("fixture control has no source a: %#v", control)
+	}
+	values, ok := source["values"].(map[string]any)
+	if !ok {
+		t.Fatalf("fixture source a has no values: %#v", source)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	client, _ := connectLiveManagerAnonymous(t, endpoint, "device-groups-fast-latency")
+	writeResponse, err := client.Write(ctx, &gu.WriteRequest{NodesToWrite: []*gu.WriteValue{{
+		NodeID: gu.NewStringNodeID(3, "Groups/device-a/SelectedSourceId"), AttributeID: gu.AttributeIDValue,
+		Value: &gu.DataValue{EncodingMask: gu.DataValueValue, Value: gu.MustVariant("lower-a")},
+	}}})
+	if err != nil || writeResponse == nil || len(writeResponse.Results) != 1 || writeResponse.Results[0] != gu.StatusOK {
+		t.Fatalf("select lower-a: response=%#v err=%v", writeResponse, err)
+	}
+	notifications := liveGroupsSubscribe(t, ctx, client, "A_VALUE")
+	initial, err := strconv.ParseFloat(fmt.Sprint(values["1"]), 64)
+	if err != nil {
+		t.Fatalf("parse initial fixture value: %v", err)
+	}
+	liveGroupsAwaitValue(t, notifications, 1, initial)
+
+	const sampleCount = 20
+	durations := make([]time.Duration, 0, sampleCount)
+	for index := 0; index < sampleCount; index++ {
+		target := float64(31 + index%2)
+		values["1"] = target
+		encoded, err := json.MarshalIndent(control, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded = append(encoded, '\n')
+		started := time.Now()
+		liveGroupsWriteAtomic(t, controlPath, encoded)
+		liveGroupsAwaitValue(t, notifications, 1, target)
+		durations = append(durations, time.Since(started))
+	}
+	sorted := append([]time.Duration(nil), durations...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	p50 := sorted[len(sorted)/2]
+	p95 := sorted[(len(sorted)*95+99)/100-1]
+	max := sorted[len(sorted)-1]
+	t.Logf("50ms end-to-end samples=%d p50=%s p95=%s max=%s all=%v", len(sorted), p50, p95, max, durations)
+	if p95 > 500*time.Millisecond {
+		t.Fatalf("end-to-end notification P95=%s exceeds 500ms", p95)
+	}
+}
+
+// Opt-in inventory/quality check for the real 28800-baud lower gateway. It is
+// read-only: all business Variables are read once and one is subscribed at the
+// requested 50 ms intervals to verify the server's revised values.
+func TestLiveFastLowerQualityAndIntervals(t *testing.T) {
+	endpoint := os.Getenv("RCD_FAST_LOWER_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("set RCD_FAST_LOWER_ENDPOINT for the real lower OPC gateway")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	client := connectLiveConfiguredEndpointAnonymous(t, endpoint, "fast-lower-quality")
+	catalog, _, err := discoverCatalog(ctx, client, domain.Source{ID: "fast-lower", GroupID: "quality"}, namespaceIndex(client.Namespaces()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	variables := make([]*gu.NodeID, 0, len(catalog.Nodes))
+	businessNS, exists := namespaceIndex(client.Namespaces())[BusinessNamespaceURI]
+	if !exists {
+		t.Fatal("lower business namespace is missing")
+	}
+	for _, node := range catalog.Nodes {
+		if node.Class == domain.NodeClassVariable {
+			variables = append(variables, gu.NewStringNodeID(businessNS, node.Key.Identifier))
+		}
+	}
+	if len(variables) == 0 {
+		t.Fatal("lower catalog has no Variables")
+	}
+
+	statusCounts := make(map[gu.StatusCode]int)
+	good, bad := 0, 0
+	for start := 0; start < len(variables); start += 500 {
+		end := start + 500
+		if end > len(variables) {
+			end = len(variables)
+		}
+		request := &gu.ReadRequest{TimestampsToReturn: gu.TimestampsToReturnBoth}
+		for _, nodeID := range variables[start:end] {
+			request.NodesToRead = append(request.NodesToRead, &gu.ReadValueID{NodeID: nodeID, AttributeID: gu.AttributeIDValue})
+		}
+		response, err := client.Read(ctx, request)
+		if err != nil || response == nil || len(response.Results) != end-start {
+			t.Fatalf("read batch %d:%d response=%#v err=%v", start, end, response, err)
+		}
+		for _, value := range response.Results {
+			statusCounts[value.Status]++
+			if domain.StatusCode(value.Status).IsGood() {
+				good++
+			} else {
+				bad++
+			}
+		}
+	}
+
+	notifications := make(chan *gopcua.PublishNotificationData, 16)
+	subscription, err := client.Subscribe(ctx, &gopcua.SubscriptionParameters{Interval: 50 * time.Millisecond}, notifications)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer closeCancel()
+		_ = subscription.Cancel(closeCtx)
+	})
+	if subscription.RevisedPublishingInterval != 50*time.Millisecond {
+		t.Fatalf("lower revised publishing interval=%s want=50ms", subscription.RevisedPublishingInterval)
+	}
+	item := gopcua.NewMonitoredItemCreateRequestWithDefaults(variables[0], gu.AttributeIDValue, 1)
+	item.RequestedParameters.SamplingInterval = 50
+	response, err := subscription.Monitor(ctx, gu.TimestampsToReturnBoth, item)
+	if err != nil || response == nil || len(response.Results) != 1 || response.Results[0].StatusCode != gu.StatusOK {
+		t.Fatalf("lower monitor response=%#v err=%v", response, err)
+	}
+	if response.Results[0].RevisedSamplingInterval != 50 {
+		t.Fatalf("lower revised sampling interval=%vms want=50ms", response.Results[0].RevisedSamplingInterval)
+	}
+	awaitDataChange(t, notifications)
+	t.Logf("real lower variables=%d good=%d bad=%d statuses=%v publishing=%s sampling=%vms", len(variables), good, bad, statusCounts, subscription.RevisedPublishingInterval, response.Results[0].RevisedSamplingInterval)
+	if good == 0 {
+		t.Fatal("real lower returned no Good business Variables")
+	}
+}
+
+func connectLiveConfiguredEndpointAnonymous(t *testing.T, endpoint, sessionName string) *gopcua.Client {
+	t.Helper()
+	discoveryCtx, discoveryCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	endpoints, err := gopcua.GetEndpoints(discoveryCtx, endpoint)
+	discoveryCancel()
+	if err != nil {
+		t.Fatalf("GetEndpoints(%s): %v", endpoint, err)
+	}
+	selected, err := gopcua.SelectEndpoint(endpoints, "None", gu.MessageSecurityModeNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := gopcua.NewClient(
+		lowerDialEndpoint(endpoint, selected.EndpointURL),
+		gopcua.SecurityFromEndpoint(selected, gu.UserTokenTypeAnonymous),
+		gopcua.AuthAnonymous(), gopcua.AutoReconnect(false), gopcua.SessionName(sessionName),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connectCtx, connectCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := client.Connect(connectCtx); err != nil {
+		connectCancel()
+		t.Fatal(err)
+	}
+	connectCancel()
+	t.Cleanup(func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer closeCancel()
+		_ = client.Close(closeCtx)
+	})
+	return client
+}
+
+func liveGroupsWriteAtomic(t *testing.T, path string, data []byte) {
+	t.Helper()
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".fast-latency-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		t.Fatal(err)
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		t.Fatal(err)
+	}
+	if err := temporary.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func liveGroupsCheckWireCommands(t *testing.T, path string, offset int) {
 	t.Helper()
 	deadline := time.Now().Add(8 * time.Second)
@@ -359,9 +572,12 @@ func liveGroupsJSON(t *testing.T, base, method, path string, revision uint64, bo
 func liveGroupsSubscribe(t *testing.T, ctx context.Context, client *gopcua.Client, identifiers ...string) <-chan *gopcua.PublishNotificationData {
 	t.Helper()
 	notifications := make(chan *gopcua.PublishNotificationData, 64)
-	subscription, err := client.Subscribe(ctx, &gopcua.SubscriptionParameters{Interval: 250 * time.Millisecond}, notifications)
+	subscription, err := client.Subscribe(ctx, &gopcua.SubscriptionParameters{Interval: 50 * time.Millisecond}, notifications)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if subscription.RevisedPublishingInterval != 50*time.Millisecond {
+		t.Fatalf("revised publishing interval=%s want=50ms", subscription.RevisedPublishingInterval)
 	}
 	t.Cleanup(func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -371,7 +587,7 @@ func liveGroupsSubscribe(t *testing.T, ctx context.Context, client *gopcua.Clien
 	requests := make([]*gu.MonitoredItemCreateRequest, 0, len(identifiers))
 	for i, identifier := range identifiers {
 		request := gopcua.NewMonitoredItemCreateRequestWithDefaults(gu.NewStringNodeID(2, identifier), gu.AttributeIDValue, uint32(i+1))
-		request.RequestedParameters.SamplingInterval = 250
+		request.RequestedParameters.SamplingInterval = 50
 		requests = append(requests, request)
 	}
 	response, err := subscription.Monitor(ctx, gu.TimestampsToReturnBoth, requests...)
@@ -381,6 +597,9 @@ func liveGroupsSubscribe(t *testing.T, ctx context.Context, client *gopcua.Clien
 	for _, result := range response.Results {
 		if result.StatusCode != gu.StatusOK {
 			t.Fatal(result.StatusCode)
+		}
+		if result.RevisedSamplingInterval != 50 {
+			t.Fatalf("revised sampling interval=%vms want=50ms", result.RevisedSamplingInterval)
 		}
 	}
 	return notifications

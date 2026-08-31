@@ -436,6 +436,10 @@ async fn init_serial_ports(
                 software_config.serial.stop_bits,
                 software_config.serial.parity,
                 Duration::from_millis(software_config.settings.timeout),
+            )
+            .with_transmit_timing(
+                Duration::from_millis(software_config.settings.parity_switch_delay_ms),
+                Duration::from_millis(software_config.settings.transmit_settle_guard_ms),
             ),
             port_config.clone(),
             rx,

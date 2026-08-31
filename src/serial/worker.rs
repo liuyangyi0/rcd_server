@@ -64,6 +64,7 @@ pub fn spawn_serial_worker(
         let port_name = serial_config.port_name.clone();
         let poll_interval = Duration::from_millis(software_config.settings.poll_interval_ms);
         let command_retry_count = software_config.settings.command_retry_count.max(1);
+        let query_retry_count = software_config.settings.query_retry_count.min(1);
         let run_on = software_config.server.run_on.clone();
         let current_run = software_config.server.current_run.clone();
         let mut port_config = port_config;
@@ -106,6 +107,7 @@ pub fn spawn_serial_worker(
                     &cancel,
                     poll_interval,
                     command_retry_count,
+                    query_retry_count,
                 );
             }));
 
@@ -157,6 +159,7 @@ fn run_worker_loop(
     cancel: &CancellationToken,
     poll_interval: Duration,
     command_retry_count: u32,
+    query_retry_count: u32,
 ) {
     let mut last_idle_log = Instant::now() - WORKER_HEARTBEAT_INTERVAL;
     let mut last_heartbeat_log = Instant::now() - WORKER_HEARTBEAT_INTERVAL;
@@ -222,7 +225,7 @@ fn run_worker_loop(
                     port_name, manager.current_run, manager.index, device_id
                 );
                 let receive_started = Instant::now();
-                manager.receive_query_with_retry(query);
+                manager.receive_query_with_retry(query, query_retry_count);
                 let elapsed = receive_started.elapsed();
                 if elapsed >= SLOW_RECEIVE_LOG_THRESHOLD {
                     debug!(

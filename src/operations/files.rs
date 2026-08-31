@@ -944,6 +944,14 @@ fn validate_application(content: &str, result: &mut Validation) {
             "config.toml: baud_rate、timeout、poll_interval_ms、command_retry_count 必须大于 0",
         );
     }
+    if config.settings.query_retry_count > 1 {
+        result.error("config.toml: query_retry_count 只能是 0 或 1");
+    }
+    if config.settings.parity_switch_delay_ms > 100
+        || config.settings.transmit_settle_guard_ms > 100
+    {
+        result.error("config.toml: parity_switch_delay_ms、transmit_settle_guard_ms 不能超过 100");
+    }
     let logging = &config.logging;
     if let Err(error) = flexi_logger::LogSpecification::parse(&logging.level) {
         result.error(format!("config.toml logging.level: {error}"));
@@ -1411,9 +1419,12 @@ parity = "None"
 stop_bits = "One"
 flow_control = "none"
 [settings]
-timeout = 300
-poll_interval_ms = 20
+timeout = 50
+poll_interval_ms = 1
 command_retry_count = 3
+query_retry_count = 0
+parity_switch_delay_ms = 1
+transmit_settle_guard_ms = 1
 "#;
 
     fn csv(port: &str, address: u8, prefix: &str, point: &str) -> String {

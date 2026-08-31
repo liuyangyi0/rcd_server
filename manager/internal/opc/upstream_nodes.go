@@ -78,7 +78,7 @@ func (s *UpstreamServer) addBusinessVariableLocked(spec domain.CatalogNode) (*bu
 			awu.NewReference(awu.ReferenceTypeIDHasComponent, true, awu.NewExpandedNodeID(s.devicesID)),
 		},
 		awu.NewDataValue(zeroValue(spec.DataType, spec.ValueRank), awu.BadWaitingForInitialData, time.Time{}, 0, time.Now(), 0),
-		dataType, spec.ValueRank, nil, access, 125, false, nil,
+		dataType, spec.ValueRank, nil, access, upstreamMinimumSamplingIntervalMS, false, nil,
 	)
 	node.SetReadValueHandler(func(session *awserver.Session, _ awu.ReadValueID) awu.DataValue {
 		return readBusinessValue(s.backend, sessionID(session), spec, entry.retired.Load(), time.Now())
@@ -604,7 +604,7 @@ func (s *UpstreamServer) addManagementVariableLocked(parent awu.NodeID, id strin
 	}
 	minimumSamplingInterval := definition.minimumSamplingInterval
 	if minimumSamplingInterval <= 0 {
-		minimumSamplingInterval = 125
+		minimumSamplingInterval = upstreamMinimumSamplingIntervalMS
 	}
 	if existing, exists := s.server.NamespaceManager().FindNode(nodeID); exists {
 		node, ok := existing.(*awserver.VariableNode)

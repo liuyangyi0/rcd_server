@@ -24,7 +24,7 @@ func (s *UpstreamServer) addGroupCommandNodesLocked(groupID string, parent awu.N
 				awu.NewReference(awu.ReferenceTypeIDHasComponent, true, awu.NewExpandedNodeID(parent)),
 			}, awu.NewDataValue("", awu.BadWaitingForInitialData, time.Time{}, 0, time.Now(), 0),
 			awu.DataTypeIDString, awu.ValueRankScalar, nil,
-			awu.AccessLevelsCurrentRead|awu.AccessLevelsCurrentWrite, 125, false, nil,
+			awu.AccessLevelsCurrentRead|awu.AccessLevelsCurrentWrite, upstreamMinimumSamplingIntervalMS, false, nil,
 		)
 		node.SetReadValueHandler(func(session *awserver.Session, _ awu.ReadValueID) awu.DataValue {
 			if !supported {

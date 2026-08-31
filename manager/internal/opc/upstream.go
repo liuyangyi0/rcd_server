@@ -72,8 +72,9 @@ type memberCoverageSnapshotKey struct {
 }
 
 const (
-	forceSessionRefreshBatchSize = 500
-	managementMaxArrayLength     = 131_072
+	forceSessionRefreshBatchSize      = 500
+	managementMaxArrayLength          = 131_072
+	upstreamMinimumSamplingIntervalMS = 50.0
 )
 
 type UpstreamServer struct {
@@ -142,6 +143,7 @@ func NewUpstreamServer(cfg UpstreamConfig, backend UpstreamBackend) (*UpstreamSe
 	}
 	serverCapabilities := awu.NewServerCapabilities()
 	serverCapabilities.MaxArrayLength = managementMaxArrayLength
+	serverCapabilities.MinSupportedSampleRate = upstreamMinimumSamplingIntervalMS
 	adapter := &UpstreamServer{
 		cfg: cfg, backend: backend,
 		business:                make(map[string]*businessEntry),

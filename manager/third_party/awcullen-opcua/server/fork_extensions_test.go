@@ -9,6 +9,18 @@ import (
 	"github.com/awcullen/opcua/ua"
 )
 
+func TestSubscriptionRevisesFastPublishingIntervalTo50Milliseconds(t *testing.T) {
+	srv := newForkUnitServer()
+	session := newForkSession(srv, "fast-publishing")
+	subscription := NewSubscription(srv.subscriptionManager, session, 1, 20, 10, 0, true, 0)
+	t.Cleanup(subscription.Delete)
+
+	revised, _, _ := subscription.responseSettings()
+	if revised != 50 {
+		t.Fatalf("revised publishing interval = %v ms, want 50 ms", revised)
+	}
+}
+
 func TestDiagnosticsSnapshotsSupportConcurrentRequestUpdates(t *testing.T) {
 	srv := newForkUnitServer()
 	srv.serverDiagnosticsSummary = &ua.ServerDiagnosticsSummaryDataType{}

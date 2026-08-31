@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	minPublishingInterval        = 125.0
+	minPublishingInterval        = 50.0
 	maxPublishingInterval        = 60 * 1000.0
 	minLifetime                  = 10 * 1000.0
 	maxLifetime                  = 60 * 60 * 1000.0

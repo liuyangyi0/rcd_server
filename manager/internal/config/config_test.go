@@ -2,6 +2,7 @@ package config
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -13,6 +14,8 @@ func TestLoadFlagsOverrideDefaults(t *testing.T) {
 		"--opc-listen", "127.0.0.1:14840",
 		"--opc-advertise-host", "manager.local",
 		"--http-listen", "127.0.0.1:18080",
+		"--lower-publishing-interval", "40ms",
+		"--lower-sampling-interval", "30ms",
 		"--audit-retention", "1080h",
 		"--max-audit-rows", "25000",
 	})
@@ -27,6 +30,9 @@ func TestLoadFlagsOverrideDefaults(t *testing.T) {
 	}
 	if cfg.AuditRetention != 45*24*time.Hour || cfg.MaxAuditRows != 25000 {
 		t.Fatalf("retention=%s max rows=%d", cfg.AuditRetention, cfg.MaxAuditRows)
+	}
+	if cfg.LowerPublishingInterval != 40*time.Millisecond || cfg.LowerSamplingInterval != 30*time.Millisecond {
+		t.Fatalf("lower publishing=%s sampling=%s", cfg.LowerPublishingInterval, cfg.LowerSamplingInterval)
 	}
 }
 
@@ -74,5 +80,9 @@ func TestServiceArgumentsUseAbsoluteDataDirectory(t *testing.T) {
 		if arg == cfg.OPCPassword {
 			t.Fatalf("service arguments contain OPC password")
 		}
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--lower-publishing-interval 50ms") || !strings.Contains(joined, "--lower-sampling-interval 50ms") {
+		t.Fatalf("service arguments omit lower OPC intervals: %s", joined)
 	}
 }

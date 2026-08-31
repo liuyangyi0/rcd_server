@@ -19,6 +19,9 @@ pub const OPCUA_MIN_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 pub const OPCUA_MIN_MAX_CHUNK_COUNT: usize = 256;
 /// 串口事件已经完成采样，允许客户端请求零采样间隔。
 const OPCUA_MIN_SAMPLING_INTERVAL_MS: f64 = 0.0;
+/// 下级 OPC 最快发布周期；与订阅调度时钟保持一致。
+const OPCUA_MIN_PUBLISHING_INTERVAL_MS: f64 = 50.0;
+const OPCUA_SUBSCRIPTION_POLL_INTERVAL_MS: u64 = 50;
 /// OPC 写命令日志最多展示的字符数，避免异常大输入阻塞控制台和日志文件。
 const OPC_WRITE_LOG_PREVIEW_CHARS: usize = 256;
 /// `_Send` 节点启动时的非空字符串值，兼容按当前值推断点类型的 OPC 客户端。
@@ -208,9 +211,9 @@ fn configure_opcua_limits(builder: &mut ServerBuilder, total_variables: usize) -
     limits.operational.max_references_per_browse_node = limit_target;
     limits.operational.max_monitored_items_per_call = limit_target;
     limits.subscriptions.max_monitored_items_per_sub = limit_target;
-    // 串口采集已经决定了数据产生频率；不再由 OPC UA 层追加默认 100 ms
-    // 的二次采样延迟。Publishing Interval 保持库原有约束。
+    // 串口采集已经决定了数据产生频率；不再由 OPC UA 层追加二次采样延迟。
     limits.subscriptions.min_sampling_interval_ms = OPCUA_MIN_SAMPLING_INTERVAL_MS;
+    limits.subscriptions.min_publishing_interval_ms = OPCUA_MIN_PUBLISHING_INTERVAL_MS;
     limits.max_message_size = message_size;
     limits.max_chunk_count = OPCUA_MIN_MAX_CHUNK_COUNT;
 
@@ -451,6 +454,7 @@ pub async fn run_opcua_server(
             ),
         )
         .default_endpoint("basic256sha256_signenc")
+        .subscription_poll_interval_ms(OPCUA_SUBSCRIPTION_POLL_INTERVAL_MS)
         .build_info(BuildInfo {
             product_uri: "urn:SerialServer".into(),
             manufacturer_name: "Rust Serial OPC UA Server".into(),
@@ -500,13 +504,15 @@ pub async fn run_opcua_server(
         .max(topology_json.len())
         .max(MAX_REQUEST_BYTES);
     info!(
-        "[OPC UA] 变量规划: 设备变量={}, 写命令变量={}, 计算变量={}, 总变量={}, 动态限制={}, min_sampling_interval_ms={}",
+        "[OPC UA] 变量规划: 设备变量={}, 写命令变量={}, 计算变量={}, 总变量={}, 动态限制={}, min_sampling_interval_ms={}, min_publishing_interval_ms={}, subscription_poll_interval_ms={}",
         variable_counts.device_variables,
         variable_counts.send_variables,
         variable_counts.calc_variables,
         variable_counts.total(),
         limit_target,
         OPCUA_MIN_SAMPLING_INTERVAL_MS,
+        OPCUA_MIN_PUBLISHING_INTERVAL_MS,
+        OPCUA_SUBSCRIPTION_POLL_INTERVAL_MS,
     );
 
     let (server, handle) = builder
@@ -2287,7 +2293,7 @@ mod tests {
     }
 
     #[test]
-    fn opcua_limits_allow_event_driven_zero_sampling_interval() {
+    fn opcua_limits_allow_zero_sampling_and_50ms_publishing() {
         let mut builder = ServerBuilder::new();
 
         configure_opcua_limits(&mut builder, 10);
@@ -2295,6 +2301,13 @@ mod tests {
         assert_eq!(
             builder.limits_mut().subscriptions.min_sampling_interval_ms,
             OPCUA_MIN_SAMPLING_INTERVAL_MS
+        );
+        assert_eq!(
+            builder
+                .limits_mut()
+                .subscriptions
+                .min_publishing_interval_ms,
+            OPCUA_MIN_PUBLISHING_INTERVAL_MS
         );
     }
 

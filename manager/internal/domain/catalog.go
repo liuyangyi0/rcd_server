@@ -109,8 +109,8 @@ func BuildCatalogUnion(catalogs []SourceCatalog) (CatalogUnion, error) {
 				result.Groups[groupID] = make(map[string]CatalogNode)
 				owners[groupID] = make(map[string]*nodeOwner)
 			}
-			identifier := strings.TrimSpace(node.Key.Identifier)
-			if identifier == "" {
+			identifier := node.Key.Identifier
+			if strings.TrimSpace(identifier) == "" {
 				markConflict(&result, CatalogConflictDetail{
 					Kind: ConflictDuplicateNode, GroupID: groupID,
 					SourceIDs: []string{catalog.SourceID}, Message: "empty node identifier",

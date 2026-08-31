@@ -70,7 +70,7 @@ pub mod constants {
     /// The polling interval in millis on subscriptions and monitored items. The more
     /// fine-grained this is, the more often subscriptions will be checked for changes. The minimum
     /// publish interval cannot be less than this.
-    pub const SUBSCRIPTION_TIMER_RATE_MS: u64 = 100;
+    pub const SUBSCRIPTION_TIMER_RATE_MS: u64 = 50;
     /// Minimum publishing interval for subscriptions
     pub const MIN_PUBLISHING_INTERVAL_MS: f64 = SUBSCRIPTION_TIMER_RATE_MS as f64;
     /// Minimum sampling interval on monitored items

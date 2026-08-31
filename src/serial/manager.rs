@@ -35,8 +35,10 @@ const RESPONSE_FRAME_OVERHEAD_WITH_STATUS_LEN: usize = 4;
 const FORWARD_PREFIX_GRACE: Duration = Duration::from_millis(5);
 const FAILURE_LOG_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 const BAD_FRAME_LOG_MAX_BYTES: usize = 64;
-const TRANSMIT_SETTLE_MARGIN: Duration = Duration::from_millis(25);
+const OUTPUT_QUEUE_POLL_INTERVAL: Duration = Duration::from_micros(250);
+const MIN_TRANSMIT_IO_SLACK: Duration = Duration::from_millis(50);
 const MAX_TRANSMIT_TIMEOUT: Duration = Duration::from_secs(5);
+const RESPONSE_COMPLETION_GUARD: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeviceFailureKind {
@@ -373,6 +375,8 @@ pub struct SerialConfig {
     pub stop_bits: StopBits,
     pub parity: Parity,
     pub read_timeout: Duration,
+    pub parity_switch_delay: Duration,
+    pub transmit_settle_guard: Duration,
 }
 
 impl SerialConfig {
@@ -391,7 +395,19 @@ impl SerialConfig {
             stop_bits,
             parity,
             read_timeout,
+            parity_switch_delay: Duration::from_millis(1),
+            transmit_settle_guard: Duration::from_millis(1),
         }
+    }
+
+    pub fn with_transmit_timing(
+        mut self,
+        parity_switch_delay: Duration,
+        transmit_settle_guard: Duration,
+    ) -> Self {
+        self.parity_switch_delay = parity_switch_delay;
+        self.transmit_settle_guard = transmit_settle_guard;
+        self
     }
 }
 
@@ -1003,7 +1019,7 @@ impl SerialManager {
         if let Err(error) = self.write_segment(
             Some(Parity::Mark),
             &addr_byte,
-            Duration::from_millis(25),
+            self.serial_config.parity_switch_delay,
             true,
         ) {
             return self.handle_send_transport_error(
@@ -1101,18 +1117,23 @@ impl SerialManager {
             )
         })?;
         if wait_for_settle {
-            wait_for_output_settle(data.len(), self.serial_config.baud_rate, deadline).map_err(
-                |error| {
-                    io_error_with_context(
-                        error,
-                        format!(
-                            "stage=wait_output_settle data_len={} elapsed_us={}",
-                            data.len(),
-                            segment_started.elapsed().as_micros()
-                        ),
-                    )
-                },
-            )?;
+            wait_for_output_settle(
+                port.as_ref(),
+                data.len(),
+                self.serial_config.baud_rate,
+                self.serial_config.transmit_settle_guard,
+                deadline,
+            )
+            .map_err(|error| {
+                io_error_with_context(
+                    error,
+                    format!(
+                        "stage=wait_output_settle data_len={} elapsed_us={}",
+                        data.len(),
+                        segment_started.elapsed().as_micros()
+                    ),
+                )
+            })?;
         }
         Ok(())
     }
@@ -1268,8 +1289,8 @@ impl SerialManager {
         }
     }
 
-    /// 接收主机自动查询响应，首轮读取超时或协议解析失败时向同一设备补发一次。
-    pub(crate) fn receive_query_with_retry(&mut self, query: SendData) {
+    /// 接收主机自动查询响应；仅在显式配置时对首轮超时或坏帧补发一次。
+    pub(crate) fn receive_query_with_retry(&mut self, query: SendData, retry_count: u32) {
         let query_index = self.index;
         let Some(device) = self.port_config.devices.get(query_index) else {
             return;
@@ -1284,6 +1305,11 @@ impl SerialManager {
                 return
             }
         };
+
+        if retry_count == 0 {
+            self.commit_query_failure(first_failure, None);
+            return;
+        }
 
         // 临时主机在接收期间可能因检测到有效转发头切回备机，此时禁止主动补发。
         if self.current_run != RunLocation::Primary || self.index != query_index {
@@ -1419,9 +1445,20 @@ impl SerialManager {
             return ReceiveDataOutcome::TransportHandled;
         }
 
-        // `SerialPort::read` 的 timeout 是单次 read 超时。这里另设整帧截止时间，
-        // 防止设备持续零星发送字节时每次 read 都重新获得一个完整超时窗口。
-        let deadline = Instant::now() + self.serial_config.read_timeout;
+        // 50 ms 是“等待响应开始”的截止时间。若截止前已收到首字节，只按当前
+        // 波特率和最大合法帧长追加一次收帧预算，避免晚到的合法帧被截断，同时
+        // 防止设备持续零星发送字节时不断刷新完整超时窗口。
+        let completion_budget =
+            response_completion_budget(&self.port_config, self.index, self.serial_config.baud_rate);
+        let mut deadline = Instant::now() + self.serial_config.read_timeout;
+        let mut completion_deadline_extended = false;
+        if !self.rx_pending.is_empty() {
+            let completion_deadline = Instant::now() + completion_budget;
+            if completion_deadline > deadline {
+                deadline = completion_deadline;
+            }
+            completion_deadline_extended = true;
+        }
         let mut read_call = 0u32;
         let raw_frame = loop {
             if let Some(frame_len) = complete_frame_len(
@@ -1517,6 +1554,13 @@ impl SerialManager {
                 }
                 Ok(n) => {
                     self.rx_pending.extend_from_slice(&self.read_buf[..n]);
+                    if !completion_deadline_extended {
+                        let completion_deadline = Instant::now() + completion_budget;
+                        if completion_deadline > deadline {
+                            deadline = completion_deadline;
+                        }
+                        completion_deadline_extended = true;
+                    }
                     if frame_diagnostics {
                         let (chunk_hex, chunk_truncated) =
                             format_hex_preview(&self.read_buf[..n], BAD_FRAME_LOG_MAX_BYTES);
@@ -2306,13 +2350,33 @@ fn wire_duration(byte_count: usize, baud_rate: u32) -> Duration {
     Duration::from_nanos(nanos as u64)
 }
 
+/// 首字节已经到达后，用线速计算一次性的完整收帧预算。
+///
+/// 始终包含转发前缀，既覆盖直连帧，也覆盖主备切换期间可能出现的转发帧。
+fn response_completion_budget(
+    port_config: &SerialPortConfig,
+    device_index: usize,
+    baud_rate: u32,
+) -> Duration {
+    let maximum_frame_len = port_config
+        .devices
+        .get(device_index)
+        .map(|device| {
+            usize::from(device.config.data_len)
+                .saturating_add(RESPONSE_FRAME_OVERHEAD)
+                .saturating_add(FORWARD_PREFIX_LEN)
+        })
+        .unwrap_or(RESPONSE_FRAME_OVERHEAD + FORWARD_PREFIX_LEN);
+    wire_duration(maximum_frame_len, baud_rate).saturating_add(RESPONSE_COMPLETION_GUARD)
+}
+
 fn transmit_wire_budget(byte_count: usize, baud_rate: u32) -> Duration {
     wire_duration(byte_count, baud_rate)
         .saturating_add(wire_duration(byte_count.min(16), baud_rate))
 }
 
 fn minimum_transmit_timeout(byte_count: usize, baud_rate: u32) -> Duration {
-    transmit_wire_budget(byte_count, baud_rate).saturating_add(Duration::from_millis(100))
+    transmit_wire_budget(byte_count, baud_rate).saturating_add(MIN_TRANSMIT_IO_SLACK)
 }
 
 fn transmit_timeout(byte_count: usize, baud_rate: u32, configured: Duration) -> Duration {
@@ -2320,16 +2384,33 @@ fn transmit_timeout(byte_count: usize, baud_rate: u32, configured: Duration) -> 
     // 读取超时只是一个可复用的 I/O 余量，不得因为它大于发送保护上限就把所有
     // 短命令误判为“帧过长”。余量限制在剩余的 5 秒总预算内。
     let remaining_budget = MAX_TRANSMIT_TIMEOUT.saturating_sub(wire_budget);
-    let io_slack = configured
-        .max(Duration::from_millis(100))
-        .min(remaining_budget);
+    let io_slack = configured.max(MIN_TRANSMIT_IO_SLACK).min(remaining_budget);
     wire_budget.saturating_add(io_slack)
 }
 
-/// 等待驱动缓冲中的数据按线速发送完成。固定余量覆盖 XR17/USB 串口从驱动队列
-/// 到 UART 的调度延迟，同时由调用方截止时间限制最长等待时间。
-fn wait_for_output_settle(byte_count: usize, baud_rate: u32, deadline: Instant) -> io::Result<()> {
-    let settle = wire_duration(byte_count, baud_rate).saturating_add(TRANSMIT_SETTLE_MARGIN);
+/// 等待驱动发送队列清空，再按完整段线速时间和短保护时间等待 UART 发完。
+/// `bytes_to_write` 不受驱动支持时仍使用线速时间兜底；不调用可能永久阻塞的 flush/tcdrain。
+fn wait_for_output_settle(
+    port: &dyn SerialPort,
+    byte_count: usize,
+    baud_rate: u32,
+    settle_guard: Duration,
+    deadline: Instant,
+) -> io::Result<()> {
+    while matches!(port.bytes_to_write(), Ok(queued) if queued > 0) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                ErrorKind::TimedOut,
+                "serial output queue drain deadline elapsed",
+            ));
+        }
+        std::thread::sleep(OUTPUT_QUEUE_POLL_INTERVAL.min(remaining));
+    }
+
+    // 即使驱动报告队列为 0，字节仍可能已经进入 UART FIFO/移位寄存器；完整
+    // 线速时间是安全上界，额外保护时间用于校验位切换和 USB/XR17 调度抖动。
+    let settle = wire_duration(byte_count, baud_rate).saturating_add(settle_guard);
     let remaining = deadline.saturating_duration_since(Instant::now());
     if settle > remaining {
         return Err(io::Error::new(
@@ -2554,7 +2635,7 @@ mod tests {
         DeviceConfig {
             config: CsvConfig {
                 com: "COM1".to_string(),
-                baud_rate: 9_600,
+                baud_rate: 28_800,
                 is_special: true,
                 com_index: device_id,
                 device_id,
@@ -2584,13 +2665,13 @@ mod tests {
             command_queue: Arc::new(Mutex::new(VecDeque::new())),
             serial_config: SerialConfig::new(
                 "COM1".to_string(),
-                9_600,
+                28_800,
                 DataBits::Eight,
                 StopBits::One,
                 Parity::None,
                 Duration::from_millis(100),
             ),
-            port_config: SerialPortConfig::new("COM1".to_string(), 9_600, true, vec![device]),
+            port_config: SerialPortConfig::new("COM1".to_string(), 28_800, true, vec![device]),
             broadcaster: Broadcaster::new(),
             latest_status_cache: LatestStatusCache::new(),
             device_states: vec![DeviceRuntimeState::new()],
@@ -2729,7 +2810,7 @@ mod tests {
         }
 
         fn baud_rate(&self) -> serialport::Result<u32> {
-            Ok(9_600)
+            Ok(28_800)
         }
 
         fn data_bits(&self) -> serialport::Result<DataBits> {
@@ -2875,10 +2956,14 @@ mod tests {
     }
 
     fn run_auto_query(manager: &mut SerialManager) {
+        run_auto_query_with_retries(manager, 1);
+    }
+
+    fn run_auto_query_with_retries(manager: &mut SerialManager, retry_count: u32) {
         let query = status_query();
         manager.prepare_automatic_query(query.device_id as u8, manager.index);
         assert!(manager.send_command(query.clone()));
-        manager.receive_query_with_retry(query);
+        manager.receive_query_with_retry(query, retry_count);
     }
 
     #[test]
@@ -3347,18 +3432,67 @@ mod tests {
     }
 
     #[test]
+    fn response_start_before_timeout_gets_one_wire_time_completion_budget() {
+        let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+        manager.serial_config.read_timeout = Duration::from_millis(50);
+        let frame = valid_status_frame(1, cmd::READ_STATUS);
+        install_scripted_port(
+            &mut manager,
+            vec![
+                ReadStep::DelayedData(Duration::from_millis(45), frame[..3].to_vec()),
+                ReadStep::DelayedData(Duration::from_millis(4), frame[3..].to_vec()),
+            ],
+            vec![],
+        );
+
+        let started = Instant::now();
+        let outcome = manager.receive_data_attempt(1);
+        let elapsed = started.elapsed();
+
+        assert!(matches!(outcome, ReceiveDataOutcome::Success));
+        assert!(elapsed >= Duration::from_millis(45));
+        assert!(
+            elapsed < Duration::from_millis(80),
+            "首字节后的收帧预算不应变成第二个完整超时: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn response_completion_budget_matches_28800_baud_maximum_fixture_frame() {
+        let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+        manager.port_config.devices[0].config.data_len = 35;
+
+        let budget = response_completion_budget(&manager.port_config, 0, 28_800);
+
+        // 35 数据字节 + 5 固定字节 + 9 转发前缀，以 12 bit/byte 保守计算，
+        // 再加 5 ms 调度保护，理论预算约 25.42 ms。
+        assert!(budget >= Duration::from_micros(25_400));
+        assert!(budget < Duration::from_millis(26));
+    }
+
+    #[test]
     fn normal_send_uses_bounded_settle_without_flush() {
         let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
         manager.port_config.is_special = false;
         let observations = install_scripted_port(&mut manager, vec![], vec![true, true]);
 
+        let started = Instant::now();
         assert!(manager.send_command(status_query()));
+        let elapsed = started.elapsed();
 
         let observations = observations.lock().unwrap();
         assert_eq!(observations.write_attempts, 2);
         assert_eq!(observations.flush_attempts, 0);
         assert_eq!(observations.writes[0], vec![1]);
         assert_eq!(observations.writes[1].len(), 6);
+        println!(
+            "ordinary Mark/Space transmit elapsed_us={}",
+            elapsed.as_micros()
+        );
+        assert!(
+            elapsed < Duration::from_millis(45),
+            "普通串口发送仍包含过长固定等待: {elapsed:?}"
+        );
     }
 
     #[test]
@@ -3662,6 +3796,45 @@ mod tests {
                 .stats(Instant::now())
                 .first_timeouts,
             1
+        );
+    }
+
+    #[test]
+    fn automatic_query_fast_mode_commits_after_one_timeout_without_resend() {
+        let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+        manager.serial_config.read_timeout = Duration::from_millis(50);
+        let observations = install_scripted_port(
+            &mut manager,
+            vec![
+                ReadStep::DelayedData(Duration::from_millis(100), Vec::new()),
+                ReadStep::Data(valid_status_frame(1, cmd::READ_STATUS)),
+            ],
+            vec![true, true],
+        );
+        let mut rx = manager.broadcaster.subscribe();
+
+        let started = Instant::now();
+        run_auto_query_with_retries(&mut manager, 0);
+        let elapsed = started.elapsed();
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.write_attempts, 1);
+        assert_eq!(observations.input_clears, 1);
+        drop(observations);
+        assert_eq!(manager.time_out_count, 1);
+        assert_eq!(manager.device_states[0].timeout_count, 1);
+        assert!(!rx.try_recv().expect("单次超时应立即发布离线").device_status);
+        println!(
+            "single-attempt 50ms query elapsed_ms={}",
+            elapsed.as_millis()
+        );
+        assert!(
+            elapsed >= Duration::from_millis(45),
+            "脚本化读取没有实际等待约 50ms: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(90),
+            "快速模式不应再等待第二个 50ms 超时: {elapsed:?}"
         );
     }
 

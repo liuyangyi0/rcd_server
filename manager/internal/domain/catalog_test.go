@@ -25,6 +25,23 @@ func TestBuildCatalogUnionMergesCompatibleNodes(t *testing.T) {
 	}
 }
 
+func TestBuildCatalogUnionPreservesExactWireIdentifier(t *testing.T) {
+	node := variable("KKS_WITH_LEGACY_SPACE ", DataTypeUInt32)
+	catalog, err := BuildCatalogUnion([]SourceCatalog{{
+		SourceID: "a", GroupID: "g", State: CatalogReady, Nodes: []CatalogNode{node},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, exists := catalog.Groups["g"][node.Key.Identifier]
+	if !exists || actual.Key.Identifier != node.Key.Identifier {
+		t.Fatalf("exact wire identifier was changed: groups=%#v", catalog.Groups["g"])
+	}
+	if _, normalized := catalog.Groups["g"]["KKS_WITH_LEGACY_SPACE"]; normalized {
+		t.Fatal("trimmed identifier must not replace the lower OPC NodeID")
+	}
+}
+
 func TestBuildCatalogUnionRejectsCrossGroupDuplicate(t *testing.T) {
 	_, err := BuildCatalogUnion([]SourceCatalog{
 		{SourceID: "a", GroupID: "g1", Nodes: []CatalogNode{variable("KKS", DataTypeUInt32)}},

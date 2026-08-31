@@ -9,8 +9,11 @@ use std::net::SocketAddr;
 
 use crate::logging::LoggingConfig;
 
-pub const DEFAULT_POLL_INTERVAL_MS: u64 = 20;
+pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1;
 pub const DEFAULT_COMMAND_RETRY_COUNT: u32 = 3;
+pub const DEFAULT_QUERY_RETRY_COUNT: u32 = 0;
+pub const DEFAULT_PARITY_SWITCH_DELAY_MS: u64 = 1;
+pub const DEFAULT_TRANSMIT_SETTLE_GUARD_MS: u64 = 1;
 
 // ============================================================
 //  远程类型桥接（serde 无法直接反序列化外部 crate 的枚举）
@@ -141,6 +144,15 @@ pub struct Settings {
     /// 命令未收到 ACK 时的最大连续下发次数。
     #[serde(default = "default_command_retry_count")]
     pub command_retry_count: u32,
+    /// 自动轮询查询失败后的补发次数。快速模式使用 0，避免一次故障等待两个读取超时。
+    #[serde(default = "default_query_retry_count")]
+    pub query_retry_count: u32,
+    /// 普通串口切换 Mark/Space 校验位后、写入前的驱动保护时间（毫秒）。
+    #[serde(default = "default_parity_switch_delay_ms")]
+    pub parity_switch_delay_ms: u64,
+    /// 驱动发送队列清空并等待线速发送后追加的保护时间（毫秒）。
+    #[serde(default = "default_transmit_settle_guard_ms")]
+    pub transmit_settle_guard_ms: u64,
 }
 
 /// 顶层配置结构，对应 `config.toml` 全部内容。
@@ -161,6 +173,18 @@ fn default_poll_interval_ms() -> u64 {
 
 fn default_command_retry_count() -> u32 {
     DEFAULT_COMMAND_RETRY_COUNT
+}
+
+fn default_query_retry_count() -> u32 {
+    DEFAULT_QUERY_RETRY_COUNT
+}
+
+fn default_parity_switch_delay_ms() -> u64 {
+    DEFAULT_PARITY_SWITCH_DELAY_MS
+}
+
+fn default_transmit_settle_guard_ms() -> u64 {
+    DEFAULT_TRANSMIT_SETTLE_GUARD_MS
 }
 
 // ============================================================
@@ -206,7 +230,7 @@ flow_control = "none"
 "#;
 
     #[test]
-    fn settings_poll_interval_defaults_to_20_ms() {
+    fn settings_fast_serial_defaults_are_applied() {
         let toml_str = format!(
             r#"{BASE_CONFIG}
 [settings]
@@ -224,6 +248,15 @@ timeout = 300
             config.settings.command_retry_count,
             DEFAULT_COMMAND_RETRY_COUNT
         );
+        assert_eq!(config.settings.query_retry_count, DEFAULT_QUERY_RETRY_COUNT);
+        assert_eq!(
+            config.settings.parity_switch_delay_ms,
+            DEFAULT_PARITY_SWITCH_DELAY_MS
+        );
+        assert_eq!(
+            config.settings.transmit_settle_guard_ms,
+            DEFAULT_TRANSMIT_SETTLE_GUARD_MS
+        );
         assert_eq!(config.logging.level, "warn,rcd_server=info");
         assert_eq!(config.logging.keep_files, 30);
     }
@@ -236,6 +269,9 @@ timeout = 300
 timeout = 300
 poll_interval_ms = 50
 command_retry_count = 5
+query_retry_count = 1
+parity_switch_delay_ms = 2
+transmit_settle_guard_ms = 3
 
 [logging]
 level = "debug"
@@ -249,6 +285,9 @@ serial_frame_logs = true
         assert_eq!(config.settings.timeout, 300);
         assert_eq!(config.settings.poll_interval_ms, 50);
         assert_eq!(config.settings.command_retry_count, 5);
+        assert_eq!(config.settings.query_retry_count, 1);
+        assert_eq!(config.settings.parity_switch_delay_ms, 2);
+        assert_eq!(config.settings.transmit_settle_guard_ms, 3);
         assert_eq!(config.logging.level, "debug");
         assert!(config.logging.serial_frame_logs);
     }

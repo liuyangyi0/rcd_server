@@ -459,6 +459,9 @@ func TestUpstreamManagementArrayCapacityCoversMaximumDeployment(t *testing.T) {
 	if got := server.server.ServerCapabilities().MaxArrayLength; got != managementMaxArrayLength || got < 20*5300 {
 		t.Fatalf("MaxArrayLength=%d, want %d and enough for 20x5300", got, managementMaxArrayLength)
 	}
+	if got := server.server.ServerCapabilities().MinSupportedSampleRate; got != upstreamMinimumSamplingIntervalMS {
+		t.Fatalf("MinSupportedSampleRate=%v, want %v", got, upstreamMinimumSamplingIntervalMS)
+	}
 }
 
 func TestGroupCatalogRevisionIsARecoverableSeqlock(t *testing.T) {
