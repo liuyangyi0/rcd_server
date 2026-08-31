@@ -1,6 +1,7 @@
 package opc
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -23,6 +24,10 @@ type groupMemberTreeSpec struct {
 	ProvidedPoints   uint32                    `json:"provided_points"`
 	MissingPoints    uint32                    `json:"missing_points"`
 	CompleteCoverage bool                      `json:"complete_coverage"`
+	CoverageKnown    bool                      `json:"coverage_known"`
+	CoverageHash     string                    `json:"coverage_hash"`
+	ProvidedPointIDs []string                  `json:"provided_point_ids"`
+	MissingPointIDs  []string                  `json:"missing_point_ids"`
 	Ports            []groupMemberTreePortSpec `json:"ports"`
 }
 
@@ -49,8 +54,8 @@ type groupMemberTreeDeviceSpec struct {
 }
 
 type memberTreeTracker struct {
-	nodes  map[string]awu.NodeID
-	values []awu.NodeID
+	nodes    map[string]awu.NodeID
+	routeIDs []awu.NodeID
 }
 
 func newMemberTreeTracker() *memberTreeTracker {
@@ -63,7 +68,11 @@ func (t *memberTreeTracker) object(id awu.NodeID) {
 
 func (t *memberTreeTracker) value(id awu.NodeID) {
 	t.nodes[fmt.Sprint(id)] = id
-	t.values = append(t.values, id)
+}
+
+func (t *memberTreeTracker) routeValue(id awu.NodeID) {
+	t.value(id)
+	t.routeIDs = append(t.routeIDs, id)
 }
 
 // reconcileGroupMemberTreeLocked publishes the physical membership behind one
@@ -72,15 +81,24 @@ func (t *memberTreeTracker) value(id awu.NodeID) {
 // group's SelectedSourceId variable.
 func (s *UpstreamServer) reconcileGroupMemberTreeLocked(group domain.Group, sources []domain.Source, catalog domain.CatalogUnion) error {
 	specs := buildGroupMemberTreeSpecs(group.ID, sources, catalog)
-	payload, err := json.Marshal(specs)
-	if err != nil {
-		return fmt.Errorf("encode group %q member tree: %w", group.ID, err)
+	hasher := sha256.New()
+	encoder := json.NewEncoder(hasher)
+	for _, spec := range specs {
+		// CoverageHash already commits to both point-ID arrays. Do not scan and
+		// serialize those potentially large lists a second time just to decide
+		// whether the physical member tree needs reconciliation.
+		spec.ProvidedPointIDs = nil
+		spec.MissingPointIDs = nil
+		if err := encoder.Encode(spec); err != nil {
+			return fmt.Errorf("encode group %q member tree: %w", group.ID, err)
+		}
 	}
-	hash := string(payload)
+	hash := fmt.Sprintf("%x", hasher.Sum(nil))
 	rootIdentifier := "Groups/" + group.ID + "/Members"
 	rootID := awu.NewNodeIDString(s.managementNS, rootIdentifier)
 	if s.memberTreeHashes[group.ID] == hash && s.memberTreeNodeIDs[group.ID] != nil {
 		if _, exists := s.server.NamespaceManager().FindNode(rootID); exists {
+			s.purgeMemberCoverageSnapshotsLocked(group.ID, specs)
 			return nil
 		}
 	}
@@ -123,13 +141,15 @@ func (s *UpstreamServer) reconcileGroupMemberTreeLocked(group domain.Group, sour
 	}
 	s.purgeMissingManagementIndexLocked()
 	s.memberTreeNodeIDs[group.ID] = tracker.nodes
-	sort.Slice(tracker.values, func(i, j int) bool { return fmt.Sprint(tracker.values[i]) < fmt.Sprint(tracker.values[j]) })
-	s.memberTreeValueIDs[group.ID] = tracker.values
+	sort.Slice(tracker.routeIDs, func(i, j int) bool { return fmt.Sprint(tracker.routeIDs[i]) < fmt.Sprint(tracker.routeIDs[j]) })
+	s.memberTreeRouteIDs[group.ID] = tracker.routeIDs
 	s.memberTreeHashes[group.ID] = hash
+	s.purgeMemberCoverageSnapshotsLocked(group.ID, specs)
 	return nil
 }
 
 func (s *UpstreamServer) addGroupMemberLocked(groupID string, parent awu.NodeID, member groupMemberTreeSpec, tracker *memberTreeTracker) error {
+	coverageSnapshot := s.updateMemberCoverageSnapshotLocked(groupID, member)
 	sourcePath := "Groups/" + groupID + "/Members/" + managementPathComponent(member.SourceID)
 	sourceID := awu.NewNodeIDString(s.managementNS, sourcePath)
 	if err := s.ensureMemberObjectLocked(sourceID, member.SourceID, member.SourceID, parent); err != nil {
@@ -143,10 +163,15 @@ func (s *UpstreamServer) addGroupMemberLocked(groupID string, parent awu.NodeID,
 		{name: "Endpoint", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: staticManagementValue(member.Endpoint)},
 		{name: "UsesDefaultGroup", dataType: awu.DataTypeIDBoolean, valueRank: awu.ValueRankScalar, read: staticManagementValue(member.UsesDefaultGroup)},
 		{name: "PortCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, read: staticManagementValue(uint32(len(member.Ports)))},
-		{name: "ExpectedPointCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, read: staticManagementValue(member.ExpectedPoints)},
-		{name: "ProvidedPointCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, read: staticManagementValue(member.ProvidedPoints)},
-		{name: "MissingPointCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, read: staticManagementValue(member.MissingPoints)},
-		{name: "CompleteCoverage", dataType: awu.DataTypeIDBoolean, valueRank: awu.ValueRankScalar, read: staticManagementValue(member.CompleteCoverage)},
+		{name: "ExpectedPointCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, read: memberCoverageValue(coverageSnapshot, func(snapshot *memberCoverageSnapshot) any { return snapshot.expectedPoints })},
+		{name: "ProvidedPointCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, read: memberCoverageValue(coverageSnapshot, func(snapshot *memberCoverageSnapshot) any { return snapshot.providedPoints })},
+		{name: "MissingPointCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, read: memberCoverageValue(coverageSnapshot, func(snapshot *memberCoverageSnapshot) any { return snapshot.missingPoints })},
+		{name: "CompleteCoverage", dataType: awu.DataTypeIDBoolean, valueRank: awu.ValueRankScalar, read: memberCoverageValue(coverageSnapshot, func(snapshot *memberCoverageSnapshot) any { return snapshot.completeCoverage })},
+		{name: "CoverageKnown", dataType: awu.DataTypeIDBoolean, valueRank: awu.ValueRankScalar, read: memberCoverageValue(coverageSnapshot, func(snapshot *memberCoverageSnapshot) any { return snapshot.coverageKnown })},
+		{name: "CoverageFingerprint", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: memberCoverageValue(coverageSnapshot, func(snapshot *memberCoverageSnapshot) any { return snapshot.fingerprint })},
+		{name: "CoverageRevision", dataType: awu.DataTypeIDUInt64, valueRank: awu.ValueRankScalar, read: memberCoverageValue(coverageSnapshot, func(snapshot *memberCoverageSnapshot) any { return snapshot.revision })},
+		{name: "ProvidedPointNodeIds", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankOneDimension, minimumSamplingInterval: 1000, read: memberCoverageValue(coverageSnapshot, func(snapshot *memberCoverageSnapshot) any { return snapshot.providedIDs })},
+		{name: "MissingPointNodeIds", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankOneDimension, minimumSamplingInterval: 1000, read: memberCoverageValue(coverageSnapshot, func(snapshot *memberCoverageSnapshot) any { return snapshot.missingIDs })},
 	}
 	for _, definition := range static {
 		if err := s.addMemberVariableLocked(tracker, sourceID, sourcePath+"/"+definition.name, definition); err != nil {
@@ -165,7 +190,7 @@ func (s *UpstreamServer) addGroupMemberLocked(groupID string, parent awu.NodeID,
 	}); err != nil {
 		return err
 	}
-	if err := s.addMemberVariableLocked(tracker, sourceID, sourcePath+"/IsSelected", managementVariable{
+	if err := s.addRouteMemberVariableLocked(tracker, sourceID, sourcePath+"/IsSelected", managementVariable{
 		name: "IsSelected", dataType: awu.DataTypeIDBoolean, valueRank: awu.ValueRankScalar,
 		read: func(sessionID string) (any, awu.StatusCode) {
 			session, err := s.backend.Session(sessionID)
@@ -279,12 +304,24 @@ func (s *UpstreamServer) addGroupMemberPortLocked(parent awu.NodeID, parentPath 
 
 func buildGroupMemberTreeSpecs(groupID string, sources []domain.Source, catalog domain.CatalogUnion) []groupMemberTreeSpec {
 	result := make([]groupMemberTreeSpec, 0, len(sources))
+	groupPointIDs := groupPointNodeIDs(groupID, catalog)
 	for _, source := range sources {
-		expected, provided, missing := memberCoverage(groupID, source.ID, catalog)
+		providedIDs, missingIDs := memberPointNodeIDsFromGroup(groupID, source.ID, groupPointIDs, catalog)
+		expected, provided, missing := uint32(len(providedIDs)+len(missingIDs)), uint32(len(providedIDs)), uint32(len(missingIDs))
+		catalogState := catalog.SourceStates[source.ID]
+		if catalogState == "" {
+			catalogState = source.CatalogState
+		}
+		// Only a validated live or cached catalog is authoritative. Conflict
+		// sources may still expose best-effort lists for diagnosis, but a damaged
+		// or quarantined cache must never masquerade as known coverage.
+		coverageKnown := catalogState.Selectable()
 		member := groupMemberTreeSpec{
 			SourceID: source.ID, SourceName: source.Name, Endpoint: source.Endpoint,
 			UsesDefaultGroup: source.GroupID == groupID, ExpectedPoints: expected,
-			ProvidedPoints: provided, MissingPoints: missing, CompleteCoverage: missing == 0,
+			ProvidedPoints: provided, MissingPoints: missing, CompleteCoverage: coverageKnown && missing == 0,
+			CoverageKnown: coverageKnown, CoverageHash: pointListFingerprint([]string{string(catalogState)}, providedIDs, missingIDs),
+			ProvidedPointIDs: providedIDs, MissingPointIDs: missingIDs,
 		}
 		configured := make(map[domain.TopologyOwner]bool)
 		for _, binding := range source.GroupBindings {
@@ -359,19 +396,94 @@ func buildGroupMemberTreeSpecs(groupID string, sources []domain.Source, catalog 
 	return result
 }
 
-func memberCoverage(groupID, sourceID string, catalog domain.CatalogUnion) (expected, provided, missing uint32) {
-	sourceNodes := catalog.SourceNodes[sourceID]
-	for identifier, unionNode := range catalog.Groups[groupID] {
-		if !memberCoveragePoint(unionNode) {
-			continue
-		}
-		expected++
-		sourceNode, exists := sourceNodes[identifier]
-		if exists && !sourceNode.Retired && sourceNode.Class == unionNode.Class && sourceNode.DataType == unionNode.DataType && sourceNode.ValueRank == unionNode.ValueRank {
-			provided++
+// groupPointNodeIDs is the authoritative, sorted list of ns=2 data point
+// identifiers routed by one logical group. Command variables and methods are
+// intentionally excluded because their physical target is resolved from the
+// command payload instead of from a static KKS-to-group lookup.
+func groupPointNodeIDs(groupID string, catalog domain.CatalogUnion) []string {
+	identifiers := make([]string, 0, len(catalog.Groups[groupID]))
+	for identifier, node := range catalog.Groups[groupID] {
+		if memberCoveragePoint(node) {
+			identifiers = append(identifiers, identifier)
 		}
 	}
-	return expected, provided, expected - provided
+	sort.Strings(identifiers)
+	return identifiers
+}
+
+func memberPointNodeIDs(groupID, sourceID string, catalog domain.CatalogUnion) (provided, missing []string) {
+	return memberPointNodeIDsFromGroup(groupID, sourceID, groupPointNodeIDs(groupID, catalog), catalog)
+}
+
+func memberPointNodeIDsFromGroup(groupID, sourceID string, groupPointIDs []string, catalog domain.CatalogUnion) (provided, missing []string) {
+	sourceNodes := catalog.SourceNodes[sourceID]
+	for _, identifier := range groupPointIDs {
+		unionNode := catalog.Groups[groupID][identifier]
+		sourceNode, exists := sourceNodes[identifier]
+		sameGroup := sourceNode.GroupID == "" || sourceNode.GroupID == groupID
+		if exists && sameGroup && memberCoveragePoint(sourceNode) && sourceNode.Class == unionNode.Class && sourceNode.DataType == unionNode.DataType && sourceNode.ValueRank == unionNode.ValueRank {
+			provided = append(provided, identifier)
+		} else {
+			missing = append(missing, identifier)
+		}
+	}
+	return provided, missing
+}
+
+func pointListFingerprint(lists ...[]string) string {
+	hasher := sha256.New()
+	_ = json.NewEncoder(hasher).Encode(lists)
+	return fmt.Sprintf("%x", hasher.Sum(nil))
+}
+
+func (s *UpstreamServer) updateMemberCoverageSnapshotLocked(groupID string, member groupMemberTreeSpec) *memberCoverageSnapshotStore {
+	key := memberCoverageSnapshotKey{groupID: groupID, sourceID: member.SourceID}
+	store := s.memberCoverageSnapshots[key]
+	if store == nil {
+		store = &memberCoverageSnapshotStore{}
+		s.memberCoverageSnapshots[key] = store
+	}
+	current := store.current.Load()
+	if current != nil && current.fingerprint == member.CoverageHash {
+		return store
+	}
+	revision := uint64(1)
+	if current != nil {
+		revision = current.revision + 1
+	}
+	store.current.Store(&memberCoverageSnapshot{
+		revision: revision, expectedPoints: member.ExpectedPoints,
+		providedPoints: member.ProvidedPoints, missingPoints: member.MissingPoints,
+		completeCoverage: member.CompleteCoverage, coverageKnown: member.CoverageKnown,
+		fingerprint: member.CoverageHash,
+		providedIDs: append([]string(nil), member.ProvidedPointIDs...),
+		missingIDs:  append([]string(nil), member.MissingPointIDs...),
+	})
+	return store
+}
+
+func (s *UpstreamServer) purgeMemberCoverageSnapshotsLocked(groupID string, members []groupMemberTreeSpec) {
+	desired := make(map[string]struct{}, len(members))
+	for _, member := range members {
+		desired[member.SourceID] = struct{}{}
+	}
+	for key := range s.memberCoverageSnapshots {
+		if key.groupID == groupID {
+			if _, keep := desired[key.sourceID]; !keep {
+				delete(s.memberCoverageSnapshots, key)
+			}
+		}
+	}
+}
+
+func memberCoverageValue(store *memberCoverageSnapshotStore, selectValue func(*memberCoverageSnapshot) any) func(string) (any, awu.StatusCode) {
+	return func(string) (any, awu.StatusCode) {
+		snapshot := store.current.Load()
+		if snapshot == nil {
+			return nil, awu.BadWaitingForInitialData
+		}
+		return selectValue(snapshot), awu.Good
+	}
 }
 
 func memberCoveragePoint(node domain.CatalogNode) bool {
@@ -405,6 +517,14 @@ func (s *UpstreamServer) addMemberVariableLocked(tracker *memberTreeTracker, par
 	return nil
 }
 
+func (s *UpstreamServer) addRouteMemberVariableLocked(tracker *memberTreeTracker, parent awu.NodeID, identifier string, definition managementVariable) error {
+	if err := s.addManagementVariableLocked(parent, identifier, definition); err != nil {
+		return err
+	}
+	tracker.routeValue(awu.NewNodeIDString(s.managementNS, identifier))
+	return nil
+}
+
 func deviceAddressManagementValue(device groupMemberTreeDeviceSpec) func(string) (any, awu.StatusCode) {
 	return func(string) (any, awu.StatusCode) {
 		if !device.AddressKnown {
@@ -434,6 +554,13 @@ func newComponentObject(srv *awserver.Server, namespace uint16, id awu.NodeID, b
 
 func staticManagementValue(value any) func(string) (any, awu.StatusCode) {
 	return func(string) (any, awu.StatusCode) { return value, awu.Good }
+}
+
+func staticStringSliceManagementValue(value []string) func(string) (any, awu.StatusCode) {
+	snapshot := append([]string(nil), value...)
+	return func(string) (any, awu.StatusCode) {
+		return snapshot, awu.Good
+	}
 }
 
 func managementPathComponent(value string) string {

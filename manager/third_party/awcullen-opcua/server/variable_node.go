@@ -221,11 +221,28 @@ func (n *VariableNode) SetReadValueHandler(value func(*Session, ua.ReadValueID) 
 	n.readValueHandler = value
 }
 
+// ReadValueHandler returns a stable handler snapshot. The lock is deliberately
+// released before the caller invokes the callback because application handlers
+// may read or update this node again.
+func (n *VariableNode) ReadValueHandler() func(*Session, ua.ReadValueID) ua.DataValue {
+	n.RLock()
+	defer n.RUnlock()
+	return n.readValueHandler
+}
+
 // SetWriteValueHandler sets the WriteValueHandler of this node.
 func (n *VariableNode) SetWriteValueHandler(value func(*Session, ua.WriteValue) (ua.DataValue, ua.StatusCode)) {
 	n.Lock()
 	defer n.Unlock()
 	n.writeValueHandler = value
+}
+
+// WriteValueHandler returns a stable handler snapshot without holding the node
+// lock while user code executes.
+func (n *VariableNode) WriteValueHandler() func(*Session, ua.WriteValue) (ua.DataValue, ua.StatusCode) {
+	n.RLock()
+	defer n.RUnlock()
+	return n.writeValueHandler
 }
 
 // IsAttributeIDValid returns true if attributeId is supported for the node.

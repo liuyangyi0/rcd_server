@@ -79,13 +79,21 @@ Groups/<group_id>/Members
 └─ <source_id>
    ├─ Selectable / IsSelected / ConnectionState / CatalogState
    ├─ ExpectedPointCount / ProvidedPointCount / MissingPointCount / CompleteCoverage
+   ├─ CoverageKnown / CoverageFingerprint / CoverageRevision
+   ├─ ProvidedPointNodeIds / MissingPointNodeIds
    └─ Ports/<port_id>/Devices/<device_id>
       └─ DeviceAddress / AddressKnown / DeviceName / KKSPrefix
          PointCount / RawPointCount / CalculationPointCount
          Configured / ExplicitlyBound / PresentInTopology
 ```
 
-客户端先 Browse 成员树确认 source、实际串口和子站关系，再将目标 `source_id` 作为 String
+组节点的 `PointNodeCount` / `PointNodeIds` 公开该组当前可发布、非热退役的
+`urn:SerialServer` 数据变量 identifier，并以 `PointSetFingerprint` 标识内容、`PointSetRevision`
+标识本进程内的每次变化；客户端分页前后必须校验 Revision 相同。组级 `CatalogRevision` 是覆盖
+点表和全部成员的 seqlock：整套读取前后必须是同一个非零偶数。客户端可先用它从
+KKS 精确反查逻辑组，再通过成员的 `ProvidedPointNodeIds` / `MissingPointNodeIds` 判断该来源是否
+提供兼容的此点。`CoverageKnown=false` 时清单尚未完成；冲突来源的清单只相对当前可发布组并集，
+用于诊断而不能表示该来源全部原始目录。客户端 Browse 成员树确认 source、实际串口和子站关系，再将目标 `source_id` 作为 String
 写入同组的 `SelectedSourceId`。写入与业务点 Read/Subscribe 必须使用同一个 OPC Session；
 切换的是该 Session 的整个逻辑设备组，不是整台下级，也不是一个 KKS。成员树没有写接口，
 串口/子站映射只能通过经过 revision 校验的 Web/REST 配置修改。

@@ -36,29 +36,70 @@ type businessEntry struct {
 	retired atomic.Bool
 }
 
-const forceSessionRefreshBatchSize = 500
+// The discovery lists are deliberately served through stable holders. Every
+// VariableNode for one list family loads the same immutable snapshot, so a hot
+// catalog update cannot publish a new fingerprint while its count or array is
+// still backed by the previous catalog.
+type groupPointSnapshot struct {
+	revision    uint64
+	fingerprint string
+	identifiers []string
+}
+
+type groupPointSnapshotStore struct {
+	current atomic.Pointer[groupPointSnapshot]
+}
+
+type memberCoverageSnapshot struct {
+	revision         uint64
+	expectedPoints   uint32
+	providedPoints   uint32
+	missingPoints    uint32
+	completeCoverage bool
+	coverageKnown    bool
+	fingerprint      string
+	providedIDs      []string
+	missingIDs       []string
+}
+
+type memberCoverageSnapshotStore struct {
+	current atomic.Pointer[memberCoverageSnapshot]
+}
+
+type memberCoverageSnapshotKey struct {
+	groupID  string
+	sourceID string
+}
+
+const (
+	forceSessionRefreshBatchSize = 500
+	managementMaxArrayLength     = 131_072
+)
 
 type UpstreamServer struct {
 	cfg     UpstreamConfig
 	backend UpstreamBackend
 	server  *awserver.Server
 
-	mu                 sync.RWMutex
-	business           map[string]*businessEntry
-	management         map[string]awserver.Node
-	managementGroups   map[string]awserver.Node
-	managementSources  map[string]awserver.Node
-	memberTreeHashes   map[string]string
-	memberTreeNodeIDs  map[string]map[string]awu.NodeID
-	memberTreeValueIDs map[string][]awu.NodeID
-	groupNodeIDs       map[string][]awu.NodeID
-	businessNS         uint16
-	managementNS       uint16
-	devicesID          awu.NodeID
-	methodsID          awu.NodeID
-	managerRootID      awu.NodeID
-	groupsRootID       awu.NodeID
-	sourcesRootID      awu.NodeID
+	mu                      sync.RWMutex
+	business                map[string]*businessEntry
+	management              map[string]awserver.Node
+	managementGroups        map[string]awserver.Node
+	managementSources       map[string]awserver.Node
+	memberTreeHashes        map[string]string
+	memberTreeNodeIDs       map[string]map[string]awu.NodeID
+	memberTreeRouteIDs      map[string][]awu.NodeID
+	groupCatalogRevisions   map[string]*atomic.Uint64
+	groupPointSnapshots     map[string]*groupPointSnapshotStore
+	memberCoverageSnapshots map[memberCoverageSnapshotKey]*memberCoverageSnapshotStore
+	groupNodeIDs            map[string][]awu.NodeID
+	businessNS              uint16
+	managementNS            uint16
+	devicesID               awu.NodeID
+	methodsID               awu.NodeID
+	managerRootID           awu.NodeID
+	groupsRootID            awu.NodeID
+	sourcesRootID           awu.NodeID
 }
 
 type upstreamCatalogPlan struct {
@@ -99,18 +140,24 @@ func NewUpstreamServer(cfg UpstreamConfig, backend UpstreamBackend) (*UpstreamSe
 		ApplicationType: awu.ApplicationTypeServer,
 		DiscoveryURLs:   []string{cfg.EndpointURL},
 	}
+	serverCapabilities := awu.NewServerCapabilities()
+	serverCapabilities.MaxArrayLength = managementMaxArrayLength
 	adapter := &UpstreamServer{
 		cfg: cfg, backend: backend,
-		business:           make(map[string]*businessEntry),
-		management:         make(map[string]awserver.Node),
-		managementGroups:   make(map[string]awserver.Node),
-		managementSources:  make(map[string]awserver.Node),
-		memberTreeHashes:   make(map[string]string),
-		memberTreeNodeIDs:  make(map[string]map[string]awu.NodeID),
-		memberTreeValueIDs: make(map[string][]awu.NodeID),
-		groupNodeIDs:       make(map[string][]awu.NodeID),
+		business:                make(map[string]*businessEntry),
+		management:              make(map[string]awserver.Node),
+		managementGroups:        make(map[string]awserver.Node),
+		managementSources:       make(map[string]awserver.Node),
+		memberTreeHashes:        make(map[string]string),
+		memberTreeNodeIDs:       make(map[string]map[string]awu.NodeID),
+		memberTreeRouteIDs:      make(map[string][]awu.NodeID),
+		groupCatalogRevisions:   make(map[string]*atomic.Uint64),
+		groupPointSnapshots:     make(map[string]*groupPointSnapshotStore),
+		memberCoverageSnapshots: make(map[memberCoverageSnapshotKey]*memberCoverageSnapshotStore),
+		groupNodeIDs:            make(map[string][]awu.NodeID),
 	}
 	opts := []awserver.Option{
+		awserver.WithServerCapabilities(serverCapabilities),
 		awserver.WithMaxSessionCount(cfg.MaxSessions),
 		awserver.WithMaxSubscriptionCount(cfg.MaxSubscriptions),
 		awserver.WithMaxWorkerThreads(cfg.MaxWorkerThreads),
@@ -226,7 +273,7 @@ func (s *UpstreamServer) ReconcileCatalog(catalog domain.CatalogUnion, groups []
 	}
 	s.groupNodeIDs = make(map[string][]awu.NodeID, len(catalog.Groups))
 	for identifier, groupID := range groupForNode {
-		if entry := s.business[identifier]; entry != nil {
+		if entry := s.business[identifier]; entry != nil && entry.spec.Class == domain.NodeClassVariable {
 			s.groupNodeIDs[groupID] = append(s.groupNodeIDs[groupID], entry.node.NodeID())
 		}
 	}
@@ -236,7 +283,7 @@ func (s *UpstreamServer) ReconcileCatalog(catalog domain.CatalogUnion, groups []
 		}
 	}
 	for _, group := range groups {
-		s.groupNodeIDs[group.ID] = append(s.groupNodeIDs[group.ID], s.memberTreeValueIDs[group.ID]...)
+		s.groupNodeIDs[group.ID] = append(s.groupNodeIDs[group.ID], s.memberTreeRouteIDs[group.ID]...)
 	}
 	// A legacy command variable is shared by the devices on its physical port.
 	// Its ACK view can become ambiguous when any of those device routes changes.
@@ -279,6 +326,7 @@ func (s *UpstreamServer) validateCatalog(catalog domain.CatalogUnion, groups []d
 	groupForNode := make(map[string]string)
 	reserved := map[string]struct{}{"Devices": {}, "Methods": {}}
 	for groupID, nodes := range catalog.Groups {
+		pointCount := 0
 		for identifier, node := range nodes {
 			if identifier == "" || node.Key.Identifier != identifier {
 				return upstreamCatalogPlan{}, fmt.Errorf("catalog node identifier mismatch for %q", identifier)
@@ -308,6 +356,12 @@ func (s *UpstreamServer) validateCatalog(catalog domain.CatalogUnion, groups []d
 			default:
 				return upstreamCatalogPlan{}, fmt.Errorf("unsupported node class %q", node.Class)
 			}
+			if memberCoveragePoint(node) {
+				pointCount++
+			}
+		}
+		if pointCount > managementMaxArrayLength {
+			return upstreamCatalogPlan{}, fmt.Errorf("group %q has %d data points; maximum is %d", groupID, pointCount, managementMaxArrayLength)
 		}
 	}
 	for identifier := range desired {

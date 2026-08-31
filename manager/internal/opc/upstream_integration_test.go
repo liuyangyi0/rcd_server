@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	awu "github.com/awcullen/opcua/ua"
 	gopcua "github.com/gopcua/opcua"
 	"github.com/gopcua/opcua/id"
 	gu "github.com/gopcua/opcua/ua"
@@ -143,6 +144,16 @@ func TestUpstreamServerReturnsDifferentValuesForSameNodeBySession(t *testing.T) 
 	if err := server.ReconcileCatalog(catalog, backend.groups, backend.sources); err != nil {
 		t.Fatal(err)
 	}
+	largePointIDs := make([]string, 5300)
+	for i := range largePointIDs {
+		largePointIDs[i] = fmt.Sprintf("KKS_%04d", i)
+	}
+	if err := server.addManagementVariableLocked(server.groupsRootID, "Tests/LargePointNodeIds", managementVariable{
+		name: "LargePointNodeIds", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankOneDimension,
+		minimumSamplingInterval: 1000, read: staticStringSliceManagementValue(largePointIDs),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- server.ListenAndServe() }()
 
@@ -151,6 +162,47 @@ func TestUpstreamServerReturnsDifferentValuesForSameNodeBySession(t *testing.T) 
 	namespaces := clientOne.Namespaces()
 	if len(namespaces) < 4 || namespaces[2] != BusinessNamespaceURI || namespaces[3] != ManagementNamespaceURI {
 		t.Fatalf("namespace order = %#v", namespaces)
+	}
+	capability, err := clientOne.Read(context.Background(), &gu.ReadRequest{NodesToRead: []*gu.ReadValueID{{
+		NodeID: gu.NewNumericNodeID(0, id.Server_ServerCapabilities_MaxArrayLength), AttributeID: gu.AttributeIDValue,
+	}}})
+	if err != nil || capability == nil || len(capability.Results) != 1 || capability.Results[0] == nil || capability.Results[0].Status != gu.StatusOK || capability.Results[0].Value == nil || capability.Results[0].Value.Value() != uint32(managementMaxArrayLength) {
+		t.Fatalf("published MaxArrayLength: response=%#v err=%v", capability, err)
+	}
+	readLarge := func(indexRange string) []string {
+		t.Helper()
+		response, readErr := clientOne.Read(context.Background(), &gu.ReadRequest{NodesToRead: []*gu.ReadValueID{{
+			NodeID: gu.NewStringNodeID(3, "Tests/LargePointNodeIds"), AttributeID: gu.AttributeIDValue, IndexRange: indexRange,
+		}}})
+		if readErr != nil || response == nil || len(response.Results) != 1 || response.Results[0].Status != gu.StatusOK || response.Results[0].Value == nil {
+			t.Fatalf("read 5300-point management array range %q: response=%#v err=%v", indexRange, response, readErr)
+		}
+		items, stringsOK := response.Results[0].Value.Value().([]string)
+		if !stringsOK {
+			t.Fatalf("large management value type=%T", response.Results[0].Value.Value())
+		}
+		return items
+	}
+	if items := readLarge(""); len(items) != 5300 {
+		t.Fatalf("full management array length=%d, want 5300", len(items))
+	} else if items[0] != "KKS_0000" || items[5299] != "KKS_5299" {
+		t.Fatalf("full 5300-point management array boundaries=%#v/%#v", items[0], items[5299])
+	}
+	if items := readLarge("5000:5299"); len(items) != 300 || items[0] != "KKS_5000" || items[299] != "KKS_5299" {
+		t.Fatalf("ranged management array=%#v", items)
+	}
+	if items := readLarge("5299:5299"); len(items) != 1 || items[0] != "KKS_5299" {
+		t.Fatalf("single-element management array range=%#v", items)
+	}
+	pointIDs, err := clientOne.Read(context.Background(), &gu.ReadRequest{NodesToRead: []*gu.ReadValueID{{
+		NodeID: gu.NewStringNodeID(3, "Groups/g/PointNodeIds"), AttributeID: gu.AttributeIDValue,
+	}}})
+	if err != nil || pointIDs == nil || len(pointIDs.Results) != 1 || pointIDs.Results[0] == nil || pointIDs.Results[0].Status != gu.StatusOK || pointIDs.Results[0].Value == nil {
+		t.Fatalf("read group point identifiers: response=%#v err=%v", pointIDs, err)
+	}
+	identifiers, ok := pointIDs.Results[0].Value.Value().([]string)
+	if !ok || len(identifiers) != 1 || identifiers[0] != "KKS" {
+		t.Fatalf("group PointNodeIds=%#v (%T), want [KKS] without commands/methods", pointIDs.Results[0].Value.Value(), pointIDs.Results[0].Value.Value())
 	}
 	deviceRefs, err := clientOne.Node(gu.NewStringNodeID(2, "Devices")).References(
 		context.Background(), id.HasComponent, gu.BrowseDirectionForward, gu.NodeClassVariable, true,

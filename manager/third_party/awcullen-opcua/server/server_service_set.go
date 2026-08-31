@@ -3455,7 +3455,7 @@ func parseBounds(s string, length int) (int, int, ua.StatusCode) {
 		if hi < 0 {
 			return -1, -1, ua.BadIndexRangeInvalid
 		}
-		if lo >= hi {
+		if lo > hi {
 			return -1, -1, ua.BadIndexRangeInvalid
 		}
 	} else {
@@ -6056,7 +6056,7 @@ func (srv *Server) writeValue(session *Session, writeValue ua.WriteValue) ua.Sta
 
 			}
 
-			if f := n1.writeValueHandler; f != nil {
+			if f := n1.WriteValueHandler(); f != nil {
 				result, status := f(session, writeValue)
 				if status == ua.Good && !srv.sessionScopedWriteHandlers {
 					n1.SetValue(result)
@@ -6123,8 +6123,8 @@ func (srv *Server) readValue(session *Session, readValueId ua.ReadValueID) ua.Da
 			if (n1.UserAccessLevel(session.UserIdentity()) & ua.AccessLevelsCurrentRead) == 0 {
 				return ua.NewDataValue(nil, ua.BadUserAccessDenied, time.Time{}, 0, time.Now(), 0)
 			}
-			if f := n1.readValueHandler; f != nil {
-				return f(session, readValueId)
+			if f := n1.ReadValueHandler(); f != nil {
+				return readRange(f(session, readValueId), readValueId.IndexRange)
 			}
 			return readRange(n1.Value(), readValueId.IndexRange)
 		default:

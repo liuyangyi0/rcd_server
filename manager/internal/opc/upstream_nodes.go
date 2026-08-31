@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	awserver "github.com/awcullen/opcua/server"
@@ -305,12 +306,14 @@ func (s *UpstreamServer) reconcileManagementLocked(catalog domain.CatalogUnion, 
 	}
 	for _, group := range groups {
 		desiredGroups[group.ID] = struct{}{}
-		if err := s.addGroupManagementLocked(group, sourcesByGroup[group.ID]); err != nil {
+		catalogRevision := s.beginGroupCatalogUpdateLocked(group.ID)
+		if err := s.addGroupManagementLocked(group, sourcesByGroup[group.ID], groupPointNodeIDs(group.ID, catalog), catalogRevision); err != nil {
 			return err
 		}
 		if err := s.reconcileGroupMemberTreeLocked(group, membersByGroup[group.ID], catalog); err != nil {
 			return err
 		}
+		s.finishGroupCatalogUpdateLocked(catalogRevision)
 	}
 	for _, source := range sources {
 		if err := s.addSourceManagementLocked(source); err != nil {
@@ -327,7 +330,22 @@ func (s *UpstreamServer) reconcileManagementLocked(catalog domain.CatalogUnion, 
 		if _, keep := desiredGroups[groupID]; !keep {
 			delete(s.memberTreeHashes, groupID)
 			delete(s.memberTreeNodeIDs, groupID)
-			delete(s.memberTreeValueIDs, groupID)
+			delete(s.memberTreeRouteIDs, groupID)
+		}
+	}
+	for groupID := range s.groupPointSnapshots {
+		if _, keep := desiredGroups[groupID]; !keep {
+			delete(s.groupPointSnapshots, groupID)
+		}
+	}
+	for groupID := range s.groupCatalogRevisions {
+		if _, keep := desiredGroups[groupID]; !keep {
+			delete(s.groupCatalogRevisions, groupID)
+		}
+	}
+	for key := range s.memberCoverageSnapshots {
+		if _, keep := desiredGroups[key.groupID]; !keep {
+			delete(s.memberCoverageSnapshots, key)
 		}
 	}
 	return nil
@@ -361,7 +379,8 @@ func (s *UpstreamServer) removeStaleManagementLocked(objects map[string]awserver
 	return nil
 }
 
-func (s *UpstreamServer) addGroupManagementLocked(group domain.Group, members []string) error {
+func (s *UpstreamServer) addGroupManagementLocked(group domain.Group, members, pointNodeIDs []string, catalogRevision *atomic.Uint64) error {
+	pointSnapshot := s.updateGroupPointSnapshotLocked(group.ID, pointNodeIDs)
 	objectID := awu.NewNodeIDString(s.managementNS, "Groups/"+group.ID)
 	object, exists := s.management[objectID.String()]
 	if !exists {
@@ -444,6 +463,21 @@ func (s *UpstreamServer) addGroupManagementLocked(group domain.Group, members []
 				sort.Strings(current)
 				return current, awu.Good
 			}},
+		{name: "CatalogRevision", dataType: awu.DataTypeIDUInt64, valueRank: awu.ValueRankScalar,
+			read: func(_ string) (any, awu.StatusCode) { return catalogRevision.Load(), awu.Good }},
+		{name: "PointNodeIds", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankOneDimension,
+			minimumSamplingInterval: 1000,
+			read: func(_ string) (any, awu.StatusCode) {
+				return pointSnapshot.current.Load().identifiers, awu.Good
+			}},
+		{name: "PointNodeCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar,
+			read: func(_ string) (any, awu.StatusCode) {
+				return uint32(len(pointSnapshot.current.Load().identifiers)), awu.Good
+			}},
+		{name: "PointSetFingerprint", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar,
+			read: func(_ string) (any, awu.StatusCode) { return pointSnapshot.current.Load().fingerprint, awu.Good }},
+		{name: "PointSetRevision", dataType: awu.DataTypeIDUInt64, valueRank: awu.ValueRankScalar,
+			read: func(_ string) (any, awu.StatusCode) { return pointSnapshot.current.Load().revision, awu.Good }},
 		{name: "PendingCommandCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar,
 			read: func(_ string) (any, awu.StatusCode) { return uint32(s.backend.PendingCount(group.ID)), awu.Good }},
 	}
@@ -453,6 +487,47 @@ func (s *UpstreamServer) addGroupManagementLocked(group domain.Group, members []
 		}
 	}
 	return s.addGroupCommandNodesLocked(group.ID, objectID)
+}
+
+func (s *UpstreamServer) beginGroupCatalogUpdateLocked(groupID string) *atomic.Uint64 {
+	revision := s.groupCatalogRevisions[groupID]
+	if revision == nil {
+		revision = &atomic.Uint64{}
+		s.groupCatalogRevisions[groupID] = revision
+	}
+	// An odd value is a seqlock write marker. If a prior reconciliation failed,
+	// leave its odd marker in place until this attempt completes successfully.
+	if revision.Load()%2 == 0 {
+		revision.Add(1)
+	}
+	return revision
+}
+
+func (s *UpstreamServer) finishGroupCatalogUpdateLocked(revision *atomic.Uint64) {
+	if revision != nil && revision.Load()%2 == 1 {
+		revision.Add(1)
+	}
+}
+
+func (s *UpstreamServer) updateGroupPointSnapshotLocked(groupID string, identifiers []string) *groupPointSnapshotStore {
+	fingerprint := pointListFingerprint(identifiers)
+	store := s.groupPointSnapshots[groupID]
+	if store == nil {
+		store = &groupPointSnapshotStore{}
+		s.groupPointSnapshots[groupID] = store
+	}
+	current := store.current.Load()
+	if current != nil && current.fingerprint == fingerprint {
+		return store
+	}
+	revision := uint64(1)
+	if current != nil {
+		revision = current.revision + 1
+	}
+	store.current.Store(&groupPointSnapshot{
+		revision: revision, fingerprint: fingerprint, identifiers: append([]string(nil), identifiers...),
+	})
+	return store
 }
 
 func (s *UpstreamServer) addSourceManagementLocked(source domain.Source) error {
@@ -512,12 +587,13 @@ func (s *UpstreamServer) addSourceManagementLocked(source domain.Source) error {
 }
 
 type managementVariable struct {
-	name      string
-	dataType  awu.NodeID
-	valueRank int32
-	writable  bool
-	read      func(sessionID string) (any, awu.StatusCode)
-	write     func(sessionID string, value any) awu.StatusCode
+	name                    string
+	dataType                awu.NodeID
+	valueRank               int32
+	minimumSamplingInterval float64
+	writable                bool
+	read                    func(sessionID string) (any, awu.StatusCode)
+	write                   func(sessionID string, value any) awu.StatusCode
 }
 
 func (s *UpstreamServer) addManagementVariableLocked(parent awu.NodeID, id string, definition managementVariable) error {
@@ -526,12 +602,16 @@ func (s *UpstreamServer) addManagementVariableLocked(parent awu.NodeID, id strin
 	if definition.writable {
 		access |= awu.AccessLevelsCurrentWrite
 	}
+	minimumSamplingInterval := definition.minimumSamplingInterval
+	if minimumSamplingInterval <= 0 {
+		minimumSamplingInterval = 125
+	}
 	if existing, exists := s.server.NamespaceManager().FindNode(nodeID); exists {
 		node, ok := existing.(*awserver.VariableNode)
 		if !ok {
 			return fmt.Errorf("management node %q has class %T, want Variable", id, existing)
 		}
-		if node.DataType() != definition.dataType || node.ValueRank() != definition.valueRank || node.AccessLevel() != access {
+		if node.DataType() != definition.dataType || node.ValueRank() != definition.valueRank || node.AccessLevel() != access || node.MinimumSamplingInterval() != minimumSamplingInterval {
 			return fmt.Errorf("management variable %q changed shape", id)
 		}
 		configureManagementVariable(node, definition)
@@ -544,7 +624,7 @@ func (s *UpstreamServer) addManagementVariableLocked(parent awu.NodeID, id strin
 			awu.NewReference(awu.ReferenceTypeIDHasTypeDefinition, false, awu.NewExpandedNodeID(awu.VariableTypeIDBaseDataVariableType)),
 			awu.NewReference(awu.ReferenceTypeIDHasComponent, true, awu.NewExpandedNodeID(parent)),
 		}, awu.NewDataValue(nil, awu.BadWaitingForInitialData, time.Time{}, 0, time.Now(), 0),
-		definition.dataType, definition.valueRank, nil, access, 125, false, nil,
+		definition.dataType, definition.valueRank, nil, access, minimumSamplingInterval, false, nil,
 	)
 	configureManagementVariable(node, definition)
 	if err := s.server.NamespaceManager().AddNode(node); err != nil {

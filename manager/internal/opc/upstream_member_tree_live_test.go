@@ -59,6 +59,29 @@ func TestLiveGroupMemberTreeBrowsesPhysicalBindingsAndControlsSelection(t *testi
 		}
 		return response.Results[0].Value.Value()
 	}
+	groupPointIDs, ok := read("Groups/device-a/PointNodeIds").([]string)
+	if !ok || len(groupPointIDs) == 0 {
+		t.Fatalf("device-a PointNodeIds=%#v; want a non-empty String[]", read("Groups/device-a/PointNodeIds"))
+	}
+	if count := read("Groups/device-a/PointNodeCount").(uint32); count != uint32(len(groupPointIDs)) {
+		t.Fatalf("device-a PointNodeCount=%d, list length=%d", count, len(groupPointIDs))
+	}
+	if fingerprint, ok := read("Groups/device-a/PointSetFingerprint").(string); !ok || len(fingerprint) != 64 {
+		t.Fatalf("device-a PointSetFingerprint=%#v", fingerprint)
+	}
+	if revision, ok := read("Groups/device-a/PointSetRevision").(uint64); !ok || revision == 0 {
+		t.Fatalf("device-a PointSetRevision=%#v", revision)
+	}
+	if revision, ok := read("Groups/device-a/CatalogRevision").(uint64); !ok || revision == 0 || revision%2 != 0 {
+		t.Fatalf("device-a CatalogRevision=%#v; want a completed even generation", revision)
+	}
+	groupPoints := make(map[string]struct{}, len(groupPointIDs))
+	for _, identifier := range groupPointIDs {
+		if _, duplicate := groupPoints[identifier]; duplicate {
+			t.Fatalf("device-a PointNodeIds contains duplicate %q: %#v", identifier, groupPointIDs)
+		}
+		groupPoints[identifier] = struct{}{}
+	}
 	writeSelection := func(target *gopcua.Client, sourceID string) {
 		t.Helper()
 		response, err := target.Write(ctx, &gu.WriteRequest{NodesToWrite: []*gu.WriteValue{{
@@ -117,7 +140,22 @@ func TestLiveGroupMemberTreeBrowsesPhysicalBindingsAndControlsSelection(t *testi
 		provided := read(sourcePath + "/ProvidedPointCount").(uint32)
 		missing := read(sourcePath + "/MissingPointCount").(uint32)
 		complete := read(sourcePath + "/CompleteCoverage").(bool)
-		if provided+missing != expected || complete != (missing == 0) {
+		coverageKnown := read(sourcePath + "/CoverageKnown").(bool)
+		coverageFingerprint, fingerprintOK := read(sourcePath + "/CoverageFingerprint").(string)
+		coverageRevision, revisionOK := read(sourcePath + "/CoverageRevision").(uint64)
+		providedIDs, providedOK := read(sourcePath + "/ProvidedPointNodeIds").([]string)
+		missingIDs, missingOK := read(sourcePath + "/MissingPointNodeIds").([]string)
+		if !coverageKnown || !fingerprintOK || len(coverageFingerprint) != 64 || !revisionOK || coverageRevision == 0 || !providedOK || !missingOK || uint32(len(providedIDs)) != provided || uint32(len(missingIDs)) != missing {
+			t.Fatalf("%s point identifier arrays provided=%#v missing=%#v counts=%d/%d", sourceID, providedIDs, missingIDs, provided, missing)
+		}
+		coverage := make(map[string]struct{}, len(providedIDs)+len(missingIDs))
+		for _, identifier := range append(append([]string(nil), providedIDs...), missingIDs...) {
+			if _, exists := groupPoints[identifier]; !exists {
+				t.Fatalf("%s coverage contains point %q outside group list %#v", sourceID, identifier, groupPointIDs)
+			}
+			coverage[identifier] = struct{}{}
+		}
+		if len(coverage) != len(groupPoints) || provided+missing != expected || complete != (missing == 0) {
 			t.Fatalf("%s coverage expected=%d provided=%d missing=%d complete=%v", sourceID, expected, provided, missing, complete)
 		}
 	}

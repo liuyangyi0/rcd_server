@@ -101,6 +101,11 @@ NodeKey { NamespaceURI, Identifier }
 - `Groups/<group_id>/SelectedSourceId`；
 - `Groups/<group_id>/SelectionRevision`；
 - `Groups/<group_id>/MemberSourceIds`；
+- `Groups/<group_id>/PointNodeIds`：该组当前可发布、非热退役的 `urn:SerialServer` 数据变量 identifier；
+- `Groups/<group_id>/PointNodeCount`：清单元素数，配合标准 OPC `IndexRange` 分页；
+- `Groups/<group_id>/PointSetFingerprint`：点集变化指纹；
+- `Groups/<group_id>/PointSetRevision`：进程内单调点集版本；
+- `Groups/<group_id>/CatalogRevision`：覆盖组点表和全部成员的目录 seqlock；
 - `Groups/<group_id>/PendingCommandCount`；
 - `Groups/<group_id>/Members/<source_id>`：该逻辑组的候选物理来源；
 - `Groups/<group_id>/Members/<source_id>/Ports/<port_id>/Devices/<device_id>`：来源内实际串口、子站和点数的只读树；
@@ -109,7 +114,11 @@ NodeKey { NamespaceURI, Identifier }
 
 `DefaultSourceId` 是全局持久配置，写入空字符串会清除默认源；`SelectedSourceId` 和 `SelectionRevision` 的读写上下文来自当前 OPC Session，不使用全局 backing value。
 成员来源节点同时提供 `Selectable`、当前 Session 的 `IsSelected`、`ConnectionState`、
-`CatalogState` 和并集点位的期望/提供/缺失覆盖统计。串口节点提供 `PortId`、显示名和命令
+`CatalogState` 和并集点位的期望/提供/缺失覆盖统计，并通过 `CoverageKnown`、
+`CoverageFingerprint`、`CoverageRevision`、`ProvidedPointNodeIds`、`MissingPointNodeIds` 公开相对当前可发布并集的
+覆盖快照。每组或每成员的 revision、fingerprint、count 和数组由同一个原子不可变快照提供；客户端
+在单个数组分页前后校验自身 revision；跨点表与成员读取时还要在最外层校验相同的非零偶数
+`CatalogRevision`，不一致或为奇数时丢弃重读。串口节点提供 `PortId`、显示名和命令
 NodeId；设备节点提供 `DeviceId`、地址是否已知、名称、KKS 前缀、原始/计算/合计点数，
 以及有效归组 `Configured`、人工绑定 `ExplicitlyBound`、拓扑快照存在性
 `PresentInTopology`。这棵树完全只读，客户端仍只向

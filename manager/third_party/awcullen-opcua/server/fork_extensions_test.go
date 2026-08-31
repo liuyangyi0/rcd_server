@@ -743,6 +743,79 @@ func TestSessionScopedWriteHandlerDoesNotMutateBackingValue(t *testing.T) {
 	}
 }
 
+func TestVariableNodeHandlerSnapshotsAreSafeDuringReplacement(t *testing.T) {
+	srv := newForkUnitServer()
+	node := NewVariableNode(
+		srv, ua.NewNodeIDString(2, "hot-handler"), ua.NewQualifiedName(2, "hot-handler"),
+		ua.NewLocalizedText("hot-handler", ""), ua.LocalizedText{}, nil, nil,
+		ua.NewDataValue(uint32(0), ua.Good, time.Time{}, 0, time.Now(), 0),
+		ua.DataTypeIDUInt32, ua.ValueRankScalar, nil,
+		ua.AccessLevelsCurrentRead|ua.AccessLevelsCurrentWrite, 0, false, nil,
+	)
+	read := func(*Session, ua.ReadValueID) ua.DataValue {
+		return ua.NewDataValue(uint32(1), ua.Good, time.Time{}, 0, time.Now(), 0)
+	}
+	write := func(_ *Session, value ua.WriteValue) (ua.DataValue, ua.StatusCode) {
+		return value.Value, ua.Good
+	}
+	node.SetReadValueHandler(read)
+	node.SetWriteValueHandler(write)
+
+	var workers sync.WaitGroup
+	workers.Add(3)
+	go func() {
+		defer workers.Done()
+		for i := 0; i < 10_000; i++ {
+			node.SetReadValueHandler(read)
+			node.SetWriteValueHandler(write)
+		}
+	}()
+	for range 2 {
+		go func() {
+			defer workers.Done()
+			for i := 0; i < 10_000; i++ {
+				if handler := node.ReadValueHandler(); handler != nil {
+					_ = handler(nil, ua.ReadValueID{})
+				}
+				if handler := node.WriteValueHandler(); handler != nil {
+					_, _ = handler(nil, ua.WriteValue{})
+				}
+			}
+		}()
+	}
+	workers.Wait()
+}
+
+func TestReadValueHandlerAppliesIndexRange(t *testing.T) {
+	srv := newForkUnitServer()
+	nodeID := ua.NewNodeIDString(2, "handled-array")
+	node := NewVariableNode(
+		srv, nodeID, ua.NewQualifiedName(2, "handled-array"), ua.NewLocalizedText("handled-array", ""),
+		ua.LocalizedText{}, nil, nil, ua.NewDataValue([]string{}, ua.Good, time.Time{}, 0, time.Now(), 0),
+		ua.DataTypeIDString, ua.ValueRankOneDimension, nil, ua.AccessLevelsCurrentRead, 0, false, nil,
+	)
+	node.SetReadValueHandler(func(*Session, ua.ReadValueID) ua.DataValue {
+		return ua.NewDataValue([]string{"zero", "one", "two", "three"}, ua.Good, time.Time{}, 0, time.Now(), 0)
+	})
+	if err := srv.namespaceManager.AddNode(node); err != nil {
+		t.Fatal(err)
+	}
+	value := srv.readValue(newForkSession(srv, "range"), ua.ReadValueID{
+		NodeID: nodeID, AttributeID: ua.AttributeIDValue, IndexRange: "1:2",
+	})
+	items, ok := value.Value.([]string)
+	if value.StatusCode != ua.Good || !ok || len(items) != 2 || items[0] != "one" || items[1] != "two" {
+		t.Fatalf("ranged handler value=%#v", value)
+	}
+	value = srv.readValue(newForkSession(srv, "single-range"), ua.ReadValueID{
+		NodeID: nodeID, AttributeID: ua.AttributeIDValue, IndexRange: "0:0",
+	})
+	items, ok = value.Value.([]string)
+	if value.StatusCode != ua.Good || !ok || len(items) != 1 || items[0] != "zero" {
+		t.Fatalf("single-element ranged handler value=%#v", value)
+	}
+}
+
 func TestForceResampleTargetsOnlyRequestedSessionAndNode(t *testing.T) {
 	srv := newForkUnitServer()
 	nodeID := ua.NewNodeIDString(2, "KKS")
