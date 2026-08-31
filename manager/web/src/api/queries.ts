@@ -11,6 +11,7 @@ export const queryKeys = {
   allTopologies: ['source-topology'] as const,
   sessions: ['sessions'] as const,
   points: (params: ListParams) => ['points', params] as const,
+  pointComparison: (left: ListParams, right: ListParams) => ['points', 'comparison', left, right] as const,
   allPoints: ['points'] as const,
   commands: (params: ListParams) => ['commands', params] as const,
   allCommands: ['commands'] as const,
@@ -46,8 +47,20 @@ export function useSourceTopology(sourceId: string) {
 export function usePoints(params: ListParams, enabled = true) {
   return useQuery({
     queryKey: queryKeys.points(params),
-    queryFn: () => api.points(params),
-    placeholderData: (previous) => previous,
+    queryFn: ({ signal }) => api.points(params, signal),
+    enabled,
+  });
+}
+
+export function usePointComparison(leftParams: ListParams, rightParams: ListParams, enabled: boolean) {
+  return useQuery({
+    queryKey: queryKeys.pointComparison(leftParams, rightParams),
+    queryFn: async ({ signal }) => {
+      // Cache and publish a pair atomically. Neither an old page nor half of a
+      // background refresh may be compared against the other query's result.
+      const [left, right] = await Promise.all([api.points(leftParams, signal), api.points(rightParams, signal)]);
+      return { left, right };
+    },
     enabled,
   });
 }

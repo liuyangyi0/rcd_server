@@ -38,6 +38,9 @@ type Session struct {
 	publishRequests                         chan *publishOp
 	stateChanges                            chan *stateChangeOp
 	channelId                               uint32
+	channelDetached                         bool
+	lifecycleEvents                         []*queuedSessionEvent
+	drainingLifecycleEvents                 bool
 	securityMode                            ua.MessageSecurityMode
 	securityPolicyURI                       string
 	clientCertificate                       ua.ByteString
@@ -153,6 +156,10 @@ func (s *Session) IsExpired() bool {
 func (s *Session) delete() {
 	s.Lock()
 	defer s.Unlock()
+	s.deleteLocked()
+}
+
+func (s *Session) deleteLocked() {
 	s.deleted = true
 	//s.sessionId = nil  // need to keep to look up diagnostics node
 	s.authenticationToken = nil
@@ -162,10 +169,10 @@ func (s *Session) delete() {
 	s.securityPolicyURI = ua.SecurityPolicyURINone
 	s.sessionNonce = ua.ByteString("")
 	s.clientCertificate = ua.ByteString("")
-	// publishRequests is immutable for the lifetime of the Session. Closing it
-	// would race senders and setting it to nil can make the full-queue fallback
-	// block forever on a nil receive. The deleted flag rejects new requests while
-	// existing queue entries remain available to in-flight subscription workers.
+	// Keep the channel allocated: closing it would race senders and replacing
+	// it with nil can block a queue consumer forever. Closed Sessions must not
+	// let their queued requests consume any more monitored-item notifications.
+	s.prunePublishRequestsLocked()
 	for k := range s.browseCPs {
 		delete(s.browseCPs, k)
 	}
@@ -210,6 +217,10 @@ func (s *Session) UserIdentity() any {
 func (s *Session) SetUserIdentity(value any) {
 	s.Lock()
 	defer s.Unlock()
+	s.setUserIdentityLocked(value)
+}
+
+func (s *Session) setUserIdentityLocked(value any) {
 	s.userIdentity = value
 	// update diagnostics
 	switch ui := s.userIdentity.(type) {
@@ -339,6 +350,11 @@ func (s *Session) SetSecureChannelId(value uint32) {
 	s.Lock()
 	defer s.Unlock()
 	s.channelId = value
+	s.channelDetached = false
+	// Rebinding and queue cleanup share the same lock as admission/removal.
+	// Preserve requests for this channel, including on same-channel activation;
+	// never let a delayed cleanup discard requests admitted on the new channel.
+	s.prunePublishRequestsLocked()
 }
 
 func (s *Session) SetRemoteAddress(value string) {
@@ -377,13 +393,51 @@ func (s *Session) ClientCertificate() ua.ByteString {
 	return s.clientCertificate
 }
 
+// publishChannelStatusLocked requires the Session lock. No Subscription lock
+// or network write is acquired here; publishing uses Subscription -> Session.
+func (s *Session) publishChannelStatusLocked(ch *serverSecureChannel) ua.StatusCode {
+	if s.deleted {
+		return ua.BadSessionClosed
+	}
+	if ch.IsClosed() {
+		return ua.BadSecureChannelClosed
+	}
+	if s.channelDetached {
+		return ua.BadSecureChannelClosed
+	}
+	if s.channelId == 0 || s.channelId != ch.ChannelID() {
+		return ua.BadSecureChannelIDInvalid
+	}
+	if ch.IsExpired() {
+		return ua.BadSecureChannelClosed
+	}
+	return ua.Good
+}
+
+func (s *Session) publishChannelStatus(ch *serverSecureChannel) ua.StatusCode {
+	s.RLock()
+	defer s.RUnlock()
+	return s.publishChannelStatusLocked(ch)
+}
+
+func (s *Session) prunePublishRequestsLocked() {
+	// Every producer/consumer holds this lock, so rotating exactly the original
+	// queue length preserves FIFO order without blocking or dropping new work.
+	for n := len(s.publishRequests); n > 0; n-- {
+		op := <-s.publishRequests
+		if op != nil && s.publishChannelStatusLocked(op.ch) == ua.Good {
+			s.publishRequests <- op
+		}
+	}
+}
+
 func (s *Session) addPublishRequest(ch *serverSecureChannel, requestid uint32, req *ua.PublishRequest, results []ua.StatusCode) error {
 	for {
 		var rejected *publishOp
 		s.Lock()
-		if s.deleted {
+		if status := s.publishChannelStatusLocked(ch); status != ua.Good {
 			s.Unlock()
-			return ua.BadSessionClosed
+			return status
 		}
 		select {
 		case s.publishRequests <- &publishOp{ch, requestid, req, results}:
@@ -399,10 +453,13 @@ func (s *Session) addPublishRequest(ch *serverSecureChannel, requestid uint32, r
 			default:
 			}
 			s.Unlock()
-			if rejected == nil {
+			if rejected == nil || s.publishChannelStatus(rejected.ch) != ua.Good {
 				continue
 			}
-			err := rejected.ch.Write(
+			// A response on a superseded/broken channel must not reject the
+			// incoming request on a healthy replacement channel. Transport write
+			// failures invalidate only the rejected request's channel.
+			_ = rejected.ch.Write(
 				&ua.ServiceFault{
 					ResponseHeader: ua.ResponseHeader{
 						Timestamp:     time.Now(),
@@ -412,9 +469,6 @@ func (s *Session) addPublishRequest(ch *serverSecureChannel, requestid uint32, r
 				},
 				rejected.requestId,
 			)
-			if err != nil {
-				return err
-			}
 		}
 	}
 }
@@ -425,14 +479,21 @@ func (s *Session) removePublishRequest() (*serverSecureChannel, uint32, *ua.Publ
 		var op *publishOp
 		select {
 		case op = <-s.publishRequests:
+			if op == nil || s.publishChannelStatusLocked(op.ch) != ua.Good {
+				s.Unlock()
+				continue
+			}
 			s.Unlock()
 			ch := op.ch
 			req := op.req
 			rid := op.requestId
 			results := op.results
 			// check if expired
-			if time.Now().After(req.RequestHeader.Timestamp.Add(time.Duration(req.RequestHeader.TimeoutHint) * time.Millisecond)) {
-				err := ch.Write(
+			if req.TimeoutHint > 0 && time.Now().After(req.Timestamp.Add(time.Duration(req.TimeoutHint)*time.Millisecond)) {
+				// Best effort only: a timeout response may race reconnection. Its
+				// failure must not prevent this call from finding the next valid
+				// Publish request (which may already be on the replacement channel).
+				_ = ch.Write(
 					&ua.ServiceFault{
 						ResponseHeader: ua.ResponseHeader{
 							Timestamp:     time.Now(),
@@ -442,9 +503,6 @@ func (s *Session) removePublishRequest() (*serverSecureChannel, uint32, *ua.Publ
 					},
 					rid,
 				)
-				if err != nil {
-					return nil, 0, nil, nil, false, err
-				}
 				continue
 			}
 			return ch, rid, req, results, true, nil

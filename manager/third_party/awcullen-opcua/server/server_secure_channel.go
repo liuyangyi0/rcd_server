@@ -96,6 +96,7 @@ type serverSecureChannel struct {
 	maxRequestChunkCount   uint32
 	endpointURL            string
 	conn                   net.Conn
+	closed                 atomic.Bool
 }
 
 // newServerSecureChannel initializes a new instance of the UaTcpSecureChannel.
@@ -186,6 +187,13 @@ func (ch *serverSecureChannel) IsExpired() bool {
 	ch.RLock()
 	defer ch.RUnlock()
 	return time.Now().After(ch.tokenExpiration)
+}
+
+// IsClosed is independent of the channel lock so queued Publish requests can
+// be discarded as soon as transport shutdown starts, including while another
+// goroutine is completing a failed write.
+func (ch *serverSecureChannel) IsClosed() bool {
+	return ch == nil || ch.closed.Load()
 }
 
 // Open the secure channel to the remote endpoint.
@@ -386,6 +394,7 @@ func (ch *serverSecureChannel) Open() error {
 
 // Close the secure channel.
 func (ch *serverSecureChannel) Close() error {
+	ch.closed.Store(true)
 	ch.Lock()
 	defer ch.Unlock()
 
@@ -417,11 +426,15 @@ func (ch *serverSecureChannel) Abort(reason ua.StatusCode, message string) error
 		// log.Printf("<- Err { reason: 0x%X, message: %s }\n", uint32(reason), message)
 		ch.conn.Close()
 	}
+	ch.closed.Store(true)
 	return nil
 }
 
 // Write the service response.
 func (ch *serverSecureChannel) Write(res ua.ServiceResponse, id uint32) error {
+	if ch.IsClosed() {
+		return ua.BadSecureChannelClosed
+	}
 	if ch.trace {
 		b, _ := json.MarshalIndent(res, "", " ")
 		log.Printf("%s%s", reflect.TypeOf(res).Elem().Name(), b)
@@ -1100,8 +1113,12 @@ func (ch *serverSecureChannel) readRequest() (ua.ServiceRequest, uint32, error) 
 					return nil, 0, ua.BadSecureChannelTokenUnknown
 				}
 				ch.tokenID = ch.pendingTokenID
+				// Publish queue admission may inspect token expiration while the
+				// receive worker accepts a renewed token on this same channel.
+				ch.Lock()
 				ch.tokenExpiration = ch.pendingTokenExpiration
 				ch.conn.SetDeadline(ch.tokenExpiration)
+				ch.Unlock()
 				if ch.securityMode == ua.MessageSecurityModeSignAndEncrypt || ch.securityMode == ua.MessageSecurityModeSign {
 
 					// (re)create security keys for verifying, decrypting
@@ -1627,8 +1644,19 @@ func (ch *serverSecureChannel) read(p []byte) (int, error) {
 
 // Write sends a chunk to the remote endpoint.
 func (ch *serverSecureChannel) write(p []byte) (int, error) {
-	if ch.conn == nil {
+	if ch.IsClosed() || ch.conn == nil {
 		return 0, ua.BadSecureChannelClosed
 	}
-	return ch.conn.Write(p)
+	n, err := ch.conn.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		// A failed/partial UA chunk cannot be retried on this transport. Wake
+		// the reader and invalidate its queued Publish requests immediately.
+		// Do not acquire the channel lock: Abort can call write while holding it.
+		ch.closed.Store(true)
+		ch.conn.Close()
+	}
+	return n, err
 }

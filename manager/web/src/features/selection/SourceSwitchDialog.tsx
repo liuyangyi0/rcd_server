@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Check, Info } from 'lucide-react';
 import type { Group, Source, UaSession } from '../../api/types';
 import { apiErrorMessage } from '../../api/client';
@@ -8,7 +8,7 @@ import { InlineNotice } from '../../components/InlineNotice';
 import { StatusBadge } from '../../components/StatusBadge';
 import { formatNumber, shortSessionId } from '../../lib/format';
 import { sourceHealth, statusLabel } from '../../lib/status';
-import { groupDeviceLabel, sourceHasGroup } from '../../lib/sourceGroups';
+import { groupDeviceLabel, sourceHasGroup, sourceSelectableForGroup, sourceUnavailableReason } from '../../lib/sourceGroups';
 
 interface SourceSwitchDialogProps {
   open: boolean;
@@ -21,42 +21,29 @@ interface SourceSwitchDialogProps {
   onSuccess?: (message: string) => void;
 }
 
-export function SourceSwitchDialog({ open, mode, group, sources: allSources, sessions, initialSessionId, onClose, onSuccess }: SourceSwitchDialogProps) {
+export function SourceSwitchDialog(props: SourceSwitchDialogProps) {
+  // A closed dialog owns no draft. Opening it captures the explicit target and
+  // revision once; background list refreshes must never rebase either of them.
+  return props.open ? <SourceSwitchForm key={`${props.mode}:${props.group.id}`} {...props} /> : null;
+}
+
+function SourceSwitchForm({ mode, group, sources: allSources, sessions, initialSessionId, onClose, onSuccess }: SourceSwitchDialogProps) {
   const sources = useMemo(() => allSources.filter((source) => sourceHasGroup(source, group.id)), [allSources, group.id]);
-  const [sessionId, setSessionId] = useState('');
-  const [sourceId, setSourceId] = useState('');
+  const [sessionId] = useState(initialSessionId ?? '');
+  const session = sessions.find((item) => item.id === sessionId);
+  const currentSourceId = mode === 'default' ? group.defaultSourceId : (session ? (session.selectedSources[group.id] ?? group.defaultSourceId) : '');
+  const [sourceId, setSourceId] = useState(() => sources.find((source) => source.id !== currentSourceId && sourceSelectableForGroup(source, group.id) && sourceHealth(source) === 'good')?.id ?? currentSourceId);
   const [confirmed, setConfirmed] = useState(false);
-  const [editRevision, setEditRevision] = useState(0);
-  const wasOpen = useRef(false);
+  const [editRevision] = useState(() => mode === 'default' ? group.selectionRevision : (session?.routeRevisions[group.id] ?? 1));
   const sessionMutation = useSelectSessionSource();
   const defaultMutation = useSetDefaultSource();
 
-  const session = useMemo(() => sessions.find((item) => item.id === sessionId), [sessionId, sessions]);
-  const currentSourceId = mode === 'default' ? group.defaultSourceId : (session?.selectedSources[group.id] ?? group.defaultSourceId);
   const currentSource = sources.find((source) => source.id === currentSourceId);
   const mutationError = sessionMutation.error ?? defaultMutation.error;
   const pending = sessionMutation.isPending || defaultMutation.isPending;
 
-  const sourceSelectable = (source: Source) => source.enabled && ['ready', 'cached'].includes(source.catalogState.toLowerCase()) && (source.availableGroupIds === undefined || source.availableGroupIds.includes(group.id));
-  const preferredSourceId = (currentId: string) => sources.find((source) => source.id !== currentId && sourceSelectable(source) && sourceHealth(source) === 'good')?.id ?? currentId;
-
-  useEffect(() => {
-    if (open && !wasOpen.current) {
-      const nextSessionId = mode === 'session' ? (initialSessionId ?? sessions[0]?.id ?? '') : '';
-      setSessionId(nextSessionId);
-      const selectedSession = sessions.find((item) => item.id === nextSessionId);
-      const currentId = mode === 'default' ? group.defaultSourceId : (selectedSession?.selectedSources[group.id] ?? group.defaultSourceId);
-      setEditRevision(mode === 'default' ? group.selectionRevision : (selectedSession?.routeRevisions[group.id] ?? 1));
-      setSourceId(preferredSourceId(currentId));
-      setConfirmed(false);
-      sessionMutation.reset();
-      defaultMutation.reset();
-    }
-    wasOpen.current = open;
-  }, [group.defaultSourceId, group.id, group.selectionRevision, initialSessionId, mode, open, sessions]); // mutation instances are stable
-
   const handleSubmit = async () => {
-    if (!confirmed || (mode === 'session' && !sourceId)) return;
+    if (!confirmed || pending || staleSelection || group.pendingCommandCount > 0 || selectedUnavailable || unchanged || (mode === 'session' && !sourceId)) return;
     if (mode === 'session') {
       if (!session) return;
       await sessionMutation.mutateAsync({
@@ -75,13 +62,13 @@ export function SourceSwitchDialog({ open, mode, group, sources: allSources, ses
   const unavailable = mode === 'session' && !session;
   const unchanged = sourceId === currentSourceId;
   const selectedSource = sources.find((source) => source.id === sourceId);
-  const selectedUnavailable = Boolean(sourceId && (!selectedSource || !sourceSelectable(selectedSource)));
+  const selectedUnavailable = Boolean(sourceId && (!selectedSource || !sourceSelectableForGroup(selectedSource, group.id)));
   const currentRevision = mode === 'default' ? group.selectionRevision : (session?.routeRevisions[group.id] ?? 1);
   const staleSelection = editRevision !== 0 && currentRevision !== editRevision;
 
   return (
     <Modal
-      open={open}
+      open
       title={mode === 'default' ? '设置逻辑组默认数据源' : '切换整逻辑设备组'}
       description={`逻辑组 ${group.id} · ${formatNumber(group.totalPoints)} 个并集点位`}
       onClose={onClose}
@@ -123,7 +110,8 @@ export function SourceSwitchDialog({ open, mode, group, sources: allSources, ses
         {sources.length === 0 ? <div className="source-empty">该分组尚未配置下级 OPC 来源</div> : sources.map((source) => {
           const health = sourceHealth(source);
           const selected = source.id === sourceId;
-          const selectable = sourceSelectable(source);
+          const unavailableReason = sourceUnavailableReason(source, group.id);
+          const selectable = unavailableReason === undefined;
           return (
             <label key={source.id} className={`source-option${selected ? ' is-selected' : ''}${selectable ? '' : ' is-disabled'}`}>
               <input type="radio" name="source" value={source.id} checked={selected} disabled={!selectable} onChange={() => { setSourceId(source.id); setConfirmed(false); }} />
@@ -133,7 +121,7 @@ export function SourceSwitchDialog({ open, mode, group, sources: allSources, ses
                   <strong>{source.id}</strong>
                   <StatusBadge state={health} label={statusLabel(health)} compact />
                   <span className={health === 'bad' ? 'text-bad' : source.qualityKnown ? 'text-good' : 'text-muted'}>
-                    来源整体 {source.qualityKnown ? `${formatNumber(source.goodPoints)} / ${formatNumber(source.totalPoints)}` : `${formatNumber(source.totalPoints)} 点`} {selectable ? (source.lastError || (source.qualityKnown && health === 'good' ? 'Good' : '')) : `不可选 · ${source.availableGroupIds && !source.availableGroupIds.includes(group.id) ? '未发现本组目录' : source.catalogState}`}
+                    来源整体 {source.qualityKnown ? `${formatNumber(source.goodPoints)} / ${formatNumber(source.totalPoints)}` : `${formatNumber(source.totalPoints)} 点`} {selectable ? (source.lastError || (source.qualityKnown && health === 'good' ? 'Good' : '')) : `不可选 · ${unavailableReason}`}
                   </span>
                 </span>
                 <span className="source-option-endpoint">{source.endpoint}</span>

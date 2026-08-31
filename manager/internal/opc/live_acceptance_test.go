@@ -10,7 +10,38 @@ import (
 	gopcua "github.com/gopcua/opcua"
 	"github.com/gopcua/opcua/id"
 	gu "github.com/gopcua/opcua/ua"
+
+	"rcd_manager/internal/domain"
 )
+
+// TestLiveLowerEndpointProbe is an opt-in read-only smoke test for the exact
+// downstream endpoint shipped or migrated with a deployment. It verifies UA
+// discovery, Session activation, NamespaceArray resolution and the complete
+// legacy catalog browse without changing acquisition or sending commands.
+func TestLiveLowerEndpointProbe(t *testing.T) {
+	endpoint := os.Getenv("RCD_LOWER_LIVE_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("set RCD_LOWER_LIVE_ENDPOINT to probe a live Rust lower")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	result, err := ProbeLower(ctx, LowerConfig{Source: domain.Source{
+		ID: "live-lower-probe", GroupID: "live-lower-probe", Endpoint: endpoint, Enabled: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stage := range result.Stages {
+		if !stage.OK {
+			t.Fatalf("lower probe stage %s failed: %s", stage.Name, stage.Message)
+		}
+	}
+	if result.EndpointCount == 0 || result.NamespaceCount < 3 || result.VariableCount == 0 || result.MethodCount == 0 {
+		t.Fatalf("incomplete lower probe result: %#v", result)
+	}
+	t.Logf("lower %s: endpoints=%d namespaces=%d variables=%d methods=%d duration=%dms",
+		endpoint, result.EndpointCount, result.NamespaceCount, result.VariableCount, result.MethodCount, result.DurationMS)
+}
 
 // TestLiveManagerAnonymousNone is an opt-in deployment smoke test. Keeping the
 // OPC Session open with RCD_MANAGER_LIVE_HOLD makes it visible in the Web

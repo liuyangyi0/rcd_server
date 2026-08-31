@@ -484,6 +484,9 @@ func (srv *Server) handleConnection(conn net.Conn, wg *sync.WaitGroup) {
 	defer wg.Done()
 	ch := newServerSecureChannel(srv, conn, srv.trace)
 	defer srv.sessionManager.DetachChannel(ch.ChannelID())
+	// Mark transport closure before detaching the Session. The Session remains
+	// resumable, but its queued requests must no longer consume notifications.
+	defer ch.Close()
 	err := ch.Open()
 	if err != nil {
 		// log.Printf("Error opening secure channel. %s\n", err)

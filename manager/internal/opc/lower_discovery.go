@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	gopcua "github.com/gopcua/opcua"
@@ -33,7 +34,7 @@ func discoverCatalog(
 		return domain.SourceCatalog{}, nil, fmt.Errorf("namespace %q is missing", BusinessNamespaceURI)
 	}
 	devicesID := gu.NewStringNodeID(ns, "Devices")
-	deviceRefs, err := client.Node(devicesID).References(ctx, id.HasComponent, gu.BrowseDirectionForward, gu.NodeClassVariable, true)
+	deviceRefs, err := browseForwardReferences(ctx, client, devicesID, id.HasComponent, gu.NodeClassVariable)
 	if err != nil {
 		return domain.SourceCatalog{}, nil, fmt.Errorf("browse Devices: %w", err)
 	}
@@ -43,7 +44,7 @@ func discoverCatalog(
 	}
 
 	methodsID := gu.NewStringNodeID(ns, "Methods")
-	methodRefs, err := client.Node(methodsID).References(ctx, id.HasComponent, gu.BrowseDirectionForward, gu.NodeClassMethod, true)
+	methodRefs, err := browseForwardReferences(ctx, client, methodsID, id.HasComponent, gu.NodeClassMethod)
 	if err != nil {
 		return domain.SourceCatalog{}, nil, fmt.Errorf("browse Methods: %w", err)
 	}
@@ -100,7 +101,7 @@ func discoverVariables(
 		if err != nil {
 			return nil, nil, fmt.Errorf("read variable attributes: %w", err)
 		}
-		if len(response.Results) != len(request.NodesToRead) {
+		if response == nil || len(response.Results) != len(request.NodesToRead) {
 			return nil, nil, errors.New("read variable attributes returned an incomplete result")
 		}
 		for local, ref := range refs[start:end] {
@@ -127,10 +128,16 @@ func discoverVariables(
 				Writable: gu.AccessLevelType(access)&gu.AccessLevelTypeCurrentWrite != 0,
 			}
 			nodes[start+local] = node
-			observed[ref.NodeID.NodeID.String()] = observedNode{key: key, dataType: dataType}
+			observed[ref.NodeID.NodeID.String()] = observedNode{key: key, dataType: dataType, command: isCommandVariable(node)}
 		}
 	}
 	return nodes, observed, nil
+}
+
+func isCommandVariable(node domain.CatalogNode) bool {
+	return node.Key.NamespaceURI == BusinessNamespaceURI && node.Class == domain.NodeClassVariable &&
+		node.Writable && node.DataType == domain.DataTypeString && node.ValueRank == -1 &&
+		strings.HasSuffix(node.Key.Identifier, "_Send")
 }
 
 func discoverMethod(
@@ -147,7 +154,7 @@ func discoverMethod(
 		Key: key, BrowseName: ref.BrowseName.Name, ParentPath: "Objects/Methods",
 		Class: domain.NodeClassMethod, ValueRank: -1,
 	}
-	properties, err := client.Node(ref.NodeID.NodeID).References(ctx, id.HasProperty, gu.BrowseDirectionForward, gu.NodeClassVariable, true)
+	properties, err := browseForwardReferences(ctx, client, ref.NodeID.NodeID, id.HasProperty, gu.NodeClassVariable)
 	if err != nil {
 		return domain.CatalogNode{}, fmt.Errorf("browse method %s properties: %w", key.Identifier, err)
 	}
@@ -158,8 +165,11 @@ func discoverMethod(
 		res, err := client.Read(ctx, &gu.ReadRequest{NodesToRead: []*gu.ReadValueID{{
 			NodeID: property.NodeID.NodeID, AttributeID: gu.AttributeIDValue,
 		}}})
-		if err != nil || len(res.Results) != 1 {
+		if err != nil {
 			return domain.CatalogNode{}, fmt.Errorf("read method %s %s: %w", key.Identifier, property.BrowseName.Name, err)
+		}
+		if res == nil || len(res.Results) != 1 {
+			return domain.CatalogNode{}, fmt.Errorf("read method %s %s returned an incomplete result", key.Identifier, property.BrowseName.Name)
 		}
 		args, err := argumentsFromDataValue(res.Results[0])
 		if err != nil {

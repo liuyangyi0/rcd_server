@@ -417,6 +417,9 @@ pub(crate) struct DeviceRuntimeState {
     same_count: u32,
     /// 是否处于轮询读取状态。
     pub(crate) is_enabled: bool,
+    /// Acquisition-only gate, independent of legacy whole-device disable.
+    pub(crate) read_enabled: bool,
+    last_data_at: Option<String>,
     /// 当前设备通信故障周期的限频日志状态。
     failure_log: DeviceFailureLogState,
     /// 查询需要补发才能成功时的限频日志状态。
@@ -434,6 +437,8 @@ impl DeviceRuntimeState {
             last_device_status: None,
             same_count: 0,
             is_enabled: true,
+            read_enabled: true,
+            last_data_at: None,
             failure_log: DeviceFailureLogState::default(),
             query_retry_log: QueryRetryLogState::default(),
         }
@@ -479,10 +484,12 @@ pub(crate) struct QueuedCommand {
     pub(crate) report_ack: bool,
     pub(crate) ack_id: Option<u64>,
     pub(crate) expires_at: Option<Instant>,
+    pub(crate) _permit: Option<crate::operations::CommandPermit>,
 }
 
 pub(crate) struct SerialManager {
     pub(crate) port: Option<Box<dyn SerialPort>>,
+    pub(crate) operations: Option<crate::operations::Operations>,
     pub(crate) command_queue: Arc<Mutex<VecDeque<QueuedCommand>>>,
     pub(crate) serial_config: SerialConfig,
     pub(crate) port_config: SerialPortConfig,
@@ -526,22 +533,26 @@ impl SerialManager {
         current_run: RunLocation,
         system_record: Arc<Mutex<BoundedVecDeque<String>>>,
     ) -> Self {
-        // 首次启动等待设备就绪
-        std::thread::sleep(Duration::from_millis(2000));
-
-        let opened = open_serial_port(
-            &serial_config.port_name,
-            serial_config.baud_rate,
-            serial_config.data_bits,
-            serial_config.stop_bits,
-            serial_config.parity,
-            serial_config.read_timeout,
-        );
+        // A persistently closed port must never be opened even momentarily at
+        // startup (another application may legitimately own the hardware).
+        let opened = if port_config.status {
+            std::thread::sleep(Duration::from_millis(2000));
+            Some(open_serial_port(
+                &serial_config.port_name,
+                serial_config.baud_rate,
+                serial_config.data_bits,
+                serial_config.stop_bits,
+                serial_config.parity,
+                serial_config.read_timeout,
+            ))
+        } else {
+            None
+        };
 
         let mut reconnect_failure_log = ReconnectFailureLogState::default();
         let (port, initial_open_error) = match opened {
-            Ok(port) => (Some(port), None),
-            Err(error) => {
+            Some(Ok(port)) => (Some(port), None),
+            Some(Err(error)) => {
                 let error_text = format!("{error:?}");
                 let _ = reconnect_failure_log.record_failure(&error_text, Instant::now());
                 error!(
@@ -553,6 +564,7 @@ impl SerialManager {
                 );
                 (None, Some(error_text))
             }
+            None => (None, None),
         };
 
         let device_states = port_config
@@ -563,6 +575,7 @@ impl SerialManager {
 
         let mut manager = Self {
             port,
+            operations: None,
             command_queue: Arc::new(Mutex::new(VecDeque::new())),
             serial_config,
             port_config,
@@ -587,6 +600,8 @@ impl SerialManager {
         if let Some(error) = initial_open_error {
             manager.log_record(format!("串口打开失败: error={error:?}"));
             manager.publish_port_offline_once();
+        } else if !manager.port_config.status {
+            manager.publish_port_disabled();
         }
 
         manager
@@ -601,6 +616,12 @@ impl SerialManager {
     /// 必须收到有效帧后才恢复在线状态。
     pub(crate) fn reconnect(&mut self) {
         const RECONNECT_COOLDOWN: Duration = Duration::from_secs(2);
+
+        if !self.port_config.status {
+            self.port = None;
+            self.rx_pending.clear();
+            return;
+        }
 
         // 连接恢复前，端口下所有设备都已经失去可信数据。该动作必须发生在
         // 冷却判断之前，否则冷却期间会继续向 OPC 暴露旧值。
@@ -741,6 +762,78 @@ impl SerialManager {
             "串口已禁用: affected_devices={} action=publish_all_zero_bad_no_communication",
             self.port_config.devices.len()
         ));
+    }
+
+    /// Called on the worker between serial transactions; disabling really
+    /// releases the descriptor, unlike the former polling-only flag.
+    pub(crate) fn set_port_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        self.port_config.status = enabled;
+        if !enabled {
+            self.port = None;
+            self.rx_pending.clear();
+            self.publish_port_disabled();
+            return Ok(());
+        }
+        if self.port.is_none() {
+            self.last_reconnect = Instant::now() - Duration::from_secs(2);
+            self.reconnect();
+        }
+        if self.port.is_none() {
+            return Err("port enable is applied, but opening the serial device failed; automatic connection recovery remains active".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_device_read_enabled(
+        &mut self,
+        device_id: u8,
+        enabled: bool,
+    ) -> Result<(), String> {
+        let index = self
+            .port_config
+            .devices
+            .iter()
+            .position(|d| d.config.device_id == device_id)
+            .ok_or_else(|| "unknown device".to_string())?;
+        self.device_states[index].read_enabled = enabled;
+        // Never claim recovery until a new valid frame is accepted. Retain
+        // control command permission and all other devices' receive buffers.
+        self.send_zero_status_for_index(index, self.port.is_some(), false);
+        if enabled {
+            self.device_states[index].timeout_count = 0;
+            self.device_states[index].current_round = 0;
+        }
+        self.log_record(format!(
+            "设备读取设置: device_id={device_id} read_enabled={enabled}"
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn refresh_operations_state(&self) {
+        if let Some(operations) = &self.operations {
+            operations.report_runtime(
+                &self.port_config.port_number,
+                self.port_config.status,
+                self.port.is_some(),
+                self.port_config
+                    .devices
+                    .iter()
+                    .zip(&self.device_states)
+                    .map(|(device, runtime)| {
+                        (
+                            device.config.device_id,
+                            runtime.read_enabled,
+                            self.port_config.status
+                                && self.port.is_some()
+                                && runtime.is_enabled
+                                && runtime.read_enabled
+                                && runtime.last_com_status == Some(true)
+                                && runtime.last_device_status == Some(true),
+                            runtime.last_data_at.clone(),
+                        )
+                    }),
+            );
+        }
     }
 
     /// 上层主动禁用单个设备时立即撤销该设备的 OPC 有效值。
@@ -1635,6 +1728,19 @@ impl SerialManager {
     }
 
     fn handle_valid_packet(&mut self, packet: protocol::DataPacket, frame: Vec<u8>) {
+        // This gate covers both active polling and passive secondary frames.
+        // A stopped station must not become Good because its peer still polls.
+        if !self.port_config.status
+            || !self.device_states[self.index].is_enabled
+            || !self.device_states[self.index].read_enabled
+        {
+            self.send_zero_status_for_index(
+                self.index,
+                self.port_config.status && self.port.is_some(),
+                false,
+            );
+            return;
+        }
         // 只有长度与校验和均有效的完整帧才能证明通信恢复。
         let now = Instant::now();
         self.log_device_recovery(now, frame.len());
@@ -1643,6 +1749,7 @@ impl SerialManager {
         self.time_out_count = 0;
         self.device_states[self.index].parse_fail_count = 0;
         self.parse_fail_count = 0;
+        self.device_states[self.index].last_data_at = Some(chrono::Utc::now().to_rfc3339());
 
         let dev = &self.port_config.devices[self.index];
         let parsed = protocol::parse_status(&packet.status, &dev.records);
@@ -2473,6 +2580,7 @@ mod tests {
 
         SerialManager {
             port: None,
+            operations: None,
             command_queue: Arc::new(Mutex::new(VecDeque::new())),
             serial_config: SerialConfig::new(
                 "COM1".to_string(),
@@ -2531,6 +2639,7 @@ mod tests {
         writes: Vec<Vec<u8>>,
         input_clears: usize,
         flush_attempts: usize,
+        drops: usize,
     }
 
     struct ScriptedSerialPort {
@@ -2538,6 +2647,15 @@ mod tests {
         write_results: VecDeque<bool>,
         observations: Arc<Mutex<SerialObservations>>,
         timeout: Duration,
+    }
+
+    impl Drop for ScriptedSerialPort {
+        fn drop(&mut self) {
+            self.observations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drops += 1;
+        }
     }
 
     impl Read for ScriptedSerialPort {
@@ -3771,5 +3889,185 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn acquisition_port_close_releases_handle_and_blocks_reconnect() {
+        let mut manager = test_manager_with_devices(2);
+        let observations = install_scripted_port(&mut manager, vec![], vec![]);
+        manager.rx_pending.extend_from_slice(&[1, 2, 3]);
+        manager.set_port_enabled(false).unwrap();
+        assert!(manager.port.is_none());
+        assert_eq!(observations.lock().unwrap().drops, 1);
+        assert!(manager.rx_pending.is_empty());
+        assert!(!manager.port_config.status);
+        manager.last_reconnect = Instant::now() - Duration::from_secs(5);
+        manager.reconnect();
+        assert!(manager.port.is_none());
+        assert_eq!(manager.reconnect_failure_log.attempts, 0);
+        assert!(manager
+            .latest_status_cache
+            .snapshot_statuses()
+            .iter()
+            .all(|s| !s.com_status && !s.device_status));
+    }
+
+    #[test]
+    fn acquisition_closed_startup_never_attempts_to_open_port() {
+        let seed = test_manager_with_devices(1);
+        let mut port_config = seed.port_config;
+        port_config.status = false;
+        let mut serial_config = seed.serial_config;
+        serial_config.port_name = "__TEST_CLOSED_NONEXISTENT_SERIAL_PORT__".into();
+        let manager = SerialManager::new(
+            serial_config,
+            port_config,
+            Broadcaster::new(),
+            LatestStatusCache::new(),
+            RunLocation::Primary,
+            RunLocation::Primary,
+            seed.system_record,
+        );
+        assert!(manager.port.is_none());
+        assert_eq!(
+            manager.reconnect_failure_log.attempts, 0,
+            "disabled startup must not even attempt open"
+        );
+        assert!(!manager.latest_status_cache.snapshot_statuses()[0].device_status);
+    }
+
+    #[test]
+    fn acquisition_stopped_device_ignores_primary_and_secondary_valid_frames() {
+        for role in [RunLocation::Primary, RunLocation::Secondary] {
+            let mut manager = test_manager_with_devices(2);
+            manager.current_run = role;
+            install_scripted_port(&mut manager, vec![], vec![]);
+            for index in 0..2 {
+                manager.index = index;
+                let frame = valid_status_frame((index + 1) as u8, cmd::READ_STATUS);
+                manager.handle_valid_packet(protocol::parse_data_packet(&frame).unwrap(), frame);
+            }
+            let last_received = manager.device_states[0].last_data_at.clone();
+            manager.set_device_read_enabled(1, false).unwrap();
+            assert!(
+                manager.device_states[0].is_enabled,
+                "stop-read must not disable control commands"
+            );
+            manager.index = 0;
+            let frame = valid_status_frame(1, cmd::READ_STATUS);
+            manager.handle_valid_packet(protocol::parse_data_packet(&frame).unwrap(), frame);
+            let samples = manager.latest_status_cache.snapshot_statuses();
+            assert!(
+                !samples[0].device_status,
+                "passive/late valid frame cannot revive stopped station"
+            );
+            assert!(samples[1].device_status, "other station must stay online");
+            assert_eq!(manager.device_states[0].last_data_at, last_received);
+            manager.set_device_read_enabled(1, true).unwrap();
+            assert!(
+                !manager.latest_status_cache.snapshot_statuses()[0].device_status,
+                "enable is not evidence of a new frame"
+            );
+            let frame = valid_status_frame(1, cmd::READ_STATUS);
+            manager.handle_valid_packet(protocol::parse_data_packet(&frame).unwrap(), frame);
+            assert!(manager.latest_status_cache.snapshot_statuses()[0].device_status);
+        }
+    }
+
+    #[test]
+    fn acquisition_stop_read_skips_polling_but_preserves_control_commands() {
+        let mut manager = test_manager_with_devices(2);
+        let observations = install_scripted_port(&mut manager, vec![], vec![]);
+        manager.set_device_read_enabled(1, false).unwrap();
+        let (ack_tx, _ack_rx) = std::sync::mpsc::channel();
+        assert!(super::super::worker::test_primary_cycle_is_idle(
+            &mut manager,
+            &ack_tx
+        ));
+        assert_eq!(observations.lock().unwrap().write_attempts, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(crate::model::Command {
+            com: manager.port_config.port_number.clone(),
+            command: crate::model::CommandType::SendData(SendData {
+                device_id: 1,
+                command: vec![1, 9, 2, 3],
+            }),
+            ack_id: None,
+            expires_at: None,
+            control_receipt: None,
+            permit: None,
+        })
+        .unwrap();
+        super::super::worker::process_test_commands(
+            &mut manager,
+            &rx,
+            &crate::model::SystemState::new(),
+            &ack_tx,
+        );
+        assert_eq!(manager.command_queue.lock().unwrap().len(), 1);
+        assert!(!super::super::worker::test_primary_cycle_is_idle(
+            &mut manager,
+            &ack_tx
+        ));
+        assert!(observations.lock().unwrap().write_attempts > 0);
+        assert!(!manager.latest_status_cache.snapshot_statuses()[0].device_status);
+    }
+
+    #[test]
+    fn acquisition_worker_receipt_follows_actual_stop_read_and_port_close() {
+        let mut manager = test_manager_with_devices(2);
+        let observations = install_scripted_port(&mut manager, vec![], vec![]);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("config")).unwrap();
+        std::fs::create_dir(root.path().join("logs")).unwrap();
+        let operations = crate::operations::Operations::new(
+            root.path().join("config"),
+            root.path().join("logs"),
+            "test".into(),
+            &[manager.port_config.clone()],
+        )
+        .unwrap();
+        let port_id = manager.port_config.port_number.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        operations.register_worker(&port_id, tx);
+        manager.operations = Some(operations.clone());
+        manager.refresh_operations_state();
+        let system_state = crate::model::SystemState::new();
+        system_state.add_port(manager.port_config.to_runtime_state());
+        let (ack_tx, _ack_rx) = std::sync::mpsc::channel();
+        for (action, revision) in [("set_device_read_enabled", "1"), ("set_port_enabled", "2")] {
+            let caller = operations.clone();
+            let request = serde_json::json!({"action":action,"port_id":port_id,"device_id":"1","enabled":false,"expected_revision":revision});
+            let task = std::thread::spawn(move || caller.execute(&request));
+            let command = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(operations.status()["ports"][0]["control_pending"], true);
+            let (forward, receiver) = std::sync::mpsc::channel();
+            forward.send(command).unwrap();
+            super::super::worker::process_test_commands(
+                &mut manager,
+                &receiver,
+                &system_state,
+                &ack_tx,
+            );
+            let response = task.join().unwrap().unwrap();
+            assert_eq!(response["status"], "Applied");
+            assert_eq!(response["ports"][0]["control_pending"], false);
+        }
+        assert!(!manager.device_states[0].read_enabled);
+        assert!(manager.device_states[0].is_enabled);
+        assert!(manager.device_states[1].read_enabled);
+        assert!(manager.port.is_none());
+        assert_eq!(observations.lock().unwrap().drops, 1);
+        let restarted = crate::operations::Operations::new(
+            root.path().join("config"),
+            root.path().join("logs"),
+            "test".into(),
+            &[manager.port_config.clone()],
+        )
+        .unwrap();
+        assert!(!restarted.initial_port_enabled(&port_id));
+        assert!(!restarted.initial_device_read_enabled(&port_id, 1));
+        assert!(restarted.initial_device_read_enabled(&port_id, 2));
+        assert_eq!(restarted.status()["revision"], "3");
     }
 }

@@ -266,6 +266,9 @@ func (r *Runtime) RestartSource(ctx context.Context, id string, revision uint64,
 	if !source.Enabled {
 		return api.SourceView{}, &domain.FieldError{Field: "enabled", Message: "disabled source cannot be restarted"}
 	}
+	if err := r.checkSourceOperationLocked(id); err != nil {
+		return api.SourceView{}, err
+	}
 	if r.sourceGroupsPending(source) {
 		return api.SourceView{}, domain.ErrGroupPending
 	}

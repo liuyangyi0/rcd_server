@@ -202,7 +202,11 @@ func (r *Runtime) UpdateGroup(ctx context.Context, id string, revision uint64, m
 
 func (r *Runtime) DeleteGroup(ctx context.Context, id string, revision uint64) error {
 	r.configMu.Lock()
-	defer r.configMu.Unlock()
+	var refreshGroups []string
+	defer func() {
+		r.configMu.Unlock()
+		r.queueGroupRefreshes(refreshGroups...)
+	}()
 	if r.closing.Load() {
 		return domain.ErrShuttingDown
 	}
@@ -222,6 +226,9 @@ func (r *Runtime) DeleteGroup(ctx context.Context, id string, revision uint64) e
 			return fmt.Errorf("remove source %q device bindings before deleting this group: %w", source.ID, domain.ErrGroupInUse)
 		}
 		if source.GroupID == id {
+			if err := r.checkSourceOperationLocked(source.ID); err != nil {
+				return err
+			}
 			removedSources = append(removedSources, source)
 			continue
 		}
@@ -259,6 +266,11 @@ func (r *Runtime) DeleteGroup(ctx context.Context, id string, revision uint64) e
 		r.cache.DeleteSource(source.ID)
 	}
 	r.mu.Lock()
+	for sourceID, catalog := range candidateCatalogs {
+		if r.catalogs[sourceID].State != catalog.State {
+			r.dirtyCatalogs[sourceID] = catalog
+		}
+	}
 	r.catalogs = candidateCatalogs
 	r.index = candidateIndex
 	r.conflictCount = candidateConflictCount
@@ -281,6 +293,7 @@ func (r *Runtime) DeleteGroup(ctx context.Context, id string, revision uint64) e
 		deleted := opc.LowerStatus{SourceID: source.ID}
 		r.persistLowerStatusTransition(deleted, deleted, true)
 	}
+	refreshGroups = r.syncCatalogStatuses()
 	r.reconcileAfterConfiguration()
 	r.audit(ctx, "group.delete", id, revision, nil)
 	r.broker.Publish(api.Event{Type: "group.changed", Data: map[string]string{"deleted_id": id}})
@@ -508,7 +521,11 @@ func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, 
 		return api.SourceView{}, err
 	}
 	r.configMu.Lock()
-	defer r.configMu.Unlock()
+	var refreshGroups []string
+	defer func() {
+		r.configMu.Unlock()
+		r.queueGroupRefreshes(refreshGroups...)
+	}()
 	if r.closing.Load() {
 		return api.SourceView{}, domain.ErrShuttingDown
 	}
@@ -522,6 +539,9 @@ func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, 
 	}
 	if mutation.GroupBindings == nil {
 		mutation.GroupBindings = append([]domain.GroupBinding(nil), current.GroupBindings...)
+	}
+	if err := r.checkSourceOperationLocked(id); err != nil {
+		return api.SourceView{}, err
 	}
 	updatedInput := sourceFromMutation(mutation)
 	updatedInput.Revision = current.Revision
@@ -591,11 +611,9 @@ func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, 
 		if validateErr != nil {
 			return api.SourceView{}, validateErr
 		}
-		recoveringSourceID := ""
-		if resetCatalog {
-			recoveringSourceID = id
-		}
-		candidateConflictCount += r.enforceCatalogQuarantine(candidateIndex, states, recoveringSourceID)
+		// A configuration edit is not successful rediscovery. Keep explicit
+		// rejection markers even when the old connection/catalog is reset.
+		candidateConflictCount += r.enforceCatalogQuarantine(candidateIndex, states, "")
 		for sourceIndex := range candidate {
 			if state, ok := states[candidate[sourceIndex].ID]; ok {
 				candidate[sourceIndex].CatalogState = state
@@ -642,11 +660,8 @@ func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, 
 		r.catalogs = candidateCatalogs
 		r.index = candidateIndex
 		r.conflictCount = candidateConflictCount
-		if resetCatalog {
-			delete(r.quarantinedSources, id)
-		}
 		delete(r.dirtyCatalogs, id)
-		if bindingsChanged && !resetCatalog {
+		if (bindingsChanged && !resetCatalog) || candidateCatalogs[id].QuarantineReason != "" {
 			r.dirtyCatalogs[id] = candidateCatalogs[id]
 		}
 		if len(r.dirtyCatalogs) == 0 {
@@ -661,7 +676,7 @@ func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, 
 		}
 	}
 	if resetCatalog || bindingsChanged {
-		r.syncCatalogStatuses()
+		refreshGroups = append(updated.GroupIDs(), r.syncCatalogStatuses()...)
 	}
 	r.reconcileAfterConfiguration()
 	r.audit(ctx, "source.update", id, updated.Revision, map[string]any{"group_id": updated.GroupID, "group_bindings": append([]domain.GroupBinding(nil), updated.GroupBindings...)})
@@ -671,7 +686,11 @@ func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, 
 
 func (r *Runtime) DeleteSource(ctx context.Context, id string, revision uint64) error {
 	r.configMu.Lock()
-	defer r.configMu.Unlock()
+	var refreshGroups []string
+	defer func() {
+		r.configMu.Unlock()
+		r.queueGroupRefreshes(refreshGroups...)
+	}()
 	if r.closing.Load() {
 		return domain.ErrShuttingDown
 	}
@@ -684,6 +703,9 @@ func (r *Runtime) DeleteSource(ctx context.Context, id string, revision uint64) 
 		return &domain.RevisionConflictError{Expected: revision, Actual: current.Revision}
 	}
 	candidate := removeSource(oldSources, id)
+	if err := r.checkSourceOperationLocked(id); err != nil {
+		return err
+	}
 	r.mu.RLock()
 	candidateCatalogs := cloneCatalogMap(r.catalogs)
 	r.mu.RUnlock()
@@ -712,6 +734,11 @@ func (r *Runtime) DeleteSource(ctx context.Context, id string, revision uint64) 
 	r.stopLower(id)
 	r.cache.DeleteSource(id)
 	r.mu.Lock()
+	for sourceID, catalog := range candidateCatalogs {
+		if r.catalogs[sourceID].State != catalog.State {
+			r.dirtyCatalogs[sourceID] = catalog
+		}
+	}
 	r.catalogs = candidateCatalogs
 	r.index = candidateIndex
 	r.conflictCount = candidateConflictCount
@@ -730,6 +757,7 @@ func (r *Runtime) DeleteSource(ctx context.Context, id string, revision uint64) 
 	r.mu.Unlock()
 	deleted := opc.LowerStatus{SourceID: id}
 	r.persistLowerStatusTransition(deleted, deleted, true)
+	refreshGroups = append(current.GroupIDs(), r.syncCatalogStatuses()...)
 	r.reconcileAfterConfiguration()
 	r.audit(ctx, "source.delete", id, revision, nil)
 	r.broker.Publish(api.Event{Type: "source.status", Data: map[string]string{"deleted_id": id}})

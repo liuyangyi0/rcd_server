@@ -62,6 +62,19 @@ describe('API client contract', () => {
     expect(init.headers).toMatchObject({ 'X-RCD-Operator': 'Alice' });
   });
 
+  it('forwards point-query cancellation to fetch without turning cancellation into an API outage', async () => {
+    const controller = new AbortController();
+    const cancelled = new DOMException('Query superseded', 'AbortError');
+    const fetchMock = vi.fn((_url: string, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init.signal?.addEventListener('abort', () => reject(cancelled), { once: true });
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const request = api.points({ groupId: 'device-a', routeSourceId: 'lower-a' }, controller.signal);
+    expect(fetchMock.mock.calls[0][1].signal).toBe(controller.signal);
+    controller.abort();
+    await expect(request).rejects.toBe(cancelled);
+  });
+
   it('unwraps the backend error envelope', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ error: { code: 'revision_conflict', message: 'revision conflict', details: { expected: 2, actual: 3 } } }, 409)));
     await expect(api.deleteGroup('fire', 2)).rejects.toMatchObject({ status: 409, code: 'revision_conflict', message: 'revision conflict' } satisfies Partial<ApiError>);

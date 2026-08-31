@@ -7,7 +7,7 @@
 JSON 写请求必须满足：
 
 - `Content-Type: application/json`；
-- 请求体不超过 1 MiB；
+- 普通请求体不超过 1 MiB；下级配置校验/保存允许最多 13 MiB JSON（解码后的文件文本最多 2 MiB）；
 - 未定义字段会被拒绝；
 - 浏览器写请求的 `Origin` 必须与请求 scheme/host 完全一致；
 - `Sec-Fetch-Site` 若存在，只接受 `same-origin` 或 `none`。
@@ -28,6 +28,7 @@ JSON 写请求必须满足：
 | POST | `/api/v1/sources/{id}/probe` | 独立执行 Endpoint、登录、Namespace 和目录浏览测试，不修改在线连接 |
 | POST | `/api/v1/sources/{id}/reconnect` | 立即重启该来源连接监督器；重连过程也会重新浏览目录 |
 | POST | `/api/v1/sources/{id}/rediscover` | 立即重连并重新发现目录；保留用于脚本表达操作意图 |
+| GET/POST/PUT | `/api/v1/sources/{id}/operations/*` | 下级配置、采集开关、日志；能力/路径/版本规则见[下级运维协议](lower-operations.md) |
 | GET | `/api/v1/sessions` | 当前在线 OPC Session 列表及各组路由 |
 | PUT | `/api/v1/sessions/{session}/groups/{group}/selection` | 修改目标 Session 的组选源 |
 | GET | `/api/v1/points` | 分页点位，可查看默认源、指定 Session 或指定来源样本 |
@@ -60,6 +61,10 @@ If-Match: "7"
 
 支持带引号的数字和弱 ETag 形式。缺失 header 返回 HTTP 428；格式非法返回 400；版本已变化返回 HTTP 409：
 
+下级 `operations` 接口不同：`If-Match` 必须是一个**精确、不透明的下级版本**（不支持弱 ETag、
+通配或多个版本），并在 PUT JSON 中另带管理程序的 `source_revision`。配置文件版本是 SHA256，
+不是管理程序的配置 revision；先读能力/状态/文件，不能在几个版本之间混用。
+
 ```json
 {
   "error": {
@@ -91,7 +96,7 @@ $source = Invoke-RestMethod -Method Post `
     id = 'line-a-primary'
     group_id = 'line-a'
     name = '一号线主机'
-    endpoint = 'opc.tcp://10.10.1.21:4840'
+    endpoint = 'opc.tcp://10.10.1.21:4841'
     security_policy = 'None'
     security_mode = 'None'
     enabled = $true
@@ -153,7 +158,7 @@ Invoke-RestMethod -Method Put `
     {"group_id": "device-b", "port_id": "COM1", "device_id": "2"}
   ],
   "name": "一号线安全端点",
-  "endpoint": "opc.tcp://10.10.1.22:4840",
+  "endpoint": "opc.tcp://10.10.1.22:4841",
   "security_policy": "Basic256Sha256",
   "security_mode": "SignAndEncrypt",
   "username": "user1",
@@ -322,9 +327,23 @@ curl.exe -N http://127.0.0.1:8080/api/v1/events
 - `catalog.changed`、`group.changed`；
 - `selection.changed`、`session.changed`；
 - `command.changed`；
+- `source.process`（指定来源的进程绑定或作业状态变化）；
 - `alarm.changed`、`configuration.changed`。
 
 SSE 是“相关资源已变化”的通知，不是全量实时点流。`source.sample` 只携带来源和 identifier 等轻量信息；客户端应使相关分页查询失效后按需重取，不能把约 10 万点持续塞入全局前端状态。
+
+## 独立下级进程管理（Linux）
+
+新增 `/api/v1/sources/{id}/process` 下的 `binding`、`status`、`actions`、
+`operations`、`operations/{request_id}/resolve` 和 `log`。这些接口面向物理来源的独立 agent，
+不跟随 Session 选源；下级 OPC 离线时仍可使用在线 agent 启停和查看进程输出。
+
+绑定使用数值型 binding revision，动作使用不透明的 agent revision，并携带原 source_revision、
+binding_revision 和唯一 request_id。202 仅代表非终态；HTTP 200 的作业也可能失败，应检查
+state。结果未知时只查询/resolve 原请求，不换新 ID 重试重启。进程作业处理中，来源命令和运维
+修改返回 409；只读状态、配置与日志仍可查询，但 OPC 下级离线时其运维读取返回不可用。
+
+带配置版本的显式重启、完整正文、错误及 agent 协议见 [下级进程管理](lower-process-management.md)。
 
 ## HTTP 错误
 

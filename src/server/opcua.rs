@@ -5,8 +5,9 @@
 /// OPC UA 默认监听地址。
 pub const OPCUA_BIND_HOST: &str = "0.0.0.0";
 /// OPC UA 默认监听端口。
-pub const OPCUA_BIND_PORT: u16 = 4840;
-/// 独立部署/联调可覆盖监听端口，未设置时保留原来的 4840。
+/// 4840 专用于上级 RCD Manager；下级网关默认使用 4841。
+pub const OPCUA_BIND_PORT: u16 = 4841;
+/// 同一主机部署多个下级时，为每个实例显式分配唯一端口。
 pub const OPCUA_PORT_ENV: &str = "RCD_OPCUA_PORT";
 /// 命令 ACK 状态回写检查间隔。
 pub const ACK_STATUS_DRAIN_INTERVAL_MS: u64 = 50;
@@ -35,6 +36,7 @@ use log::{debug, info, warn};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+use super::operations::{publish_operations, OPERATIONS_NAMESPACE_URI};
 use super::topology::{publish_topology, TopologyManifest, TOPOLOGY_NAMESPACE_URI};
 use crate::broadcast::Broadcaster;
 use crate::calc_engine::config::{normalize_data_type, CalcDataType};
@@ -44,6 +46,7 @@ use crate::model::{
     get_sum, Command, CommandAckStatus, CommandAckUpdate, CommandType, DeviceStatus, SendData,
     SystemState, Value,
 };
+use crate::operations::{Operations, MAX_REQUEST_BYTES};
 use crate::protocol::hex_str_to_bytes;
 use crate::runtime_cache::LatestStatusCache;
 use crate::serial::port_config::SerialPortConfig;
@@ -157,6 +160,7 @@ struct SendNodeWriteContext {
     pending_commands: Arc<Mutex<HashMap<String, PendingCommand>>>,
     local_ack_status_tx: mpsc::Sender<CommandAckUpdate>,
     command_pending_timeout: Duration,
+    operations: Option<Operations>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -414,6 +418,7 @@ pub async fn run_opcua_server(
     calc_engine: Arc<CalcEngine>,
     latest_status_cache: LatestStatusCache,
     cancel: CancellationToken,
+    operations: Operations,
 ) -> io::Result<()> {
     validate_opcua_kks_namespace(&serial_ports, &calc_engine)?;
     let topology = TopologyManifest::build(&serial_ports, &calc_engine)?;
@@ -470,6 +475,14 @@ pub async fn run_opcua_server(
             },
             "topology",
         ))
+        .with_node_manager(simple_node_manager(
+            NamespaceMetadata {
+                namespace_uri: OPERATIONS_NAMESPACE_URI.to_owned(),
+                namespace_version: Some("1".into()),
+                ..Default::default()
+            },
+            "operations",
+        ))
         .trust_client_certs(true)
         .diagnostics_enabled(true);
 
@@ -477,11 +490,15 @@ pub async fn run_opcua_server(
         &mut builder,
         variable_counts
             .total()
-            .saturating_add(topology.metadata_variable_count()),
+            .saturating_add(topology.metadata_variable_count())
+            .saturating_add(3),
     );
     // Manifest 是一个原子 JSON String，正常的大点表可能超过库默认的 64 KiB。
     let limits = builder.limits_mut();
-    limits.max_string_length = limits.max_string_length.max(topology_json.len());
+    limits.max_string_length = limits
+        .max_string_length
+        .max(topology_json.len())
+        .max(MAX_REQUEST_BYTES);
     info!(
         "[OPC UA] 变量规划: 设备变量={}, 写命令变量={}, 计算变量={}, 总变量={}, 动态限制={}, min_sampling_interval_ms={}",
         variable_counts.device_variables,
@@ -516,6 +533,10 @@ pub async fn run_opcua_server(
         .node_managers()
         .get_by_name::<SimpleNodeManager>("topology")
         .expect("获取拓扑节点管理器失败");
+    let operations_manager: Arc<SimpleNodeManager> = handle
+        .node_managers()
+        .get_by_name::<SimpleNodeManager>("operations")
+        .expect("获取运维节点管理器失败");
     let subscriptions: Arc<SubscriptionCache> = handle.subscriptions().clone();
     let ns = handle
         .get_namespace_index("urn:SerialServer")
@@ -523,6 +544,9 @@ pub async fn run_opcua_server(
     let topology_ns = handle
         .get_namespace_index(TOPOLOGY_NAMESPACE_URI)
         .expect("拓扑命名空间未注册");
+    let operations_ns = handle
+        .get_namespace_index(OPERATIONS_NAMESPACE_URI)
+        .expect("运维命名空间未注册");
 
     // 先建立广播接收器，再创建节点。节点创建期间的状态由最新值缓存承接；
     // 节点就绪后会把接收游标切到通道尾部，再用缓存快照完成一致的初始同步。
@@ -549,6 +573,7 @@ pub async fn run_opcua_server(
         pending_commands: pending_commands.clone(),
         local_ack_status_tx,
         command_pending_timeout,
+        operations: Some(operations.clone()),
     };
     let tx_by_com: HashMap<String, mpsc::Sender<Command>> = serial_ports
         .iter()
@@ -557,7 +582,8 @@ pub async fn run_opcua_server(
         .collect();
 
     // ---- 注册 Method 回调 ----
-    register_send_methods(&node_manager, ns, &serial_ports, &txs)?;
+    register_send_methods(&node_manager, ns, &serial_ports, &txs, operations.clone())?;
+    publish_operations(&operations_manager, operations_ns, operations)?;
     publish_topology(
         &topology_manager,
         &node_manager,
@@ -1260,6 +1286,7 @@ fn register_send_methods(
     ns: u16,
     serial_ports: &[SerialPortConfig],
     txs: &[mpsc::Sender<Command>],
+    operations: Operations,
 ) -> io::Result<()> {
     if serial_ports.len() != txs.len() {
         return Err(io::Error::new(
@@ -1344,6 +1371,7 @@ fn register_send_methods(
 
         let com = port.port_number.clone();
         let tx = txs[idx].clone();
+        let operations = operations.clone();
 
         node_manager
             .inner()
@@ -1356,7 +1384,7 @@ fn register_send_methods(
                     return Err(StatusCode::BadInvalidArgument);
                 }
 
-                match forward_hex_command(hex_str, &com, &tx, false) {
+                match forward_hex_command(hex_str, &com, &tx, false, &operations) {
                     Ok(msg) => Ok(vec![Variant::String(UAString::from(msg))]),
                     Err(msg) => {
                         warn!("Method 调用失败: {}", msg);
@@ -1481,6 +1509,19 @@ fn handle_send_node_write(
 
     let deadline = Instant::now() + context.command_pending_timeout;
     cmd.expires_at = Some(deadline);
+    if let Some(operations) = &context.operations {
+        cmd.permit = match operations.admit_command(com) {
+            Ok(permit) => Some(permit),
+            Err(error) => {
+                log_opc_write_warn(format!("[OPC 写诊断] 拒绝写入: 串口={com}, 原因={error}"));
+                return if error.code == "busy" {
+                    StatusCode::BadWaitingForResponse
+                } else {
+                    StatusCode::BadOutOfService
+                };
+            }
+        };
+    }
     if let Err(e) = tx.send(cmd) {
         log_opc_write_warn(format!(
             "[OPC 写诊断] 拒绝写入: 串口={}, 原因=命令通道不可用, 错误={:?}",
@@ -1606,6 +1647,8 @@ fn build_hex_command(
         },
         ack_id: if with_ack { ack_id } else { None },
         expires_at: None,
+        control_receipt: None,
+        permit: None,
     })
 }
 
@@ -1615,11 +1658,19 @@ fn forward_hex_command(
     com: &str,
     tx: &mpsc::Sender<Command>,
     with_ack: bool,
+    operations: &Operations,
 ) -> Result<String, String> {
-    let cmd = build_hex_command(hex_str, com, with_ack, None)?;
+    let mut cmd = build_hex_command(hex_str, com, with_ack, None)?;
+    cmd.permit = Some(
+        operations
+            .admit_command(com)
+            .map_err(|error| error.to_string())?,
+    );
     let device_id = match &cmd.command {
         CommandType::SendData(data) | CommandType::SendDataWithAck(data) => data.device_id,
-        CommandType::PortStatus(_) | CommandType::DeviceSetting(_) => 0,
+        CommandType::PortStatus(_)
+        | CommandType::DeviceSetting(_)
+        | CommandType::DeviceReadSetting(_) => 0,
     };
     tx.send(cmd)
         .map_err(|e| format!("转发命令到串口失败: {:?}", e))?;
@@ -1906,9 +1957,9 @@ mod tests {
     }
 
     #[test]
-    fn opcua_bind_port_override_is_strict_and_default_stays_4840() {
+    fn opcua_bind_port_override_is_strict_and_default_is_reserved_lower_port() {
         use std::ffi::OsStr;
-        assert_eq!(parse_opcua_bind_port(None).unwrap(), 4840);
+        assert_eq!(parse_opcua_bind_port(None).unwrap(), 4841);
         for (text, expected) in [("1", 1), ("4845", 4845), ("65535", 65535)] {
             assert_eq!(
                 parse_opcua_bind_port(Some(OsStr::new(text))).unwrap(),
@@ -2526,6 +2577,7 @@ mod tests {
             pending_commands: pending.clone(),
             local_ack_status_tx: local_tx,
             command_pending_timeout: Duration::from_secs(5),
+            operations: None,
         };
 
         let status = handle_send_node_write(data_value_string("01 02"), "COM1", &tx, &context, 42);
@@ -2560,6 +2612,7 @@ mod tests {
             pending_commands: pending.clone(),
             local_ack_status_tx: local_tx,
             command_pending_timeout: Duration::from_secs(5),
+            operations: None,
         };
 
         for value in [SEND_NODE_IDLE_VALUE, "", "0", "1", "2", "3"] {
@@ -2585,6 +2638,7 @@ mod tests {
             pending_commands: pending.clone(),
             local_ack_status_tx: local_tx,
             command_pending_timeout: Duration::from_secs(5),
+            operations: None,
         };
 
         assert_eq!(
@@ -2622,6 +2676,7 @@ mod tests {
             pending_commands: pending.clone(),
             local_ack_status_tx: local_tx,
             command_pending_timeout: Duration::from_secs(5),
+            operations: None,
         };
         pending.lock().unwrap().insert(
             "COM1".into(),

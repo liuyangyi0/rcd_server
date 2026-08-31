@@ -235,6 +235,100 @@ impl DeviceConfig {
 //  CSV 解析入口
 // ============================================================
 
+/// 运维保存前的严格校验。与启动解析器分开，避免改变已有采集行为；
+/// 不把非法布尔值、越界点、未知类型或重复 KKS 静默当成有效配置。
+pub fn validate_csv_content(content: &str) -> Result<(Config, Vec<Record>), String> {
+    let mut reader = ReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(content.as_bytes());
+    let mut rows = reader.records();
+    let fields = [
+        "com",
+        "baud_rate",
+        "is_special",
+        "com_index",
+        "device_id",
+        "data_len",
+        "kks_prefix",
+    ];
+    let mut headers = Vec::with_capacity(fields.len());
+    for (index, field) in fields.iter().enumerate() {
+        let row = rows
+            .next()
+            .ok_or_else(|| format!("第 {} 行缺少配置字段 {field}", index + 1))?
+            .map_err(|error| error.to_string())?;
+        if row.get(0).map(str::trim) != Some(*field) {
+            return Err(format!("第 {} 行应为配置字段 {field}", index + 1));
+        }
+        headers.push(row.get(1).unwrap_or_default().to_string());
+    }
+    let com = headers[0].trim().to_string();
+    if com.is_empty() || com.chars().any(char::is_control) {
+        return Err("com 必须为非空串口名且不含控制字符".to_string());
+    }
+    if headers[6].chars().any(char::is_control) {
+        return Err("kks_prefix 不能包含控制字符".to_string());
+    }
+    let config = Config {
+        com,
+        baud_rate: parse_required(&headers, 1, "baud_rate").map_err(|e| e.to_string())?,
+        is_special: parse_required(&headers, 2, "is_special").map_err(|e| e.to_string())?,
+        com_index: parse_required(&headers, 3, "com_index").map_err(|e| e.to_string())?,
+        device_id: parse_required(&headers, 4, "device_id").map_err(|e| e.to_string())?,
+        data_len: parse_required(&headers, 5, "data_len").map_err(|e| e.to_string())?,
+        kks_prefix: headers[6].clone(),
+    };
+    if config.baud_rate == 0 {
+        return Err("baud_rate 必须大于 0".to_string());
+    }
+    let columns = rows
+        .next()
+        .ok_or_else(|| "第 8 行缺少点表列头".to_string())?
+        .map_err(|error| error.to_string())?;
+    if columns.iter().collect::<Vec<_>>() != RECORD_CSV_HEADER.split(',').collect::<Vec<_>>() {
+        return Err(format!("第 8 行列头必须为 {RECORD_CSV_HEADER}"));
+    }
+    let mut records = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    for (offset, row) in rows.enumerate() {
+        let row_number = offset + 9;
+        let row = row.map_err(|error| format!("第 {row_number} 行: {error}"))?;
+        let mut record: Record = row
+            .deserialize(None)
+            .map_err(|error| format!("第 {row_number} 行: {error}"))?;
+        if record.kks.trim().is_empty() || record.kks.chars().any(char::is_control) {
+            return Err(format!("第 {row_number} 行 KKS 为空或含控制字符"));
+        }
+        record.kks = format!("{}{}", config.kks_prefix, record.kks);
+        if !names.insert(record.kks.clone()) {
+            return Err(format!("第 {row_number} 行 KKS 重复: {}", record.kks));
+        }
+        if !matches!(record.type_.as_str(), "uint" | "bool" | "float") {
+            return Err(format!(
+                "第 {row_number} 行 {}: type_ 仅支持 uint/bool/float",
+                record.kks
+            ));
+        }
+        if record.byte_order > 1 {
+            return Err(format!(
+                "第 {row_number} 行 {}: lh 必须为 0 或 1",
+                record.kks
+            ));
+        }
+        // Deployed files use either the wire Len field or the actual status
+        // byte count (Len + 1); the serial receiver already accepts both.
+        // Without a frame, validation must use their common protocol upper
+        // bound, including Len=0 (one status byte) and Len=255 (256 bytes).
+        // Keep the startup parser's existing warning behaviour unchanged.
+        let max_status_bytes = usize::from(config.data_len) + 1;
+        if let Some(reason) = record_bounds_error(&record, max_status_bytes) {
+            return Err(format!("第 {row_number} 行 {}: {reason}", record.kks));
+        }
+        records.push(record);
+    }
+    Ok((config, records))
+}
+
 /// 解析一个设备 CSV 文件，返回 `(设备配置, 数据点列表)`。
 ///
 /// 文件格式：
@@ -402,5 +496,114 @@ kks,type_,f_type,byte_index,bit_index,def,max,min,lh
         assert!(record_bounds_error(&test_record(1, BitIndex::Single(8)), 1).is_some());
         assert!(record_bounds_error(&test_record(1, BitIndex::Range(0..=8)), 1).is_some());
         assert!(record_bounds_error(&test_record(1, BitIndex::Range(0..=32)), 8).is_some());
+    }
+
+    fn strict_fixture(data_len: u8, byte_index: u32, bit_index: &str) -> String {
+        format!(
+            "com,COM1,,,,,,,\n\
+             baud_rate,9600,,,,,,,\n\
+             is_special,false,,,,,,,\n\
+             com_index,1,,,,,,,\n\
+             device_id,1,,,,,,,\n\
+             data_len,{data_len},,,,,,,\n\
+             kks_prefix,PX_,,,,,,,\n\
+             {RECORD_CSV_HEADER}\n\
+             VALUE,uint,status,{byte_index},{bit_index},0,255,0,0\n"
+        )
+    }
+
+    fn parsed_wire_values(records: &[Record], status: &[u8]) -> crate::model::Value {
+        assert!(!status.is_empty() && status.len() <= 256);
+        let mut frame = vec![
+            1,
+            crate::protocol::cmd::READ_STATUS,
+            (status.len() - 1) as u8,
+        ];
+        frame.extend_from_slice(status);
+        frame.push(crate::model::get_sum(&frame));
+        let packet = crate::protocol::parse_data_packet(&frame).expect("valid real protocol frame");
+        assert_eq!(packet.status, status);
+        crate::protocol::parse_status(&packet.status, records)
+            .remove("PX_VALUE")
+            .expect("configured point is present in the actual frame")
+    }
+
+    #[test]
+    fn strict_csv_matches_runtime_for_both_data_length_conventions() {
+        // The same two-byte response has wire Len=1. Both data_len=1 and
+        // data_len=2 are supported by configured_protocol_frame_len.
+        for data_len in [1, 2] {
+            let content = strict_fixture(data_len, 2, "0.7");
+            let (_directory, path) = write_tmp(&content);
+            let (runtime_config, runtime_records) = parse_csv(&path).unwrap();
+            let actual = parsed_wire_values(&runtime_records, &[0xaa, 0xbb]);
+            assert_eq!(actual, crate::model::Value::UInt(0xbb));
+            let (validated_config, validated_records) = validate_csv_content(&content)
+                .unwrap_or_else(|error| panic!("working data_len={data_len} rejected: {error}"));
+            assert_eq!(validated_config.data_len, runtime_config.data_len);
+            assert_eq!(
+                parsed_wire_values(&validated_records, &[0xaa, 0xbb]),
+                actual
+            );
+        }
+    }
+
+    #[test]
+    fn strict_csv_accepts_cross_byte_ranges_at_protocol_boundary() {
+        let content = strict_fixture(1, 1, "8.15");
+        let (_directory, path) = write_tmp(&content);
+        let (_, runtime_records) = parse_csv(&path).unwrap();
+        let actual = parsed_wire_values(&runtime_records, &[0xaa, 0xbb]);
+        assert_eq!(actual, crate::model::Value::UInt(0xbb));
+        let (_, validated_records) = validate_csv_content(&content).unwrap();
+        assert_eq!(
+            parsed_wire_values(&validated_records, &[0xaa, 0xbb]),
+            actual
+        );
+    }
+
+    #[test]
+    fn strict_csv_allows_protocol_length_endpoints() {
+        for data_len in [0, u8::MAX] {
+            let status_len = usize::from(data_len) + 1;
+            let content = strict_fixture(data_len, status_len as u32, "0.7");
+            let mut status = vec![0; status_len];
+            status[status_len - 1] = 0xbb;
+            let (_directory, path) = write_tmp(&content);
+            let (_, runtime_records) = parse_csv(&path).unwrap();
+            assert_eq!(
+                parsed_wire_values(&runtime_records, &status),
+                crate::model::Value::UInt(0xbb)
+            );
+            let (_, validated_records) = validate_csv_content(&content).unwrap();
+            assert_eq!(
+                parsed_wire_values(&validated_records, &status),
+                crate::model::Value::UInt(0xbb)
+            );
+        }
+    }
+
+    #[test]
+    fn strict_csv_rejects_real_byte_and_bit_overruns() {
+        for (data_len, byte_index, bit_index) in [
+            (0, 2, "0.7"),
+            (1, 3, "0.7"),
+            (255, 257, "0.7"),
+            (1, 0, "0.7"),
+            (1, 2, "0.8"),
+            (1, 1, "8"),
+            (1, 1, "7.0"),
+            (8, 1, "0.32"),
+        ] {
+            let content = strict_fixture(data_len, byte_index, bit_index);
+            assert!(
+                validate_csv_content(&content).is_err(),
+                "accepted true overrun data_len={data_len} byte_index={byte_index} bit_index={bit_index}"
+            );
+        }
+        let zero_baud = strict_fixture(0, 1, "0.7").replace("baud_rate,9600", "baud_rate,0");
+        assert!(validate_csv_content(&zero_baud).is_err());
+        let too_long = strict_fixture(255, 256, "0.7").replace("data_len,255", "data_len,256");
+        assert!(validate_csv_content(&too_long).is_err());
     }
 }

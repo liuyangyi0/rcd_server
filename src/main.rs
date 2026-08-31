@@ -27,6 +27,7 @@ use rcd_server::csv_parser::{self, DeviceConfig};
 use rcd_server::file_scanner;
 use rcd_server::logging;
 use rcd_server::model::{Command, CommandAckUpdate, SystemState};
+use rcd_server::operations::Operations;
 use rcd_server::runtime_cache::LatestStatusCache;
 use rcd_server::serial::manager::SerialConfig;
 use rcd_server::serial::port_config::SerialPortConfig;
@@ -77,19 +78,11 @@ async fn main() -> tokio::io::Result<()> {
 }
 
 async fn run_server() -> tokio::io::Result<()> {
-    // 全局取消信号：Ctrl+C / 服务器异常退出时通知所有子任务
+    // 全局取消信号：Ctrl+C / SIGTERM / 服务器异常退出时通知所有子任务。
+    // 启动阶段提前返回也必须取消信号监听任务。
     let cancel = CancellationToken::new();
-    {
-        let c = cancel.clone();
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_err() {
-                warn!("注册 Ctrl+C 处理器失败");
-                return;
-            }
-            info!("收到 Ctrl+C，开始优雅退出");
-            c.cancel();
-        });
-    }
+    let _cancel_on_return = cancel.clone().drop_guard();
+    let _signal_listener = spawn_shutdown_listener(cancel.clone())?;
 
     // 全局广播器：串口数据会广播到所有订阅者（OPC UA / TCP 客户端）
     let broadcaster = Broadcaster::new();
@@ -135,6 +128,20 @@ async fn run_server() -> tokio::io::Result<()> {
         }
     };
 
+    // Load once: operations identities and worker configurations must refer to
+    // the same validated CSV snapshot, including a persisted closed port.
+    let serial_configs = load_and_group_csv_configs()?;
+    let (log_dir, log_basename) = logging::startup_log_location()?;
+    let operations = Operations::new_with_shutdown(
+        config::config_dir().map_err(|e| io::Error::other(e.to_string()))?,
+        log_dir,
+        log_basename,
+        &serial_configs,
+        cancel.clone(),
+    )?;
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     let (ack_status_tx, ack_status_rx) = mpsc::channel::<CommandAckUpdate>();
 
     // 初始化串口并启动通信线程
@@ -146,10 +153,16 @@ async fn run_server() -> tokio::io::Result<()> {
         latest_status_cache.clone(),
         ack_status_tx,
         cancel.clone(),
+        serial_configs,
+        operations.clone(),
     )
     .await
     {
         Ok((configs, txs, worker_handles)) => {
+            if cancel.is_cancelled() {
+                shutdown_workers(worker_handles).await;
+                return Ok(());
+            }
             // ---- 计算引擎基础变量是否在 CSV 数据点中定义 ----
             let mut all_kks: HashSet<String> = HashSet::new();
             for port in &configs {
@@ -193,6 +206,7 @@ async fn run_server() -> tokio::io::Result<()> {
                 calc_engine,
                 latest_status_cache,
                 cancel.clone(),
+                operations,
             )
             .await;
             match &server_result {
@@ -216,6 +230,51 @@ async fn run_server() -> tokio::io::Result<()> {
     };
 
     result
+}
+
+fn spawn_shutdown_listener(cancel: CancellationToken) -> io::Result<JoinHandle<()>> {
+    // Register Unix handlers before loading configuration or starting workers.
+    // A service supervisor sends SIGTERM; it must use the same cleanup path as
+    // an interactive SIGINT, rather than the OS's immediate termination path.
+    #[cfg(unix)]
+    let signal = {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        async move {
+            let (received, name) = tokio::select! {
+                received = interrupt.recv() => (received, "SIGINT"),
+                received = terminate.recv() => (received, "SIGTERM"),
+            };
+            received.map(|()| name).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "shutdown signal stream closed")
+            })
+        }
+    };
+    #[cfg(not(unix))]
+    let signal = async {
+        tokio::signal::ctrl_c().await?;
+        Ok("Ctrl+C")
+    };
+
+    Ok(tokio::spawn(shutdown_on_signal(cancel, signal)))
+}
+
+async fn shutdown_on_signal(
+    cancel: CancellationToken,
+    signal: impl std::future::Future<Output = io::Result<&'static str>>,
+) {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {}
+        result = signal => {
+            match result {
+                Ok(name) => info!("收到 {}，开始优雅退出", name),
+                Err(error) => error!("退出信号监听失败，开始关闭服务: {}", error),
+            }
+            cancel.cancel();
+        }
+    }
 }
 
 /// 持有操作系统级独占文件锁；进程正常退出、panic 展开或被系统终止时，
@@ -298,7 +357,9 @@ fn install_panic_hook() {
     }));
 }
 
-/// 等待所有串口 worker 自然结束，超时后放弃（tokio runtime drop 会清理）。
+/// 等待所有串口 worker 自然结束。这里的超时只限制 join 等待；
+/// 已开始的 spawn_blocking I/O 不能通过丢弃 JoinHandle 强制中断。
+/// 外部守护进程应以真实进程退出为准，并单独记录超时强制结束。
 async fn shutdown_workers(handles: Vec<JoinHandle<()>>) {
     if handles.is_empty() {
         return;
@@ -322,6 +383,8 @@ async fn shutdown_workers(handles: Vec<JoinHandle<()>>) {
 /// 扫描 CSV 配置文件、聚合串口设备、启动通信线程。
 ///
 /// 返回 `(串口配置列表, 命令发送器列表)` 供服务器使用。
+/// 这是启动边界；显式传入各个共享资源，避免把可变全局状态隐藏在聚合对象中。
+#[allow(clippy::too_many_arguments)]
 async fn init_serial_ports(
     broadcaster: Broadcaster,
     software_config: &config::Config,
@@ -330,14 +393,13 @@ async fn init_serial_ports(
     latest_status_cache: LatestStatusCache,
     ack_status_tx: mpsc::Sender<CommandAckUpdate>,
     cancel: CancellationToken,
+    serial_port_configs: Vec<SerialPortConfig>,
+    operations: Operations,
 ) -> io::Result<(
     Vec<SerialPortConfig>,
     Vec<mpsc::Sender<Command>>,
     Vec<JoinHandle<()>>,
 )> {
-    // 1. 扫描 CSV 并按串口号聚合
-    let serial_port_configs = load_and_group_csv_configs()?;
-
     if serial_port_configs.is_empty() {
         warn!("未找到任何有效的设备配置文件");
     } else {
@@ -356,8 +418,12 @@ async fn init_serial_ports(
     let mut handles = Vec::with_capacity(serial_port_configs.len());
 
     for port_config in &serial_port_configs {
+        if cancel.is_cancelled() {
+            break;
+        }
         let (tx, rx) = mpsc::channel();
         txs.push(tx);
+        operations.register_worker(&port_config.port_number, txs.last().unwrap().clone());
 
         system_state.add_port(port_config.to_runtime_state());
 
@@ -379,6 +445,7 @@ async fn init_serial_ports(
             system_record.clone(),
             latest_status_cache.clone(),
             cancel.clone(),
+            operations.clone(),
         );
         handles.push(handle);
     }
@@ -408,12 +475,30 @@ fn load_and_group_csv_configs_from_dir(config_dir: &Path) -> io::Result<Vec<Seri
                 format!("解析设备配置 CSV {file:?} 失败，拒绝启动: {error}"),
             )
         })?;
-        let device = DeviceConfig::new(conf.clone(), recs);
-        configs
+        let port = configs
             .entry(conf.com.clone())
-            .or_insert_with(|| SerialPortConfig::from_csv_config(&conf))
-            .devices
-            .push(device);
+            .or_insert_with(|| SerialPortConfig::from_csv_config(&conf));
+        // 一个物理串口只能使用一套通信参数，不能让后续设备静默继承
+        // 第一份 CSV 的波特率或协议模式。仍在打开任何串口之前失败。
+        if port.baud_rate != conf.baud_rate {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "设备配置 CSV {file:?} 的串口 {} 参数冲突: baud_rate 已有 {}，当前 {}，拒绝启动",
+                    conf.com, port.baud_rate, conf.baud_rate
+                ),
+            ));
+        }
+        if port.is_special != conf.is_special {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "设备配置 CSV {file:?} 的串口 {} 参数冲突: is_special 已有 {}，当前 {}，拒绝启动",
+                    conf.com, port.is_special, conf.is_special
+                ),
+            ));
+        }
+        port.devices.push(DeviceConfig::new(conf, recs));
     }
 
     let mut ports: Vec<_> = configs.into_values().collect();
@@ -424,6 +509,41 @@ fn load_and_group_csv_configs_from_dir(config_dir: &Path) -> io::Result<Vec<Seri
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_signal_delivery_cancels_workers_and_admission_token() {
+        for name in ["SIGINT", "SIGTERM", "Ctrl+C"] {
+            let cancel = CancellationToken::new();
+            let worker = cancel.child_token();
+            let admission = cancel.clone();
+            shutdown_on_signal(cancel.clone(), std::future::ready(Ok(name))).await;
+            assert!(cancel.is_cancelled(), "{name}");
+            assert!(worker.is_cancelled(), "{name}");
+            assert!(admission.is_cancelled(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_waiter_ends_on_internal_cancellation() {
+        let cancel = CancellationToken::new();
+        let listener = tokio::spawn(shutdown_on_signal(cancel.clone(), std::future::pending()));
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), listener)
+            .await
+            .expect("internal failure must not leave a signal waiter alive")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_failure_closes_admission_instead_of_ignoring_error() {
+        let cancel = CancellationToken::new();
+        shutdown_on_signal(
+            cancel.clone(),
+            std::future::ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "test error"))),
+        )
+        .await;
+        assert!(cancel.is_cancelled());
+    }
 
     fn device_csv(address: &str) -> String {
         format!(
@@ -460,6 +580,64 @@ mod startup_tests {
         assert_eq!(ports[0].devices.len(), 2);
         assert_eq!(ports[0].devices[0].config.device_id, 0);
         assert_eq!(ports[0].devices[1].config.device_id, 255);
+    }
+
+    #[test]
+    fn csv_loading_rejects_conflicting_baud_rates_on_one_port() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rcd_a.csv"), device_csv("1")).unwrap();
+        std::fs::write(
+            dir.path().join("rcd_b.csv"),
+            device_csv("2").replace("baud_rate,115200", "baud_rate,9600"),
+        )
+        .unwrap();
+
+        let error = load_and_group_csv_configs_from_dir(dir.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        for expected in ["rcd_b.csv", "COM1", "baud_rate", "115200", "9600"] {
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn csv_loading_rejects_conflicting_protocol_modes_on_one_port() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rcd_a.csv"), device_csv("1")).unwrap();
+        std::fs::write(
+            dir.path().join("rcd_b.csv"),
+            device_csv("2").replace("is_special,false", "is_special,true"),
+        )
+        .unwrap();
+
+        let error = load_and_group_csv_configs_from_dir(dir.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        for expected in ["rcd_b.csv", "COM1", "is_special", "false", "true"] {
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn csv_loading_allows_different_settings_on_different_ports() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rcd_a.csv"), device_csv("1")).unwrap();
+        std::fs::write(
+            dir.path().join("rcd_b.csv"),
+            device_csv("2")
+                .replace("com,COM1", "com,COM2")
+                .replace("baud_rate,115200", "baud_rate,9600")
+                .replace("is_special,false", "is_special,true"),
+        )
+        .unwrap();
+
+        let ports = load_and_group_csv_configs_from_dir(dir.path()).unwrap();
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0].port_number, "COM1");
+        assert_eq!(ports[0].baud_rate, 115200);
+        assert!(!ports[0].is_special);
+        assert_eq!(ports[1].port_number, "COM2");
+        assert_eq!(ports[1].baud_rate, 9600);
+        assert!(ports[1].is_special);
+        assert_eq!(ports[1].devices[0].config.device_id, 2);
     }
 
     #[test]

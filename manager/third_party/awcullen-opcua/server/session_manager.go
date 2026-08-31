@@ -62,12 +62,15 @@ func (m *SessionManager) Add(s *Session) error {
 		atomic.StoreUint32(&m.server.serverDiagnosticsSummary.CurrentSessionCount, uint32(len(m.sessionsByToken)))
 		m.server.Unlock()
 	}
-	m.Unlock()
-	m.server.emitSessionEvent(SessionEvent{
+	s.Lock()
+	s.enqueueLifecycleEventLocked(SessionEvent{
 		Kind:       SessionCreated,
-		Session:    snapshotSession(s),
+		Session:    snapshotSessionLocked(s),
 		OccurredAt: time.Now(),
 	})
+	s.Unlock()
+	m.Unlock()
+	s.drainLifecycleEvents(m.server)
 	return nil
 }
 
@@ -79,26 +82,30 @@ func (m *SessionManager) Delete(s *Session) {
 // DeleteWithReason removes a session and emits one terminal lifecycle event.
 func (m *SessionManager) DeleteWithReason(s *Session, reason SessionCloseReason) {
 	m.Lock()
-	if _, exists := m.sessionsByToken[s.authenticationToken]; !exists {
+	token := s.AuthenticationToken()
+	if current, exists := m.sessionsByToken[token]; !exists || current != s {
 		m.Unlock()
 		return
 	}
-	snapshot := snapshotSession(s)
-	delete(m.sessionsByToken, s.authenticationToken)
+	delete(m.sessionsByToken, token)
 	if m.server.serverDiagnostics {
 		m.removeDiagnosticsNode(s)
 		m.server.Lock()
 		atomic.StoreUint32(&m.server.serverDiagnosticsSummary.CurrentSessionCount, uint32(len(m.sessionsByToken)))
 		m.server.Unlock()
 	}
-	s.delete()
-	m.Unlock()
-	m.server.emitSessionEvent(SessionEvent{
+	s.Lock()
+	snapshot := snapshotSessionLocked(s)
+	s.deleteLocked()
+	s.enqueueLifecycleEventLocked(SessionEvent{
 		Kind:       SessionClosed,
 		Reason:     reason,
 		Session:    snapshot,
 		OccurredAt: time.Now(),
 	})
+	s.Unlock()
+	m.Unlock()
+	s.drainLifecycleEvents(m.server)
 }
 
 // Len returns the number of sessions.
@@ -110,10 +117,10 @@ func (m *SessionManager) Len() int {
 
 func (m *SessionManager) checkForExpiredSessions() {
 	m.Lock()
-	closed := make([]SessionSnapshot, 0)
+	closed := make([]*Session, 0)
 	for k, s := range m.sessionsByToken {
 		if s.IsExpired() {
-			closed = append(closed, snapshotSession(s))
+			closed = append(closed, s)
 			delete(m.sessionsByToken, k)
 			if m.server.serverDiagnostics {
 				m.removeDiagnosticsNode(s)
@@ -122,17 +129,19 @@ func (m *SessionManager) checkForExpiredSessions() {
 				atomic.StoreUint32(&m.server.serverDiagnosticsSummary.CurrentSessionCount, uint32(len(m.sessionsByToken)))
 				m.server.Unlock()
 			}
-			s.delete()
+			s.Lock()
+			snapshot := snapshotSessionLocked(s)
+			s.deleteLocked()
+			s.enqueueLifecycleEventLocked(SessionEvent{
+				Kind: SessionClosed, Reason: SessionCloseReasonTimeout,
+				Session: snapshot, OccurredAt: time.Now(),
+			})
+			s.Unlock()
 		}
 	}
 	m.Unlock()
-	for _, snapshot := range closed {
-		m.server.emitSessionEvent(SessionEvent{
-			Kind:       SessionClosed,
-			Reason:     SessionCloseReasonTimeout,
-			Session:    snapshot,
-			OccurredAt: time.Now(),
-		})
+	for _, s := range closed {
+		s.drainLifecycleEvents(m.server)
 	}
 }
 
@@ -168,20 +177,31 @@ func (m *SessionManager) DetachChannel(channelID uint32) {
 	m.RLock()
 	sessions := make([]*Session, 0)
 	for _, s := range m.sessionsByToken {
-		if s.SecureChannelId() == channelID {
-			sessions = append(sessions, s)
-		}
+		sessions = append(sessions, s)
 	}
 	m.RUnlock()
 	for _, s := range sessions {
-		snapshot := snapshotSession(s)
-		m.server.emitSessionEvent(SessionEvent{
-			Kind:         SessionDetached,
-			Session:      snapshot,
-			OccurredAt:   time.Now(),
-			OldChannelID: channelID,
-		})
+		s.detachChannel(m.server, channelID)
 	}
+}
+
+func (s *Session) detachChannel(srv *Server, channelID uint32) {
+	s.Lock()
+	// A candidate copied from SessionManager may have rebound or closed while
+	// the manager lock was released. Validate and snapshot the exact binding
+	// atomically; a delayed old-channel close cannot describe the new channel.
+	if s.deleted || s.channelId != channelID || s.channelDetached {
+		s.Unlock()
+		return
+	}
+	s.channelDetached = true
+	s.prunePublishRequestsLocked()
+	s.enqueueLifecycleEventLocked(SessionEvent{
+		Kind: SessionDetached, Session: snapshotSessionLocked(s),
+		OccurredAt: time.Now(), OldChannelID: channelID,
+	})
+	s.Unlock()
+	s.drainLifecycleEvents(srv)
 }
 
 // CloseAll removes every session using a common terminal reason.

@@ -82,7 +82,7 @@ func TestLiveDeviceGroupsLegacyShapeAndSecureRead(t *testing.T) {
 					t.Fatal("business namespace missing")
 				}
 				response, err := client.Read(ctx, &gu.ReadRequest{NodesToRead: []*gu.ReadValueID{{NodeID: gu.NewStringNodeID(ns, "A_VALUE"), AttributeID: gu.AttributeIDValue}}})
-				if err != nil || response == nil || len(response.Results) != 1 || response.Results[0].Status != gu.StatusOK {
+				if err != nil || response == nil || len(response.Results) != 1 || !liveGroupsDataValueHasStatus(response.Results[0], gu.StatusOK) {
 					t.Fatalf("secure read response=%#v err=%v", response, err)
 				}
 			})
@@ -164,15 +164,15 @@ func TestLiveDeviceGroupsReadSubscribeWebAndCommands(t *testing.T) {
 		deadline := time.Now().Add(8 * time.Second)
 		for time.Now().Before(deadline) {
 			last = read(client, 2, identifier)
-			if last.Status == gu.StatusOK && last.Value != nil {
-				value, err := strconv.ParseFloat(fmt.Sprint(last.Value.Value()), 64)
-				if err == nil && value == want {
-					return
+			if liveGroupsNumberMatches(last, want) {
+				if last.Status != gu.StatusOK {
+					t.Logf("point %s accepted Good with information bits: %s", identifier, liveGroupsDescribeValue(last))
 				}
+				return
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
-		t.Fatalf("point %s want=%v last=%#v", identifier, want, last)
+		t.Fatalf("point %s want=%v last=%s", identifier, want, liveGroupsDescribeValue(last))
 	}
 	selectSource := func(client *gopcua.Client, group, source string) {
 		write(client, 3, "Groups/"+group+"/SelectedSourceId", source, gu.StatusOK)
@@ -239,14 +239,16 @@ func TestLiveDeviceGroupsReadSubscribeWebAndCommands(t *testing.T) {
 	awaitAck := func(ns uint16, identifier string) {
 		t.Helper()
 		deadline := time.Now().Add(8 * time.Second)
+		var last *gu.DataValue
 		for time.Now().Before(deadline) {
-			value := read(first, ns, identifier)
-			if value.Status == gu.StatusOK && value.Value != nil && fmt.Sprint(value.Value.Value()) == "1" {
+			last = read(first, ns, identifier)
+			if liveDeviceFaultResultMatches(last, "1", true) {
+				t.Logf("ACK %s: %s", identifier, liveGroupsDescribeValue(last))
 				return
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
-		t.Fatalf("ACK not successful for %s", identifier)
+		t.Fatalf("ACK not successful for %s: last=%s", identifier, liveGroupsDescribeValue(last))
 	}
 	awaitAck(3, "Groups/device-a/Send")
 	t.Log("same source+physical port rejects concurrent device commands; only the pending logical group is selection-locked")
@@ -388,6 +390,8 @@ func liveGroupsAwaitValue(t *testing.T, notifications <-chan *gopcua.PublishNoti
 	t.Helper()
 	timer := time.NewTimer(8 * time.Second)
 	defer timer.Stop()
+	var last *gu.DataValue
+	var received, matchingHandle int
 	for {
 		select {
 		case notification, ok := <-notifications:
@@ -405,17 +409,57 @@ func liveGroupsAwaitValue(t *testing.T, notifications <-chan *gopcua.PublishNoti
 				continue
 			}
 			for _, item := range change.MonitoredItems {
-				if item.ClientHandle == handle && item.Value != nil && item.Value.Status == gu.StatusOK && item.Value.Value != nil {
-					value, err := strconv.ParseFloat(fmt.Sprint(item.Value.Value.Value()), 64)
-					if err == nil && value == want {
-						return
-					}
+				received++
+				if item != nil && item.ClientHandle == handle {
+					matchingHandle++
+					last = item.Value
+				}
+				if liveGroupsMonitoredValueMatches(item, handle, want) {
+					t.Logf("subscription handle=%d matched %s", handle, liveGroupsDescribeValue(item.Value))
+					return
 				}
 			}
 		case <-timer.C:
-			t.Fatalf("no subscription notification for handle=%d value=%v", handle, want)
+			t.Fatalf("no subscription notification for handle=%d value=%v: received=%d matching_handle=%d last=%s", handle, want, received, matchingHandle, liveGroupsDescribeValue(last))
 		}
 	}
+}
+
+func liveGroupsDataValueHasStatus(value *gu.DataValue, want gu.StatusCode) bool {
+	if value == nil || value.Value == nil {
+		return false
+	}
+	// Like liveDeviceFaultResultMatches for ACKs, a request for Good quality
+	// accepts its information bits (including Rust's Overflow flag). Keep the
+	// complete status untouched, and still require exact explicitly named Bad
+	// or Uncertain codes in tests of quality propagation.
+	if want == gu.StatusOK {
+		return domain.StatusCode(value.Status).IsGood()
+	}
+	return value.Status == want
+}
+
+func liveGroupsNumberMatches(value *gu.DataValue, want float64) bool {
+	if !liveGroupsDataValueHasStatus(value, gu.StatusOK) {
+		return false
+	}
+	actual, err := strconv.ParseFloat(fmt.Sprint(value.Value.Value()), 64)
+	return err == nil && actual == want
+}
+
+func liveGroupsMonitoredValueMatches(item *gu.MonitoredItemNotification, handle uint32, want float64) bool {
+	return item != nil && item.ClientHandle == handle && liveGroupsNumberMatches(item.Value, want)
+}
+
+func liveGroupsDescribeValue(value *gu.DataValue) string {
+	if value == nil {
+		return "<no DataValue>"
+	}
+	var actual any
+	if value.Value != nil {
+		actual = value.Value.Value()
+	}
+	return fmt.Sprintf("value=%v status=0x%08X source_timestamp=%s server_timestamp=%s", actual, uint32(value.Status), value.SourceTimestamp.Format(time.RFC3339Nano), value.ServerTimestamp.Format(time.RFC3339Nano))
 }
 
 func TestLiveDeviceGroupsDisconnectAndRecoverWithoutFailover(t *testing.T) {
@@ -477,12 +521,13 @@ func TestLiveDeviceGroupsDisconnectAndRecoverWithoutFailover(t *testing.T) {
 		var last *gu.DataValue
 		for time.Now().Before(deadline) {
 			last = readValue(2, "A_VALUE")
-			if last.Status == status && last.Value != nil && fmt.Sprint(last.Value.Value()) == want {
+			if liveGroupsDataValueHasStatus(last, status) && fmt.Sprint(last.Value.Value()) == want {
+				t.Logf("A_VALUE matched requested %s: %s", status, liveGroupsDescribeValue(last))
 				return
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
-		t.Fatalf("A_VALUE want=%s/%s last=%#v", want, status, last)
+		t.Fatalf("A_VALUE want=%s/%s last=%s", want, status, liveGroupsDescribeValue(last))
 	}
 	writeSelection("lower-b")
 	await(gu.StatusOK, "101")
@@ -492,8 +537,8 @@ func TestLiveDeviceGroupsDisconnectAndRecoverWithoutFailover(t *testing.T) {
 	if value := readValue(3, "Groups/device-a/SelectedSourceId"); value.Status != gu.StatusOK || value.Value.Value() != "lower-b" {
 		t.Fatalf("disconnection silently changed route: %#v", value)
 	}
-	if value := readValue(2, "B_VALUE"); value.Status != gu.StatusOK || fmt.Sprint(value.Value.Value()) != "22" {
-		t.Fatalf("other device group stopped with source b: %#v", value)
+	if value := readValue(2, "B_VALUE"); !liveGroupsDataValueHasStatus(value, gu.StatusOK) || fmt.Sprint(value.Value.Value()) != "22" {
+		t.Fatalf("other device group stopped with source b: %s", liveGroupsDescribeValue(value))
 	}
 	writeSelection("lower-a")
 	await(gu.StatusOK, "11")

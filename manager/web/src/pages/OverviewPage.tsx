@@ -12,6 +12,7 @@ import { formatDuration, formatNumber, formatRelativeTime, shortSessionId } from
 import { stateLabel } from '../lib/labels';
 import { sourceHealth } from '../lib/status';
 import { sourceGroupIds } from '../lib/sourceGroups';
+import { useSessionSelection } from '../hooks/useSessionSelection';
 
 function Quality({ good, bad, total, known }: { good: number; bad: number; total: number; known?: boolean }) {
   if (!known) return <span className="text-muted">目录 {formatNumber(total)} 点</span>;
@@ -36,6 +37,7 @@ export default function OverviewPage() {
   const groups = groupsQuery.data ?? [];
   const sources = sourcesQuery.data ?? [];
   const sessions = sessionsQuery.data ?? [];
+  const { sessionId, setSessionId } = useSessionSelection(sessions);
   const data = overview.data;
 
   const sourceMap = useMemo(() => new Map(sources.map((source) => [source.id, source])), [sources]);
@@ -107,7 +109,7 @@ export default function OverviewPage() {
         <section className="work-panel"><div className="panel-heading"><div><h2>最近命令</h2><p>执行结果与端到端耗时</p></div><NavLink to="/commands">查看记录 <ArrowRight size={15} /></NavLink></div>{commandsQuery.isLoading ? <LoadingState label="正在加载命令…" /> : (commandsQuery.data?.items.length ?? 0) === 0 ? <EmptyState title="暂无命令记录" /> : <div className="command-timeline">{commandsQuery.data?.items.slice(0, 5).map((command) => <div key={command.id} className="command-line"><span className={command.error || command.result.toLowerCase().includes('fail') ? 'timeline-dot timeline-dot-bad' : 'timeline-dot'} /><time>{formatRelativeTime(command.createdAt)}</time><strong>{command.port}</strong><span>{command.sourceId}</span><b className={command.error ? 'text-bad' : 'text-good'}>{command.error ? '失败' : command.result || '完成'}</b><em>{command.durationMs === undefined ? '—' : `${command.durationMs} ms`}</em></div>)}</div>}</section>
       </div>
 
-      <GroupDetailDrawer group={selectedGroup} sources={sources} sessions={sessions} onClose={() => setSelectedGroupId(undefined)} />
+      {selectedGroup ? <GroupDetailDrawer key={selectedGroup.id} group={selectedGroup} sources={sources} sessions={sessions} sessionId={sessionId} onSessionChange={setSessionId} onClose={() => setSelectedGroupId(undefined)} /> : null}
       <SetupWizard open={setupOpen} onClose={() => setSetupOpen(false)} onComplete={setMessage} />
     </div>
   );

@@ -31,6 +31,23 @@ Set-Location ..
 
 需要单独确认构建出的 EXE 在没有 `web/dist` 外部文件、没有 Node.js 的干净 Windows 主机上仍能打开 Web 页面，以证明静态资源确实内嵌。
 
+### 原 Session 与订阅恢复回归
+
+当前远端验证还必须分别执行两个固定 OPC 依赖的测试；管理模块的 `go test ./...` 不会自动递归进入嵌套模块。以下命令在隔离的远端 Linux 测试机运行，不在开发机启动程序或测试：
+
+```sh
+# 当前目录为远端 manager/
+go test -race ./...
+(cd third_party/awcullen-opcua && go test -race ./...)
+(cd third_party/gopcua-opcua && go test -race ./...)
+
+RCD_DEVICE_GROUPS_ENDPOINT=opc.tcp://127.0.0.1:4847 \
+RCD_DEVICE_GROUPS_API=http://127.0.0.1:8083 \
+go test -v -count=10 -timeout=5m ./internal/opc -run '^TestLiveDeviceGroupsSessionResume$'
+```
+
+该 opt-in 测试使用已配置好的两台真实 Rust 测试下级，仅截断自身代理连接。验收须同时确认原 Session ID、组路由 revision、原订阅及数据值保持正确，并覆盖断开时仍有 Publish 排队、重传/确认和通知序号不复用。不能用新建 Session、重建空订阅或只验证 Read 来替代原订阅恢复。测试代码存在不表示本次构建已经通过，须保留实际日志和版本。
+
 ### 2026-08-24 仓库内验证记录
 
 本次实现已执行以下仓库级验证；它们验证 Go 管理程序和内嵌测试服务，不等价于后文的真实 Rust 下级或目标 Windows 主机验收：
@@ -272,6 +289,71 @@ Kylin 不提供 Windows DPAPI，带持久密码的 Username 来源创建会明�
 当前仓库不包含完整现场规模的压测驱动、1 小时/24 小时结果或性能报告；这些目标尚未被本文件宣称为已通过。
 
 ## Web 与 Windows 服务验收
+
+### 下级运维回归（仅远端隔离实例）
+
+先用本次编译的 Rust 二进制启动新的 `tools/device-groups-fixture.py` 实例，再使用
+`tools/configure-device-groups.py` 配置空的测试管理器。不得把下列命令指向原有现场实例。
+
+```bash
+python3 tools/lower-operations-qa.py \
+  --api http://127.0.0.1:8085 \
+  --fixture /absolute/isolated-run/operations-fixture/Fixture.json \
+  --output /absolute/evidence/operations-e2e-unique \
+  --allow-mutations
+```
+
+该脚本的宿主和目录保护按本次 `192.168.10.46` 隔离部署设置，换环境须先核对保护条件，
+不可直接移除保护。它校验两来源身份，覆盖文件往返/预检/CAS/备份恢复、单站停读、物理
+句柄释放、开关重启保持、文件重启生效、2 MiB 配置的最坏转义传输、UTF-8 日志分片/追加/轮转/截断、
+带筛选长行的完整续页及回溯上限，并在 finally
+恢复配置和采集开关。日志页与配置正文不进入管理审计，测试会检查哈希及目标记录。
+结果写 `report.json`，须同时检查 `ok`、`restoration`、原进程未变及进程退出码；失败与复跑
+必须用不同输出目录。脚本会保留自动备份和测试日志，不代表真实串口硬件验收。
+
+另需在远端执行 Rust/Go 单元及 race 回归，并用实际浏览器点击采集确认、配置草稿/版本冲突、
+备份恢复、日志筛选分页和下载；测试旧版无运维能力、下级离线、长文件、Pending/命令互斥及窄屏。
+不能以 HTTP 自动化或构建通过替代这些 UI 与边界验证。
+
+真实 OPC 回归仍从远端 `manager/` 目录执行，使用与上面相同的独立 PTY 实例。旧版本兼容
+检查必须指向另一个确实未提供运维命名空间的测试下级，不能使用新下级或依赖用例跳过：
+
+```bash
+RCD_DEVICE_GROUPS_ENDPOINT=opc.tcp://127.0.0.1:4862 \
+RCD_DEVICE_GROUPS_API=http://127.0.0.1:8085 \
+RCD_DEVICE_GROUPS_CONTROL=/absolute/isolated-run/operations-fixture/control.json \
+RCD_LOWER_OPERATIONS_LIVE=1 \
+RCD_LOWER_OPERATIONS_LEGACY_ENDPOINT=opc.tcp://127.0.0.1:4858 \
+go test -race -v -count=3 -timeout=6m ./internal/opc -run '^TestLiveDeviceGroups'
+```
+
+该组合覆盖业务点表、两个匿名 Session 隔离、命令 ACK/超时、组和物理串口互斥、原 Session
+恢复，以及无运维能力下级仍可采集。运维用例验证停读不阻止合法命令、命令 pending 时修改
+开关返回 409 且不改变持久化/实际开关，清理时恢复采集并关闭测试 Session。
+
+浏览器验收脚本在远端调用已安装的 Playwright Chromium；即使工作站 Browser 插件可用，
+也不违反“全部测试在远端”的约束而改在本机执行：
+
+```bash
+RCD_QA_REMOTE=1 RCD_QA_ALLOW_MUTATIONS=1 \
+RCD_QA_URL=http://127.0.0.1:8085 \
+RCD_QA_FIXTURE=/absolute/isolated-run/operations-fixture/Fixture.json \
+RCD_QA_OUTPUT=/absolute/evidence/operations-ui-unique \
+PLAYWRIGHT_MODULE=/absolute/browser-tools/node_modules/playwright/index.js \
+node web/scripts/lower-operations-qa.mjs
+```
+
+浏览器脚本的应用修改全部通过可见按钮与编辑器进行；API 仅用于只读断言，额外写入仅为
+专属 PTY 日志目录内唯一命名的合成日志。它记录站点隔离、真实句柄释放、草稿保护、双页面
+真实 CAS 冲突、备份恢复、日志筛选/续页/下载/轮转及 390px 窄屏操作；旧版/离线 UI 注入
+必须与真实 OPC 兼容测试分开记账。恢复同样通过 UI，分别检查正文、开关、另一来源和原进程。
+须人工查看产出的桌面与窄屏截图，不能只依赖整页没有横向溢出的数值断言。
+
+上述脚本与其他修改同一 PTY 实例的测试应串行运行。原有 `web/scripts/device-groups-qa.mjs`
+需分别在零 Session 与两个真实在线 Session 下复跑，以覆盖映射往返和 Session 定向切源；
+两轮各自有意跳过的场景必须由另一轮实际覆盖，不能把跳过当作通过。
+
+### 原有 Web 与服务检查
 
 使用支持的桌面浏览器逐项验证：
 

@@ -26,8 +26,10 @@ func newSampleCache() *sampleCache {
 	return cache
 }
 
-// Put ignores notifications from an older lower-session epoch and late values
-// from a parallel observation path within the same epoch.
+// Put ignores notifications from an older lower-session epoch. Within an
+// epoch, arrival order is authoritative: source clocks may move backwards and
+// timestamps can remain unchanged while a value or its quality changes. The
+// lower command observer separately orders its subscription/probe ACK paths.
 func (c *sampleCache) Put(sourceID string, key domain.NodeKey, sample domain.Sample) bool {
 	cacheKey := makeSampleKey(sourceID, key)
 	shard := c.shard(cacheKey)
@@ -35,10 +37,6 @@ func (c *sampleCache) Put(sourceID string, key domain.NodeKey, sample domain.Sam
 	defer shard.Unlock()
 	if current, ok := shard.values[cacheKey]; ok {
 		if current.Epoch > sample.Epoch {
-			return false
-		}
-		if current.Epoch == sample.Epoch && !current.SourceTimestamp.IsZero() && !sample.SourceTimestamp.IsZero() &&
-			sample.SourceTimestamp.Before(current.SourceTimestamp) {
 			return false
 		}
 	}

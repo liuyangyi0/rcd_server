@@ -149,22 +149,87 @@ func liveDeviceFaultWrite(t *testing.T, ctx context.Context, client *gopcua.Clie
 func liveDeviceFaultAwaitSend(t *testing.T, ctx context.Context, client *gopcua.Client, ns uint16, identifier, want string, good bool) {
 	t.Helper()
 	var last *gu.DataValue
+	defer func() {
+		if !t.Failed() {
+			return
+		}
+		if last == nil {
+			t.Logf("command %s never returned a DataValue", identifier)
+			return
+		}
+		var actual any
+		if last.Value != nil {
+			actual = last.Value.Value()
+		}
+		t.Logf("last command read %s=%v status=%s (0x%08X); want=%s good=%v", identifier, actual, last.Status, uint32(last.Status), want, good)
+	}()
 	liveDeviceFaultEventually(t, ctx, 12*time.Second, "command "+identifier+" reaches "+want, func() bool {
 		response, err := client.Read(ctx, &gu.ReadRequest{NodesToRead: []*gu.ReadValueID{{NodeID: gu.NewStringNodeID(ns, identifier), AttributeID: gu.AttributeIDValue}}})
 		if err != nil || response == nil || len(response.Results) != 1 || response.Results[0] == nil {
 			t.Fatalf("read command %s response=%#v err=%v", identifier, response, err)
 		}
 		last = response.Results[0]
-		qualityMatches := last.Status == gu.StatusOK
-		if !good {
-			qualityMatches = uint32(last.Status)&0x80000000 != 0
-		}
-		if last.Value == nil || fmt.Sprint(last.Value.Value()) != want || !qualityMatches {
+		if !liveDeviceFaultResultMatches(last, want, good) {
 			return false
 		}
-		t.Logf("command read %s=%s status=%s", identifier, want, last.Status)
+		t.Logf("command read %s=%s status=%s (0x%08X)", identifier, want, last.Status, uint32(last.Status))
 		return true
 	})
+}
+
+func liveDeviceFaultResultMatches(value *gu.DataValue, want string, good bool) bool {
+	if value == nil || value.Value == nil || fmt.Sprint(value.Value.Value()) != want {
+		return false
+	}
+	// Rust may attach the Overflow information bit when Waiting and the ACK
+	// share a publish interval. Keep that flag intact: quality is determined
+	// by the severity bits, not by equality with the all-zero Good code.
+	status := domain.StatusCode(value.Status)
+	if good {
+		return status.IsGood()
+	}
+	return status.IsBad()
+}
+
+func TestLiveDeviceFaultResultMatchesStatusSeverity(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		status  gu.StatusCode
+		value   string
+		want    string
+		good    bool
+		matches bool
+	}{
+		{name: "plain Good", status: gu.StatusOK, value: "1", want: "1", good: true, matches: true},
+		{name: "Rust Good with Overflow", status: 0x00000080, value: "1", want: "1", good: true, matches: true},
+		{name: "Good with DataValue Overflow", status: 0x00000480, value: "1", want: "1", good: true, matches: true},
+		{name: "Good with semantic change", status: 0x00004000, value: "1", want: "1", good: true, matches: true},
+		{name: "Good subcode", status: gu.StatusGoodClamped, value: "1", want: "1", good: true, matches: true},
+		{name: "wrong ACK with Good Overflow", status: 0x00000080, value: "3", want: "1", good: true},
+		{name: "Uncertain is not success", status: 0x40000480, value: "1", want: "1", good: true},
+		{name: "Bad is not success", status: gu.StatusBadNoCommunication, value: "1", want: "1", good: true},
+		{name: "Bad terminal", status: gu.StatusBadUnexpectedError, value: "3", want: "3", matches: true},
+		{name: "Bad terminal with Overflow", status: 0x80010080, value: "3", want: "3", matches: true},
+		{name: "Good is not failure", status: 0x00000080, value: "3", want: "3"},
+		{name: "Uncertain is not failure", status: 0x40000480, value: "3", want: "3"},
+		{name: "reserved severity is not success", status: 0xC0000080, value: "1", want: "1", good: true},
+		{name: "reserved severity is not failure", status: 0xC0000080, value: "3", want: "3"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			value := &gu.DataValue{Value: gu.MustVariant(test.value), Status: test.status}
+			if got := liveDeviceFaultResultMatches(value, test.want, test.good); got != test.matches {
+				t.Fatalf("value=%s status=0x%08X want=%s good=%v matched=%v want=%v", test.value, uint32(test.status), test.want, test.good, got, test.matches)
+			}
+			if value.Status != test.status {
+				t.Fatal("checking quality must preserve every status information bit")
+			}
+		})
+	}
+	for _, value := range []*gu.DataValue{nil, {Status: gu.StatusOK}} {
+		if liveDeviceFaultResultMatches(value, "1", true) || liveDeviceFaultResultMatches(value, "3", false) {
+			t.Fatal("missing DataValue/Variant must not count as a terminal ACK")
+		}
+	}
 }
 
 func liveDeviceFaultSession(t *testing.T, ctx context.Context, apiURL, name string) api.SessionView {

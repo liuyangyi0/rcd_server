@@ -846,14 +846,11 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 		return nil
 	}
 
-	oldChannelID := session.SecureChannelId()
-	session.SetUserIdentity(userIdentity)
-	session.SetSessionNonce(ua.ByteString(getNextNonce(nonceLength)))
-	session.SetSecureChannelId(ch.ChannelID())
-	session.SetRemoteAddress(ch.RemoteAddress())
-	session.SetSecurityMode(ch.securityMode)
-	session.SetSecurityPolicyURI(ch.securityPolicyURI)
-	session.SetLocaleIDs(req.LocaleIDs)
+	if err := srv.activateSessionBinding(session, ch, userIdentity, ua.ByteString(getNextNonce(nonceLength)), req.LocaleIDs); err != nil {
+		return ch.Write(&ua.ServiceFault{ResponseHeader: ua.ResponseHeader{
+			Timestamp: time.Now(), RequestHandle: req.RequestHandle, ServiceResult: err.(ua.StatusCode),
+		}}, requestid)
+	}
 
 	err = ch.Write(
 		&ua.ActivateSessionResponse{
@@ -870,7 +867,6 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 	if err != nil {
 		return err
 	}
-	srv.emitSessionActivation(session, oldChannelID)
 	return nil
 }
 
@@ -5453,7 +5449,7 @@ func (srv *Server) handlePublish(ch *serverSecureChannel, requestid uint32, req 
 	}
 
 	err := session.addPublishRequest(ch, requestid, req, results)
-	if err == ua.BadSessionClosed {
+	if err == ua.BadSessionClosed || err == ua.BadSecureChannelIDInvalid || err == ua.BadSecureChannelClosed {
 		atomic.AddUint32(&session.publishErrorCount, 1)
 		atomic.AddUint32(&session.errorCount, 1)
 		atomic.AddUint32(&srv.serverDiagnosticsSummary.RejectedRequestsCount, 1)
@@ -5462,7 +5458,7 @@ func (srv *Server) handlePublish(ch *serverSecureChannel, requestid uint32, req 
 				ResponseHeader: ua.ResponseHeader{
 					Timestamp:     time.Now(),
 					RequestHandle: req.RequestHandle,
-					ServiceResult: ua.BadSessionClosed,
+					ServiceResult: err.(ua.StatusCode),
 				},
 			},
 			requestid,

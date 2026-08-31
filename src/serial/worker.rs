@@ -23,6 +23,7 @@ use crate::config::RunLocation;
 use crate::model::{
     get_sum, Command, CommandAckStatus, CommandAckUpdate, CommandType, SendData, SystemState,
 };
+use crate::operations::{CommandPermit, Operations};
 use crate::protocol::{cmd, threshold};
 use crate::runtime_cache::LatestStatusCache;
 
@@ -57,6 +58,7 @@ pub fn spawn_serial_worker(
     system_record: Arc<Mutex<BoundedVecDeque<String>>>,
     latest_status_cache: LatestStatusCache,
     cancel: CancellationToken,
+    operations: Operations,
 ) -> JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         let port_name = serial_config.port_name.clone();
@@ -64,6 +66,8 @@ pub fn spawn_serial_worker(
         let command_retry_count = software_config.settings.command_retry_count.max(1);
         let run_on = software_config.server.run_on.clone();
         let current_run = software_config.server.current_run.clone();
+        let mut port_config = port_config;
+        port_config.status = operations.initial_port_enabled(&port_name);
         let mut manager = SerialManager::new(
             serial_config,
             port_config,
@@ -73,6 +77,14 @@ pub fn spawn_serial_worker(
             current_run,
             system_record,
         );
+        manager.operations = Some(operations.clone());
+        for index in 0..manager.port_config.devices.len() {
+            let id = manager.port_config.devices[index].config.device_id;
+            if !operations.initial_device_read_enabled(&port_name, id) {
+                let _ = manager.set_device_read_enabled(id, false);
+            }
+        }
+        manager.refresh_operations_state();
 
         info!(
             "串口 {} worker 已启动，当前角色: {:?}，设备数: {}，端口启用: {}",
@@ -111,12 +123,17 @@ pub fn spawn_serial_worker(
                         restart_count, panic_text
                     ));
                     manager.prepare_worker_restart();
+                    operations.fail_pending_controls(
+                        &port_name,
+                        "serial worker panicked before confirmation",
+                    );
                     reject_queued_commands(&mut manager, None, &ack_status_tx, "worker_panic");
                     if cancel.is_cancelled() {
                         break;
                     }
                     std::thread::sleep(Duration::from_secs(1));
                     manager.reconnect();
+                    manager.refresh_operations_state();
                     info!(
                         "[串口worker重启] port={} restart_count={} action=resume_polling",
                         port_name, restart_count
@@ -124,6 +141,9 @@ pub fn spawn_serial_worker(
                 }
             }
         }
+        // Drop the physical handle before publishing stopped state.
+        manager.port = None;
+        operations.worker_stopped(&port_name);
     })
 }
 
@@ -150,6 +170,7 @@ fn run_worker_loop(
         }
 
         process_incoming_commands(manager, rx, system_state, ack_status_tx);
+        manager.refresh_operations_state();
 
         if !manager.port_config.status {
             log_idle_reason(
@@ -232,6 +253,7 @@ fn run_worker_loop(
         if manager.current_run == RunLocation::Primary {
             manager.index = (manager.index + 1) % manager.port_config.devices.len();
         }
+        manager.refresh_operations_state();
         std::thread::sleep(poll_interval);
     }
 }
@@ -302,18 +324,47 @@ fn process_incoming_commands(
             command,
             ack_id,
             expires_at,
+            control_receipt,
+            permit,
             ..
         } = cmd;
+        if let Some(receipt) = &control_receipt {
+            if !manager.operations.as_ref().is_some_and(|operations| {
+                operations.control_is_current(&manager.port_config.port_number, receipt.revision)
+            }) {
+                let _ = receipt.reply.send(Err(
+                    "control request was superseded or invalidated; refresh status".into(),
+                ));
+                continue;
+            }
+        }
+        let mut control_outcome = Ok(());
         match command {
             CommandType::SendData(data) => {
-                enqueue_or_reject_command(manager, data, false, ack_id, expires_at, ack_status_tx);
+                enqueue_or_reject_command(
+                    manager,
+                    data,
+                    false,
+                    ack_id,
+                    expires_at,
+                    ack_status_tx,
+                    permit,
+                );
             }
             CommandType::SendDataWithAck(data) => {
-                enqueue_or_reject_command(manager, data, true, ack_id, expires_at, ack_status_tx);
+                enqueue_or_reject_command(
+                    manager,
+                    data,
+                    true,
+                    ack_id,
+                    expires_at,
+                    ack_status_tx,
+                    permit,
+                );
             }
             CommandType::PortStatus(status) => {
                 let previous = manager.port_config.status;
-                manager.port_config.status = status.device_status;
+                control_outcome = manager.set_port_enabled(status.device_status);
                 if previous != status.device_status {
                     if status.device_status {
                         info!(
@@ -324,7 +375,6 @@ fn process_incoming_commands(
                             "串口已启用: action=wait_for_valid_device_frames".to_string(),
                         );
                     } else {
-                        manager.publish_port_disabled();
                         reject_queued_commands(manager, None, ack_status_tx, "port_disabled");
                     }
                 }
@@ -380,6 +430,21 @@ fn process_incoming_commands(
                     error!("设置设备状态失败: {}", e);
                 }
             }
+            CommandType::DeviceReadSetting(setting) => {
+                control_outcome =
+                    manager.set_device_read_enabled(setting.device_id, setting.read_enabled);
+            }
+        }
+        if let Some(receipt) = control_receipt {
+            manager.refresh_operations_state();
+            if let Some(operations) = &manager.operations {
+                operations.complete_control(
+                    &manager.port_config.port_number,
+                    receipt.revision,
+                    &control_outcome,
+                );
+            }
+            let _ = receipt.reply.send(control_outcome);
         }
     }
 
@@ -396,6 +461,7 @@ fn enqueue_or_reject_command(
     ack_id: Option<u64>,
     expires_at: Option<Instant>,
     ack_status_tx: &Sender<CommandAckUpdate>,
+    permit: Option<CommandPermit>,
 ) {
     let configured_device_disabled = manager
         .port_config
@@ -434,6 +500,7 @@ fn enqueue_or_reject_command(
             report_ack,
             ack_id,
             expires_at,
+            _permit: permit,
         });
 }
 
@@ -520,7 +587,7 @@ fn run_primary_cycle(
         }
     }
 
-    if !manager.device_states[idx].is_enabled {
+    if !manager.device_states[idx].is_enabled || !manager.device_states[idx].read_enabled {
         std::thread::sleep(Duration::from_millis(20));
         return CycleResult::Idle;
     }
@@ -691,4 +758,25 @@ fn send_ack_status(
             manager.serial_config.port_name, e
         );
     }
+}
+
+#[cfg(test)]
+pub(super) fn process_test_commands(
+    manager: &mut SerialManager,
+    receiver: &Receiver<Command>,
+    state: &SystemState,
+    acknowledgements: &Sender<CommandAckUpdate>,
+) {
+    process_incoming_commands(manager, receiver, state, acknowledgements);
+}
+
+#[cfg(test)]
+pub(super) fn test_primary_cycle_is_idle(
+    manager: &mut SerialManager,
+    acknowledgements: &Sender<CommandAckUpdate>,
+) -> bool {
+    matches!(
+        run_primary_cycle(manager, acknowledgements, 1),
+        CycleResult::Idle
+    )
 }

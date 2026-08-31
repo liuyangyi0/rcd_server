@@ -210,7 +210,7 @@ rcd_server.exe
 1. 读取 `config/config.toml` 全局配置。
 2. 扫描 `config/` 下所有 `rcd*.csv` 文件。
 3. 按串口号聚合设备，为每个串口启动独立通信线程。
-4. 启动 OPC UA 服务器，监听 `0.0.0.0:4840`。
+4. 启动下级 OPC UA 服务器，默认监听 `0.0.0.0:4841`（`4840` 保留给 RCD Manager）。
 5. 等待客户端连接。
 
 ### 日志级别控制
@@ -266,7 +266,7 @@ export RCD_LOG_OPCUA_TRANSPORT_ERRORS=1
 
 | 项目 | 值 |
 |------|-----|
-| 服务器地址 | `opc.tcp://<服务器IP>:4840/` |
+| 服务器地址 | `opc.tcp://<服务器IP>:4841/` |
 | 应用名称 | `Serial OPC UA Server` |
 | 应用 URI | `urn:SerialServer:rcd_server` |
 | 命名空间 URI | `urn:SerialServer` |
@@ -473,7 +473,7 @@ Linux 串口配置使用完整设备路径时，OPC UA 节点只使用路径末�
 |------|---------|
 | 程序闪退 / 报"加载配置文件失败" | 检查 `config/config.toml` 是否存在且格式正确 |
 | 无数据节点出现 | 检查 `config/` 目录下是否有 `rcd*.csv` 文件 |
-| OPC UA 客户端连接不上 | 检查防火墙是否放行 **4840** 端口 |
+| OPC UA 客户端连接不上 | 检查防火墙是否放行下级默认的 **4841** 端口 |
 | OPC UA 显示安全错误 | 尝试使用 `none` 端点连接，或检查 `pki/` 目录证书 |
 | 所有数据都是 0 | 检查串口号是否正确，设备是否通电，波特率是否匹配 |
 | 部分设备数据为 0 | 检查 CSV 中的 `device_id` 与设备实际站地址是否一致 |
@@ -552,7 +552,7 @@ Linux 串口配置使用完整设备路径时，OPC UA 节点只使用路径末�
    ```
 
 3. **使用 OPC UA 客户端连接**
-   - 地址：`opc.tcp://服务器IP:4840/`
+   - 地址：`opc.tcp://服务器IP:4841/`
    - 选择 `none` 端点（无加密）或 `basic256sha256_signenc` 端点
    - 在 `Devices` 文件夹下浏览数据节点
 

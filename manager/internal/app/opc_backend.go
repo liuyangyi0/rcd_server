@@ -155,10 +155,13 @@ func (r *Runtime) sampleForSourceAtIndex(sourceID string, point indexedPoint, in
 	r.mu.RLock()
 	status := r.statuses[sourceID]
 	r.mu.RUnlock()
-	if status.Catalog == domain.CatalogConflict {
+	if index == nil {
 		return domain.Sample{Type: point.Node.DataType, Value: zeroValue(point.Node.DataType, point.Node.ValueRank), StatusCode: domain.StatusBadConfigurationError}
 	}
-	if index == nil {
+	// Catalog and node ownership come from one immutable publication. The
+	// status view can briefly lag a hot configuration commit and is not the
+	// authority for deciding whether that published catalog may be read.
+	if index.union.SourceStates[sourceID] == domain.CatalogConflict {
 		return domain.Sample{Type: point.Node.DataType, Value: zeroValue(point.Node.DataType, point.Node.ValueRank), StatusCode: domain.StatusBadConfigurationError}
 	}
 	sourceNode, exists := index.sourceNode(sourceID, point.Node.Key.Identifier)
@@ -220,6 +223,10 @@ func (r *Runtime) writeCommand(ctx context.Context, sessionID string, key domain
 	if err != nil {
 		r.configMu.Unlock()
 		return commandErrorStatus(err), err
+	}
+	if err := r.checkProcessMaintenanceLocked(route.SourceID); err != nil {
+		r.configMu.Unlock()
+		return domain.StatusBadWaitingForResponse, err
 	}
 	port := route.Port
 	command, err := r.routes.BeginCommand(sessionID, route.GroupID, port, "Write")
@@ -285,6 +292,10 @@ func (r *Runtime) callCommand(ctx context.Context, sessionID string, key domain.
 	if err != nil {
 		r.configMu.Unlock()
 		return "", commandErrorStatus(err), err
+	}
+	if err := r.checkProcessMaintenanceLocked(route.SourceID); err != nil {
+		r.configMu.Unlock()
+		return "", domain.StatusBadWaitingForResponse, err
 	}
 	port := route.Port
 	command, err := r.routes.BeginCommand(sessionID, route.GroupID, port, "Call")

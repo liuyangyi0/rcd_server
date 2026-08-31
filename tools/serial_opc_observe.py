@@ -122,7 +122,7 @@ def main():
     parser.add_argument("--export-config", type=Path)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--url", default="opc.tcp://192.168.10.46:4840/")
+    parser.add_argument("--url", default="opc.tcp://192.168.10.46:4841/")
     parser.add_argument("--seconds", type=int, default=120)
     parser.add_argument("--keepalive-count", type=int)
     parser.add_argument("--sampling-ms", type=float, default=0)

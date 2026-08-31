@@ -1,7 +1,10 @@
 //! 命令体系类型。
 
 use serde::{Deserialize, Serialize};
+use std::sync::mpsc;
 use std::time::Instant;
+
+use crate::operations::CommandPermit;
 
 /// 指向特定串口的命令。
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -16,6 +19,11 @@ pub struct Command {
     /// 内部执行截止时间，防止 OPC 已判定超时后 worker 再执行积压命令。
     #[serde(skip)]
     pub expires_at: Option<Instant>,
+    /// In-process control confirmation and command reservation are not wire fields.
+    #[serde(skip)]
+    pub control_receipt: Option<ControlReceipt>,
+    #[serde(skip)]
+    pub permit: Option<CommandPermit>,
 }
 
 /// 命令类型枚举。
@@ -29,6 +37,21 @@ pub enum CommandType {
     DeviceSetting(DeviceSetting),
     /// 向设备发送原始数据，并向 OPC UA 写命令变量回写 ACK 状态。
     SendDataWithAck(SendData),
+    /// Stop only acquisition; device control commands remain allowed.
+    /// Appended to retain the existing bincode discriminants 0..=3.
+    DeviceReadSetting(DeviceReadSetting),
+}
+
+#[derive(Debug, Clone)]
+pub struct ControlReceipt {
+    pub revision: u64,
+    pub reply: mpsc::Sender<Result<(), String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DeviceReadSetting {
+    pub device_id: u8,
+    pub read_enabled: bool,
 }
 
 /// 发送到设备的原始数据。
@@ -113,6 +136,7 @@ mod tests {
 
     #[test]
     fn command_ack_id_is_internal_only() {
+        let (reply, _rx) = mpsc::channel();
         let command = Command {
             com: "COM1".into(),
             command: CommandType::SendData(SendData {
@@ -121,6 +145,8 @@ mod tests {
             }),
             ack_id: Some(42),
             expires_at: Some(Instant::now()),
+            control_receipt: Some(ControlReceipt { revision: 3, reply }),
+            permit: None,
         };
 
         let bytes = bincode::serialize(&command).expect("serialize command");
@@ -129,5 +155,38 @@ mod tests {
         assert_eq!(decoded.com, "COM1");
         assert_eq!(decoded.ack_id, None);
         assert_eq!(decoded.expires_at, None);
+        assert!(decoded.control_receipt.is_none());
+        assert!(decoded.permit.is_none());
+        assert_eq!(
+            bytes,
+            bincode::serialize(&(&command.com, &command.command)).unwrap()
+        );
+    }
+
+    #[test]
+    fn acquisition_read_setting_preserves_old_bincode_variant_indices() {
+        let send = SendData {
+            device_id: 1,
+            command: vec![1, 2],
+        };
+        let variants = [
+            CommandType::SendData(send.clone()),
+            CommandType::PortStatus(PortStatus {
+                device_status: false,
+            }),
+            CommandType::DeviceSetting(DeviceSetting {
+                device_id: 1,
+                device_status: false,
+            }),
+            CommandType::SendDataWithAck(send),
+            CommandType::DeviceReadSetting(DeviceReadSetting {
+                device_id: 255,
+                read_enabled: false,
+            }),
+        ];
+        for (index, variant) in variants.into_iter().enumerate() {
+            let bytes = bincode::serialize(&variant).unwrap();
+            assert_eq!(&bytes[..4], &(index as u32).to_le_bytes());
+        }
     }
 }

@@ -5,7 +5,7 @@
 ```text
 下级 RCD OPC UA Server（最多 20 个）
               │
-              │ gopcua v0.9.1：发现、订阅、读、写、Call
+              │ gopcua v0.9.1 本地补丁：发现、订阅、读、写、Call
               ▼
 ┌────────────────────── RcdManager.exe ──────────────────────┐
 │ 每来源连接监督器 → 目录合并 → 分片热缓存                 │
@@ -25,7 +25,8 @@
 
 - `internal/domain`：不依赖 OPC 库的点键、样本、目录、Session 路由和命令状态；
 - `internal/opc`：下级 `gopcua` 适配器和上级服务端适配器；
-- `third_party/awcullen-opcua`：固定版本本地 fork；
+- `third_party/awcullen-opcua`：固定 v1.4.0 的服务端 fork；
+- `third_party/gopcua-opcua`：固定 v0.9.1 的客户端依赖闭包及原 Session 订阅恢复补丁；
 - `internal/app`：配置提交、目录合并、选源、热缓存、命令代理和 HTTP/OPC 协调；
 - `internal/store`：SQLite WAL、迁移、目录缓存、命令/管理审计、来源状态历史和持久告警；
 - `web`：React + TypeScript + Vite 管理界面及嵌入资源。
@@ -72,6 +73,10 @@ NodeKey { NamespaceURI, Identifier }
 
 系统不执行自动故障转移。选择离线来源时保持选择，向该 Session 返回坏质量，绝不静默改到其他来源。
 
+原 Session 重附着还须保持订阅的协议状态：旧 SecureChannel 的 Publish 请求不能消费新通道通知；通知进入重传队列时即占用唯一序号，发送失败也不能让下一条不同数据复用该序号。客户端恢复原 Session 后，应恢复既有订阅的重传及 Publish 循环，而不是另建空订阅来唤醒发布。两个固定依赖的具体补丁及边界测试记录在各自的 `FORK.md` 中。
+
+管理程序下级仍由独立连接监督器管理，保持 `AutoReconnect(false)`，每次新连接重新发现并订阅。客户端补丁不改变这一策略，也不改变安全端点、身份认证或默认选源。
+
 ## 固定 namespace 与地址空间
 
 上级服务端要求 namespace 顺序固定：
@@ -97,10 +102,44 @@ NodeKey { NamespaceURI, Identifier }
 - `Groups/<group_id>/SelectionRevision`；
 - `Groups/<group_id>/MemberSourceIds`；
 - `Groups/<group_id>/PendingCommandCount`；
+- `Groups/<group_id>/Members/<source_id>`：该逻辑组的候选物理来源；
+- `Groups/<group_id>/Members/<source_id>/Ports/<port_id>/Devices/<device_id>`：来源内实际串口、子站和点数的只读树；
 - `Sources/<source_id>/ConnectionState`、`SessionState`、`SubscriptionState`、`CatalogState`、`LastDataAt`、`LastProbeAt`、`LastError`、`ReconnectCount`；
 - `Sources/<source_id>/PointCount`（兼容别名）、`MonitoredPointCount`、`SubscriptionCount`、`TotalPointCount`、`GoodPointCount`、`BadPointCount`。
 
 `DefaultSourceId` 是全局持久配置，写入空字符串会清除默认源；`SelectedSourceId` 和 `SelectionRevision` 的读写上下文来自当前 OPC Session，不使用全局 backing value。
+成员来源节点同时提供 `Selectable`、当前 Session 的 `IsSelected`、`ConnectionState`、
+`CatalogState` 和并集点位的期望/提供/缺失覆盖统计。串口节点提供 `PortId`、显示名和命令
+NodeId；设备节点提供 `DeviceId`、地址是否已知、名称、KKS 前缀、原始/计算/合计点数，
+以及有效归组 `Configured`、人工绑定 `ExplicitlyBound`、拓扑快照存在性
+`PresentInTopology`。这棵树完全只读，客户端仍只向
+`Groups/<group_id>/SelectedSourceId` 写入 String 类型的 source_id，从而保持唯一的选源入口。
+含 `/`、空格等字符的物理 ID 会在管理 NodeId 路径段中进行 URL 转义，BrowseName 和只读值
+始终保留原始 ID；客户端应 Browse 这些节点，不应自行拼接转义后的物理 NodeId。
+树的热更新按稳定 NodeId 做差异化增删，并原位更新变量读取器；未变化节点不会经历删除窗口，
+现有监控项可继续使用。缓存 JSON 或拓扑语义损坏只隔离对应来源并清除不可发布快照，不阻止
+其他来源和管理服务启动；点表冲突来源虽不可选择，仍保留已验证物理拓扑供排障。
+
+## 独立的下级运维通道
+
+Rust 下级在已有拓扑 namespace 之后追加 `urn:SerialServer:operations`，不改变业务节点，
+也不改变管理 OPC 的四个固定 namespace。Go 通过现有下级 OPC 连接按 URI 发现
+`Operations/Capabilities` 和 `Operations/Execute(Request String) -> Response String`。
+运维目标为物理 `source_id/port_id/device_id`，不经过 Session 选源路由。
+
+Runtime 在短配置锁内固定来源配置版本、连接实例和 epoch；网络请求在锁外执行。
+每个来源只允许一个运维修改；执行期间拒绝该来源更新、删除或重连，其他来源、选源和采样
+不等待这次 RPC。命令锁通过已发现的拓扑把原始物理 port_id 映射到旧 OPC 端口名称；Rust
+还在命令从入队到 ACK 结束的整个生命周期持有物理端口许可，与采集控制原子互斥。
+
+采集控制先原子持久化期望状态，再由原串口 worker 在安全边界应用并确认。等待超时返回
+`Pending`，实际打开和通信状态由 worker 回报，不由期望开关推断。已有配置文件采用完整
+配置集校验、内容 SHA256 CAS、备份、原子替换；当前进程继续使用启动配置，重启才应用。
+日志读取有代次和字节上限。运维错误不误报为 UA 通道失败；修改只派发一次，超时提示核对。
+
+文件正文不写 SQLite 或审计；管理审计只保存目标、版本、动作、内容哈希、时延与结果。
+Web 面板按来源和版本缓存，按标签按需请求，退出后释放配置/日志查询缓存。协议与 REST
+接口见 [下级运维](lower-operations.md)。
 
 ## 数据值规则
 

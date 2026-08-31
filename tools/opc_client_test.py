@@ -444,7 +444,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Write a command to rcd_server OPC UA <port>_Send node."
     )
-    parser.add_argument("--endpoint", default="opc.tcp://127.0.0.1:4840/")
+    parser.add_argument("--endpoint", default="opc.tcp://127.0.0.1:4841/")
     parser.add_argument("--namespace-uri", default="urn:SerialServer")
     parser.add_argument(
         "--port",

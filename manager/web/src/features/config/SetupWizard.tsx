@@ -11,7 +11,7 @@ export function SetupWizard({ open, onClose, onComplete }: { open: boolean; onCl
   const [groupName, setGroupName] = useState('');
   const [sourceId, setSourceId] = useState('');
   const [sourceName, setSourceName] = useState('');
-  const [endpoint, setEndpoint] = useState('opc.tcp://127.0.0.1:4840');
+  const [endpoint, setEndpoint] = useState('opc.tcp://127.0.0.1:4841');
   const [secure, setSecure] = useState(false);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');

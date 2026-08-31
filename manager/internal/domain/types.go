@@ -117,6 +117,12 @@ type CatalogNode struct {
 	Retired         bool       `json:"retired"`
 }
 
+func (n CatalogNode) Clone() CatalogNode {
+	n.InputArguments = append([]Argument(nil), n.InputArguments...)
+	n.OutputArguments = append([]Argument(nil), n.OutputArguments...)
+	return n
+}
+
 type SourceCatalog struct {
 	SourceID     string          `json:"source_id"`
 	GroupID      string          `json:"group_id"`
@@ -124,6 +130,20 @@ type SourceCatalog struct {
 	DiscoveredAt time.Time       `json:"discovered_at"`
 	Nodes        []CatalogNode   `json:"nodes"`
 	Topology     *SourceTopology `json:"topology,omitempty"`
+	// QuarantineReason records an explicitly rejected discovery, unlike a
+	// derived conflict between otherwise valid source catalogs. Only a new,
+	// successfully validated discovery may clear this durable marker.
+	QuarantineReason string `json:"quarantine_reason,omitempty"`
+}
+
+func (c SourceCatalog) Clone() SourceCatalog {
+	nodes := make([]CatalogNode, len(c.Nodes))
+	for i := range c.Nodes {
+		nodes[i] = c.Nodes[i].Clone()
+	}
+	c.Nodes = nodes
+	c.Topology = c.Topology.Clone()
+	return c
 }
 
 type GroupRoute struct {

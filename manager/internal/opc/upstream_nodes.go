@@ -285,24 +285,30 @@ func zeroValue(dataType domain.DataType, valueRank int32) any {
 	}
 }
 
-func (s *UpstreamServer) reconcileManagementLocked(groups []domain.Group, sources []domain.Source) error {
+func (s *UpstreamServer) reconcileManagementLocked(catalog domain.CatalogUnion, groups []domain.Group, sources []domain.Source) error {
 	sourcesByGroup := make(map[string][]string)
+	membersByGroup := make(map[string][]domain.Source)
 	desiredGroups := make(map[string]struct{}, len(groups))
 	desiredSources := make(map[string]struct{}, len(sources))
 	for _, source := range sources {
 		for _, group := range groups {
 			if source.HasGroup(group.ID) {
 				sourcesByGroup[group.ID] = append(sourcesByGroup[group.ID], source.ID)
+				membersByGroup[group.ID] = append(membersByGroup[group.ID], source.Clone())
 			}
 		}
 		desiredSources[source.ID] = struct{}{}
 	}
 	for groupID := range sourcesByGroup {
 		sort.Strings(sourcesByGroup[groupID])
+		sort.Slice(membersByGroup[groupID], func(i, j int) bool { return membersByGroup[groupID][i].ID < membersByGroup[groupID][j].ID })
 	}
 	for _, group := range groups {
 		desiredGroups[group.ID] = struct{}{}
 		if err := s.addGroupManagementLocked(group, sourcesByGroup[group.ID]); err != nil {
+			return err
+		}
+		if err := s.reconcileGroupMemberTreeLocked(group, membersByGroup[group.ID], catalog); err != nil {
 			return err
 		}
 	}
@@ -316,6 +322,13 @@ func (s *UpstreamServer) reconcileManagementLocked(groups []domain.Group, source
 	}
 	if err := s.removeStaleManagementLocked(s.managementSources, desiredSources); err != nil {
 		return fmt.Errorf("remove stale source management nodes: %w", err)
+	}
+	for groupID := range s.memberTreeHashes {
+		if _, keep := desiredGroups[groupID]; !keep {
+			delete(s.memberTreeHashes, groupID)
+			delete(s.memberTreeNodeIDs, groupID)
+			delete(s.memberTreeValueIDs, groupID)
+		}
 	}
 	return nil
 }
@@ -509,12 +522,21 @@ type managementVariable struct {
 
 func (s *UpstreamServer) addManagementVariableLocked(parent awu.NodeID, id string, definition managementVariable) error {
 	nodeID := awu.NewNodeIDString(s.managementNS, id)
-	if _, exists := s.management[nodeID.String()]; exists {
-		return nil
-	}
 	access := awu.AccessLevelsCurrentRead
 	if definition.writable {
 		access |= awu.AccessLevelsCurrentWrite
+	}
+	if existing, exists := s.server.NamespaceManager().FindNode(nodeID); exists {
+		node, ok := existing.(*awserver.VariableNode)
+		if !ok {
+			return fmt.Errorf("management node %q has class %T, want Variable", id, existing)
+		}
+		if node.DataType() != definition.dataType || node.ValueRank() != definition.valueRank || node.AccessLevel() != access {
+			return fmt.Errorf("management variable %q changed shape", id)
+		}
+		configureManagementVariable(node, definition)
+		s.management[nodeID.String()] = node
+		return nil
 	}
 	node := awserver.NewVariableNode(
 		s.server, nodeID, awu.NewQualifiedName(s.managementNS, definition.name), awu.NewLocalizedText(definition.name, ""), awu.NewLocalizedText("", ""), nil,
@@ -524,21 +546,27 @@ func (s *UpstreamServer) addManagementVariableLocked(parent awu.NodeID, id strin
 		}, awu.NewDataValue(nil, awu.BadWaitingForInitialData, time.Time{}, 0, time.Now(), 0),
 		definition.dataType, definition.valueRank, nil, access, 125, false, nil,
 	)
-	node.SetReadValueHandler(func(session *awserver.Session, _ awu.ReadValueID) awu.DataValue {
-		value, status := definition.read(sessionID(session))
-		return awu.NewDataValue(value, status, time.Time{}, 0, time.Now(), 0)
-	})
-	if definition.write != nil {
-		node.SetWriteValueHandler(func(session *awserver.Session, req awu.WriteValue) (awu.DataValue, awu.StatusCode) {
-			status := definition.write(sessionID(session), req.Value.Value)
-			return awu.NewDataValue(req.Value.Value, status, time.Time{}, 0, time.Now(), 0), status
-		})
-	}
+	configureManagementVariable(node, definition)
 	if err := s.server.NamespaceManager().AddNode(node); err != nil {
 		return err
 	}
 	s.management[nodeID.String()] = node
 	return nil
+}
+
+func configureManagementVariable(node *awserver.VariableNode, definition managementVariable) {
+	node.SetReadValueHandler(func(session *awserver.Session, _ awu.ReadValueID) awu.DataValue {
+		value, status := definition.read(sessionID(session))
+		return awu.NewDataValue(value, status, time.Time{}, 0, time.Now(), 0)
+	})
+	if definition.write == nil {
+		node.SetWriteValueHandler(nil)
+		return
+	}
+	node.SetWriteValueHandler(func(session *awserver.Session, req awu.WriteValue) (awu.DataValue, awu.StatusCode) {
+		status := definition.write(sessionID(session), req.Value.Value)
+		return awu.NewDataValue(req.Value.Value, status, time.Time{}, 0, time.Now(), 0), status
+	})
 }
 
 func findGroup(groups []domain.Group, id string) (domain.Group, bool) {

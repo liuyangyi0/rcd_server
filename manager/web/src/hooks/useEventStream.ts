@@ -6,11 +6,11 @@ import type { EventEnvelope } from '../api/types';
 
 export type StreamState = 'connecting' | 'connected' | 'disconnected' | 'mock';
 
-const EVENT_NAMES = ['source.status', 'source.sample', 'source.event', 'group.changed', 'selection.changed', 'session.changed', 'command.changed', 'catalog.changed', 'alarm.changed', 'management.audit', 'configuration.changed', 'resync'];
+const EVENT_NAMES = ['source.status', 'source.sample', 'source.event', 'source.operation', 'group.changed', 'selection.changed', 'session.changed', 'command.changed', 'catalog.changed', 'alarm.changed', 'management.audit', 'configuration.changed', 'resync'];
 
 export function eventInvalidatesPoints(type: string): boolean {
   return type.includes('sample') || type.includes('catalog') || type.includes('selection') ||
-    type === 'source.status' || type === 'group.changed';
+    type === 'source.status' || type === 'group.changed' || type === 'session.changed';
 }
 
 export function eventInvalidatesSourceEvents(type: string): boolean {
@@ -19,6 +19,11 @@ export function eventInvalidatesSourceEvents(type: string): boolean {
 
 export function eventInvalidatesManagementAudit(type: string): boolean {
   return type === 'management.audit';
+}
+
+export function eventInvalidatesOperations(type: string, key: readonly unknown[]): boolean {
+  if (key[0] !== 'source-operations') return false;
+  return type === 'source.operation' || type === 'source.status' || (type === 'command.changed' && key[3] === 'status');
 }
 
 export function useEventStream(): StreamState {
@@ -32,8 +37,9 @@ export function useEventStream(): StreamState {
     const invalidate = (event: MessageEvent<string>) => {
       let envelope: EventEnvelope = { type: event.type || 'message' };
       try {
-        const raw = JSON.parse(event.data) as EventEnvelope & { source_id?: string; group_id?: string; session_id?: string };
-        envelope = { ...envelope, ...raw, sourceId: raw.sourceId ?? raw.source_id, groupId: raw.groupId ?? raw.group_id, sessionId: raw.sessionId ?? raw.session_id };
+        const raw = JSON.parse(event.data) as EventEnvelope & { source_id?: string; group_id?: string; session_id?: string; data?: { source_id?: unknown } };
+        const nestedSource = typeof raw.data?.source_id === 'string' ? raw.data.source_id : undefined;
+        envelope = { ...envelope, ...raw, sourceId: raw.sourceId ?? raw.source_id ?? nestedSource, groupId: raw.groupId ?? raw.group_id, sessionId: raw.sessionId ?? raw.session_id };
       } catch {
         // Event name is still enough to choose the affected query families.
       }
@@ -49,6 +55,16 @@ export function useEventStream(): StreamState {
         void queryClient.invalidateQueries({ queryKey: queryKeys.groups });
         void queryClient.invalidateQueries({ queryKey: queryKeys.allAlarms });
       }
+      if (type === 'source.operation' || type === 'source.status' || type === 'command.changed') {
+        // Keep the maintenance feature lazy: only its key prefix is needed.
+        // Never fan sample traffic into config/log reads. Command events affect
+        // the physical port lock, not file contents, and refresh status only.
+        void queryClient.invalidateQueries({
+          queryKey: envelope.sourceId ? ['source-operations', envelope.sourceId] : ['source-operations'],
+          predicate: (query) => eventInvalidatesOperations(type, query.queryKey),
+          refetchType: 'active',
+        });
+      }
       if (type.includes('catalog')) {
         void queryClient.invalidateQueries({ queryKey: envelope.sourceId ? queryKeys.sourceTopology(envelope.sourceId) : queryKeys.allTopologies });
       }
@@ -56,7 +72,8 @@ export function useEventStream(): StreamState {
       // Connection state changes alter every affected point's synthesized
       // quality (for example Good -> BadNoCommunication), while a group change
       // can replace the default route. Both must refresh the active point view
-      // even when no further sample arrives after a disconnect.
+      // even when no further sample arrives after a disconnect. Session close
+      // also invalidates its cached point view instead of waiting for samples.
       if (eventInvalidatesPoints(type)) {
         void queryClient.invalidateQueries({ queryKey: queryKeys.allPoints, refetchType: 'active' });
       }
@@ -74,6 +91,8 @@ export function useEventStream(): StreamState {
       }
       if (type.includes('command')) {
         void queryClient.invalidateQueries({ queryKey: queryKeys.allCommands, refetchType: 'active' });
+        // Pending commands lock both defaults and Session routes immediately.
+        void queryClient.invalidateQueries({ queryKey: queryKeys.groups });
       }
       if (type.includes('alarm')) {
         void queryClient.invalidateQueries({ queryKey: queryKeys.allAlarms });

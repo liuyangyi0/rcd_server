@@ -252,9 +252,9 @@ func (r *Repository) UpdateSource(ctx context.Context, source domain.Source, pas
 }
 
 // UpdateSourceAndResetCatalog atomically changes connection/configuration data,
-// clears the persisted point catalog, and marks discovery pending. It prevents a
-// failed catalog reset from leaving a newly revised source paired with stale
-// schema rows.
+// clears the persisted point catalog, and marks discovery pending unless an
+// explicit rejection is still quarantined. It prevents a failed catalog reset
+// from leaving a newly revised source paired with stale schema rows.
 func (r *Repository) UpdateSourceAndResetCatalog(ctx context.Context, source domain.Source, password *string, expectedRevision uint64) (domain.Source, error) {
 	return r.updateSource(ctx, source, password, expectedRevision, true)
 }
@@ -302,13 +302,17 @@ func (r *Repository) updateSource(ctx context.Context, source domain.Source, pas
 		return domain.Source{}, err
 	}
 	if resetCatalog {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM source_topology WHERE source_id = ?`, source.ID); err != nil {
+		// A connection/mapping edit is not proof of a valid replacement
+		// discovery. Discard stale topology but keep an explicit quarantine.
+		if _, err := tx.ExecContext(ctx, `UPDATE source_topology SET manifest = 'null', discovered_at = ? WHERE source_id = ?`, encodeTime(now), source.ID); err != nil {
 			return domain.Source{}, err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM catalog_nodes WHERE source_id = ?`, source.ID); err != nil {
 			return domain.Source{}, fmt.Errorf("clear source catalog: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE sources SET catalog_state = ? WHERE id = ?`, domain.CatalogDiscovering, source.ID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE sources SET catalog_state = CASE
+			WHEN EXISTS (SELECT 1 FROM source_topology WHERE source_id = ? AND quarantine_reason <> '') THEN ? ELSE ? END
+			WHERE id = ?`, source.ID, domain.CatalogConflict, domain.CatalogDiscovering, source.ID); err != nil {
 			return domain.Source{}, fmt.Errorf("reset source catalog state: %w", err)
 		}
 	}

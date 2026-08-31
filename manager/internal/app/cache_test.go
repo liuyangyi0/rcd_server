@@ -22,19 +22,20 @@ func TestSampleCacheRejectsStaleEpoch(t *testing.T) {
 	}
 }
 
-func TestSampleCacheRejectsOlderTimestampWithinEpoch(t *testing.T) {
+func TestSampleCachePreservesValueAndQualityWhenSourceClockMovesBack(t *testing.T) {
 	cache := newSampleCache()
-	key := domain.NodeKey{NamespaceURI: "urn:test", Identifier: "COM1_Send"}
+	key := domain.NodeKey{NamespaceURI: "urn:test", Identifier: "KKS001"}
 	newer := time.Now().UTC()
-	if !cache.Put("source", key, domain.Sample{Value: "1", Epoch: 2, SourceTimestamp: newer}) {
-		t.Fatal("new terminal sample was rejected")
+	if !cache.Put("source", key, domain.Sample{Value: float64(10), StatusCode: domain.StatusGood, Epoch: 2, SourceTimestamp: newer}) {
+		t.Fatal("initial sample was rejected")
 	}
-	if cache.Put("source", key, domain.Sample{Value: "2", Epoch: 2, SourceTimestamp: newer.Add(-time.Second)}) {
-		t.Fatal("late waiting sample was accepted")
+	older := newer.Add(-time.Hour)
+	if !cache.Put("source", key, domain.Sample{Value: float64(-1), StatusCode: domain.StatusBadOutOfService, Epoch: 2, SourceTimestamp: older}) {
+		t.Fatal("current-epoch sample was rejected because the source clock moved backwards")
 	}
 	got, _ := cache.Get("source", key)
-	if got.Value != "1" {
-		t.Fatalf("cached value regressed to %#v", got.Value)
+	if got.Value != float64(-1) || got.StatusCode != domain.StatusBadOutOfService || !got.SourceTimestamp.Equal(older) {
+		t.Fatalf("cache did not preserve the latest received value/quality/time: %+v", got)
 	}
 }
 

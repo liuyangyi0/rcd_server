@@ -9,6 +9,18 @@ export function sourceGroupIds(source: Pick<Source, 'groupId' | 'groupBindings'>
   return [...new Set([source.groupId, ...(source.groupBindings ?? []).map((binding) => binding.groupId)])].filter(Boolean);
 }
 
+export function sourceUnavailableReason(source: Source, groupId: string): string | undefined {
+  if (!sourceHasGroup(source, groupId)) return '非本组来源';
+  if (!source.enabled) return '来源已停用';
+  if (!['ready', 'cached'].includes(source.catalogState.toLowerCase())) return source.catalogState || '目录未就绪';
+  if (source.availableGroupIds !== undefined && !source.availableGroupIds.includes(groupId)) return '未发现本组目录';
+  return undefined;
+}
+
+export function sourceSelectableForGroup(source: Source, groupId: string): boolean {
+  return sourceUnavailableReason(source, groupId) === undefined;
+}
+
 export function deviceKey(portId: string, deviceId: string): string {
   return JSON.stringify([portId, deviceId]);
 }

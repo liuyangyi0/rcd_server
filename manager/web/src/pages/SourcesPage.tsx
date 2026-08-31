@@ -1,5 +1,5 @@
 import { lazy, Suspense, useMemo, useState } from 'react';
-import { Network, Pencil, Plus, RefreshCw, ScanSearch, Search, TestTube2, Trash2 } from 'lucide-react';
+import { Network, Pencil, Plus, RefreshCw, ScanSearch, Search, TestTube2, Trash2, Wrench } from 'lucide-react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { api, apiErrorMessage } from '../api/client';
 import { queryKeys, useGroups, useSources } from '../api/queries';
@@ -16,6 +16,7 @@ import { sourceHealth } from '../lib/status';
 import { sourceGroupIds, sourceHasGroup } from '../lib/sourceGroups';
 
 const SourceTopologyDrawer = lazy(() => import('../features/config/SourceTopologyDrawer'));
+const SourceOperationsDrawer = lazy(() => import('../features/operations/SourceOperationsDrawer'));
 
 export default function SourcesPage() {
   const client = useQueryClient();
@@ -28,6 +29,7 @@ export default function SourcesPage() {
   const [editing, setEditing] = useState<Source | 'new'>();
   const [deleting, setDeleting] = useState<Source>();
   const [topologySourceId, setTopologySourceId] = useState('');
+  const [operationsSelection, setOperationsSelection] = useState<{ source: Source; deleted: boolean }>();
   const [diagnostics, setDiagnostics] = useState<{ source: Source; mode: 'probe' | 'conflicts' }>();
   const [message, setMessage] = useState('');
 
@@ -68,6 +70,15 @@ export default function SourcesPage() {
   const loading = groupsQuery.isLoading || sourcesQuery.isLoading;
   const error = groupsQuery.error ?? sourcesQuery.error;
   const topologySource = sources.find((source) => source.id === topologySourceId);
+  const currentOperationsSource = operationsSelection ? sources.find((source) => source.id === operationsSelection.source.id) : undefined;
+  const operationsSourceMissing = Boolean(operationsSelection && sourcesQuery.data && !currentOperationsSource);
+  // Keep the opened snapshot and dirty editor mounted after deletion. Once
+  // observed, deletion is terminal for this panel, even if the ID is reused.
+  // Adjust only this component's state, before rendering its children, so no
+  // transient render can unlock writes against a newly created source.
+  if (operationsSelection && operationsSourceMissing && !operationsSelection.deleted) setOperationsSelection({ ...operationsSelection, deleted: true });
+  const operationsSourceDeleted = operationsSourceMissing || Boolean(operationsSelection?.deleted);
+  const operationsSource = operationsSourceDeleted ? operationsSelection?.source : currentOperationsSource ?? operationsSelection?.source;
   return (
     <div className="page">
       <PageHeader
@@ -106,6 +117,7 @@ export default function SourcesPage() {
                     <td>数据 {formatRelativeTime(source.lastDataAt)}<span className="sub-cell">探针 {formatRelativeTime(source.lastProbeAt)}</span></td>
                     <td>{source.reconnectCount}</td>
                     <td className="align-right table-actions">
+                      <button className="button button-small button-outline" type="button" aria-label={`运维 ${source.id}`} title="管理此下级的物理采集、配置文件和日志，不是 Session 选源" onClick={() => { setTopologySourceId(''); setOperationsSelection({ source, deleted: false }); }}><Wrench aria-hidden="true" size={15} />运维</button>
                       <button className="button button-small button-outline" type="button" aria-label={`串口 / 设备映射 ${source.id}`} onClick={() => setTopologySourceId(source.id)}><Network aria-hidden="true" size={15} />串口 / 设备映射</button>
                       <button className="button button-small button-outline" type="button" aria-label={`测试连接 ${source.id}`} title="独立连接测试，不影响在线连接" onClick={() => setDiagnostics({ source, mode: 'probe' })}><TestTube2 aria-hidden="true" size={15} />连接测试</button>
                       <button className="button button-small button-secondary" type="button" disabled={restartMutation.isPending} aria-label={`重新连接并发现目录 ${source.id}`} title="每次重新连接都会重新读取 NamespaceArray、浏览目录并重建订阅" onClick={() => restartMutation.mutate(source)}><ScanSearch aria-hidden="true" size={15} />重连并发现</button>
@@ -123,6 +135,7 @@ export default function SourcesPage() {
       <SourceFormModal open={Boolean(editing)} source={editing === 'new' ? undefined : editing} groups={groups} onClose={() => setEditing(undefined)} onSaved={setMessage} />
       <SourceDiagnosticsModal source={diagnostics?.source} mode={diagnostics?.mode} onClose={() => setDiagnostics(undefined)} />
       {topologySource ? <Suspense fallback={<LoadingState label="正在加载设备映射…" />}><SourceTopologyDrawer key={topologySource.id} source={topologySource} groups={groups} onClose={() => setTopologySourceId('')} onSaved={setMessage} /></Suspense> : null}
+      {operationsSource ? <Suspense fallback={<LoadingState label="正在加载下级运维…" />}><SourceOperationsDrawer key={operationsSource.id} source={operationsSource} sourceDeleted={operationsSourceDeleted} onClose={() => setOperationsSelection(undefined)} /></Suspense> : null}
       <DeleteConfirmModal open={Boolean(deleting)} title="删除下级 OPC" subject={deleting?.id ?? ''} pending={removeMutation.isPending} error={removeMutation.error ? apiErrorMessage(removeMutation.error) : undefined} onClose={() => setDeleting(undefined)} onConfirm={() => deleting && removeMutation.mutate(deleting)} />
     </div>
   );

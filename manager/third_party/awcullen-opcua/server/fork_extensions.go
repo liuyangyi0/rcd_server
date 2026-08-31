@@ -157,22 +157,97 @@ func (srv *Server) emitSessionEvent(event SessionEvent) {
 	}
 }
 
-func (srv *Server) emitSessionActivation(session *Session, oldChannelID uint32) {
+type queuedSessionEvent struct {
+	event SessionEvent
+	done  chan struct{}
+}
+
+// enqueueLifecycleEventLocked orders event snapshots with the state changes
+// they describe. It requires the Session lock and never invokes user code.
+func (s *Session) enqueueLifecycleEventLocked(event SessionEvent) <-chan struct{} {
+	queued := &queuedSessionEvent{event: event, done: make(chan struct{})}
+	s.lifecycleEvents = append(s.lifecycleEvents, queued)
+	return queued.done
+}
+
+// drainLifecycleEvents serializes callbacks for one Session without holding
+// any Session/Manager lock or creating a background goroutine. Reentrant
+// Snapshot, Detach, and Delete calls are safe: new events are queued for the
+// outer drainer instead of recursively invoking the callback.
+func (s *Session) drainLifecycleEvents(srv *Server) {
+	s.Lock()
+	if s.drainingLifecycleEvents {
+		s.Unlock()
+		return
+	}
+	s.drainingLifecycleEvents = true
+	for len(s.lifecycleEvents) > 0 {
+		queued := s.lifecycleEvents[0]
+		s.lifecycleEvents[0] = nil
+		s.lifecycleEvents = s.lifecycleEvents[1:]
+		s.Unlock()
+		srv.emitSessionEvent(queued.event)
+		close(queued.done)
+		s.Lock()
+	}
+	s.lifecycleEvents = nil
+	s.drainingLifecycleEvents = false
+	s.Unlock()
+}
+
+// activateSessionBinding commits the authenticated binding and its event
+// together. The service handler waits for this event BEFORE writing a success
+// response; manager Session-local routes must exist before the client can Read.
+// Only the internal activation path waits. Reentrant public lifecycle APIs do
+// not wait on the callback which called them.
+func (srv *Server) activateSessionBinding(s *Session, ch *serverSecureChannel, identity any, nonce ua.ByteString, locales []string) error {
+	channelID, remoteAddress := ch.ChannelID(), ch.RemoteAddress()
+	securityMode, policyURI := ch.SecurityMode(), ch.SecurityPolicyURI()
+	s.Lock()
+	if s.deleted {
+		s.Unlock()
+		return ua.BadSessionClosed
+	}
+	oldChannelID := s.channelId
+	s.setUserIdentityLocked(identity)
+	s.sessionNonce = nonce
+	s.channelId = channelID
+	s.channelDetached = false
+	s.remoteAddress = remoteAddress
+	s.securityMode = securityMode
+	s.securityPolicyURI = policyURI
+	s.localeIds = append([]string(nil), locales...)
+	s.prunePublishRequestsLocked()
 	kind := SessionActivated
-	if oldChannelID != 0 && oldChannelID != session.SecureChannelId() {
+	if oldChannelID != 0 && oldChannelID != channelID {
 		kind = SessionAttached
 	}
-	srv.emitSessionEvent(SessionEvent{
-		Kind:         kind,
-		Session:      snapshotSession(session),
-		OccurredAt:   time.Now(),
-		OldChannelID: oldChannelID,
+	done := s.enqueueLifecycleEventLocked(SessionEvent{
+		Kind: kind, Session: snapshotSessionLocked(s),
+		OccurredAt: time.Now(), OldChannelID: oldChannelID,
 	})
+	s.Unlock()
+	s.drainLifecycleEvents(srv)
+	select {
+	case <-done:
+		// A callback may explicitly close or detach this Session. Do not
+		// report successful activation of a binding it has already removed.
+		if status := s.publishChannelStatus(ch); status != ua.Good {
+			return status
+		}
+		return nil
+	case <-srv.closing:
+		return ua.BadSessionClosed
+	}
 }
 
 func snapshotSession(s *Session) SessionSnapshot {
 	s.RLock()
 	defer s.RUnlock()
+	return snapshotSessionLocked(s)
+}
+
+func snapshotSessionLocked(s *Session) SessionSnapshot {
 	return SessionSnapshot{
 		SessionID:            s.sessionId,
 		SessionName:          s.sessionName,

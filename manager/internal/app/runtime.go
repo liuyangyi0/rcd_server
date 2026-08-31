@@ -40,6 +40,7 @@ type RuntimeOptions struct {
 	PublishingInterval time.Duration
 	SamplingInterval   time.Duration
 	LowerFactory       LowerFactory
+	ProcessAgentClient ProcessAgentClient
 }
 
 type lowerHandle struct {
@@ -76,51 +77,54 @@ type Runtime struct {
 	cache   *sampleCache
 	options RuntimeOptions
 
-	configMu               sync.RWMutex
-	lifecycleMu            sync.Mutex
-	commandMu              sync.Mutex
-	statusPersistMu        sync.Mutex
-	statusRetryMu          sync.Mutex
-	mu                     sync.RWMutex
-	catalogs               map[string]domain.SourceCatalog
-	index                  *catalogIndex
-	statuses               map[string]opc.LowerStatus
-	lowers                 map[string]lowerHandle
-	generations            map[string]uint64
-	dirtyCatalogs          map[string]domain.SourceCatalog
-	dirtyCommands          map[string]domain.PendingCommand
-	dirtyAudits            map[string]domain.AuditEntry
-	dirtySourceEvents      []domain.SourceEvent
-	dirtyAlarmStatuses     map[string]opc.LowerStatus
-	quarantinedSources     map[string]string
-	pendingCommandMeta     map[string]pendingCommandMeta
-	ackSequences           map[string]uint64
-	ackEpochs              map[string]uint64
-	commandHistory         map[string]commandHistoryEntry
-	catalogPersistError    string
-	commandPersistError    string
-	auditPersistError      string
-	statusPersistError     string
-	upstreamReconcileError string
-	upstreamReconcileDirty bool
-	conflictCount          int
-	selectionCount         uint64
-	lastSelectionAt        time.Time
-	groupLastSelectedAt    map[string]time.Time
-	lastLowerDataAt        time.Time
-	lastSampleEventAt      time.Time
-	sampleEventPending     bool
-	startedAt              time.Time
-	runContext             context.Context
-	runCancel              context.CancelFunc
-	shutdownDone           chan struct{}
-	refreshSession         func(sessionID, groupID string)
-	refreshQueue           chan sessionRefreshRequest
-	statusPersistWake      chan struct{}
-	catalogValidator       CatalogPublisher
-	catalogReconciler      CatalogPublisher
-	sessionViews           func() map[string]api.SessionView
-	subscriptionCount      func() int
+	configMu                sync.RWMutex
+	sourceOperations        map[string]bool   // guarded by configMu; no hot-path I/O
+	sourceProcessOperations map[string]string // durable maintenance fences, guarded by configMu
+	processExecuting        map[string]string // source -> executing request, guarded by configMu
+	lifecycleMu             sync.Mutex
+	commandMu               sync.Mutex
+	statusPersistMu         sync.Mutex
+	statusRetryMu           sync.Mutex
+	mu                      sync.RWMutex
+	catalogs                map[string]domain.SourceCatalog
+	index                   *catalogIndex
+	statuses                map[string]opc.LowerStatus
+	lowers                  map[string]lowerHandle
+	generations             map[string]uint64
+	dirtyCatalogs           map[string]domain.SourceCatalog
+	dirtyCommands           map[string]domain.PendingCommand
+	dirtyAudits             map[string]domain.AuditEntry
+	dirtySourceEvents       []domain.SourceEvent
+	dirtyAlarmStatuses      map[string]opc.LowerStatus
+	quarantinedSources      map[string]string
+	pendingCommandMeta      map[string]pendingCommandMeta
+	ackSequences            map[string]uint64
+	ackEpochs               map[string]uint64
+	commandHistory          map[string]commandHistoryEntry
+	catalogPersistError     string
+	commandPersistError     string
+	auditPersistError       string
+	statusPersistError      string
+	upstreamReconcileError  string
+	upstreamReconcileDirty  bool
+	conflictCount           int
+	selectionCount          uint64
+	lastSelectionAt         time.Time
+	groupLastSelectedAt     map[string]time.Time
+	lastLowerDataAt         time.Time
+	lastSampleEventAt       time.Time
+	sampleEventPending      bool
+	startedAt               time.Time
+	runContext              context.Context
+	runCancel               context.CancelFunc
+	shutdownDone            chan struct{}
+	refreshSession          func(sessionID, groupID string)
+	refreshQueue            chan sessionRefreshRequest
+	statusPersistWake       chan struct{}
+	catalogValidator        CatalogPublisher
+	catalogReconciler       CatalogPublisher
+	sessionViews            func() map[string]api.SessionView
+	subscriptionCount       func() int
 
 	running atomic.Bool
 	ready   atomic.Bool
@@ -165,6 +169,9 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 			return opc.NewLowerSupervisor(cfg, sink)
 		}
 	}
+	if options.ProcessAgentClient == nil {
+		options.ProcessAgentClient = newProcessAgentHTTPClient()
+	}
 
 	groups, err := repo.ListGroups(ctx)
 	if err != nil {
@@ -175,29 +182,45 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 		return nil, fmt.Errorf("load sources: %w", err)
 	}
 	catalogs := make(map[string]domain.SourceCatalog, len(sources))
-	invalidTopologies := make(map[string]string)
+	quarantinedSources := make(map[string]string)
+	dirtyCatalogs := make(map[string]domain.SourceCatalog)
 	for index := range sources {
 		catalog, loadErr := repo.LoadSourceCatalog(ctx, sources[index].ID)
 		if loadErr != nil {
-			return nil, fmt.Errorf("load catalog for %s: %w", sources[index].ID, loadErr)
-		}
-		active := catalog.Nodes[:0]
-		for _, node := range catalog.Nodes {
-			// Retired nodes only survive the process in which they disappeared.
-			if !node.Retired {
-				active = append(active, node)
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("load catalog for %s: %w", sources[index].ID, loadErr)
+			}
+			catalog = domain.SourceCatalog{
+				SourceID: sources[index].ID, GroupID: sources[index].GroupID,
+				State: domain.CatalogConflict, QuarantineReason: "cached catalog unreadable: " + loadErr.Error(),
+			}
+			dirtyCatalogs[sources[index].ID] = catalog
+		} else {
+			active := catalog.Nodes[:0]
+			for _, node := range catalog.Nodes {
+				// Retired nodes only survive the process in which they disappeared.
+				if !node.Retired {
+					active = append(active, node)
+				}
+			}
+			catalog.Nodes = active
+			annotated, topologyErr := domain.AssignCatalogGroups(sources[index], catalog)
+			if topologyErr != nil {
+				catalog.QuarantineReason = topologyErr.Error()
+				catalog.Nodes = nil
+				// Never publish an unvalidated cached topology. A later successful
+				// discovery replaces this quarantined snapshot atomically.
+				catalog.Topology = nil
+				catalog.State = domain.CatalogConflict
+				dirtyCatalogs[sources[index].ID] = catalog
+			} else {
+				catalog = annotated
 			}
 		}
-		catalog.Nodes = active
-		annotated, topologyErr := domain.AssignCatalogGroups(sources[index], catalog)
-		if topologyErr != nil {
-			invalidTopologies[sources[index].ID] = topologyErr.Error()
-			catalog.Nodes = nil
+		if catalog.QuarantineReason != "" {
 			catalog.State = domain.CatalogConflict
-		} else {
-			catalog = annotated
-		}
-		if len(catalog.Nodes) == 0 {
+			quarantinedSources[sources[index].ID] = catalog.QuarantineReason
+		} else if len(catalog.Nodes) == 0 {
 			catalog.State = domain.CatalogDiscovering
 		} else if catalog.State != domain.CatalogConflict {
 			catalog.State = domain.CatalogCached
@@ -210,7 +233,7 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 	if err != nil {
 		return nil, err
 	}
-	for id := range invalidTopologies {
+	for id := range quarantinedSources {
 		states[id] = domain.CatalogConflict
 		index.union.SourceStates[id] = domain.CatalogConflict
 		conflicts++
@@ -239,10 +262,10 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 		repo: repo, routes: routes, broker: api.NewBroker(), cache: newSampleCache(), options: options,
 		catalogs: catalogs, index: index, statuses: make(map[string]opc.LowerStatus),
 		lowers: make(map[string]lowerHandle), generations: make(map[string]uint64),
-		dirtyCatalogs: make(map[string]domain.SourceCatalog),
+		dirtyCatalogs: dirtyCatalogs,
 		dirtyCommands: make(map[string]domain.PendingCommand), dirtyAudits: make(map[string]domain.AuditEntry),
 		dirtyAlarmStatuses: make(map[string]opc.LowerStatus),
-		quarantinedSources: invalidTopologies,
+		quarantinedSources: quarantinedSources,
 		pendingCommandMeta: make(map[string]pendingCommandMeta),
 		ackSequences:       make(map[string]uint64),
 		ackEpochs:          make(map[string]uint64),
@@ -250,6 +273,10 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 		statusPersistWake:  make(chan struct{}, 1),
 		conflictCount:      conflicts, selectionCount: selectionCount, lastSelectionAt: lastSelectionAt,
 		groupLastSelectedAt: groupLastSelectedAt, startedAt: now,
+		sourceProcessOperations: make(map[string]string), processExecuting: make(map[string]string),
+	}
+	if err := runtime.restoreProcessOperations(ctx); err != nil {
+		return nil, fmt.Errorf("restore process maintenance fences: %w", err)
 	}
 	// Rehydrate in-flight command locks before any OPC Session can be accepted.
 	for offset := 0; ; offset += 1000 {
@@ -275,7 +302,7 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 		lastError := ""
 		if source.CatalogState == domain.CatalogConflict {
 			lastError = catalogConflictSummary(conflictsForSource(index.union.Conflicts, source.ID))
-			if reason := invalidTopologies[source.ID]; reason != "" {
+			if reason := quarantinedSources[source.ID]; reason != "" {
 				lastError = "catalog rejected: " + reason
 			}
 		}
@@ -321,6 +348,8 @@ func (r *Runtime) Start(ctx context.Context) error {
 	go r.sessionRefreshWorker()
 	r.wg.Add(1)
 	go r.retentionSweeper()
+	r.wg.Add(1)
+	go r.processControlWorker()
 	return nil
 }
 
@@ -569,22 +598,7 @@ func loadSelectionMetrics(ctx context.Context, repo *store.Repository) (uint64, 
 func (r *Runtime) CatalogUnion() domain.CatalogUnion {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	result := domain.CatalogUnion{
-		Groups:       make(map[string]map[string]domain.CatalogNode, len(r.index.union.Groups)),
-		SourceStates: make(map[string]domain.CatalogState, len(r.index.union.SourceStates)),
-		Conflicts:    append([]domain.CatalogConflictDetail(nil), r.index.union.Conflicts...),
-	}
-	for groupID, nodes := range r.index.union.Groups {
-		copyNodes := make(map[string]domain.CatalogNode, len(nodes))
-		for identifier, node := range nodes {
-			copyNodes[identifier] = node
-		}
-		result.Groups[groupID] = copyNodes
-	}
-	for sourceID, state := range r.index.union.SourceStates {
-		result.SourceStates[sourceID] = state
-	}
-	return result
+	return cloneCatalogUnion(r.index.union)
 }
 
 func (r *Runtime) startLower(source domain.Source) error {
@@ -638,7 +652,7 @@ func (r *Runtime) startLower(source domain.Source) error {
 			slog.Error("lower OPC supervisor stopped", "source_id", source.ID, "error", runErr)
 			proxy.OnLowerStatus(opc.LowerStatus{SourceID: source.ID, Connection: opc.ConnectionDisconnected,
 				Session: opc.SessionInactive, Subscription: opc.SubscriptionInactive,
-				Catalog: source.CatalogState, LastError: runErr.Error(), UpdatedAt: time.Now().UTC()})
+				LastError: runErr.Error(), UpdatedAt: time.Now().UTC()})
 		}
 		r.mu.Lock()
 		if current, exists := r.lowers[source.ID]; exists && current.generation == generation {
@@ -655,7 +669,7 @@ func (r *Runtime) recordLowerStartFailure(source domain.Source, err error) {
 	r.mu.RUnlock()
 	r.OnLowerStatus(opc.LowerStatus{SourceID: source.ID, Connection: opc.ConnectionDisconnected,
 		Session: opc.SessionInactive, Subscription: opc.SubscriptionInactive,
-		Catalog: source.CatalogState, Epoch: current.Epoch, ReconnectCount: current.ReconnectCount,
+		Epoch: current.Epoch, ReconnectCount: current.ReconnectCount,
 		LastDataAt: current.LastDataAt, LastProbeAt: current.LastProbeAt,
 		LastError: err.Error(), UpdatedAt: time.Now().UTC()})
 }
@@ -717,17 +731,17 @@ func (r *Runtime) OnLowerStatus(status opc.LowerStatus) {
 }
 
 func (r *Runtime) onLowerStatus(status opc.LowerStatus, generation uint64) {
+	var refreshGroups []string
 	if status.Catalog == domain.CatalogConflict {
-		r.mu.RLock()
-		alreadyQuarantined := r.catalogs[status.SourceID].State == domain.CatalogConflict
-		r.mu.RUnlock()
-		if !alreadyQuarantined {
-			r.quarantineLowerTopology(status, generation)
-		}
+		r.configMu.Lock()
+		defer func() {
+			r.configMu.Unlock()
+			r.queueGroupRefreshes(refreshGroups...)
+		}()
 	}
 	now := time.Now().UTC()
 	r.mu.Lock()
-	if generation != 0 && (!r.running.Load() || r.generations[status.SourceID] != generation) {
+	if !r.lowerCallbackCurrentLocked(status.SourceID, generation) {
 		r.mu.Unlock()
 		return
 	}
@@ -735,6 +749,13 @@ func (r *Runtime) onLowerStatus(status opc.LowerStatus, generation uint64) {
 	if existed && previous.Epoch > status.Epoch && status.Epoch != 0 {
 		r.mu.Unlock()
 		return
+	}
+	quarantined := false
+	if status.Catalog == domain.CatalogConflict {
+		// Do not unlock between accepting this connection and quarantining its
+		// catalog. Otherwise a delayed old epoch can clear newer Session routes.
+		quarantined = r.markCatalogQuarantineLocked(status.SourceID, status.LastError)
+		status.LastError = "catalog rejected: " + r.quarantinedSources[status.SourceID]
 	}
 	if catalog, ok := r.catalogs[status.SourceID]; ok {
 		status.Catalog = catalog.State
@@ -758,6 +779,11 @@ func (r *Runtime) onLowerStatus(status opc.LowerStatus, generation uint64) {
 		r.sampleEventPending = true
 	}
 	r.mu.Unlock()
+	if quarantined {
+		r.applyQuarantinedSourceLocked(status.SourceID)
+		refreshGroups = r.groupsForSources(status.SourceID)
+		r.broker.Publish(api.Event{Type: "catalog.changed", SourceID: status.SourceID})
+	}
 	if meaningfulChange {
 		r.persistLowerStatusTransition(previous, status, existed)
 	}
@@ -780,7 +806,11 @@ func (r *Runtime) OnCatalog(catalog domain.SourceCatalog) {
 
 func (r *Runtime) onCatalog(sourceID string, generation uint64, discovered domain.SourceCatalog) {
 	r.configMu.Lock()
-	defer r.configMu.Unlock()
+	var refreshGroups []string
+	defer func() {
+		r.configMu.Unlock()
+		r.queueGroupRefreshes(refreshGroups...)
+	}()
 	if r.closing.Load() {
 		return
 	}
@@ -799,9 +829,14 @@ func (r *Runtime) onCatalog(sourceID string, generation uint64, discovered domai
 	discovered.SourceID = sourceID
 	discovered.GroupID = source.GroupID
 	discovered.State = domain.CatalogReady
+	// Incoming discoveries must pass all topology and upstream validation;
+	// only their successful publication clears a saved explicit rejection.
+	discovered.QuarantineReason = ""
 	annotated, topologyErr := domain.AssignCatalogGroups(source, discovered)
 	if topologyErr != nil {
-		r.quarantineLowerTopologyLocked(sourceID, topologyErr.Error())
+		if r.quarantineLowerTopologyLocked(sourceID, topologyErr.Error(), generation) {
+			refreshGroups = source.GroupIDs()
+		}
 		return
 	}
 	discovered = annotated
@@ -837,9 +872,10 @@ func (r *Runtime) onCatalog(sourceID string, generation uint64, discovered domai
 		}
 	}
 	if err := r.validateUpstream(index, groups, sources); err != nil {
-		r.recordReconcileError(err)
 		slog.Error("reject catalog before upstream publish", "source_id", sourceID, "error", err)
-		r.isolateRejectedCatalog(sourceID, discovered.DiscoveredAt, before, groups, sources, handler, err)
+		if r.isolateRejectedCatalog(sourceID, generation, discovered.DiscoveredAt, before, groups, sources, handler, err) {
+			refreshGroups = source.GroupIDs()
+		}
 		return
 	}
 	type statusChange struct {
@@ -849,7 +885,7 @@ func (r *Runtime) onCatalog(sourceID string, generation uint64, discovered domai
 	}
 	statusChanges := make([]statusChange, 0, len(states))
 	r.mu.Lock()
-	if generation != 0 && (!r.running.Load() || r.generations[sourceID] != generation) {
+	if !r.lowerCallbackCurrentLocked(sourceID, generation) {
 		r.mu.Unlock()
 		return
 	}
@@ -864,7 +900,9 @@ func (r *Runtime) onCatalog(sourceID string, generation uint64, discovered domai
 		status.SourceID = id
 		status.Catalog = state
 		if state == domain.CatalogConflict {
-			if status.LastError == "" || strings.HasPrefix(status.LastError, "catalog conflict:") || strings.HasPrefix(status.LastError, "catalog rejected:") {
+			if reason := candidate[id].QuarantineReason; reason != "" {
+				status.LastError = "catalog rejected: " + reason
+			} else if status.LastError == "" || strings.HasPrefix(status.LastError, "catalog conflict:") || strings.HasPrefix(status.LastError, "catalog rejected:") {
 				status.LastError = catalogConflictSummary(conflictsForSource(index.union.Conflicts, id))
 			}
 		} else if strings.HasPrefix(status.LastError, "catalog conflict:") || strings.HasPrefix(status.LastError, "catalog rejected:") || (id == sourceID && previousStatus.Catalog == domain.CatalogConflict) {
@@ -909,6 +947,11 @@ func (r *Runtime) onCatalog(sourceID string, generation uint64, discovered domai
 	if err := r.routes.ApplyConfiguration(groups, sources); err != nil {
 		slog.Error("apply catalog selection state", "error", err)
 	}
+	changedSources := []string{sourceID}
+	for _, change := range statusChanges {
+		changedSources = append(changedSources, change.current.SourceID)
+	}
+	refreshGroups = r.groupsForSources(changedSources...)
 	if handler != nil {
 		if err := handler(cloneCatalogUnion(index.union), groups, sources); err != nil {
 			slog.Error("reconcile upstream catalog", "error", err)
@@ -1000,9 +1043,9 @@ func (r *Runtime) flushPendingSampleEvent(now time.Time) {
 	r.broker.Publish(api.Event{Type: "source.sample"})
 }
 
-func (r *Runtime) isolateRejectedCatalog(sourceID string, discoveredAt time.Time, before map[string]domain.SourceCatalog,
+func (r *Runtime) isolateRejectedCatalog(sourceID string, generation uint64, discoveredAt time.Time, before map[string]domain.SourceCatalog,
 	groups []domain.Group, sources []domain.Source, handler CatalogPublisher, validationErr error,
-) {
+) bool {
 	rejectedCatalogs := cloneCatalogMap(before)
 	rejected := rejectedCatalogs[sourceID]
 	rejected.SourceID = sourceID
@@ -1010,6 +1053,7 @@ func (r *Runtime) isolateRejectedCatalog(sourceID string, discoveredAt time.Time
 		rejected.GroupID = source.GroupID
 	}
 	rejected.State = domain.CatalogConflict
+	rejected.QuarantineReason = validationErr.Error()
 	rejected.DiscoveredAt = discoveredAt
 	for index := range rejected.Nodes {
 		rejected.Nodes[index].Retired = true
@@ -1024,24 +1068,23 @@ func (r *Runtime) isolateRejectedCatalog(sourceID string, discoveredAt time.Time
 	index, buildErr := buildCatalogIndex(visible)
 	if buildErr != nil {
 		slog.Error("build isolated catalog", "source_id", sourceID, "error", buildErr)
-		return
+		return false
 	}
-	r.mu.RLock()
-	_, wasQuarantined := r.quarantinedSources[sourceID]
-	r.mu.RUnlock()
 	for sourceIndex := range sources {
 		if sources[sourceIndex].ID == sourceID {
 			sources[sourceIndex].CatalogState = domain.CatalogConflict
 		}
 	}
-	if err := r.routes.ApplyConfiguration(groups, sources); err != nil {
-		slog.Error("isolate rejected catalog route", "source_id", sourceID, "error", err)
-		return
-	}
 	r.mu.Lock()
+	if !r.lowerCallbackCurrentLocked(sourceID, generation) {
+		r.mu.Unlock()
+		return false
+	}
+	_, wasQuarantined := r.quarantinedSources[sourceID]
 	r.catalogs = rejectedCatalogs
 	r.index = index
 	r.quarantinedSources[sourceID] = validationErr.Error()
+	r.upstreamReconcileError = validationErr.Error()
 	if !wasQuarantined {
 		r.conflictCount++
 	}
@@ -1053,6 +1096,9 @@ func (r *Runtime) isolateRejectedCatalog(sourceID string, discoveredAt time.Time
 	status.UpdatedAt = time.Now().UTC()
 	r.statuses[sourceID] = status
 	r.mu.Unlock()
+	if err := r.routes.ApplyConfiguration(groups, sources); err != nil {
+		slog.Error("isolate rejected catalog route", "source_id", sourceID, "error", err)
+	}
 	if !statusExisted || lowerStatusControlChanged(previousStatus, status) {
 		r.persistLowerStatusTransition(previousStatus, status, statusExisted)
 	}
@@ -1078,6 +1124,7 @@ func (r *Runtime) isolateRejectedCatalog(sourceID string, discoveredAt time.Time
 		}
 	}
 	r.broker.Publish(api.Event{Type: "catalog.changed", Data: map[string]any{"source_id": sourceID, "rejected": true}})
+	return true
 }
 
 func (r *Runtime) enforceCatalogQuarantine(index *catalogIndex, states map[string]domain.CatalogState, recoveringSourceID string) int {
@@ -1251,7 +1298,23 @@ func validateCatalogs(catalogs map[string]domain.SourceCatalog) (*catalogIndex, 
 	if err != nil {
 		return nil, nil, 0, fmt.Errorf("build catalog index: %w", err)
 	}
-	index.union.Conflicts = append([]domain.CatalogConflictDetail(nil), details...)
+	// Physical topology and per-source coverage are diagnostic data, not public
+	// union ownership. Keep validated snapshots even when a point conflict makes
+	// that source unselectable, so operators can still inspect the real binding.
+	for sourceID, catalog := range working {
+		if catalog.Topology != nil {
+			index.union.SourceTopologies[sourceID] = catalog.Topology.Clone()
+		}
+		nodes := make(map[string]domain.CatalogNode, len(catalog.Nodes))
+		for _, node := range catalog.Nodes {
+			nodes[node.Key.Identifier] = node.Clone()
+		}
+		index.union.SourceNodes[sourceID] = nodes
+	}
+	index.union.Conflicts = make([]domain.CatalogConflictDetail, len(details))
+	for i := range details {
+		index.union.Conflicts[i] = details[i].Clone()
+	}
 	for sourceID, state := range states {
 		index.union.SourceStates[sourceID] = state
 	}
@@ -1261,29 +1324,41 @@ func validateCatalogs(catalogs map[string]domain.SourceCatalog) (*catalogIndex, 
 func cloneCatalogMap(input map[string]domain.SourceCatalog) map[string]domain.SourceCatalog {
 	output := make(map[string]domain.SourceCatalog, len(input))
 	for id, catalog := range input {
-		clone := catalog
-		clone.Nodes = append([]domain.CatalogNode(nil), catalog.Nodes...)
-		clone.Topology = catalog.Topology.Clone()
-		output[id] = clone
+		output[id] = catalog.Clone()
 	}
 	return output
 }
 
 func cloneCatalogUnion(input domain.CatalogUnion) domain.CatalogUnion {
 	output := domain.CatalogUnion{
-		Groups:       make(map[string]map[string]domain.CatalogNode, len(input.Groups)),
-		SourceStates: make(map[string]domain.CatalogState, len(input.SourceStates)),
-		Conflicts:    append([]domain.CatalogConflictDetail(nil), input.Conflicts...),
+		Groups:           make(map[string]map[string]domain.CatalogNode, len(input.Groups)),
+		SourceStates:     make(map[string]domain.CatalogState, len(input.SourceStates)),
+		SourceTopologies: make(map[string]*domain.SourceTopology, len(input.SourceTopologies)),
+		SourceNodes:      make(map[string]map[string]domain.CatalogNode, len(input.SourceNodes)),
+		Conflicts:        make([]domain.CatalogConflictDetail, len(input.Conflicts)),
 	}
 	for groupID, nodes := range input.Groups {
 		copyNodes := make(map[string]domain.CatalogNode, len(nodes))
 		for identifier, node := range nodes {
-			copyNodes[identifier] = node
+			copyNodes[identifier] = node.Clone()
 		}
 		output.Groups[groupID] = copyNodes
 	}
 	for sourceID, state := range input.SourceStates {
 		output.SourceStates[sourceID] = state
+	}
+	for sourceID, topology := range input.SourceTopologies {
+		output.SourceTopologies[sourceID] = topology.Clone()
+	}
+	for sourceID, nodes := range input.SourceNodes {
+		copyNodes := make(map[string]domain.CatalogNode, len(nodes))
+		for identifier, node := range nodes {
+			copyNodes[identifier] = node.Clone()
+		}
+		output.SourceNodes[sourceID] = copyNodes
+	}
+	for i := range input.Conflicts {
+		output.Conflicts[i] = input.Conflicts[i].Clone()
 	}
 	return output
 }

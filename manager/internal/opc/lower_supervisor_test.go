@@ -123,3 +123,60 @@ func TestCommandAckProbeDoesNotReuseUnchangedTerminalValue(t *testing.T) {
 	default:
 	}
 }
+
+func TestCommandAckProbeCannotOverwriteNewerSubscriptionValue(t *testing.T) {
+	baseline := time.Now().UTC()
+	sink := &ackProbeSink{samples: make(chan domain.Sample, 3)}
+	supervisor := &LowerSupervisor{cfg: LowerConfig{Source: domain.Source{ID: "source-a"}}, sink: sink}
+	supervisor.epoch.Store(7)
+	key := domain.NodeKey{NamespaceURI: BusinessNamespaceURI, Identifier: "COM1_Send"}
+	node := observedNode{key: key, dataType: domain.DataTypeString, command: true}
+	if !supervisor.emitMonitoredSample("ns=2;s=COM1_Send", node, ackReadResponse("2", baseline.Add(2*time.Millisecond)).Results[0], 7) {
+		t.Fatal("subscription Waiting was not accepted")
+	}
+	reader := &sequenceValueReader{responses: []*gu.ReadResponse{ackReadResponse("1", baseline.Add(time.Millisecond))}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	supervisor.pollCommandAck(ctx, reader, gu.NewStringNodeID(2, "COM1_Send"), key, domain.DataTypeString, 7, baseline)
+	if first := <-sink.samples; first.Value != "2" {
+		t.Fatalf("initial sample=%#v", first)
+	}
+	select {
+	case stale := <-sink.samples:
+		t.Fatalf("older probe ACK replaced newer subscription state: %#v", stale)
+	default:
+	}
+	if !supervisor.emitMonitoredSample("ns=2;s=COM1_Send", node, ackReadResponse("1", baseline.Add(3*time.Millisecond)).Results[0], 7) {
+		t.Fatal("fresh subscription terminal was not accepted")
+	}
+	if final := <-sink.samples; final.Value != "1" {
+		t.Fatalf("fresh terminal=%#v", final)
+	}
+}
+
+type epochChangingValueReader struct {
+	supervisor *LowerSupervisor
+	response   *gu.ReadResponse
+}
+
+func (r *epochChangingValueReader) Read(context.Context, *gu.ReadRequest) (*gu.ReadResponse, error) {
+	r.supervisor.epoch.Add(1)
+	return r.response, nil
+}
+
+func TestCommandAckProbeRejectsResponseAfterEpochChanges(t *testing.T) {
+	baseline := time.Now().UTC()
+	sink := &ackProbeSink{samples: make(chan domain.Sample, 1)}
+	supervisor := &LowerSupervisor{cfg: LowerConfig{Source: domain.Source{ID: "source-a"}}, sink: sink}
+	supervisor.epoch.Store(7)
+	reader := &epochChangingValueReader{supervisor: supervisor, response: ackReadResponse("1", baseline.Add(time.Millisecond))}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	supervisor.pollCommandAck(ctx, reader, gu.NewStringNodeID(2, "COM1_Send"),
+		domain.NodeKey{NamespaceURI: BusinessNamespaceURI, Identifier: "COM1_Send"}, domain.DataTypeString, 7, baseline)
+	select {
+	case late := <-sink.samples:
+		t.Fatalf("probe response from a closed epoch was accepted: %#v", late)
+	default:
+	}
+}

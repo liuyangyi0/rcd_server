@@ -83,7 +83,7 @@ async function parseResponse(response: Response): Promise<unknown> {
   return text ? { message: text } : undefined;
 }
 
-async function request(path: string, init: RequestInit = {}): Promise<unknown> {
+export async function request(path: string, init: RequestInit = {}): Promise<unknown> {
   if (isMockMode) {
     const { mockRequest } = await import('./mock');
     return mockRequest(path, init);
@@ -103,6 +103,7 @@ async function request(path: string, init: RequestInit = {}): Promise<unknown> {
       },
     });
   } catch (error) {
+    if (init.signal?.aborted) throw error;
     throw new ApiError(0, { message: '无法连接管理 API', detail: error instanceof Error ? error.message : undefined }, '无法连接管理 API');
   }
 
@@ -186,8 +187,8 @@ export const api = {
     return normalizeList(await request('/sessions'), normalizeSession);
   },
 
-  async points(params: ListParams): Promise<PageResult<Point>> {
-    return normalizePage(await request(`/points${queryString(params)}`), normalizePoint);
+  async points(params: ListParams, signal?: AbortSignal): Promise<PageResult<Point>> {
+    return normalizePage(await request(`/points${queryString(params)}`, { signal }), normalizePoint);
   },
 
   async commands(params: ListParams): Promise<PageResult<CommandAudit>> {

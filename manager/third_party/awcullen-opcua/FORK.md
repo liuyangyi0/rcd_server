@@ -16,6 +16,16 @@ not silently move to a different server implementation.
   Created, Activated, Attached, Detached, and Closed events. Close events carry
   client, timeout, or server-shutdown reasons. Snapshots include the peer remote
   address and do not expose mutable `Session` objects.
+- Lifecycle snapshots and channel binding changes are committed under the same
+  Session lock and delivered through a per-Session FIFO. A delayed old-channel
+  detach cannot describe a new binding or arrive after its Attached event.
+  Repeated detach callbacks are suppressed. Activated/Attached processing must
+  complete before an ActivateSession success response is written, so a client's
+  immediate Read sees initialized Session-local routes. Callbacks run without
+  Session/Manager locks; Snapshot, Detach, and Delete callback reentry is safe.
+  Reentrant events are appended for the existing drainer, with no background
+  goroutine. Closed is ordered with other lifecycle events. The deterministic
+  and concurrent checks are in `server/session_lifecycle_order_test.go`.
 - Session identity reads use `Session.UserIdentity()` under the session lock.
 - `WithSessionScopedWriteHandlers` lets a successful custom write handler
   perform session-local routing without replacing a variable's global backing
@@ -30,8 +40,25 @@ not silently move to a different server implementation.
   rejected such keys during otherwise valid username connections. Endpoint,
   identity and authorization policies are unchanged. The deterministic size
   regression is `server/rsa_username_test.go`.
+- Publish queues reject closed, expired, or superseded SecureChannels. Session
+  reactivation filters old requests under the same lock used for admission,
+  preserving requests on the new channel and keeping the original Session and
+  subscriptions alive. A failed timeout/overflow response on an old channel
+  does not prevent a queued request on the replacement channel from proceeding.
+  Transport close and failed/partial writes invalidate queued requests promptly.
+  A consumed valid Publish resets the subscription lifetime even if its response
+  cannot be written, avoiding premature expiry during recovery.
+- Scheduled and late Publish paths commit each notification's sequence number
+  when inserting it into the retransmission queue, before writing the response.
+  A failed transport write leaves the original notification available for
+  Republish, but its sequence number is never reused for a new value. Sequence
+  rollover skips zero; keepalives neither consume sequence numbers nor replace
+  acknowledgement errors with Good. Session locks are never held across network
+  writes. Deterministic transport-failure and concurrent reactivation regressions
+  live in `server/publish_reconnect_test.go`.
 
-The focused regression suite is `server/fork_extensions_test.go`. When
+The focused regression suites are `server/fork_extensions_test.go` and
+`server/publish_reconnect_test.go`. When
 upgrading the base version, port these named APIs and tests first, then run both
 the fork's `go test ./server` and the manager's real gopcua loopback tests before
 changing the replace target.

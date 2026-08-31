@@ -438,6 +438,8 @@ func TestBindingEditCannotClearMalformedManifestQuarantine(t *testing.T) {
 	if updated.CatalogState != domain.CatalogConflict {
 		t.Fatalf("binding edit bypassed invalid manifest quarantine: %#v", updated)
 	}
+	runtime.persistDirtyCatalogs(context.Background())
+	assertSourceQuarantined(t, reopenRuntimeFromCache(t, runtime), "b")
 }
 
 func TestPassiveSendResetOnlyUpdatesInitiatingSessionAndControlNode(t *testing.T) {

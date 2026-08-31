@@ -162,14 +162,18 @@ func (c SourceCatalog) NodeGroup(node CatalogNode) string {
 // legacy browse parents remain unchanged. No sample value is copied or stored.
 func AssignCatalogGroups(source Source, catalog SourceCatalog) (SourceCatalog, error) {
 	catalog.GroupID = source.GroupID
-	catalog.Nodes = append([]CatalogNode(nil), catalog.Nodes...)
-	catalog.Topology = catalog.Topology.Clone()
-	nodes := make(map[string]int, len(catalog.Nodes))
+	nodes := make([]CatalogNode, len(catalog.Nodes))
 	for i := range catalog.Nodes {
-		if _, exists := nodes[catalog.Nodes[i].Key.Identifier]; exists {
+		nodes[i] = catalog.Nodes[i].Clone()
+	}
+	catalog.Nodes = nodes
+	catalog.Topology = catalog.Topology.Clone()
+	nodeIndexes := make(map[string]int, len(catalog.Nodes))
+	for i := range catalog.Nodes {
+		if _, exists := nodeIndexes[catalog.Nodes[i].Key.Identifier]; exists {
 			return SourceCatalog{}, &FieldError{Field: "topology.nodes", Message: "duplicate business node"}
 		}
-		nodes[catalog.Nodes[i].Key.Identifier] = i
+		nodeIndexes[catalog.Nodes[i].Key.Identifier] = i
 		if catalog.Nodes[i].Retired {
 			continue
 		}
@@ -199,7 +203,7 @@ func AssignCatalogGroups(source Source, catalog SourceCatalog) (SourceCatalog, e
 		}
 		ports[port.PortID] = struct{}{}
 		for _, commandID := range []string{port.SendNodeID, port.SendMethodID} {
-			i, exists := nodes[commandID]
+			i, exists := nodeIndexes[commandID]
 			if !exists {
 				return SourceCatalog{}, &FieldError{Field: "topology.commands", Message: "missing command " + commandID}
 			}
@@ -231,7 +235,7 @@ func AssignCatalogGroups(source Source, catalog SourceCatalog) (SourceCatalog, e
 					return SourceCatalog{}, &FieldError{Field: "topology.node_ids", Message: "duplicate point ownership"}
 				}
 				owners[identifier] = owner
-				i, exists := nodes[identifier]
+				i, exists := nodeIndexes[identifier]
 				if !exists {
 					return SourceCatalog{}, &FieldError{Field: "topology.node_ids", Message: "unknown point " + identifier}
 				}
@@ -244,7 +248,7 @@ func AssignCatalogGroups(source Source, catalog SourceCatalog) (SourceCatalog, e
 		}
 	}
 	for _, calculation := range catalog.Topology.Calculations {
-		i, exists := nodes[calculation.NodeID]
+		i, exists := nodeIndexes[calculation.NodeID]
 		if !exists {
 			return SourceCatalog{}, &FieldError{Field: "topology.calculations", Message: "unknown calculation " + calculation.NodeID}
 		}

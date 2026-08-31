@@ -43,19 +43,22 @@ type UpstreamServer struct {
 	backend UpstreamBackend
 	server  *awserver.Server
 
-	mu                sync.RWMutex
-	business          map[string]*businessEntry
-	management        map[string]awserver.Node
-	managementGroups  map[string]awserver.Node
-	managementSources map[string]awserver.Node
-	groupNodeIDs      map[string][]awu.NodeID
-	businessNS        uint16
-	managementNS      uint16
-	devicesID         awu.NodeID
-	methodsID         awu.NodeID
-	managerRootID     awu.NodeID
-	groupsRootID      awu.NodeID
-	sourcesRootID     awu.NodeID
+	mu                 sync.RWMutex
+	business           map[string]*businessEntry
+	management         map[string]awserver.Node
+	managementGroups   map[string]awserver.Node
+	managementSources  map[string]awserver.Node
+	memberTreeHashes   map[string]string
+	memberTreeNodeIDs  map[string]map[string]awu.NodeID
+	memberTreeValueIDs map[string][]awu.NodeID
+	groupNodeIDs       map[string][]awu.NodeID
+	businessNS         uint16
+	managementNS       uint16
+	devicesID          awu.NodeID
+	methodsID          awu.NodeID
+	managerRootID      awu.NodeID
+	groupsRootID       awu.NodeID
+	sourcesRootID      awu.NodeID
 }
 
 type upstreamCatalogPlan struct {
@@ -98,11 +101,14 @@ func NewUpstreamServer(cfg UpstreamConfig, backend UpstreamBackend) (*UpstreamSe
 	}
 	adapter := &UpstreamServer{
 		cfg: cfg, backend: backend,
-		business:          make(map[string]*businessEntry),
-		management:        make(map[string]awserver.Node),
-		managementGroups:  make(map[string]awserver.Node),
-		managementSources: make(map[string]awserver.Node),
-		groupNodeIDs:      make(map[string][]awu.NodeID),
+		business:           make(map[string]*businessEntry),
+		management:         make(map[string]awserver.Node),
+		managementGroups:   make(map[string]awserver.Node),
+		managementSources:  make(map[string]awserver.Node),
+		memberTreeHashes:   make(map[string]string),
+		memberTreeNodeIDs:  make(map[string]map[string]awu.NodeID),
+		memberTreeValueIDs: make(map[string][]awu.NodeID),
+		groupNodeIDs:       make(map[string][]awu.NodeID),
 	}
 	opts := []awserver.Option{
 		awserver.WithMaxSessionCount(cfg.MaxSessions),
@@ -215,7 +221,7 @@ func (s *UpstreamServer) ReconcileCatalog(catalog domain.CatalogUnion, groups []
 		s.business[identifier] = entry
 	}
 
-	if err := s.reconcileManagementLocked(groups, sources); err != nil {
+	if err := s.reconcileManagementLocked(catalog, groups, sources); err != nil {
 		return err
 	}
 	s.groupNodeIDs = make(map[string][]awu.NodeID, len(catalog.Groups))
@@ -228,6 +234,9 @@ func (s *UpstreamServer) ReconcileCatalog(catalog domain.CatalogUnion, groups []
 		for _, name := range []string{"SelectedSourceId", "SelectionRevision", "Send"} {
 			s.groupNodeIDs[group.ID] = append(s.groupNodeIDs[group.ID], awu.NewNodeIDString(s.managementNS, "Groups/"+group.ID+"/"+name))
 		}
+	}
+	for _, group := range groups {
+		s.groupNodeIDs[group.ID] = append(s.groupNodeIDs[group.ID], s.memberTreeValueIDs[group.ID]...)
 	}
 	// A legacy command variable is shared by the devices on its physical port.
 	// Its ACK view can become ambiguous when any of those device routes changes.

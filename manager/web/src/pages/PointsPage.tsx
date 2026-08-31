@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Download, RefreshCw, Search } from 'lucide-react';
 import { useSearchParams } from 'react-router-dom';
 import { queryString } from '../api/client';
-import { useGroups, usePoints, useSessions, useSources, useSourceTopology } from '../api/queries';
+import { useGroups, usePointComparison, usePoints, useSessions, useSources, useSourceTopology } from '../api/queries';
 import type { ListParams, Point } from '../api/types';
 import { EmptyState, ErrorState, LoadingState } from '../components/PageState';
 import { PageHeader } from '../components/PageHeader';
@@ -37,7 +37,11 @@ export default function PointsPage() {
   const ports = topologyQuery.data?.ports ?? [];
   const devices = ports.find((port) => port.portId === portId)?.devices ?? [];
   const groupSources = useMemo(() => (sourcesQuery.data ?? []).filter((source) => !groupId || sourceHasGroup(source, groupId)), [groupId, sourcesQuery.data]);
-  const routeReady = view === 'default' || (view === 'session' && Boolean(sessionId)) || (view === 'source' && Boolean(groupId && routeSourceId));
+  const selectedSession = sessionsQuery.data?.find((session) => session.id === sessionId);
+  const sessionRequested = !compare && view === 'session' && Boolean(sessionId);
+  const sessionEnded = sessionRequested && sessionsQuery.isSuccess && !selectedSession;
+  const routeReady = view === 'default' || (view === 'session' && Boolean(selectedSession)) || (view === 'source' && Boolean(groupId && routeSourceId));
+  const comparisonConfigured = Boolean(groupId && leftSourceId && rightSourceId);
 
   const routeParams: ListParams = {
     page, pageSize: PAGE_SIZE, query, groupId, sourceId: catalogSourceId, portId, deviceId, status: quality,
@@ -50,10 +54,10 @@ export default function PointsPage() {
   // an existing point look missing on one side.
   const leftParams: ListParams = { page, pageSize: PAGE_SIZE, query, groupId, sourceId: catalogSourceId, portId, deviceId, routeSourceId: leftSourceId };
   const rightParams: ListParams = { page, pageSize: PAGE_SIZE, query, groupId, sourceId: catalogSourceId, portId, deviceId, routeSourceId: rightSourceId };
-  const leftQuery = usePoints(leftParams, compare && Boolean(groupId && leftSourceId));
-  const rightQuery = usePoints(rightParams, compare && Boolean(groupId && rightSourceId));
+  const comparisonQuery = usePointComparison(leftParams, rightParams, compare && comparisonConfigured);
   const points = pointsQuery.data?.items ?? [];
-  const comparison = useMemo(() => joinComparison(leftQuery.data?.items ?? [], rightQuery.data?.items ?? []), [leftQuery.data?.items, rightQuery.data?.items]);
+  const comparisonData = comparisonQuery.data;
+  const comparison = useMemo(() => comparisonData ? joinComparison(comparisonData.left.items, comparisonData.right.items) : [], [comparisonData]);
 
   useEffect(() => setDraftQuery(query), [query]);
 
@@ -66,10 +70,14 @@ export default function PointsPage() {
     setSearchParams(params);
   };
 
-  const loading = compare ? !comparisonReady(leftQuery.data, rightQuery.data) || leftQuery.isLoading || rightQuery.isLoading : pointsQuery.isLoading;
-  const error = compare ? leftQuery.error ?? rightQuery.error : pointsQuery.error;
-  const activeData = compare ? (leftQuery.data && rightQuery.data ? leftQuery.data : undefined) : pointsQuery.data;
+  const loading = compare ? comparisonQuery.isPending : pointsQuery.isPending;
+  const error = compare ? comparisonQuery.error : pointsQuery.error;
+  const activeData = compare ? comparisonData?.left : pointsQuery.data;
   const exportParams = compare ? leftParams : routeParams;
+  const refreshPoints = () => {
+    if (compare && comparisonConfigured) void comparisonQuery.refetch();
+    else if (!compare && routeReady) void pointsQuery.refetch();
+  };
 
   return (
     <div className="page">
@@ -82,7 +90,7 @@ export default function PointsPage() {
         <label className="field inline-field"><span>设备</span><select value={deviceId} disabled={!portId} onChange={(event) => updateParams({ device: event.target.value, page: 1 })}><option value="">全部设备</option>{deviceId && !devices.some((device) => device.deviceId === deviceId) ? <option value={deviceId}>{deviceId}（未发现）</option> : null}{devices.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.name || '设备'} · 地址 {device.deviceAddress}</option>)}</select></label>
         <label className="field inline-field"><span>质量</span><select value={compare ? '' : quality} disabled={compare} title={compare ? '双来源对比必须按同一并集目录分页' : undefined} onChange={(event) => updateParams({ quality: event.target.value, page: 1 })}><option value="">全部质量</option><option value="Good">正常</option><option value="Bad">异常</option></select></label>
         <label className="comparison-toggle"><input type="checkbox" checked={compare} onChange={(event) => updateParams({ compare: event.target.checked ? '1' : '', quality: event.target.checked ? '' : quality, page: 1 })} /><span>双来源对比</span></label>
-        <button className="button button-secondary" type="button" onClick={() => void (compare ? Promise.all([leftQuery.refetch(), rightQuery.refetch()]) : pointsQuery.refetch())}><RefreshCw aria-hidden="true" size={16} />刷新</button>
+        <button className="button button-secondary" type="button" disabled={compare ? !comparisonConfigured : !routeReady} onClick={refreshPoints}><RefreshCw aria-hidden="true" size={16} />刷新</button>
       </form>
       {catalogSourceId && topologyQuery.error ? <div className="form-error" role="alert">无法加载此来源的串口 / 设备选项，点位查询仍按当前筛选执行。<button className="table-link" type="button" onClick={() => void topologyQuery.refetch()}>重试拓扑</button></div> : null}
       {portId ? <p className="point-topology-hint">目录按 {catalogSourceId} 的串口 / 设备过滤；样本仍按下面指定的路由读取。不同下级的实际串口名可以不同。</p> : null}
@@ -96,15 +104,15 @@ export default function PointsPage() {
       </div> : <div className="route-view-toolbar">
         <strong>样本路由</strong>
         <label className="field inline-field"><span>查看方式</span><select value={view} onChange={(event) => updateParams({ view: event.target.value === 'default' ? '' : event.target.value, page: 1 })}><option value="default">当前默认源</option><option value="session">指定在线 Session</option><option value="source">指定来源（诊断）</option></select></label>
-        {view === 'session' ? <label className="field inline-field route-picker"><span>Session</span><select value={sessionId} onChange={(event) => updateParams({ session: event.target.value, page: 1 })}><option value="">选择 Session</option>{(sessionsQuery.data ?? []).map((session) => <option key={session.id} value={session.id}>{session.clientName || '匿名客户端'} · {shortSessionId(session.id)}</option>)}</select></label> : null}
+        {view === 'session' ? <label className="field inline-field route-picker"><span>Session</span><select value={sessionId} onChange={(event) => updateParams({ session: event.target.value, page: 1 })}><option value="">选择 Session</option>{sessionEnded ? <option value={sessionId}>{shortSessionId(sessionId)}（已结束）</option> : null}{(sessionsQuery.data ?? []).map((session) => <option key={session.id} value={session.id}>{session.clientName || '匿名客户端'} · {shortSessionId(session.id)}</option>)}</select></label> : null}
         {view === 'source' ? <label className="field inline-field route-picker"><span>来源</span><select value={routeSourceId} onChange={(event) => updateParams({ source: event.target.value, page: 1 })}><option value="">选择来源</option>{groupSources.map((source) => <option key={source.id} value={source.id}>{source.name || source.id}</option>)}</select></label> : null}
         <span className="route-view-hint">{view === 'default' ? '显示每个分组当前默认源的数据' : view === 'session' ? '忠实显示该上级 Session 实际读取的路由' : '不修改任何选源，仅用于检查指定下级数据'}</span>
       </div>}
 
       <section className="table-panel content-panel">
-        {compare && (!groupId || !leftSourceId || !rightSourceId) ? <EmptyState title="选择两个来源开始比较" description="对比限定在同一分组，不会修改默认源或任何在线 Session。" /> : !compare && !routeReady ? <EmptyState title={view === 'session' ? '请选择在线 Session' : '请选择分组和来源'} description="选择只用于查看，不会修改默认源或任何 Session 路由。" /> : loading && !activeData ? <LoadingState /> : error ? <ErrorState error={error} onRetry={() => void (compare ? Promise.all([leftQuery.refetch(), rightQuery.refetch()]) : pointsQuery.refetch())} /> : compare ? (
+        {compare && !comparisonConfigured ? <EmptyState title="选择两个来源开始比较" description="对比限定在同一分组，不会修改默认源或任何在线 Session。" /> : sessionRequested && sessionsQuery.isPending ? <LoadingState label="正在核对目标 Session…" /> : sessionRequested && sessionsQuery.error ? <ErrorState error={sessionsQuery.error} onRetry={() => void sessionsQuery.refetch()} /> : sessionEnded ? <EmptyState title="目标 Session 已结束" description="原会话的旧点值已停止展示。请显式选择其他在线 Session；不会自动更换查看目标或回退到默认源。" /> : !compare && !routeReady ? <EmptyState title={view === 'session' ? '请选择在线 Session' : '请选择分组和来源'} description="选择只用于查看，不会修改默认源或任何 Session 路由。" /> : error ? <ErrorState error={error} onRetry={refreshPoints} /> : loading ? <LoadingState label={compare ? '正在加载同一查询的双来源点位…' : undefined} /> : compare ? (
           comparison.length === 0 ? <EmptyState title="没有匹配的点位" description="请调整搜索、目录成员或质量条件。" /> : <>
-            <div className={`table-scroll${leftQuery.isFetching || rightQuery.isFetching ? ' is-refreshing' : ''}`}>
+            <div className={`table-scroll${comparisonQuery.isFetching ? ' is-refreshing' : ''}`}>
               <table className="data-table comparison-table"><thead><tr><th>Node ID / 类型</th><th>{leftSourceId} 当前值</th><th>{leftSourceId} 质量 / 时间</th><th>{rightSourceId} 当前值</th><th>{rightSourceId} 质量 / 时间</th><th>比较</th></tr></thead><tbody>{comparison.map(({ left, right }) => {
                 const point = left ?? right!;
                 const different = !samePointValue(left, right);
@@ -151,10 +159,6 @@ export default function PointsPage() {
       </section>
     </div>
   );
-}
-
-export function comparisonReady(left: unknown, right: unknown): boolean {
-  return left !== undefined && right !== undefined;
 }
 
 function joinComparison(left: Point[], right: Point[]): Array<{ left?: Point; right?: Point }> {

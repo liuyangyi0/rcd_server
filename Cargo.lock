@@ -1354,6 +1354,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serialport",
+ "sha2",
  "tempfile",
  "thiserror 1.0.61",
  "tokio",

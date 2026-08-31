@@ -22,6 +22,7 @@ import (
 type observedNode struct {
 	key      domain.NodeKey
 	dataType domain.DataType
+	command  bool
 }
 
 type observedVersion struct {
@@ -33,15 +34,17 @@ type LowerSupervisor struct {
 	cfg  LowerConfig
 	sink LowerSink
 
-	mu         sync.RWMutex
-	runContext context.Context
-	client     *gopcua.Client
-	namespaces map[string]uint16
-	nodes      map[string]observedNode
-	versions   map[string]observedVersion
-	status     LowerStatus
-	running    atomic.Bool
-	epoch      atomic.Uint64
+	mu             sync.RWMutex
+	runContext     context.Context
+	client         *gopcua.Client
+	namespaces     map[string]uint16
+	nodes          map[string]observedNode
+	versions       map[string]observedVersion
+	status         LowerStatus
+	running        atomic.Bool
+	epoch          atomic.Uint64
+	commandMu      sync.Mutex
+	operationCalls atomic.Int32
 
 	lastStatusEmit atomic.Int64
 	rng            *rand.Rand
@@ -226,6 +229,13 @@ func (s *LowerSupervisor) runConnection(parent context.Context, epoch uint64) er
 		}
 		return fmt.Errorf("discover source %s: %w", s.cfg.Source.ID, err)
 	}
+	// Monitored-item callbacks can run between creation batches. Clear a
+	// previous topology conflict before publishing the recovered catalog so
+	// initial data cannot report that obsolete conflict back to the runtime.
+	s.mu.Lock()
+	s.status.Catalog = domain.CatalogReady
+	s.status.LastError = ""
+	s.mu.Unlock()
 	s.sink.OnCatalog(catalog)
 
 	runCtx, cancelRun := context.WithCancel(parent)
@@ -482,7 +492,7 @@ func (s *LowerSupervisor) subscribeBatches(
 		if !ok || s.epoch.Load() != epoch {
 			return
 		}
-		s.emitObservedSample(msg.NodeID.String(), observed.key, observed.dataType, msg.DataValue, epoch)
+		s.emitMonitoredSample(msg.NodeID.String(), observed, msg.DataValue, epoch)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("subscribe: %w", err)
@@ -623,7 +633,7 @@ func (s *LowerSupervisor) pollCommandAck(ctx context.Context, client opcValueRea
 				continue
 			}
 			lastTimestamp = value.ServerTimestamp
-			s.emitObservedSample(nodeID.String(), key, dataType, value, epoch)
+			s.emitCommandSample(nodeID.String(), key, dataType, value, epoch)
 			if ack == "1" || ack == "3" {
 				return
 			}
@@ -631,7 +641,32 @@ func (s *LowerSupervisor) pollCommandAck(ctx context.Context, client opcValueRea
 	}
 }
 
-func (s *LowerSupervisor) emitObservedSample(nodeID string, key domain.NodeKey, dataType domain.DataType, value *gu.DataValue, epoch uint64) bool {
+func (s *LowerSupervisor) emitObservedSample(_ string, key domain.NodeKey, dataType domain.DataType, value *gu.DataValue, epoch uint64) bool {
+	if value == nil || s.epoch.Load() != epoch {
+		return false
+	}
+	// A downstream wall clock is not a sequence number. Ordinary values and
+	// quality transitions remain valid at equal or decreasing timestamps.
+	s.sink.OnSample(s.cfg.Source.ID, key, sampleFromGopcua(value, dataType, epoch))
+	s.touchLastData(epoch)
+	return true
+}
+
+func (s *LowerSupervisor) emitMonitoredSample(nodeID string, node observedNode, value *gu.DataValue, epoch uint64) bool {
+	if node.command {
+		return s.emitCommandSample(nodeID, node.key, node.dataType, value, epoch)
+	}
+	return s.emitObservedSample(nodeID, node.key, node.dataType, value, epoch)
+}
+
+func (s *LowerSupervisor) emitCommandSample(nodeID string, key domain.NodeKey, dataType domain.DataType, value *gu.DataValue, epoch uint64) bool {
+	// Only actual writable command variables merge subscription notifications
+	// with ACK probe reads. Retain their timestamp guard so an old terminal ACK
+	// cannot be replayed after a newer Waiting/terminal notification. Serialize
+	// delivery as well as the version check to prevent the two paths overtaking
+	// each other after accepting their versions.
+	s.commandMu.Lock()
+	defer s.commandMu.Unlock()
 	if value == nil || s.epoch.Load() != epoch {
 		return false
 	}
@@ -647,9 +682,7 @@ func (s *LowerSupervisor) emitObservedSample(nodeID string, key domain.NodeKey, 
 	}
 	s.versions[nodeID] = observedVersion{epoch: epoch, timestamp: timestamp}
 	s.mu.Unlock()
-	s.sink.OnSample(s.cfg.Source.ID, key, sampleFromGopcua(value, dataType, epoch))
-	s.touchLastData()
-	return true
+	return s.emitObservedSample(nodeID, key, dataType, value, epoch)
 }
 
 func (s *LowerSupervisor) Call(ctx context.Context, key domain.NodeKey, hexData string) (string, domain.StatusCode, error) {
@@ -736,9 +769,16 @@ func (s *LowerSupervisor) setDisconnected(message string) {
 	})
 }
 
-func (s *LowerSupervisor) touchLastData() {
+func (s *LowerSupervisor) touchLastData(epoch uint64) {
 	now := time.Now().UTC()
 	s.mu.Lock()
+	// OnSample can finish after its connection was replaced (for example
+	// while a command audit was being persisted). Do not relabel that old
+	// callback as current-epoch data or emit the new connection's status.
+	if s.epoch.Load() != epoch || s.status.Epoch != epoch {
+		s.mu.Unlock()
+		return
+	}
 	s.status.LastDataAt = now
 	s.status.UpdatedAt = now
 	status := s.status

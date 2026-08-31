@@ -33,6 +33,13 @@ func TestAssignCatalogGroupsKeepsOnePhysicalSourceWithMultipleGroups(t *testing.
 	if err != nil || len(union.Groups["one"]) != 2 || len(union.Groups["two"]) != 1 {
 		t.Fatalf("union=%#v err=%v", union, err)
 	}
+	if union.SourceTopologies["source"] == nil || union.SourceTopologies["source"].Ports[0].Devices[0].NodeIDs[0] != "P1" {
+		t.Fatalf("source topology missing from union: %#v", union.SourceTopologies)
+	}
+	union.SourceTopologies["source"].Ports[0].Devices[0].NodeIDs[0] = "union-mutated"
+	if assigned.Topology.Ports[0].Devices[0].NodeIDs[0] != "P1" {
+		t.Fatal("catalog union aliases the source topology")
+	}
 	assigned.Topology.Ports[0].Devices[0].NodeIDs[0] = "mutated"
 	if catalog.Topology.Ports[0].Devices[0].NodeIDs[0] != "P1" {
 		t.Fatal("topology clone shares node slice")

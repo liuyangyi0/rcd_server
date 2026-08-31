@@ -165,7 +165,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--monitor-serial", help="peer serial port used to read bytes and send ACK")
     parser.add_argument("--baud", type=int, default=28800)
     parser.add_argument("--hex", default="010602", help="command body without checksum")
-    parser.add_argument("--endpoint", default="opc.tcp://127.0.0.1:4840/")
+    parser.add_argument("--endpoint", default="opc.tcp://127.0.0.1:4841/")
     parser.add_argument("--startup-timeout", type=float, default=20.0)
     parser.add_argument("--serial-timeout", type=float, default=5.0)
     parser.add_argument("--server-timeout-ms", type=int, default=1000)

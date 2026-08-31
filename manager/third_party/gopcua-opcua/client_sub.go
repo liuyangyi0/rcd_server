@@ -1,0 +1,707 @@
+package opcua
+
+import (
+	"context"
+	"io"
+	"log"
+	"slices"
+	"time"
+
+	"github.com/gopcua/opcua/debug"
+	"github.com/gopcua/opcua/errors"
+	"github.com/gopcua/opcua/stats"
+	"github.com/gopcua/opcua/ua"
+	"github.com/gopcua/opcua/uasc"
+)
+
+// Subscribe creates a Subscription with given parameters.
+// Parameters that have not been set are set to their default values.
+// See opcua.DefaultSubscription* constants
+func (c *Client) Subscribe(ctx context.Context, params *SubscriptionParameters, notifyCh chan<- *PublishNotificationData) (*Subscription, error) {
+	stats.Client().Add("Subscribe", 1)
+
+	if params == nil {
+		params = &SubscriptionParameters{}
+	}
+
+	params.setDefaults()
+	req := &ua.CreateSubscriptionRequest{
+		RequestedPublishingInterval: float64(params.Interval / time.Millisecond),
+		RequestedLifetimeCount:      params.LifetimeCount,
+		RequestedMaxKeepAliveCount:  params.MaxKeepAliveCount,
+		PublishingEnabled:           true,
+		MaxNotificationsPerPublish:  params.MaxNotificationsPerPublish,
+		Priority:                    params.Priority,
+	}
+
+	var res *ua.CreateSubscriptionResponse
+	err := c.Send(ctx, req, func(v ua.Response) error {
+		return safeAssign(v, &res)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if res.ResponseHeader.ServiceResult != ua.StatusOK {
+		return nil, res.ResponseHeader.ServiceResult
+	}
+
+	stats.Subscription().Add("Count", 1)
+
+	sub := &Subscription{
+		SubscriptionID:            res.SubscriptionID,
+		RevisedPublishingInterval: time.Duration(res.RevisedPublishingInterval) * time.Millisecond,
+		RevisedLifetimeCount:      res.RevisedLifetimeCount,
+		RevisedMaxKeepAliveCount:  res.RevisedMaxKeepAliveCount,
+		Notifs:                    notifyCh,
+		items:                     make(map[uint32]*monitoredItem),
+		params:                    params,
+		nextSeq:                   1,
+		c:                         c,
+	}
+
+	c.subMux.Lock()
+
+	if sub.SubscriptionID == 0 || c.subs[sub.SubscriptionID] != nil {
+		// this should not happen and is usually indicative of a server bug
+		// see: Part 4 Section 5.13.2.2, Table 88 – CreateSubscription Service Parameters
+		c.subMux.Unlock()
+		return nil, ua.StatusBadSubscriptionIDInvalid
+	}
+
+	c.subs[sub.SubscriptionID] = sub
+	c.updatePublishTimeout_NeedsSubMuxLock()
+	c.subMux.Unlock()
+	// Register before waking Publish so its first response has an owner.
+	c.resumeSubscriptions(ctx)
+	return sub, nil
+}
+
+// SubscriptionIDs gets a list of subscriptionIDs
+func (c *Client) SubscriptionIDs() []uint32 {
+	c.subMux.RLock()
+	defer c.subMux.RUnlock()
+
+	var ids []uint32
+	for id := range c.subs {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// recreateSubscriptions creates new subscriptions
+// with the same parameters to replace the previous one
+func (c *Client) recreateSubscription(ctx context.Context, id uint32) error {
+	c.subMux.Lock()
+	defer c.subMux.Unlock()
+
+	sub, ok := c.subs[id]
+	if !ok {
+		return ua.StatusBadSubscriptionIDInvalid
+	}
+
+	sub.recreate_delete(ctx)
+
+	// the subscription stays registered under its old id until the replacement
+	// exists, so that a failed create leaves it for the reconnect loop to retry
+	// instead of dropping it. recreate_create only assigns the new id on
+	// success, so the old id is still the key to forget here.
+	if err := sub.recreate_create(ctx); err != nil {
+		return err
+	}
+	c.forgetSubscription_NeedsSubMuxLock(ctx, id)
+
+	if err := c.registerSubscription_NeedsSubMuxLock(sub); err != nil {
+		return err
+	}
+
+	return sub.recreate_monitoredItems(ctx)
+}
+
+// republishOrRecreateSubscriptions performs the restoreSubscriptions step of
+// the reconnect state machine. It replays subscriptions preserved by Session
+// reactivation or transfer, and recreates subscriptions which no longer exist
+// or whose server does not implement Republish. Other failures require another
+// channel/Session recovery attempt, not deletion of a healthy subscription.
+//
+// It returns the next reconnect action and the number of subscriptions which
+// are active again.
+//
+// The next action is none when every subscription was restored. If at least
+// one subscription could not be recreated the next action is recreateSession
+// so that the reconnect loop rebuilds the session and tries again instead of
+// leaving the client connected with a subscription that is gone.
+func (c *Client) republishOrRecreateSubscriptions(ctx context.Context, subsToRepublish, subsToRecreate []uint32, availableSeqs map[uint32][]uint32) (reconnectAction, int) {
+	dlog := debug.NewPrefixLogger("client: restoreSubscriptions: ")
+	// A disconnected Publish can still be unwinding. Wait for it before
+	// replaying, so it cannot overwrite the restored sequence/ACK state.
+	c.publishMu.Lock()
+	defer c.publishMu.Unlock()
+
+	action, activeSubs := none, 0
+
+	for _, subID := range subsToRepublish {
+		if err := c.republishSubscription(ctx, subID, availableSeqs[subID]); err != nil {
+			dlog.Printf("republish of subscription %d failed: %v", subID, err)
+			c.subMux.RLock()
+			_, stillRegistered := c.subs[subID]
+			c.subMux.RUnlock()
+			if !stillRegistered {
+				continue // explicitly cancelled while recovery was in flight
+			}
+			switch {
+			case errors.Is(err, ua.StatusBadSessionIDInvalid), errors.Is(err, ua.StatusBadSessionClosed):
+				return recreateSession, activeSubs
+			case errors.Is(err, ua.StatusBadSubscriptionIDInvalid), errors.Is(err, ua.StatusBadServiceUnsupported), errors.Is(err, ua.StatusBadNotImplemented):
+				subsToRecreate = append(subsToRecreate, subID)
+			default:
+				// A timeout, broken transport or malformed response gives no
+				// evidence that the Subscription was deleted on the server.
+				return createSecureChannel, activeSubs
+			}
+			continue
+		}
+		activeSubs++
+	}
+
+	for _, subID := range subsToRecreate {
+		if err := c.recreateSubscription(ctx, subID); err != nil {
+			dlog.Printf("recreate subscription %d failed: %v", subID, err)
+			action = recreateSession
+			continue
+		}
+		activeSubs++
+	}
+
+	return action, activeSubs
+}
+
+// transferSubscriptions ask the server to transfer the given subscriptions
+// of the previous session to the current one.
+func (c *Client) transferSubscriptions(ctx context.Context, ids []uint32) (*ua.TransferSubscriptionsResponse, error) {
+	req := &ua.TransferSubscriptionsRequest{
+		SubscriptionIDs:   ids,
+		SendInitialValues: false,
+	}
+
+	var res *ua.TransferSubscriptionsResponse
+	err := c.Send(ctx, req, func(v ua.Response) error {
+		return safeAssign(v, &res)
+	})
+	return res, err
+}
+
+// Only an explicit invalid/closed Session proves that its identity is gone.
+// A timeout, lost ActivateSession response, or inactive Session must first be
+// retried on a new channel with the same authentication token.
+func sessionRecoveryAction(err error) reconnectAction {
+	if errors.Is(err, ua.StatusBadSessionIDInvalid) || errors.Is(err, ua.StatusBadSessionClosed) {
+		return recreateSession
+	}
+	return createSecureChannel
+}
+
+// planSubscriptionTransfer never infers deletion from a lost or malformed
+// response. Repeating a successful transfer whose response was lost returns
+// BadNothingToDo: the subscription already belongs to this Session (Part 4,
+// 5.14.7). In that case replay using the existing cursor, not a new subscription.
+func planSubscriptionTransfer(ids []uint32, res *ua.TransferSubscriptionsResponse, err error) (reconnectAction, []uint32, []uint32, map[uint32][]uint32) {
+	if len(ids) == 0 {
+		return restoreSubscriptions, nil, nil, nil
+	}
+	if err == nil {
+		if res == nil || res.ResponseHeader == nil {
+			err = ua.StatusBadDecodingError
+		} else if res.ResponseHeader.ServiceResult != ua.StatusOK {
+			err = res.ResponseHeader.ServiceResult
+		}
+	}
+	if err != nil {
+		if errors.Is(err, ua.StatusBadServiceUnsupported) || errors.Is(err, ua.StatusBadNotImplemented) {
+			return restoreSubscriptions, nil, ids, nil
+		}
+		return sessionRecoveryAction(err), nil, nil, nil
+	}
+	if len(res.Results) != len(ids) {
+		return createSecureChannel, nil, nil, nil
+	}
+	var replay, recreate []uint32
+	available := make(map[uint32][]uint32, len(ids))
+	for i, result := range res.Results {
+		if result == nil {
+			return createSecureChannel, nil, nil, nil
+		}
+		switch result.StatusCode {
+		case ua.StatusOK:
+			replay = append(replay, ids[i])
+			available[ids[i]] = result.AvailableSequenceNumbers
+		case ua.StatusBadNothingToDo:
+			replay = append(replay, ids[i])
+		case ua.StatusBadSubscriptionIDInvalid:
+			recreate = append(recreate, ids[i])
+		default:
+			return sessionRecoveryAction(result.StatusCode), nil, nil, nil
+		}
+	}
+	return restoreSubscriptions, replay, recreate, available
+}
+
+// republishSubscriptions sends republish requests for the given subscription id.
+func (c *Client) republishSubscription(ctx context.Context, id uint32, availableSeq []uint32) error {
+	c.subMux.RLock()
+	sub := c.subs[id]
+	c.subMux.RUnlock()
+
+	if sub == nil {
+		return errors.Errorf("invalid subscription id %d", id)
+	}
+
+	debug.Printf("republishing subscription %d", sub.SubscriptionID)
+	return c.sendRepublishRequests(ctx, sub, availableSeq)
+}
+
+// sendRepublishRequests sends republish requests for the given subscription
+// until it gets a BadMessageNotAvailable which implies that there are no
+// more messages to restore.
+func (c *Client) sendRepublishRequests(ctx context.Context, sub *Subscription, availableSeq []uint32) error {
+	// todo(fs): check if sub.nextSeq is in the available sequence numbers
+	// todo(fs): if not then we need to decide whether we fail b/c of data loss
+	// todo(fs): or whether we log it and continue.
+	c.subMux.RLock()
+	nextSeq := sub.nextSeq
+	c.subMux.RUnlock()
+	if len(availableSeq) > 0 && !slices.Contains(availableSeq, nextSeq) {
+		log.Printf("sub %d: next sequence number %d not in retransmission buffer %v", sub.SubscriptionID, nextSeq, availableSeq)
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		req := &ua.RepublishRequest{
+			SubscriptionID:           sub.SubscriptionID,
+			RetransmitSequenceNumber: nextSeq,
+		}
+
+		debug.Printf("Republishing subscription %d and sequence number %d",
+			req.SubscriptionID,
+			req.RetransmitSequenceNumber,
+		)
+
+		debug.Printf("RepublishRequest: req=%s", debug.ToJSON(req))
+		var res *ua.RepublishResponse
+		err := sub.c.Send(ctx, req, func(v ua.Response) error {
+			return safeAssign(v, &res)
+		})
+		debug.Printf("RepublishResponse: res=%s err=%v", debug.ToJSON(res), err)
+
+		switch {
+		case errors.Is(err, ua.StatusBadMessageNotAvailable):
+			// No more message to restore
+			debug.Printf("Republishing subscription %d OK", req.SubscriptionID)
+			return nil
+
+		case err != nil:
+			debug.Printf("Republishing subscription %d failed: %v", req.SubscriptionID, err)
+			return err
+
+		default:
+			status := ua.StatusBad
+			if res != nil && res.ResponseHeader != nil {
+				status = res.ResponseHeader.ServiceResult
+			}
+
+			if status == ua.StatusBadMessageNotAvailable {
+				return nil
+			}
+			if status != ua.StatusOK {
+				debug.Printf("Republishing subscription %d failed: %v", req.SubscriptionID, status)
+				return status
+			}
+
+			// Republish may return only the requested data notification, not
+			// a keepalive or an unrelated sequence. Never loop forever on a
+			// malformed successful response or advance past an unreceived value.
+			notif := res.NotificationMessage
+			if notif == nil || notif.SequenceNumber != nextSeq || len(notif.NotificationData) == 0 {
+				return ua.StatusBadDecodingError
+			}
+			c.subMux.Lock()
+			if c.subs[sub.SubscriptionID] != sub {
+				c.subMux.Unlock()
+				return nil // cancelled while the request was in flight
+			}
+			c.handleNotification_NeedsSubMuxLock(sub, &ua.PublishResponse{
+				SubscriptionID: sub.SubscriptionID, NotificationMessage: notif,
+			})
+			nextSeq = sub.nextSeq
+			c.subMux.Unlock()
+			c.notifySubscription(ctx, sub, notif)
+			debug.Printf("Republished notification %d for subscription %d", notif.SequenceNumber, sub.SubscriptionID)
+
+			if len(availableSeq) > 0 && !slices.Contains(availableSeq, nextSeq) {
+				debug.Printf("Republishing subscription %d complete - no more sequences in buffer", sub.SubscriptionID)
+				return nil
+			}
+		}
+	}
+}
+
+// registerSubscription_NeedsSubMuxLock registers a subscription while subMux is held.
+func (c *Client) registerSubscription_NeedsSubMuxLock(sub *Subscription) error {
+	if sub.SubscriptionID == 0 {
+		return ua.StatusBadSubscriptionIDInvalid
+	}
+
+	if _, ok := c.subs[sub.SubscriptionID]; ok {
+		return errors.Errorf("SubscriptionID %d already registered", sub.SubscriptionID)
+	}
+
+	c.subs[sub.SubscriptionID] = sub
+	return nil
+}
+
+func (c *Client) ForgetSubscription(ctx context.Context, id uint32) {
+	c.subMux.Lock()
+	c.forgetSubscription_NeedsSubMuxLock(ctx, id)
+	c.subMux.Unlock()
+}
+
+func (c *Client) forgetSubscription_NeedsSubMuxLock(ctx context.Context, id uint32) {
+	delete(c.subs, id)
+	c.updatePublishTimeout_NeedsSubMuxLock()
+	stats.Subscription().Add("Count", -1)
+
+	if len(c.subs) == 0 {
+		// todo(fs): are we holding the lock too long here?
+		// todo(fs): consider running this as a go routine
+		c.pauseSubscriptions(ctx)
+	}
+}
+
+func (c *Client) updatePublishTimeout_NeedsSubMuxLock() {
+	maxTimeout := uasc.MaxTimeout
+	for _, s := range c.subs {
+		if d := s.publishTimeout(); d < maxTimeout {
+			maxTimeout = d
+		}
+	}
+	c.setPublishTimeout(maxTimeout)
+}
+
+func (c *Client) notifySubscriptionOfError(ctx context.Context, subID uint32, err error) {
+	c.subMux.RLock()
+	s := c.subs[subID]
+	c.subMux.RUnlock()
+
+	if s == nil {
+		return
+	}
+	go s.notify(ctx, &PublishNotificationData{Error: err})
+}
+
+func (c *Client) notifyAllSubscriptionsOfError(ctx context.Context, err error) {
+	c.subMux.RLock()
+	defer c.subMux.RUnlock()
+
+	for _, s := range c.subs {
+		go func(s *Subscription) {
+			s.notify(ctx, &PublishNotificationData{Error: err})
+		}(s)
+	}
+}
+
+func (c *Client) notifySubscription(ctx context.Context, sub *Subscription, notif *ua.NotificationMessage) {
+	// todo(fs): response.Results contains the status codes of which messages were
+	// todo(fs): were successfully removed from the transmission queue on the server.
+	// todo(fs): The client sent the list of ids in the *previous* PublishRequest.
+	// todo(fs): If we want to handle them then we probably need to keep track
+	// todo(fs): of the message ids we have ack'ed.
+	// todo(fs): see discussion in https://github.com/gopcua/opcua/issues/337
+
+	if notif == nil {
+		sub.notify(ctx, &PublishNotificationData{
+			SubscriptionID: sub.SubscriptionID,
+			Error:          errors.Errorf("empty NotificationMessage"),
+		})
+		return
+	}
+
+	// Part 4, 7.21 NotificationMessage
+	for _, data := range notif.NotificationData {
+		// Part 4, 7.20 NotificationData parameters
+		if data == nil || data.Value == nil {
+			sub.notify(ctx, &PublishNotificationData{
+				SubscriptionID: sub.SubscriptionID,
+				Error:          errors.Errorf("missing NotificationData parameter"),
+			})
+			continue
+		}
+
+		switch data.Value.(type) {
+		// Part 4, 7.20.2 DataChangeNotification parameter
+		// Part 4, 7.20.3 EventNotificationList parameter
+		// Part 4, 7.20.4 StatusChangeNotification parameter
+		case *ua.DataChangeNotification,
+			*ua.EventNotificationList,
+			*ua.StatusChangeNotification:
+			sub.notify(ctx, &PublishNotificationData{
+				SubscriptionID: sub.SubscriptionID,
+				Value:          data.Value,
+			})
+
+		// Error
+		default:
+			sub.notify(ctx, &PublishNotificationData{
+				SubscriptionID: sub.SubscriptionID,
+				Error:          errors.Errorf("unknown NotificationData parameter: %T", data.Value),
+			})
+		}
+	}
+}
+
+// pauseSubscriptions suspends the publish loop using its authoritative state.
+// It has no effect if the publish loop is already paused.
+func (c *Client) pauseSubscriptions(ctx context.Context) {
+	for {
+		state := c.publishState.Load()
+		if c.publishState.CompareAndSwap(state, (state+2)|1) {
+			return
+		}
+	}
+}
+
+// resumeSubscriptions restarts the publish loop by signalling the resumech.
+// It has no effect if the publish loop is not paused.
+func (c *Client) resumeSubscriptions(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	for {
+		state := c.publishState.Load()
+		if c.publishState.CompareAndSwap(state, (state+2)&^1) {
+			break
+		}
+	}
+	select {
+	case c.resumech <- struct{}{}:
+	default:
+	}
+}
+
+// monitorSubscriptions sends publish requests and handles publish responses
+// for all active subscriptions.
+func (c *Client) monitorSubscriptions(ctx context.Context) {
+	dlog := debug.NewPrefixLogger("sub: ")
+	defer dlog.Print("done")
+
+	for {
+		select {
+		case <-ctx.Done():
+			dlog.Println("ctx.Done()")
+			return
+
+		default:
+		}
+		state := c.publishState.Load()
+		if state&1 != 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-c.resumech:
+			}
+			continue
+		}
+		c.publishMu.Lock()
+		if state != c.publishState.Load() {
+			c.publishMu.Unlock()
+			continue
+		}
+		// publish() blocks until a response or cancellation. A concurrent
+		// pause/resume changes the generation, so a late error from this
+		// request cannot pause a successfully recovered loop.
+		if err := c.publish(ctx); err != nil {
+			dlog.Print("error: ", err.Error())
+			c.publishState.CompareAndSwap(state, state|1)
+		}
+		c.publishMu.Unlock()
+	}
+}
+
+// publish sends a publish request and handles the response.
+func (c *Client) publish(ctx context.Context) error {
+	dlog := debug.NewPrefixLogger("publish: ")
+
+	c.subMux.RLock()
+	dlog.Printf("pendingAcks=%s", debug.ToJSON(c.pendingAcks))
+	c.subMux.RUnlock()
+
+	// send the next publish request
+	// note that res contains data even if an error was returned
+	res, err := c.sendPublishRequest(ctx)
+	stats.RecordError(err)
+	switch {
+	case err == io.EOF:
+		dlog.Printf("eof: pausing publish loop")
+		return err
+
+	case err == ua.StatusBadSessionNotActivated:
+		dlog.Printf("error: session not active. pausing publish loop")
+		return err
+
+	case err == ua.StatusBadSessionIDInvalid:
+		dlog.Printf("error: session not valid. pausing publish loop")
+		return err
+
+	case err == ua.StatusBadServerNotConnected:
+		dlog.Printf("error: no connection. pausing publish loop")
+		return err
+
+	case err == ua.StatusBadSequenceNumberUnknown:
+		// todo(fs): this should only happen per in the status codes
+		// todo(fs): lets log this here to see
+		dlog.Printf("error: this should only happen when ACK'ing results: %s", err)
+
+	case err == ua.StatusBadTooManyPublishRequests:
+		// todo(fs): we have sent too many publish requests
+		// todo(fs): we need to slow down
+		dlog.Printf("error: sleeping for one second: %s", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+
+	case err == ua.StatusBadTimeout:
+		// ignore and continue the loop
+		dlog.Printf("error: ignoring: %s", err)
+
+	case err == ua.StatusBadNoSubscription:
+		// All subscriptions have been deleted, but the publishing loop is still running
+		// We should pause publishing until a subscription has been created
+		dlog.Printf("error: no subscriptions but the publishing loop is still running: %s", err)
+		return err
+
+	case err != nil && res != nil:
+		// irrecoverable error
+		// todo(fs): do we need to stop and forget the subscription?
+		if res.SubscriptionID == 0 {
+			c.notifyAllSubscriptionsOfError(ctx, err)
+		} else {
+			c.notifySubscriptionOfError(ctx, res.SubscriptionID, err)
+		}
+		dlog.Printf("error: %s", err)
+		return err
+
+	case err != nil:
+		dlog.Printf("error: unexpected error. Do we need to stop the publish loop?: %s", err)
+		return err
+
+	default:
+		c.subMux.Lock()
+		// handle pending acks for all subscriptions
+		c.handleAcks_NeedsSubMuxLock(res.Results)
+
+		sub, ok := c.subs[res.SubscriptionID]
+		if !ok {
+			c.subMux.Unlock()
+			// todo(fs): should we return an error here?
+			dlog.Printf("error: unknown subscription %d", res.SubscriptionID)
+			return nil
+		}
+
+		// handle the publish response for a specific subscription
+		c.handleNotification_NeedsSubMuxLock(sub, res)
+		c.subMux.Unlock()
+
+		c.notifySubscription(ctx, sub, res.NotificationMessage)
+		dlog.Printf("notif: %d", res.NotificationMessage.SequenceNumber)
+	}
+
+	return nil
+}
+
+func (c *Client) handleAcks_NeedsSubMuxLock(res []ua.StatusCode) {
+	dlog := debug.NewPrefixLogger("publish: ")
+
+	// we assume that the number of results in the response match
+	// the number of pending acks from the previous PublishRequest.
+	if len(c.pendingAcks) != len(res) {
+		dlog.Printf("error: got %d results for pending ACKs but want %d", len(res), len(c.pendingAcks))
+		c.pendingAcks = []*ua.SubscriptionAcknowledgement{}
+	}
+
+	// find the messages which we have received but which we have not acked.
+	var notAcked []*ua.SubscriptionAcknowledgement
+	for i, ack := range c.pendingAcks {
+		err := res[i]
+		switch err {
+		case ua.StatusOK:
+			// message ack'ed
+		case ua.StatusBadSubscriptionIDInvalid:
+			// old subscription id -> skip
+			dlog.Printf("error: subscription id invalid. skipping: %s", err)
+		case ua.StatusBadSequenceNumberUnknown:
+			// server does not have the message in its retransmission queue anymore
+			dlog.Printf("error: notif %d/%d not on server anymore: %s", ack.SubscriptionID, ack.SequenceNumber, err)
+		default:
+			// otherwise, we try to ack again
+			notAcked = append(notAcked, ack)
+			dlog.Printf("retrying to ACK notif %d/%d: %s", ack.SubscriptionID, ack.SequenceNumber, err)
+		}
+	}
+	c.pendingAcks = notAcked
+	dlog.Printf("notAcked=%v", notAcked)
+}
+
+func (c *Client) handleNotification_NeedsSubMuxLock(sub *Subscription, res *ua.PublishResponse) {
+	dlog := debug.NewPrefixLogger("publish: sub %d: ", res.SubscriptionID)
+
+	// keep-alive message
+	if len(res.NotificationMessage.NotificationData) == 0 {
+		// todo(fs): do we care about the next sequence number?
+		sub.nextSeq = res.NotificationMessage.SequenceNumber
+		return
+	}
+
+	if res.NotificationMessage.SequenceNumber != sub.nextSeq {
+		dlog.Printf("error: got notif %d but was expecting notif %d. Data loss?", res.NotificationMessage.SequenceNumber, sub.nextSeq)
+	}
+
+	sub.lastSeq = res.NotificationMessage.SequenceNumber
+	sub.nextSeq = nextNotificationSequence(sub.lastSeq)
+	c.pendingAcks = append(c.pendingAcks, &ua.SubscriptionAcknowledgement{
+		SubscriptionID: res.SubscriptionID,
+		SequenceNumber: res.NotificationMessage.SequenceNumber,
+	})
+}
+
+// Part 4: sequence zero is reserved; notification sequence numbers wrap to 1.
+func nextNotificationSequence(sequence uint32) uint32 {
+	sequence++
+	if sequence == 0 {
+		return 1
+	}
+	return sequence
+}
+
+func (c *Client) sendPublishRequest(ctx context.Context) (*ua.PublishResponse, error) {
+	dlog := debug.NewPrefixLogger("publish: ")
+
+	c.subMux.RLock()
+	req := &ua.PublishRequest{
+		SubscriptionAcknowledgements: c.pendingAcks,
+	}
+	if req.SubscriptionAcknowledgements == nil {
+		req.SubscriptionAcknowledgements = []*ua.SubscriptionAcknowledgement{}
+	}
+	c.subMux.RUnlock()
+
+	dlog.Printf("PublishRequest: %s", debug.ToJSON(req))
+	var res *ua.PublishResponse
+	err := c.sendWithTimeout(ctx, req, c.publishTimeout(), func(v ua.Response) error {
+		return safeAssign(v, &res)
+	})
+	stats.RecordError(err)
+	dlog.Printf("PublishResponse: %s", debug.ToJSON(res))
+	return res, err
+}

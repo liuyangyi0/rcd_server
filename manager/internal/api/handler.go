@@ -64,6 +64,8 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("POST /api/v1/sources/{id}/probe", h.probeSource)
 	h.mux.HandleFunc("POST /api/v1/sources/{id}/reconnect", h.reconnectSource)
 	h.mux.HandleFunc("POST /api/v1/sources/{id}/rediscover", h.rediscoverSource)
+	h.lowerOperationRoutes()
+	h.processControlRoutes()
 
 	h.mux.HandleFunc("GET /api/v1/sessions", h.listSessions)
 	h.mux.HandleFunc("PUT /api/v1/sessions/{session}/groups/{group}/selection", h.setSessionSelection)
@@ -614,6 +616,31 @@ func (h *Handler) respond(w http.ResponseWriter, value any, err error, success i
 }
 
 func mapError(err error) (int, string, any) {
+	var operation *domain.OperationError
+	if errors.As(err, &operation) {
+		status := http.StatusBadGateway
+		switch operation.Code {
+		case "invalid_request":
+			status = http.StatusUnprocessableEntity
+		case "not_found":
+			status = http.StatusNotFound
+		case "conflict", "busy":
+			status = http.StatusConflict
+		case "unsupported":
+			status = http.StatusNotImplemented
+		case "too_large":
+			status = http.StatusRequestEntityTooLarge
+		case "unavailable":
+			status = http.StatusServiceUnavailable
+		case "timeout":
+			status = http.StatusGatewayTimeout
+		}
+		var details any
+		if operation.CurrentRevision != "" {
+			details = map[string]string{"current_revision": operation.CurrentRevision}
+		}
+		return status, operation.Code, details
+	}
 	var revision *domain.RevisionConflictError
 	switch {
 	case errors.As(err, &revision):
@@ -638,6 +665,10 @@ func mapError(err error) (int, string, any) {
 }
 
 func publicMessage(err error, status int) string {
+	var operation *domain.OperationError
+	if errors.As(err, &operation) {
+		return operation.Message
+	}
 	if status >= 500 {
 		return "internal server error"
 	}

@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 use flexi_logger::{
     filter::{LogLineFilter, LogLineWriter},
@@ -19,6 +20,16 @@ const LOG_CONFIG_PATH_ENV: &str = "RCD_CONFIG";
 
 static SERIAL_FRAME_LOGS_ENABLED: AtomicBool = AtomicBool::new(false);
 static OPCUA_TRANSPORT_ERRORS_ENABLED: AtomicBool = AtomicBool::new(false);
+static STARTUP_LOG_LOCATION: OnceLock<(PathBuf, String)> = OnceLock::new();
+
+/// The destination selected when logging initialized, not a later config
+/// draft. RCD_CONFIG is deliberately scoped to logging, not business files.
+pub fn startup_log_location() -> Result<(PathBuf, String), std::io::Error> {
+    if let Some(location) = STARTUP_LOG_LOCATION.get() {
+        return Ok(location.clone());
+    }
+    Ok((log_dir(None)?, DEFAULT_LOG_BASENAME.into()))
+}
 
 /// 日志配置，对应 `config.toml` 的 `[logging]` 段。
 #[derive(Deserialize, Debug, Clone)]
@@ -93,6 +104,7 @@ pub fn init_with_config(config: LoggingConfig) -> Option<LoggerHandle> {
     };
 
     let duplicate = duplicate_to_stderr(&config);
+    let _ = STARTUP_LOG_LOCATION.set((log_dir.clone(), config.basename.clone()));
     let write_mode = write_mode_from(&config.write_mode);
 
     match Logger::try_with_env_or_str(config.level.as_str())

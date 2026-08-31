@@ -24,10 +24,17 @@ type CatalogConflictDetail struct {
 	Message    string              `json:"message"`
 }
 
+func (c CatalogConflictDetail) Clone() CatalogConflictDetail {
+	c.SourceIDs = append([]string(nil), c.SourceIDs...)
+	return c
+}
+
 type CatalogUnion struct {
-	Groups       map[string]map[string]CatalogNode `json:"groups"`
-	SourceStates map[string]CatalogState           `json:"source_states"`
-	Conflicts    []CatalogConflictDetail           `json:"conflicts"`
+	Groups           map[string]map[string]CatalogNode `json:"groups"`
+	SourceStates     map[string]CatalogState           `json:"source_states"`
+	SourceTopologies map[string]*SourceTopology        `json:"source_topologies,omitempty"`
+	SourceNodes      map[string]map[string]CatalogNode `json:"source_nodes,omitempty"`
+	Conflicts        []CatalogConflictDetail           `json:"conflicts"`
 }
 
 type nodeOwner struct {
@@ -41,8 +48,10 @@ type nodeOwner struct {
 // are retained for diagnostics and every implicated source becomes unselectable.
 func BuildCatalogUnion(catalogs []SourceCatalog) (CatalogUnion, error) {
 	result := CatalogUnion{
-		Groups:       make(map[string]map[string]CatalogNode),
-		SourceStates: make(map[string]CatalogState),
+		Groups:           make(map[string]map[string]CatalogNode),
+		SourceStates:     make(map[string]CatalogState),
+		SourceTopologies: make(map[string]*SourceTopology),
+		SourceNodes:      make(map[string]map[string]CatalogNode),
 	}
 	groupByIdentifier := make(map[string]string)
 	owners := make(map[string]map[string]*nodeOwner)
@@ -69,6 +78,10 @@ func BuildCatalogUnion(catalogs []SourceCatalog) (CatalogUnion, error) {
 			state = CatalogDiscovering
 		}
 		result.SourceStates[catalog.SourceID] = state
+		if catalog.Topology != nil {
+			result.SourceTopologies[catalog.SourceID] = catalog.Topology.Clone()
+		}
+		result.SourceNodes[catalog.SourceID] = make(map[string]CatalogNode, len(catalog.Nodes))
 		if result.Groups[catalog.GroupID] == nil {
 			result.Groups[catalog.GroupID] = make(map[string]CatalogNode)
 			owners[catalog.GroupID] = make(map[string]*nodeOwner)
@@ -90,6 +103,7 @@ func BuildCatalogUnion(catalogs []SourceCatalog) (CatalogUnion, error) {
 		nodes := append([]CatalogNode(nil), catalog.Nodes...)
 		sort.SliceStable(nodes, func(i, j int) bool { return nodes[i].Key.Identifier < nodes[j].Key.Identifier })
 		for _, node := range nodes {
+			result.SourceNodes[catalog.SourceID][node.Key.Identifier] = node.Clone()
 			groupID := catalog.NodeGroup(node)
 			if result.Groups[groupID] == nil {
 				result.Groups[groupID] = make(map[string]CatalogNode)
@@ -141,7 +155,7 @@ func BuildCatalogUnion(catalogs []SourceCatalog) (CatalogUnion, error) {
 			owner := owners[groupID][identifier]
 			if owner == nil {
 				owners[groupID][identifier] = &nodeOwner{node: node, sourceIDs: []string{catalog.SourceID}, conflictIndex: -1}
-				result.Groups[groupID][identifier] = node
+				result.Groups[groupID][identifier] = node.Clone()
 				continue
 			}
 			if owner.conflictIndex >= 0 {

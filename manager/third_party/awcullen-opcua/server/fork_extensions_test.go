@@ -108,15 +108,17 @@ func TestPublishQueueDoesNotRaceOrBlockWhenSessionIsDeleted(t *testing.T) {
 	// the next add then selected default and blocked forever receiving from nil.
 	srv := newForkUnitServer()
 	session := newForkSession(srv, "full-publish-queue")
+	ch, _ := newPublishTestChannel(srv)
+	session.SetSecureChannelId(ch.ChannelID())
 	for i := 0; i < cap(session.publishRequests); i++ {
-		if err := session.addPublishRequest(nil, uint32(i), newRequest(uint32(i)), nil); err != nil {
+		if err := session.addPublishRequest(ch, uint32(i), newRequest(uint32(i)), nil); err != nil {
 			t.Fatalf("fill publish queue at %d: %v", i, err)
 		}
 	}
 	session.delete()
 	addResult := make(chan error, 1)
 	go func() {
-		addResult <- session.addPublishRequest(nil, 100, newRequest(100), nil)
+		addResult <- session.addPublishRequest(ch, 100, newRequest(100), nil)
 	}()
 	select {
 	case err := <-addResult:
@@ -126,20 +128,21 @@ func TestPublishQueueDoesNotRaceOrBlockWhenSessionIsDeleted(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("addPublishRequest blocked after session delete")
 	}
-	if _, _, _, _, ok, err := session.removePublishRequest(); err != nil || !ok {
-		t.Fatalf("pre-close queued request was not drainable: ok=%v err=%v", ok, err)
+	if _, _, _, _, ok, err := session.removePublishRequest(); err != nil || ok {
+		t.Fatalf("closed Session retained an eligible Publish request: ok=%v err=%v", ok, err)
 	}
 
 	// Exercise the actual add/delete interleaving repeatedly for the race
 	// detector. An add that wins may succeed; one that loses must report closed.
 	for i := 0; i < 200; i++ {
 		session := newForkSession(srv, "publish-race")
+		session.SetSecureChannelId(ch.ChannelID())
 		start := make(chan struct{})
 		result := make(chan error, 1)
 		deleted := make(chan struct{})
 		go func() {
 			<-start
-			result <- session.addPublishRequest(nil, 1, newRequest(1), nil)
+			result <- session.addPublishRequest(ch, 1, newRequest(1), nil)
 		}()
 		go func() {
 			<-start
@@ -673,12 +676,15 @@ func TestSessionManagerEmitsCompleteLifecycleSnapshots(t *testing.T) {
 	if err := srv.sessionManager.Add(session); err != nil {
 		t.Fatal(err)
 	}
-	session.SetRemoteAddress("127.0.0.1:50000")
-	session.SetSecureChannelId(7)
-	srv.emitSessionActivation(session, 0)
+	firstChannel, _ := newLifecycleTestChannel(srv, 7)
+	if err := srv.activateSessionBinding(session, firstChannel, ua.AnonymousIdentity{}, "", nil); err != nil {
+		t.Fatal(err)
+	}
 	srv.sessionManager.DetachChannel(7)
-	session.SetSecureChannelId(9)
-	srv.emitSessionActivation(session, 7)
+	secondChannel, _ := newLifecycleTestChannel(srv, 9)
+	if err := srv.activateSessionBinding(session, secondChannel, ua.AnonymousIdentity{}, "", nil); err != nil {
+		t.Fatal(err)
+	}
 	srv.sessionManager.DeleteWithReason(session, SessionCloseReasonClient)
 	if len(events) != 5 {
 		t.Fatalf("events = %#v", events)

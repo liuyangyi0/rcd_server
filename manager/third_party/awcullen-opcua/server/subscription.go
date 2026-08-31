@@ -452,6 +452,48 @@ func (s *Subscription) diagnosticsSnapshot() ua.SubscriptionDiagnosticsDataType 
 	}
 }
 
+// takeNotificationSequenceNumberLocked consumes a sequence number when a
+// NotificationMessage is committed, not when the transport write succeeds.
+// A write can fail after the peer received some/all of the response; retaining
+// the message for Republish must never allow a later message to reuse its ID.
+// OPC UA notification sequence numbers wrap to 1; zero is never issued.
+func (s *Subscription) takeNotificationSequenceNumberLocked() uint32 {
+	seq := s.nextSequenceNumber
+	if seq == 0 {
+		seq = 1
+	}
+	s.nextSequenceNumber = seq + 1
+	if s.nextSequenceNumber == 0 {
+		s.nextSequenceNumber = 1
+	}
+	return seq
+}
+
+// queueNotificationLocked is shared by scheduled and late Publish paths so
+// retransmission insertion and sequence advancement cannot diverge on errors.
+func (s *Subscription) queueNotificationLocked(tn time.Time, data []ua.ExtensionObject) (ua.NotificationMessage, []uint32) {
+	nm := ua.NotificationMessage{
+		SequenceNumber:   s.takeNotificationSequenceNumberLocked(),
+		PublishTime:      tn,
+		NotificationData: data,
+	}
+	q := s.retransmissionQueue
+	for q.Len() >= maxRetransmissionQueueLength {
+		e := q.Front()
+		q.Remove(e)
+		e.Value = nil
+	}
+	q.PushBack(nm)
+	avail := make([]uint32, 0, q.Len())
+	for e := q.Front(); e != nil; e = e.Next() {
+		if message, ok := e.Value.(ua.NotificationMessage); ok {
+			avail = append(avail, message.SequenceNumber)
+		}
+	}
+	s.unacknowledgedMessageCount = uint32(len(avail))
+	return nm, avail
+}
+
 func (s *Subscription) publish(tn time.Time) error {
 	// log.Printf("onPublish id: %d, keepAlive: %d, lifetime: %d\n", s.id, s.keepAliveCount, s.lifetimeCount)
 	s.Lock()
@@ -478,6 +520,9 @@ func (s *Subscription) publish(tn time.Time) error {
 			return err
 		}
 		if ok {
+			// Receipt of a valid Publish request keeps the subscription alive,
+			// even if its response subsequently loses the transport.
+			s.lifetimeCount = 0
 			more := false
 			maxN := int(s.maxNotificationsPerPublish)
 			mins := make([]ua.MonitoredItemNotification, 0, 4)
@@ -521,23 +566,7 @@ func (s *Subscription) publish(tn time.Time) error {
 			if len(efls) > 0 {
 				nd = append(nd, ua.EventNotificationList{Events: efls})
 			}
-			nm := ua.NotificationMessage{
-				SequenceNumber:   s.nextSequenceNumber,
-				PublishTime:      tn,
-				NotificationData: nd,
-			}
-			q := s.retransmissionQueue
-			for e := q.Front(); e != nil && q.Len() >= maxRetransmissionQueueLength; e = e.Next() {
-				q.Remove(e)
-				e.Value = nil
-			}
-			q.PushBack(nm)
-			avail := make([]uint32, 0, 4)
-			for e := q.Front(); e != nil; e = e.Next() {
-				if nm, ok := e.Value.(ua.NotificationMessage); ok {
-					avail = append(avail, nm.SequenceNumber)
-				}
-			}
+			nm, avail := s.queueNotificationLocked(tn, nd)
 			err := ch.Write(
 				&ua.PublishResponse{
 					ResponseHeader: ua.ResponseHeader{
@@ -554,11 +583,10 @@ func (s *Subscription) publish(tn time.Time) error {
 				requestid,
 			)
 			if err != nil {
+				s.isLate = true
 				return err
 			}
-			s.unacknowledgedMessageCount = uint32(len(avail))
 			s.publishRequestCount++
-			s.nextSequenceNumber++
 			s.keepAliveCount = 0
 			s.lifetimeCount = 0
 			s.isLate = false
@@ -571,12 +599,11 @@ func (s *Subscription) publish(tn time.Time) error {
 		if s.lifetimeCount >= s.maxLifetimeCount {
 			// log.Printf("Subscription '%d' expired.\n", s.id)
 			nm := ua.NotificationMessage{
-				SequenceNumber:   s.nextSequenceNumber,
+				SequenceNumber:   s.takeNotificationSequenceNumberLocked(),
 				PublishTime:      time.Now(),
 				NotificationData: []ua.ExtensionObject{ua.StatusChangeNotification{Status: ua.BadTimeout}},
 			}
 			s.session.stateChanges <- &stateChangeOp{subscriptionId: s.id, message: nm}
-			s.nextSequenceNumber++
 			s.manager.Delete(s)
 			s.deleteImpl()
 		}
@@ -595,6 +622,7 @@ func (s *Subscription) publish(tn time.Time) error {
 				return err
 			}
 			if ok {
+				s.lifetimeCount = 0
 				avail := make([]uint32, 0, 4)
 				q := s.retransmissionQueue
 				for e := q.Front(); e != nil; e = e.Next() {
@@ -622,6 +650,7 @@ func (s *Subscription) publish(tn time.Time) error {
 					requestid,
 				)
 				if err != nil {
+					s.isLate = true
 					return err
 				}
 				s.unacknowledgedMessageCount = uint32(len(avail))
@@ -637,12 +666,11 @@ func (s *Subscription) publish(tn time.Time) error {
 			if s.lifetimeCount == s.maxLifetimeCount {
 				// log.Printf("Subscription '%d' expired.\n", s.id)
 				nm := ua.NotificationMessage{
-					SequenceNumber:   s.nextSequenceNumber,
+					SequenceNumber:   s.takeNotificationSequenceNumberLocked(),
 					PublishTime:      time.Now(),
 					NotificationData: []ua.ExtensionObject{ua.StatusChangeNotification{Status: ua.BadTimeout}},
 				}
 				s.session.stateChanges <- &stateChangeOp{subscriptionId: s.id, message: nm}
-				s.nextSequenceNumber++
 				s.manager.Delete(s)
 				s.deleteImpl()
 			}
@@ -661,6 +689,16 @@ func (s *Subscription) handleLatePublishRequest(ch *serverSecureChannel, request
 	if !s.isLate {
 		return false, nil
 	}
+	// Admission can race Session reactivation on a replacement SecureChannel.
+	// Do not drain monitored items for a request that is already obsolete. A
+	// closure after this check is safe: the committed message remains available
+	// under its unique sequence number for Republish on the replacement channel.
+	if s.session == nil {
+		return false, nil
+	}
+	if status := s.session.publishChannelStatus(ch); status != ua.Good {
+		return false, status
+	}
 	tn := time.Now()
 	notificationsAvailable := false
 	for _, item := range s.items {
@@ -671,6 +709,7 @@ func (s *Subscription) handleLatePublishRequest(ch *serverSecureChannel, request
 	switch {
 	case notificationsAvailable && s.publishingEnabled:
 		// log.Printf("handleLatePublishRequest %d, %d\n", s.id, s.priority)
+		s.lifetimeCount = 0
 		more := false
 		maxN := int(s.maxNotificationsPerPublish)
 		mins := make([]ua.MonitoredItemNotification, 0, 4)
@@ -714,22 +753,7 @@ func (s *Subscription) handleLatePublishRequest(ch *serverSecureChannel, request
 		if len(efls) > 0 {
 			nd = append(nd, ua.EventNotificationList{Events: efls})
 		}
-		nm := ua.NotificationMessage{
-			SequenceNumber:   s.nextSequenceNumber,
-			PublishTime:      tn,
-			NotificationData: nd,
-		}
-		q := s.retransmissionQueue
-		for e := q.Front(); e != nil && q.Len() >= maxRetransmissionQueueLength; e = e.Next() {
-			q.Remove(e)
-		}
-		q.PushBack(nm)
-		avail := make([]uint32, 0, 4)
-		for e := q.Front(); e != nil; e = e.Next() {
-			if nm, ok := e.Value.(ua.NotificationMessage); ok {
-				avail = append(avail, nm.SequenceNumber)
-			}
-		}
+		nm, avail := s.queueNotificationLocked(tn, nd)
 		err := ch.Write(
 			&ua.PublishResponse{
 				ResponseHeader: ua.ResponseHeader{
@@ -750,8 +774,6 @@ func (s *Subscription) handleLatePublishRequest(ch *serverSecureChannel, request
 		}
 		s.publishRequestCount++
 		s.latePublishRequestCount++
-		s.unacknowledgedMessageCount = uint32(len(avail))
-		s.nextSequenceNumber++
 		s.keepAliveCount = 0
 		s.lifetimeCount = 0
 		s.moreNotifications = more
@@ -762,6 +784,7 @@ func (s *Subscription) handleLatePublishRequest(ch *serverSecureChannel, request
 
 	default:
 		if s.keepAliveCount >= s.maxKeepAliveCount || s.publishRequestCount == 0 {
+			s.lifetimeCount = 0
 			avail := make([]uint32, 0, 4)
 			q := s.retransmissionQueue
 			for e := q.Front(); e != nil; e = e.Next() {
@@ -769,7 +792,6 @@ func (s *Subscription) handleLatePublishRequest(ch *serverSecureChannel, request
 					avail = append(avail, nm.SequenceNumber)
 				}
 			}
-			results := make([]ua.StatusCode, len(req.SubscriptionAcknowledgements))
 			err := ch.Write(
 				&ua.PublishResponse{
 					ResponseHeader: ua.ResponseHeader{

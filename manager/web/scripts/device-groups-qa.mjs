@@ -309,7 +309,8 @@ async function checkSessionIsolation(page, target, nextSource, evidenceName) {
   await page.locator('.session-context-picker select').selectOption(target);
   await page.getByRole('button', { name: `查看 ${ids.groupA}`, exact: true }).click();
   const drawer = page.locator('.detail-drawer.is-open');
-  await drawer.locator('.drawer-session-field select').selectOption(target);
+  // Re-selecting inside the drawer would mask a page/drawer context mismatch.
+  assert.equal(await drawer.locator('.drawer-session-field select').inputValue(), target, 'The drawer must preserve the Session selected in the page header');
   await drawer.getByRole('button', { name: '切换当前 Session 的整组来源', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: '切换整逻辑设备组', exact: true });
   assert.match(await dialog.innerText(), /其他组|其他设备组/);
@@ -443,7 +444,7 @@ try {
     }
     const sessions = list(await readAPI('/sessions'));
     if (!allowMutations || !sessions.length) { report.skips.push({ flow: 'Session selection isolation', reason: !sessions.length ? 'No OPC Session is online; run again with the separate holdSession fixture' : 'Mutation opt-in is disabled' }); return; }
-    const target = process.env.RCD_QA_SESSION_ID ? sessions.find((session) => session.id === process.env.RCD_QA_SESSION_ID) : sessions[0];
+    const target = process.env.RCD_QA_SESSION_ID ? sessions.find((session) => session.id === process.env.RCD_QA_SESSION_ID) : (sessions[1] ?? sessions[0]);
     assert.ok(target, 'RCD_QA_SESSION_ID is not an online OPC Session');
     const originalSource = routeSource(target, ids.groupA);
     assert.ok([ids.sourceA, ids.sourceB].includes(originalSource), 'Held target Session must already select lower-a or lower-b');

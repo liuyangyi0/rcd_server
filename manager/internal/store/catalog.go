@@ -19,6 +19,9 @@ func (r *Repository) ReplaceSourceCatalog(ctx context.Context, catalog domain.So
 	if catalog.State == "" {
 		return &domain.FieldError{Field: "state", Message: "must not be empty"}
 	}
+	if catalog.QuarantineReason != "" {
+		catalog.State = domain.CatalogConflict
+	}
 	source, err := r.GetSource(ctx, catalog.SourceID)
 	if err != nil {
 		return err
@@ -64,8 +67,9 @@ func (r *Repository) ReplaceSourceCatalog(ctx context.Context, catalog domain.So
 	if err != nil {
 		return fmt.Errorf("encode source topology: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO source_topology (source_id,manifest,discovered_at) VALUES (?,?,?)
-		ON CONFLICT(source_id) DO UPDATE SET manifest=excluded.manifest,discovered_at=excluded.discovered_at`, catalog.SourceID, string(topologyJSON), encodeTime(catalog.DiscoveredAt)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO source_topology (source_id,manifest,discovered_at,quarantine_reason) VALUES (?,?,?,?)
+		ON CONFLICT(source_id) DO UPDATE SET manifest=excluded.manifest,discovered_at=excluded.discovered_at,
+		quarantine_reason=excluded.quarantine_reason`, catalog.SourceID, string(topologyJSON), encodeTime(catalog.DiscoveredAt), catalog.QuarantineReason); err != nil {
 		return err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE sources SET catalog_state = ? WHERE id = ?`, catalog.State, catalog.SourceID)
@@ -128,14 +132,21 @@ func (r *Repository) LoadSourceCatalog(ctx context.Context, sourceID string) (do
 	if err := rows.Close(); err != nil {
 		return domain.SourceCatalog{}, err
 	}
-	var manifest string
-	err = r.db.QueryRowContext(ctx, `SELECT manifest FROM source_topology WHERE source_id=?`, sourceID).Scan(&manifest)
+	var manifest, discovered string
+	err = r.db.QueryRowContext(ctx, `SELECT manifest,discovered_at,quarantine_reason FROM source_topology WHERE source_id=?`, sourceID).
+		Scan(&manifest, &discovered, &catalog.QuarantineReason)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return domain.SourceCatalog{}, err
 	}
 	if err == nil {
 		if err := json.Unmarshal([]byte(manifest), &catalog.Topology); err != nil {
 			return domain.SourceCatalog{}, fmt.Errorf("decode cached topology: %w", err)
+		}
+		if catalog.DiscoveredAt.IsZero() {
+			catalog.DiscoveredAt, err = decodeTime(discovered)
+			if err != nil {
+				return domain.SourceCatalog{}, err
+			}
 		}
 	}
 	return catalog, nil

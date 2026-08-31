@@ -13,6 +13,7 @@ import (
 	"rcd_manager/internal/buildinfo"
 	"rcd_manager/internal/config"
 	"rcd_manager/internal/platform/service"
+	"rcd_manager/internal/processagent"
 )
 
 func main() {
@@ -34,6 +35,8 @@ func execute(args []string) error {
 			return nil
 		case "service":
 			return serviceCommand(args[1:])
+		case "agent":
+			return agentCommand(args[1:])
 		case "run":
 			args = args[1:]
 		}
@@ -53,6 +56,19 @@ func execute(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return runner(ctx)
+}
+
+func agentCommand(args []string) error {
+	if len(args) > 0 && args[0] == "run" {
+		args = args[1:]
+	}
+	cfg, err := processagent.Load(args)
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return processagent.Run(ctx, cfg)
 }
 
 func serviceCommand(args []string) error {
@@ -89,6 +105,7 @@ Usage:
   rcd-manager [run] [options]
   rcd-manager service install [options]
   rcd-manager service start|stop|uninstall
+  rcd-manager agent run --instance-id ID --executable PATH --data-dir PATH [agent options]
   rcd-manager version
 
 Runtime options:
@@ -101,6 +118,15 @@ Runtime options:
   --command-pending-timeout DURATION
   --shutdown-timeout DURATION
   --dev
+
+Linux process-agent options:
+  --work-dir PATH
+  --http-listen HOST:PORT             (default 0.0.0.0:8090)
+  --ready-address HOST:PORT           (optional TCP readiness, not OPC health)
+  --auto-start=true|false             (first run only; restores desired state later)
+  --restart-policy never|on-failure   (default never; no source failover)
+  --stop-timeout DURATION
+  --start-timeout DURATION
 
 Secrets such as the upper OPC password are read from RCD_MANAGER_OPC_PASSWORD.`)
 }

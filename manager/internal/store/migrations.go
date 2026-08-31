@@ -113,6 +113,42 @@ var migrations = []string{
 		manifest TEXT NOT NULL,
 		discovered_at TEXT NOT NULL
 	);`,
+	// Older Conflict rows do not distinguish a rejected discovery from a
+	// recoverable peer conflict. Backfill only an explicit rejection in the
+	// latest persisted status event; absent/stale evidence must stay unmarked.
+	`ALTER TABLE source_topology ADD COLUMN quarantine_reason TEXT NOT NULL DEFAULT '';
+	INSERT INTO source_topology (source_id, manifest, discovered_at, quarantine_reason)
+	SELECT s.id, 'null', e.occurred_at, substr(e.message, length('catalog rejected: ') + 1)
+	FROM sources s JOIN source_events e ON e.id = (
+		SELECT latest.id FROM source_events latest WHERE latest.source_id = s.id
+		ORDER BY julianday(latest.occurred_at) DESC, latest.id DESC LIMIT 1
+	)
+	WHERE s.catalog_state = 'CatalogConflict'
+		AND substr(e.message, 1, length('catalog rejected: ')) = 'catalog rejected: '
+		AND length(trim(substr(e.message, length('catalog rejected: ') + 1))) > 0
+	ON CONFLICT(source_id) DO UPDATE SET quarantine_reason = excluded.quarantine_reason;`,
+	`CREATE TABLE process_bindings (
+		source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+		agent_url TEXT NOT NULL DEFAULT '',
+		instance_id TEXT NOT NULL DEFAULT '',
+		revision INTEGER NOT NULL CHECK(revision > 0),
+		updated_at TEXT NOT NULL
+	);
+	CREATE UNIQUE INDEX process_bindings_instance_idx ON process_bindings(instance_id)
+		WHERE instance_id <> '';
+	CREATE TABLE process_control_operations (
+		source_id TEXT NOT NULL,
+		request_id TEXT NOT NULL,
+		state TEXT NOT NULL,
+		dispatched INTEGER NOT NULL DEFAULT 0 CHECK(dispatched IN (0,1)),
+		record TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		PRIMARY KEY(source_id, request_id)
+	);
+	CREATE UNIQUE INDEX process_control_pending_idx ON process_control_operations(source_id)
+		WHERE state NOT IN ('succeeded','failed');
+	CREATE INDEX process_control_history_idx ON process_control_operations(source_id, created_at DESC);`,
 }
 
 func migrate(ctx context.Context, db *sql.DB) error {

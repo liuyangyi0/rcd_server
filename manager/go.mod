@@ -25,3 +25,5 @@ require (
 )
 
 replace github.com/awcullen/opcua => ./third_party/awcullen-opcua
+
+replace github.com/gopcua/opcua => ./third_party/gopcua-opcua

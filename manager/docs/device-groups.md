@@ -70,6 +70,35 @@ API Source 返回 bindings；另提供 `GET /api/v1/sources/{id}/topology`，只
 冗余来源应使用相同的兼容默认组：旧串口命令节点仍归该组，若两个来源有同名
 `COMx_Send` 等节点却配置了不同默认组，仍会按跨组重名规则报告目录冲突。
 
+## 上级 OPC 客户端浏览与选源
+
+管理命名空间在每个逻辑组下公开只读物理成员树：
+
+```text
+Groups/<group_id>/Members
+└─ <source_id>
+   ├─ Selectable / IsSelected / ConnectionState / CatalogState
+   ├─ ExpectedPointCount / ProvidedPointCount / MissingPointCount / CompleteCoverage
+   └─ Ports/<port_id>/Devices/<device_id>
+      └─ DeviceAddress / AddressKnown / DeviceName / KKSPrefix
+         PointCount / RawPointCount / CalculationPointCount
+         Configured / ExplicitlyBound / PresentInTopology
+```
+
+客户端先 Browse 成员树确认 source、实际串口和子站关系，再将目标 `source_id` 作为 String
+写入同组的 `SelectedSourceId`。写入与业务点 Read/Subscribe 必须使用同一个 OPC Session；
+切换的是该 Session 的整个逻辑设备组，不是整台下级，也不是一个 KKS。成员树没有写接口，
+串口/子站映射只能通过经过 revision 校验的 Web/REST 配置修改。
+
+`Configured` 表示设备已有效归入该组（包括继承来源默认组），`ExplicitlyBound` 只表示存在人工
+绑定；`PresentInTopology` 表示设备存在于最后一份已验证的拓扑快照，来源是否在线另看
+`ConnectionState`。未发现的配置占位设备用 `AddressKnown=false`，其 `DeviceAddress` 返回
+`BadWaitingForInitialData`，不会把未知地址伪装成合法的站址 0。`Selectable` 只表示允许选中；
+若 `CompleteCoverage=false`，选中后缺失点仍按协议返回 `BadConfigurationError`。
+
+物理树热更新采用稳定 NodeId 的差异化增删：名称、Endpoint、点数等变化只更新原变量读取器，
+不会删除再创建未变化节点，因此已有监控项保持有效；真正被配置删除的分支才会移除。
+
 ## 命令语义
 
 共享的旧 `_Send` / `_SendCommand` 节点不能按其默认组直接发送。先从 hex payload
