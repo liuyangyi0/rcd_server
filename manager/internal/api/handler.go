@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -613,7 +614,11 @@ func (h *Handler) respond(w http.ResponseWriter, value any, err error, success i
 		return
 	}
 	status, code, details := mapError(err)
-	if status >= 500 {
+	// Browser navigation, query invalidation and SSE teardown routinely cancel
+	// in-flight requests. The repository correctly returns the wrapped context
+	// error, but recording that client lifecycle as a server fault hides real
+	// database/OPC failures in the operations log.
+	if status >= 500 && !errors.Is(err, context.Canceled) {
 		h.logger.Error("HTTP service error", "error", err)
 	}
 	writeError(w, status, code, publicMessage(err, status), details)

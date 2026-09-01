@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +14,22 @@ import (
 
 	"rcd_manager/internal/domain"
 )
+
+func TestCanceledHTTPServiceCallDoesNotEmitFalseErrorLog(t *testing.T) {
+	var logs strings.Builder
+	handler := &Handler{logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+
+	handler.respond(httptest.NewRecorder(), nil,
+		fmt.Errorf("read latest lower log receive time: %w", context.Canceled), http.StatusOK)
+	if strings.Contains(logs.String(), "HTTP service error") {
+		t.Fatalf("client cancellation was logged as a service error: %s", logs.String())
+	}
+
+	handler.respond(httptest.NewRecorder(), nil, fmt.Errorf("database failed"), http.StatusOK)
+	if !strings.Contains(logs.String(), "HTTP service error") {
+		t.Fatalf("real internal failure was not logged: %s", logs.String())
+	}
+}
 
 type fakeService struct {
 	groups          []GroupView
