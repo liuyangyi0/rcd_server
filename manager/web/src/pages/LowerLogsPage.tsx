@@ -34,6 +34,12 @@ export default function LowerLogsPage() {
     }
   }, [params, requestedSource, setParams, sourceId]);
 
+  useEffect(() => {
+    setDraft((current) => current.query === query && current.portId === portId && current.deviceId === deviceId
+      ? current
+      : { query, portId, deviceId });
+  }, [deviceId, portId, query]);
+
   const update = (values: Record<string, string | number | undefined>) => {
     const next = new URLSearchParams(params);
     for (const [key, value] of Object.entries(values)) {
