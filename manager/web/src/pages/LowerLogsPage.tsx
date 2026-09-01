@@ -74,7 +74,7 @@ export default function LowerLogsPage() {
     <PageHeader title="下级集中日志" description="下级通过独立 HTTP 队列批量发送；管理端按来源滚动保存，串口采集不会等待网络。" actions={<>
       <button className="button button-outline" type="button" disabled={!logs.data?.items.length} onClick={() => logs.data && exportCurrentPage(selectedSource?.name || sourceId, logs.data.items)}><Download size={16} />导出当前页</button>
       <button className="button button-outline" type="button" disabled={!hasViewConstraints} onClick={showLatest}>显示最新日志</button>
-      <a className="button button-outline" href="#lower-log-control">调整日志等级</a>
+      <button className="button button-outline" type="button" onClick={() => document.getElementById('lower-log-control')?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })}>调整日志等级</button>
       <button className="button button-secondary" type="button" disabled={logs.isFetching || !sourceId} onClick={() => void logs.refetch()}><RefreshCw size={16} />刷新</button>
     </>} />
 
