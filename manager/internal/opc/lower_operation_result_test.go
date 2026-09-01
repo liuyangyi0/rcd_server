@@ -157,6 +157,45 @@ func TestOperationResultCalculationModeValidatesPinnedConfigRevision(t *testing.
 	}
 }
 
+func TestOperationResultLoggingValidatesPinnedConfigRevision(t *testing.T) {
+	config := configResultFixture()
+	config["name"], config["kind"] = "config.toml", "software"
+	value := map[string]any{
+		"active_level": "info", "active_spec": "warn,rcd_server=info",
+		"configured_level": "debug", "configured_spec": "warn,rcd_server=debug",
+		"config_revision": "r2", "restart_required": true,
+		"environment_override": false, "serial_frame_logs": false,
+		"http_push_enabled": true, "http_push_source_id": "lower-a",
+		"status": "Saved", "config": config,
+	}
+	request := domain.OperationRequest{Action: "set_logging_level", LogLevel: "debug"}
+	assertOperationResult(t, request, value, true)
+	read := map[string]any{}
+	for key, item := range value {
+		read[key] = item
+	}
+	delete(read, "status")
+	delete(read, "config")
+	assertOperationResult(t, domain.OperationRequest{Action: "get_logging"}, read, true)
+
+	for name, change := range map[string]func(map[string]any){
+		"wrong configured level": func(v map[string]any) { v["configured_level"] = "trace" },
+		"wrong restart state":    func(v map[string]any) { v["restart_required"] = false },
+		"wrong config revision":  func(v map[string]any) { v["config_revision"] = "r3" },
+		"missing push state":     func(v map[string]any) { delete(v, "http_push_enabled") },
+		"missing config":         func(v map[string]any) { delete(v, "config") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			copy := map[string]any{}
+			for key, item := range value {
+				copy[key] = item
+			}
+			change(copy)
+			assertOperationResult(t, request, copy, false)
+		})
+	}
+}
+
 func TestOperationResultRejectsMalformedConfigAndUnconfirmedWrites(t *testing.T) {
 	cases := map[string]func(map[string]any){
 		"wrong name":          func(v map[string]any) { v["name"] = "config.toml" },

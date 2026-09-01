@@ -3,7 +3,8 @@ import { ApiError, request } from './client';
 import { queryKeys } from './queries';
 import type { ModuleType } from './types';
 
-export type OperationFeature = 'acquisition' | 'configuration' | 'logs' | 'station_versions' | 'calculation_mode';
+export type OperationFeature = 'acquisition' | 'configuration' | 'logs' | 'station_versions' | 'calculation_mode' | 'logging_configuration';
+export type LoggingLevel = 'error' | 'warn' | 'info' | 'debug' | 'trace';
 export interface OperationsTarget { id: string; revision: number }
 export interface OperationsCapabilities {
   source_id: string;
@@ -104,6 +105,21 @@ export interface LogPage {
   text: string;
 }
 export interface LogRequest { name: string; generation: string; offset: number; limit: number; q: string; level: string; tail: boolean }
+export interface LoggingStatus {
+  source_id: string;
+  source_revision: number;
+  active_level: LoggingLevel | 'custom';
+  active_spec: string;
+  configured_level: LoggingLevel | 'custom';
+  configured_spec: string;
+  config_revision: string;
+  restart_required: boolean;
+  environment_override: boolean;
+  serial_frame_logs: boolean;
+  http_push_enabled: boolean;
+  http_push_source_id: string;
+  status?: 'Saved' | 'Unchanged';
+}
 
 export const MAX_LOG_PAGE_BYTES = 65_536;
 export const MIN_LOG_PAGE_BYTES = 4;
@@ -169,9 +185,13 @@ export const operationsApi = {
   deviceRead: async (target: OperationsTarget, revision: string, portId: string, deviceId: string, enabled: boolean) => normalizeAcquisition(await operationRequest<AcquisitionApplyResult>(`${prefix(target.id)}/device-read`, {
     method: 'PUT', headers: { 'If-Match': JSON.stringify(revision) }, body: JSON.stringify({ source_revision: target.revision, port_id: portId, device_id: deviceId, enabled }),
   })),
-	calculationMode: (target: OperationsTarget, revision: string, mode: 'local' | 'manager') => operationRequest<Record<string, unknown>>(`${prefix(target.id)}/calculation-mode`, {
+  calculationMode: (target: OperationsTarget, revision: string, mode: 'local' | 'manager') => operationRequest<Record<string, unknown>>(`${prefix(target.id)}/calculation-mode`, {
 		method: 'PUT', headers: { 'If-Match': JSON.stringify(revision) }, body: JSON.stringify({ source_revision: target.revision, mode }),
 	}),
+  logging: (id: string, signal?: AbortSignal, revision?: number) => scopedResponse(id, operationRequest<LoggingStatus>(`${prefix(id)}/logging`, { signal }), revision),
+  loggingLevel: (target: OperationsTarget, revision: string, level: LoggingLevel) => scopedResponse(target.id, operationRequest<LoggingStatus>(`${prefix(target.id)}/logging`, {
+    method: 'PUT', headers: { 'If-Match': JSON.stringify(revision) }, body: JSON.stringify({ source_revision: target.revision, level }),
+  }), target.revision),
   deviceModuleType: async (target: OperationsTarget, stationRevision: string, portId: string, deviceId: string, moduleType: ModuleType) => normalizeAcquisition(await scopedResponse(target.id, operationRequest<AcquisitionSnapshot>(`${prefix(target.id)}/device-module-type`, {
     method: 'PUT', headers: { 'If-Match': JSON.stringify(stationRevision) }, body: JSON.stringify({ source_revision: target.revision, station_revision: stationRevision, port_id: portId, device_id: deviceId, module_type: moduleType }),
   }), target.revision)),
@@ -210,10 +230,11 @@ export const operationKeys = {
   config: (target: OperationsTarget, name: string, backupId = '') => [...operationKeys.source(target), 'config', name, backupId] as const,
   logs: (target: OperationsTarget) => [...operationKeys.source(target), 'logs'] as const,
   log: (target: OperationsTarget, input: LogRequest) => [...operationKeys.source(target), 'log', input] as const,
+  logging: (target: OperationsTarget) => [...operationKeys.source(target), 'logging'] as const,
 };
 
-export function useOperationsCapabilities(target: OperationsTarget) {
-  return useQuery({ ...queryOptions, queryKey: operationKeys.capabilities(target), queryFn: ({ signal }) => operationsApi.capabilities(target.id, signal, target.revision) });
+export function useOperationsCapabilities(target: OperationsTarget, enabled = true) {
+  return useQuery({ ...queryOptions, queryKey: operationKeys.capabilities(target), queryFn: ({ signal }) => operationsApi.capabilities(target.id, signal, target.revision), enabled: enabled && Boolean(target.id) });
 }
 export function useAcquisitionStatus(target: OperationsTarget, poll = false) {
   return useQuery({ ...queryOptions, queryKey: operationKeys.status(target), queryFn: ({ signal }) => operationsApi.status(target.id, signal, target.revision), refetchInterval: (query) => poll && !query.state.error ? 3_000 : false });
@@ -229,6 +250,24 @@ export function useOperationLogs(target: OperationsTarget) {
 }
 export function useOperationLog(target: OperationsTarget, input: LogRequest, poll = false, refreshKey = 0) {
   return useQuery({ ...queryOptions, queryKey: [...operationKeys.log(target, input), refreshKey], queryFn: ({ signal }) => operationsApi.log(target.id, input, signal, target.revision), refetchInterval: (query) => poll && !query.state.error ? 5_000 : false });
+}
+export function useLoggingStatus(target: OperationsTarget, enabled = true) {
+  return useQuery({ ...queryOptions, queryKey: operationKeys.logging(target), queryFn: ({ signal }) => operationsApi.logging(target.id, signal, target.revision), enabled: enabled && Boolean(target.id) });
+}
+
+export function useLoggingLevelMutation(target: OperationsTarget) {
+  const client = useQueryClient();
+  return useMutation({
+    retry: false,
+    mutationFn: (input: { revision: string; level: LoggingLevel }) => operationsApi.loggingLevel(target, input.revision, input.level),
+    onSuccess: (result) => client.setQueryData(operationKeys.logging(target), result),
+    onSettled: async () => { await Promise.all([
+      client.invalidateQueries({ queryKey: operationKeys.logging(target) }),
+      client.invalidateQueries({ queryKey: operationKeys.configs(target) }),
+      client.invalidateQueries({ queryKey: operationKeys.config(target, 'config.toml') }),
+      client.invalidateQueries({ queryKey: queryKeys.allManagementAudit }),
+    ]); },
+  });
 }
 
 export function useAcquisitionMutation(target: OperationsTarget) {

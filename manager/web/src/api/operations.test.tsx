@@ -78,6 +78,17 @@ describe('lower operations API contract', () => {
     expect(JSON.parse(String(fetchMock.mock.calls[2][1].body))).toEqual({ source_revision: 7, name: 'serial.toml', content: 'enabled = false' });
   });
 
+  it('reads and saves the lower logging level with the config revision', async () => {
+    const logging = { source_id: target.id, source_revision: target.revision, active_level: 'info', active_spec: 'warn,rcd_server=info', configured_level: 'debug', configured_spec: 'warn,rcd_server=debug', config_revision: 'cfg-2', restart_required: true, environment_override: false, serial_frame_logs: false, http_push_enabled: true, http_push_source_id: target.id };
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(json(logging)));
+    vi.stubGlobal('fetch', fetchMock);
+    await operationsApi.logging(target.id, undefined, target.revision);
+    await operationsApi.loggingLevel(target, 'cfg-1', 'debug');
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/sources/lower%2Fa%20b/operations/logging');
+    expect(fetchMock.mock.calls[1][1].headers).toMatchObject({ 'If-Match': '"cfg-1"' });
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1].body))).toEqual({ source_revision: 7, level: 'debug' });
+  });
+
   it.each([[-10, 4], [0, 4], [1, 4], [3, 4], [4, 4], [65_536, 65_536], [100_000, 65_536], [Number.NaN, 65_536], [Number.POSITIVE_INFINITY, 65_536]])('bounds log limit %s to %s bytes', async (limit, expected) => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(json(page())));
     vi.stubGlobal('fetch', fetchMock);

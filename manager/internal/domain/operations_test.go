@@ -9,7 +9,8 @@ func TestOperationRequestBoundaries(t *testing.T) {
 	enabled := false
 	content := "[serial]\n"
 	valid := []OperationRequest{
-		{Action: "status"}, {Action: "list_configs"}, {Action: "list_logs"},
+		{Action: "status"}, {Action: "list_configs"}, {Action: "list_logs"}, {Action: "get_logging"},
+		{Action: "set_logging_level", LogLevel: "debug", ExpectedRevision: "12"},
 		{Action: "set_port_enabled", PortID: "/dev/ttyUSB0", Enabled: &enabled, ExpectedRevision: "0"},
 		{Action: "set_device_read_enabled", PortID: "COM1", DeviceID: "255", Enabled: &enabled, ExpectedRevision: "12"},
 		{Action: "set_device_module_type", PortID: "COM1", DeviceID: "12", ModuleType: ModuleTypeDomestic, ExpectedRevision: "12", ExpectedStationRevision: "8"},
@@ -33,6 +34,9 @@ func TestOperationRequestBoundaries(t *testing.T) {
 		{Action: "set_device_read_enabled", PortID: "COM1", DeviceID: "256", Enabled: &enabled, ExpectedRevision: "1"},
 		{Action: "set_device_module_type", PortID: "COM1", DeviceID: "1", ModuleType: "automatic", ExpectedRevision: "1", ExpectedStationRevision: "1"},
 		{Action: "query_device_version", PortID: "COM1", DeviceID: "1", ExpectedRevision: "1"},
+		{Action: "set_logging_level", LogLevel: "verbose", ExpectedRevision: "1"},
+		{Action: "set_logging_level", LogLevel: "info"},
+		{Action: "get_logging", LogLevel: "info"},
 		{Action: "read_config", Name: "../config.toml"},
 		{Action: "read_config", Name: "C:\\config.toml"},
 		{Action: "read_config", Name: "config.toml", BackupID: "../backup"},

@@ -201,7 +201,7 @@ impl FileRepository {
         })
     }
 
-    /// Persist the dedicated calculation-mode edit without revalidating
+    /// Persist a dedicated typed application-config edit without revalidating
     /// unrelated legacy CSV/calc files. The running process already parsed the
     /// current application config; the caller changes only one typed field.
     /// CAS, writer locking, backup and whole-set concurrency checks remain the
@@ -211,6 +211,18 @@ impl FileRepository {
         content: &str,
         expected: &str,
     ) -> OperationResult<Value> {
+        self.write_typed_application(content, expected)
+    }
+
+    pub(super) fn write_logging_level(
+        &self,
+        content: &str,
+        expected: &str,
+    ) -> OperationResult<Value> {
+        self.write_typed_application(content, expected)
+    }
+
+    fn write_typed_application(&self, content: &str, expected: &str) -> OperationResult<Value> {
         if content.len() > MAX_CONFIG_BYTES {
             return Err(OperationError::new("too_large", "配置文件最大为 2 MiB"));
         }

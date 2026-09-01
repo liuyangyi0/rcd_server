@@ -60,7 +60,7 @@ impl fmt::Display for OperationError {
 impl std::error::Error for OperationError {}
 
 pub fn capabilities() -> Value {
-    json!({"schema_version":1,"features":["acquisition","configuration","logs","station_versions","calculation_mode"],
+    json!({"schema_version":1,"features":["acquisition","configuration","logs","station_versions","calculation_mode","logging_configuration"],
         "max_config_bytes":2_097_152,"max_log_bytes":65_536,"configuration_apply":"restart"})
 }
 
@@ -153,6 +153,8 @@ struct Inner {
     station_state_path: PathBuf,
     shutdown: CancellationToken,
     calculation: Mutex<CalculationStatus>,
+    active_logging_spec: String,
+    logging_environment_override: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -350,6 +352,13 @@ impl Operations {
             station_saved.revision = increment_persisted_revision(&station_saved.revision)?;
             persist_station_state(&station_state_path, &station_saved)?;
         }
+        let configured_logging_spec = read_logging_spec(&config_dir)
+            .unwrap_or_else(|| crate::logging::DEFAULT_LOG_SPEC.to_string());
+        let environment_logging_spec = std::env::var("RUST_LOG")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let logging_environment_override = environment_logging_spec.is_some();
+        let active_logging_spec = environment_logging_spec.unwrap_or(configured_logging_spec);
         let repository = files::FileRepository::new(config_dir, log_dir, log_basename)?;
         Ok(Self {
             inner: Arc::new(Inner {
@@ -365,6 +374,8 @@ impl Operations {
                 station_state_path,
                 shutdown,
                 calculation: Mutex::new(CalculationStatus::default()),
+                active_logging_spec,
+                logging_environment_override,
             }),
         })
     }
@@ -503,6 +514,8 @@ impl Operations {
             "set_device_module_type" => self.set_device_module_type(request, CONTROL_WAIT),
             "query_device_version" => self.query_device_version(request, CONTROL_WAIT),
             "set_calculation_mode" => self.set_calculation_mode(request),
+            "get_logging" => self.get_logging(),
+            "set_logging_level" => self.set_logging_level(request),
             "list_configs" | "read_config" | "validate_config" | "write_config" | "list_logs"
             | "read_log" => self
                 .inner
@@ -577,6 +590,79 @@ impl Operations {
             "configured_mode":mode.as_str(),
             "restart_required":active_mode != mode.as_str(),
             "config":written,
+        }))
+    }
+
+    fn get_logging(&self) -> Result<Value, OperationError> {
+        let mut files = self.inner.files.lock().unwrap_or_else(|e| e.into_inner());
+        let current = files.handle(&json!({"action":"read_config", "name":"config.toml"}))?;
+        self.logging_status(&current)
+    }
+
+    fn set_logging_level(&self, request: &Value) -> Result<Value, OperationError> {
+        let level = string_arg(request, "log_level")?;
+        let spec = logging_spec(level).ok_or_else(|| {
+            OperationError::new(
+                "invalid_request",
+                "log level must be error, warn, info, debug or trace",
+            )
+        })?;
+        let expected = string_arg(request, "expected_revision")?;
+        let mut files = self.inner.files.lock().unwrap_or_else(|e| e.into_inner());
+        let current = files.handle(&json!({"action":"read_config", "name":"config.toml"}))?;
+        let current_revision = current["revision"].as_str().unwrap_or_default();
+        if current_revision != expected {
+            return Err(OperationError::new("conflict", "配置已被修改，请重新读取")
+                .with_revision(current_revision.to_string()));
+        }
+        let content = current["content"].as_str().ok_or_else(|| {
+            OperationError::new("operation_failed", "config.toml content missing")
+        })?;
+        let mut document = content.parse::<toml_edit::DocumentMut>().map_err(|error| {
+            OperationError::new("invalid_request", format!("config.toml: {error}"))
+        })?;
+        if !document.as_table().contains_key("logging") {
+            document["logging"] = toml_edit::table();
+        }
+        let logging = document["logging"]
+            .as_table_mut()
+            .ok_or_else(|| OperationError::new("invalid_request", "[logging] must be a table"))?;
+        logging["level"] = toml_edit::value(spec);
+        let written = files.write_logging_level(&document.to_string(), expected)?;
+        drop(files);
+        let mut result = self.logging_status(&written)?;
+        result["status"] = json!(if written["revision"] == current["revision"] {
+            "Unchanged"
+        } else {
+            "Saved"
+        });
+        result["config"] = written;
+        Ok(result)
+    }
+
+    fn logging_status(&self, config: &Value) -> Result<Value, OperationError> {
+        let content = config["content"].as_str().ok_or_else(|| {
+            OperationError::new("operation_failed", "config.toml content missing")
+        })?;
+        let parsed: crate::config::Config = toml::from_str(content).map_err(|error| {
+            OperationError::new("invalid_request", format!("config.toml: {error}"))
+        })?;
+        flexi_logger::LogSpecification::parse(&parsed.logging.level).map_err(|error| {
+            OperationError::new("invalid_request", format!("logging.level: {error}"))
+        })?;
+        let active_spec = self.inner.active_logging_spec.as_str();
+        let configured_spec = parsed.logging.level.as_str();
+        Ok(json!({
+            "active_level": logging_level(active_spec),
+            "active_spec": active_spec,
+            "configured_level": logging_level(configured_spec),
+            "configured_spec": configured_spec,
+            "config_revision": config["revision"],
+            "restart_required": active_spec != configured_spec,
+            "environment_override": self.inner.logging_environment_override,
+            "serial_frame_logs": parsed.logging.serial_frame_logs,
+            "http_push_enabled": parsed.logging.http_push.enabled,
+            "http_push_source_id": parsed.logging.http_push.source_id,
         }))
     }
 
@@ -1626,6 +1712,41 @@ fn station_topology_fingerprint(
     format!("{:x}", hasher.finalize())
 }
 
+fn read_logging_spec(config_dir: &Path) -> Option<String> {
+    let content = fs::read_to_string(config_dir.join("config.toml")).ok()?;
+    let document = content.parse::<toml::Value>().ok()?;
+    document
+        .get("logging")?
+        .get("level")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn logging_spec(level: &str) -> Option<&'static str> {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "error" => Some("error"),
+        "warn" => Some("warn"),
+        // Keep dependency crates at WARN while allowing progressively more
+        // detail from this gateway. A bare INFO/DEBUG/TRACE would otherwise
+        // flood the central log with OPC and runtime dependency chatter.
+        "info" => Some("warn,rcd_server=info"),
+        "debug" => Some("warn,rcd_server=debug"),
+        "trace" => Some("warn,rcd_server=trace"),
+        _ => None,
+    }
+}
+
+fn logging_level(spec: &str) -> &'static str {
+    match spec.trim().to_ascii_lowercase().as_str() {
+        "error" => "error",
+        "warn" | "warning" => "warn",
+        "info" | "warn,rcd_server=info" => "info",
+        "debug" | "warn,rcd_server=debug" => "debug",
+        "trace" | "warn,rcd_server=trace" => "trace",
+        _ => "custom",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1803,6 +1924,56 @@ mode = "local"
             toml::from_str(&fs::read_to_string(root.path().join("config/config.toml")).unwrap())
                 .unwrap();
         assert_eq!(still_saved.calculation.mode, CalculationMode::Manager);
+    }
+
+    #[test]
+    fn logging_level_is_saved_with_config_cas_and_reports_restart() {
+        let (root, operations, _ports, _rx) = fixture();
+        fs::write(root.path().join("config/config.toml"), APPLICATION_CONFIG).unwrap();
+        let before = operations
+            .execute(&json!({"action":"read_config", "name":"config.toml"}))
+            .unwrap();
+        let revision = before["revision"].as_str().unwrap();
+
+        let initial = operations
+            .execute(&json!({"action":"get_logging"}))
+            .unwrap();
+        assert_eq!(initial["configured_level"], "info");
+        assert_eq!(initial["http_push_enabled"], false);
+
+        let response = operations
+            .execute(&json!({
+                "action":"set_logging_level",
+                "log_level":"debug",
+                "expected_revision":revision,
+            }))
+            .unwrap();
+        assert_eq!(response["status"], "Saved");
+        assert_eq!(response["configured_level"], "debug");
+        assert_eq!(response["configured_spec"], "warn,rcd_server=debug");
+        assert_eq!(response["restart_required"], true);
+        assert_ne!(response["config_revision"], revision);
+
+        let saved: crate::config::Config =
+            toml::from_str(&fs::read_to_string(root.path().join("config/config.toml")).unwrap())
+                .unwrap();
+        assert_eq!(saved.logging.level, "warn,rcd_server=debug");
+        assert!(fs::read_to_string(root.path().join("config/config.toml"))
+            .unwrap()
+            .contains("# 现场运维注释必须在切换计算模式后保留"));
+
+        let stale = operations
+            .execute(&json!({
+                "action":"set_logging_level",
+                "log_level":"trace",
+                "expected_revision":revision,
+            }))
+            .unwrap_err();
+        assert_eq!(stale.code, "conflict");
+        assert_eq!(
+            stale.current_revision.as_deref(),
+            response["config_revision"].as_str()
+        );
     }
 
     #[test]

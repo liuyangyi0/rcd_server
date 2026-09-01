@@ -113,6 +113,29 @@ func TestLowerOperationsHTTPLogBoundsAndPagination(t *testing.T) {
 	}
 }
 
+func TestLowerOperationsHTTPLoggingLevelPinsConfigRevision(t *testing.T) {
+	f := &operationServiceStub{}
+	w := operationHTTP(t, f, http.MethodPut, "/api/v1/sources/lower-a/operations/logging", `{"source_revision":5,"level":"DEBUG"}`, `"sha256:config"`)
+	if w.Code != http.StatusOK || f.calls != 1 || f.source != "lower-a" || f.revision != 5 || f.request.Action != "set_logging_level" || f.request.LogLevel != "debug" || f.request.ExpectedRevision != "sha256:config" {
+		t.Fatalf("status=%d body=%s request=%+v", w.Code, w.Body.String(), f.request)
+	}
+
+	for _, tc := range []struct {
+		body, revision string
+		status         int
+	}{
+		{`{"source_revision":5,"level":"verbose"}`, `"sha256:config"`, http.StatusUnprocessableEntity},
+		{`{"source_revision":5,"level":"info"}`, "", http.StatusPreconditionRequired},
+		{`{"level":"info"}`, `"sha256:config"`, http.StatusPreconditionRequired},
+	} {
+		f = &operationServiceStub{}
+		w = operationHTTP(t, f, http.MethodPut, "/api/v1/sources/lower-a/operations/logging", tc.body, tc.revision)
+		if w.Code != tc.status || f.calls != 0 {
+			t.Fatalf("body=%s status=%d response=%s calls=%d", tc.body, w.Code, w.Body.String(), f.calls)
+		}
+	}
+}
+
 func TestLowerOperationsHTTPBusinessErrorsRemainUseful(t *testing.T) {
 	for code, status := range map[string]int{"conflict": 409, "busy": 409, "not_found": 404, "unavailable": 503, "timeout": 504, "unsupported": 501, "invalid_response": 502, "io_error": 502, "invalid_request": 422} {
 		f := &operationServiceStub{err: &domain.OperationError{Code: code, Message: "refresh state", CurrentRevision: "9"}}

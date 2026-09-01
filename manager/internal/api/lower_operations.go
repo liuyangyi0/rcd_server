@@ -27,11 +27,30 @@ func (h *Handler) lowerOperationRoutes() {
 	h.mux.HandleFunc("GET "+base+"/config", h.readSourceOperation("read_config"))
 	h.mux.HandleFunc("GET "+base+"/logs", h.readSourceOperation("list_logs"))
 	h.mux.HandleFunc("GET "+base+"/log", h.readSourceOperation("read_log"))
+	h.mux.HandleFunc("GET "+base+"/logging", h.readSourceOperation("get_logging"))
 	h.mux.HandleFunc("PUT "+base+"/port", h.setSourceAcquisition("set_port_enabled"))
 	h.mux.HandleFunc("PUT "+base+"/device-read", h.setSourceAcquisition("set_device_read_enabled"))
 	h.mux.HandleFunc("PUT "+base+"/calculation-mode", h.setSourceCalculationMode)
+	h.mux.HandleFunc("PUT "+base+"/logging", h.setSourceLoggingLevel)
 	h.mux.HandleFunc("POST "+base+"/config/validate", h.validateSourceConfig)
 	h.mux.HandleFunc("PUT "+base+"/config", h.writeSourceConfig)
+}
+
+func (h *Handler) setSourceLoggingLevel(w http.ResponseWriter, r *http.Request) {
+	revision, ok := requireOperationRevision(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		SourceRevision uint64 `json:"source_revision"`
+		Level          string `json:"level"`
+	}
+	if decodeJSON(w, r, &body) != nil {
+		return
+	}
+	h.executeSourceOperation(w, r, body.SourceRevision, domain.OperationRequest{
+		Action: "set_logging_level", LogLevel: strings.ToLower(strings.TrimSpace(body.Level)), ExpectedRevision: revision,
+	})
 }
 
 func (h *Handler) setSourceCalculationMode(w http.ResponseWriter, r *http.Request) {
@@ -168,10 +187,17 @@ func (h *Handler) executeSourceOperation(w http.ResponseWriter, r *http.Request,
 	result, err := service.ExecuteSourceOperation(r.Context(), r.PathValue("id"), sourceRevision, request)
 	if err == nil {
 		var version struct {
-			Revision string `json:"revision"`
+			Revision       string `json:"revision"`
+			ConfigRevision string `json:"config_revision"`
 		}
-		if json.Unmarshal(result, &version) == nil && domain.ValidOperationRevision(version.Revision) {
-			w.Header().Set("ETag", strconv.Quote(version.Revision))
+		if json.Unmarshal(result, &version) == nil {
+			revision := version.Revision
+			if revision == "" {
+				revision = version.ConfigRevision
+			}
+			if domain.ValidOperationRevision(revision) {
+				w.Header().Set("ETag", strconv.Quote(revision))
+			}
 		}
 	}
 	h.respond(w, result, err, http.StatusOK)

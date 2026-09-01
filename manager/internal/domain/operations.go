@@ -25,6 +25,7 @@ type OperationRequest struct {
 	DeviceID                string  `json:"device_id,omitempty"`
 	ModuleType              string  `json:"module_type,omitempty"`
 	Mode                    string  `json:"mode,omitempty"`
+	LogLevel                string  `json:"log_level,omitempty"`
 	Enabled                 *bool   `json:"enabled,omitempty"`
 	ExpectedRevision        string  `json:"expected_revision,omitempty"`
 	ExpectedStationRevision string  `json:"expected_station_revision,omitempty"`
@@ -42,7 +43,7 @@ type OperationRequest struct {
 func (r OperationRequest) Mutates() bool {
 	return r.Action == "set_port_enabled" || r.Action == "set_device_read_enabled" ||
 		r.Action == "set_device_module_type" || r.Action == "query_device_version" ||
-		r.Action == "set_calculation_mode" || r.Action == "write_config"
+		r.Action == "set_calculation_mode" || r.Action == "set_logging_level" || r.Action == "write_config"
 }
 
 func (r OperationRequest) Feature() string {
@@ -53,6 +54,8 @@ func (r OperationRequest) Feature() string {
 		return "station_versions"
 	case "set_calculation_mode":
 		return "calculation_mode"
+	case "get_logging", "set_logging_level":
+		return "logging_configuration"
 	case "list_configs", "read_config", "validate_config", "write_config":
 		return "configuration"
 	case "list_logs", "read_log":
@@ -105,6 +108,15 @@ func (r OperationRequest) Validate() error {
 		}
 	} else if r.Mode != "" {
 		return invalid("mode", "is only valid for set_calculation_mode")
+	}
+	if r.Action == "set_logging_level" {
+		switch strings.ToLower(r.LogLevel) {
+		case "error", "warn", "info", "debug", "trace":
+		default:
+			return invalid("log_level", "must be error, warn, info, debug or trace")
+		}
+	} else if r.LogLevel != "" {
+		return invalid("log_level", "is only valid for set_logging_level")
 	}
 	switch r.Action {
 	case "read_config", "validate_config", "write_config", "read_log":

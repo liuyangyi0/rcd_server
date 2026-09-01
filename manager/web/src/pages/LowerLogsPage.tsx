@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Download, RefreshCw, Search } from 'lucide-react';
-import { useSearchParams } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
+import { apiErrorMessage } from '../api/client';
 import { useLowerLogs, type LowerLogLevel } from '../api/lowerLogs';
+import { useLoggingLevelMutation, useLoggingStatus, useOperationsCapabilities, type LoggingLevel } from '../api/operations';
 import { useSources } from '../api/queries';
+import type { Source } from '../api/types';
 import { InlineNotice } from '../components/InlineNotice';
 import { EmptyState, ErrorState, LoadingState } from '../components/PageState';
 import { PageHeader } from '../components/PageHeader';
@@ -11,6 +14,13 @@ import { StatusBadge } from '../components/StatusBadge';
 import { formatDateTime, formatRelativeTime } from '../lib/format';
 
 const PAGE_SIZE = 100;
+const LOG_LEVELS: Array<{ value: LoggingLevel; label: string; description: string }> = [
+  { value: 'error', label: 'ERROR', description: '只记录错误' },
+  { value: 'warn', label: 'WARN', description: '错误和告警' },
+  { value: 'info', label: 'INFO', description: '推荐日常运行' },
+  { value: 'debug', label: 'DEBUG', description: '详细排障' },
+  { value: 'trace', label: 'TRACE', description: '最详细，日志量很大' },
+];
 
 export default function LowerLogsPage() {
   const [params, setParams] = useSearchParams();
@@ -25,6 +35,7 @@ export default function LowerLogsPage() {
   const [draft, setDraft] = useState({ query, portId, deviceId });
   const logs = useLowerLogs({ sourceId, level, query, portId, deviceId, page, pageSize: PAGE_SIZE });
   const selectedSource = useMemo(() => sources.data?.find((source) => source.id === sourceId), [sourceId, sources.data]);
+  const hasViewConstraints = Boolean(level || query || portId || deviceId || page > 1);
 
   useEffect(() => {
     if (!requestedSource && sourceId) {
@@ -54,10 +65,16 @@ export default function LowerLogsPage() {
     : pushState === 'stored'
       ? <StatusBadge state="warning" compact label="已有历史日志" />
       : <StatusBadge state="unknown" compact label="尚未收到推送" />;
+  const showLatest = () => {
+    setDraft({ query: '', portId: '', deviceId: '' });
+    update({ q: '', port: '', device: '', level: '', page: 1 });
+  };
 
   return <div className="page lower-logs-page">
     <PageHeader title="下级集中日志" description="下级通过独立 HTTP 队列批量发送；管理端按来源滚动保存，串口采集不会等待网络。" actions={<>
       <button className="button button-outline" type="button" disabled={!logs.data?.items.length} onClick={() => logs.data && exportCurrentPage(selectedSource?.name || sourceId, logs.data.items)}><Download size={16} />导出当前页</button>
+      <button className="button button-outline" type="button" disabled={!hasViewConstraints} onClick={showLatest}>显示最新日志</button>
+      <a className="button button-outline" href="#lower-log-control">调整日志等级</a>
       <button className="button button-secondary" type="button" disabled={logs.isFetching || !sourceId} onClick={() => void logs.refetch()}><RefreshCw size={16} />刷新</button>
     </>} />
 
@@ -92,7 +109,66 @@ export default function LowerLogsPage() {
                 <td>{formatRelativeTime(item.receivedAt)}<span className="sub-cell">{formatDateTime(item.receivedAt)}</span></td>
               </tr>)}</tbody></table></div><Pagination page={logs.data.page} pageSize={logs.data.pageSize} total={logs.data.total} onPageChange={(value) => update({ page: value })} /></>}
     </section>
+
+    <SourceLoggingControl source={selectedSource} />
   </div>;
+}
+
+function SourceLoggingControl({ source }: { source?: Source }) {
+  const target = useMemo(() => ({ id: source?.id ?? '', revision: source?.revision ?? 0 }), [source?.id, source?.revision]);
+  const capabilities = useOperationsCapabilities(target, Boolean(source));
+  const supported = capabilities.data?.features.includes('logging_configuration') ?? false;
+  const logging = useLoggingStatus(target, supported);
+  const mutation = useLoggingLevelMutation(target);
+  const [desired, setDesired] = useState<LoggingLevel | ''>('');
+  const [notice, setNotice] = useState('');
+
+  useEffect(() => {
+    const configured = logging.data?.configured_level;
+    setDesired(configured && configured !== 'custom' ? configured : '');
+  }, [logging.data?.configured_level]);
+
+  useEffect(() => setNotice(''), [source?.id]);
+
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!logging.data || !desired) return;
+    setNotice('');
+    try {
+      const result = await mutation.mutateAsync({ revision: logging.data.config_revision, level: desired });
+      setNotice(result.status === 'Unchanged' ? '日志等级没有变化。' : '日志等级已保存；重启该下级后生效。');
+    } catch (error) {
+      setNotice(apiErrorMessage(error));
+    }
+  };
+
+  return <section id="lower-log-control" className="content-panel lower-log-control" aria-label="下级日志等级">
+    <div className="panel-heading"><div><h2>下级日志等级</h2><p>单独修改当前物理下级的日志详细程度，使用配置 revision 防止覆盖其他人的修改。</p></div></div>
+    {!source ? <EmptyState title="请选择下级来源" />
+      : capabilities.isPending ? <LoadingState label="正在读取下级日志能力…" />
+        : capabilities.error ? <ErrorState error={capabilities.error} title="无法读取下级日志能力" onRetry={() => void capabilities.refetch()} />
+          : !supported ? <InlineNotice tone="warning"><strong>该下级版本暂不支持快捷调整日志等级。</strong><p>仍可在“下级 OPC → 运维 → 配置”编辑 config.toml 的 logging.level。</p></InlineNotice>
+            : logging.isPending ? <LoadingState label="正在读取当前日志等级…" />
+              : logging.error ? <ErrorState error={logging.error} title="无法读取当前日志等级" onRetry={() => void logging.refetch()} />
+                : logging.data ? <>
+                  <div className="lower-log-control-status">
+                    <div><span>当前运行</span><strong>{logging.data.active_level.toUpperCase()}</strong><code>{logging.data.active_spec}</code></div>
+                    <div><span>已保存配置</span><strong>{logging.data.configured_level.toUpperCase()}</strong><code>{logging.data.configured_spec}</code></div>
+                    <div><span>HTTP 集中推送</span><strong>{logging.data.http_push_enabled ? '已启用' : '未启用'}</strong><code>{logging.data.http_push_source_id || '未设置 source_id'}</code></div>
+                  </div>
+                  {logging.data.environment_override ? <InlineNotice tone="warning"><strong>当前存在 RUST_LOG 环境变量覆盖。</strong><p>保存的等级不会接管运行日志，需先清除该环境变量再重启。</p></InlineNotice> : null}
+                  {logging.data.restart_required ? <InlineNotice tone="warning"><strong>配置尚未应用。</strong><p>当前运行仍为 {logging.data.active_level.toUpperCase()}；请到 <Link to="/sources">下级 OPC → 运维 → 进程</Link> 明确重启该下级。</p></InlineNotice> : null}
+                  <form className="lower-log-level-form" onSubmit={(event) => void save(event)}>
+                    <label className="field"><span>保存的日志等级</span><select aria-label="保存的日志等级" value={desired} disabled={mutation.isPending} onChange={(event) => setDesired(event.target.value as LoggingLevel)}>
+                      {desired === '' ? <option value="">当前为自定义规则</option> : null}
+                      {LOG_LEVELS.map((item) => <option key={item.value} value={item.value}>{item.label} · {item.description}</option>)}
+                    </select></label>
+                    <button className="button button-primary" type="submit" disabled={!desired || mutation.isPending || desired === logging.data.configured_level}>{mutation.isPending ? '正在保存…' : '保存等级'}</button>
+                    <span className="operations-muted">DEBUG/TRACE 仅建议短时排障，集中日志和本机文件都会明显增大。</span>
+                  </form>
+                  {notice ? <InlineNotice tone={mutation.error ? 'error' : 'info'}><p>{notice}</p></InlineNotice> : null}
+                </> : null}
+  </section>;
 }
 
 function exportCurrentPage(sourceName: string, items: Array<{ timestamp: string; level: string; component: string; portId?: string; deviceId?: string; message: string; receivedAt: string }>) {

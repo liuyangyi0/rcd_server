@@ -41,6 +41,8 @@ func validateOperationResult(request domain.OperationRequest, result json.RawMes
 		return validateStationVersionResult(request, object)
 	case "set_calculation_mode":
 		return validateCalculationModeResult(request, object)
+	case "get_logging", "set_logging_level":
+		return validateLoggingResult(request, object)
 	case "list_configs":
 		items, err := operationArray(object, "items")
 		if err != nil {
@@ -72,6 +74,77 @@ func validateOperationResult(request domain.OperationRequest, result json.RawMes
 		return validateLogChunk(request, object)
 	default:
 		return invalidOperationField("action")
+	}
+}
+
+func validateLoggingResult(request domain.OperationRequest, object operationResultObject) error {
+	activeLevel, err := operationString(object, "active_level", 16, false)
+	if err != nil || !validReturnedLogLevel(activeLevel) {
+		return invalidOperationField("active_level")
+	}
+	configuredLevel, err := operationString(object, "configured_level", 16, false)
+	if err != nil || !validReturnedLogLevel(configuredLevel) {
+		return invalidOperationField("configured_level")
+	}
+	activeSpec, err := operationString(object, "active_spec", 1024, false)
+	if err != nil {
+		return err
+	}
+	configuredSpec, err := operationString(object, "configured_spec", 1024, false)
+	if err != nil {
+		return err
+	}
+	configRevision, err := operationRevision(object, "config_revision", false)
+	if err != nil {
+		return err
+	}
+	var restart bool
+	if err := operationField(object, "restart_required", &restart); err != nil || restart != (activeSpec != configuredSpec) {
+		return invalidOperationField("restart_required")
+	}
+	for _, field := range []string{"environment_override", "serial_frame_logs", "http_push_enabled"} {
+		var value bool
+		if err := operationField(object, field, &value); err != nil {
+			return err
+		}
+	}
+	if _, err := operationString(object, "http_push_source_id", 128, true); err != nil {
+		return err
+	}
+	if request.Action == "get_logging" {
+		return nil
+	}
+	status, err := operationString(object, "status", 16, false)
+	if err != nil || status != "Saved" && status != "Unchanged" {
+		return invalidOperationField("status")
+	}
+	if configuredLevel != strings.ToLower(request.LogLevel) {
+		return invalidOperationField("configured_level")
+	}
+	configRaw, exists := object["config"]
+	if !exists {
+		return invalidOperationField("config")
+	}
+	config, err := operationObject(configRaw)
+	if err != nil {
+		return err
+	}
+	if err := validateConfigDocument(domain.OperationRequest{Action: "read_config", Name: "config.toml"}, config); err != nil {
+		return err
+	}
+	writtenRevision, err := operationRevision(config, "revision", false)
+	if err != nil || writtenRevision != configRevision {
+		return invalidOperationField("config_revision")
+	}
+	return nil
+}
+
+func validReturnedLogLevel(value string) bool {
+	switch value {
+	case "error", "warn", "info", "debug", "trace", "custom":
+		return true
+	default:
+		return false
 	}
 }
 

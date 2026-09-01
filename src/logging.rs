@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use crate::log_push::{HttpLogPushConfig, HttpLogPushGuard, HttpLogSink};
 
-const DEFAULT_LOG_SPEC: &str = "warn,rcd_server=info";
+pub const DEFAULT_LOG_SPEC: &str = "warn,rcd_server=info";
 const DEFAULT_LOG_BASENAME: &str = "rcd_server";
 const SERIAL_FRAME_LOG_ENV: &str = "RCD_LOG_SERIAL_FRAMES";
 const OPCUA_TRANSPORT_ERRORS_ENV: &str = "RCD_LOG_OPCUA_TRANSPORT_ERRORS";

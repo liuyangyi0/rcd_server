@@ -278,6 +278,9 @@ func operationAuditDetails(request domain.OperationRequest) map[string]any {
 	if request.Mode != "" {
 		details["mode"] = request.Mode
 	}
+	if request.LogLevel != "" {
+		details["log_level"] = request.LogLevel
+	}
 	if request.ExpectedStationRevision != "" {
 		details["expected_station_revision"] = request.ExpectedStationRevision
 	}

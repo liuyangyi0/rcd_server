@@ -11,7 +11,7 @@
 - 采集开关持久化到下级 `config/operations.json`。分别展示期望值、worker 已应用值、物理句柄状态和通信状态。异步执行未确认时显示 `Pending`，不能报告已生效。
 - 配置管理限于下级配置目录的 `config.toml`、`calc.toml`、`rcd*.csv`。保存前进行全配置预检和版本比较，自动备份并原子替换文件。CSV/计算规则及全局配置**重启下级后才生效**，本协议不自动重启进程。
 - 备份先载入编辑草稿，再由用户显式校验、保存恢复。查看备份不修改当前文件。
-- 日志只读；按文件代次和字节游标分页，最多返回 64 KiB 文本。筛选针对当前扫描页，不声称检索了整个历史日志。下载按钮下载当前显示页。
+- 日志正文只读；按文件代次和字节游标分页，最多返回 64 KiB 文本。筛选针对当前扫描页，不声称检索了整个历史日志。下载按钮下载当前显示页。日志等级可通过专用动作修改配置，但只在明确重启下级后生效。
 
 ## OPC UA
 
@@ -26,7 +26,7 @@
 能力描述：
 
 ```json
-{"schema_version":1,"features":["acquisition","configuration","logs"],"max_config_bytes":2097152,"max_log_bytes":65536,"configuration_apply":"restart"}
+{"schema_version":1,"features":["acquisition","configuration","logs","station_versions","calculation_mode","logging_configuration"],"max_config_bytes":2097152,"max_log_bytes":65536,"configuration_apply":"restart"}
 ```
 
 请求为有界 JSON 对象。业务错误放在正常方法结果中，不将文件不存在、版本冲突或日志轮转误报为 OPC 通道断开：
@@ -58,6 +58,8 @@
 | `write_config` | `name, content, expected_revision` | 保存后的 `ConfigDocument` |
 | `list_logs` | 无 | `{items: LogFile[]}` |
 | `read_log` | `name, generation?, offset?, limit?, query?, level?, tail?` | `LogChunk` |
+| `get_logging` | 无 | 当前运行/已保存等级、配置 revision、HTTP 推送状态 |
+| `set_logging_level` | `log_level, expected_revision` | 保存后的等级状态及 `restart_required` |
 
 状态中的端口包含 `port_id, port_name, enabled, applied_enabled, open, devices, pending_commands, control_pending`，可有 `last_control_error`；设备包含 `device_id, name, read_enabled, applied_read_enabled, communication_ok`，可追加确实可获得的最后采集时间。未获得实际通信证据时不得根据启用开关推断健康。`Applied` 表示 worker 已执行设置，不代表物理通信正常；确认失败或未完成时必须核对快照。修改结果另附 `operation_revision` 关联本次控制版本。
 
@@ -91,8 +93,10 @@
 | PUT | `/config` | 保存配置 |
 | GET | `/logs` | 日志文件列表 |
 | GET | `/log?name=…&generation=…&offset=…&limit=…&q=…&level=…&tail=true` | 日志分页 |
+| GET | `/logging` | 当前运行等级、已保存等级、覆盖和推送状态 |
+| PUT | `/logging` | 保存 `error/warn/info/debug/trace` 等级 |
 
-三个 PUT 必须携带 `If-Match: "下级版本"` 和 JSON 中的 `source_revision`，以同时阻止下级内容冲突、来源 Endpoint 被改后的误操作。缺少版本返回 428，冲突或 busy 返回 409；离线返回 503，调用超时返回 504；写超时后结果可能已生效，前端必须提示核对而不是重复提交。
+所有修改型 PUT 必须携带 `If-Match: "下级版本"` 和 JSON 中的 `source_revision`，以同时阻止下级内容冲突、来源 Endpoint 被改后的误操作。日志等级使用 `config.toml` 的内容 SHA256 作为下级版本；缺少版本返回 428，冲突或 busy 返回 409；离线返回 503，调用超时返回 504；写超时后结果可能已生效，前端必须提示核对而不是重复提交。
 
 沿用现有同源检查与操作员标识，不新增登录或修改 OPC 安全设置。管理审计记录动作、目标、版本、结果和内容摘要，不把配置正文或日志正文写进审计。采集控制审计以 `operation_revision` 关联本次提交；若其他端口随后修改了配置，返回的 `snapshot_revision` 单独记录，不混用两个版本。
 

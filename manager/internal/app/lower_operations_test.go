@@ -20,7 +20,27 @@ type operationLowerStub struct {
 }
 
 func (*operationLowerStub) OperationsCapabilities(context.Context, uint64) (domain.OperationsCapabilities, error) {
-	return domain.OperationsCapabilities{Supported: true, SchemaVersion: 1, Features: []string{"acquisition", "configuration", "logs"}}, nil
+	return domain.OperationsCapabilities{Supported: true, SchemaVersion: 1, Features: []string{"acquisition", "configuration", "logs", "logging_configuration"}}, nil
+}
+
+func TestOperationsAuditRecordsLoggingLevelWithoutConfigBody(t *testing.T) {
+	r := seededRuntime(t)
+	f := &operationLowerStub{execute: func(context.Context, domain.OperationRequest, uint64) (json.RawMessage, error) {
+		return json.RawMessage(`{"status":"Saved","config_revision":"sha256:new","configured_level":"debug"}`), nil
+	}}
+	revision := installOperationsLower(t, r, f)
+	request := domain.OperationRequest{Action: "set_logging_level", LogLevel: "debug", ExpectedRevision: "sha256:old"}
+	if _, err := r.ExecuteSourceOperation(context.Background(), "source-a", revision, request); err != nil {
+		t.Fatal(err)
+	}
+	page, err := r.ListManagementAudit(context.Background(), api.PageRequest{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(page)
+	if !strings.Contains(string(encoded), `"log_level":"debug"`) || strings.Contains(string(encoded), "configured_spec") {
+		t.Fatalf("audit=%s", encoded)
+	}
 }
 func (f *operationLowerStub) ExecuteOperation(ctx context.Context, request domain.OperationRequest, epoch uint64) (json.RawMessage, error) {
 	f.calls.Add(1)
