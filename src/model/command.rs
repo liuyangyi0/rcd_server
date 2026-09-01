@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::mpsc;
 use std::time::Instant;
 
+use super::station_version::ModuleType;
 use crate::operations::CommandPermit;
 
 /// 指向特定串口的命令。
@@ -40,6 +41,10 @@ pub enum CommandType {
     /// Stop only acquisition; device control commands remain allowed.
     /// Appended to retain the existing bincode discriminants 0..=3.
     DeviceReadSetting(DeviceReadSetting),
+    /// Persisted type has changed; the worker may schedule a one-shot probe.
+    StationModuleTypeSetting(StationModuleTypeSetting),
+    /// Dedicated register query; never handled by the generic command ACK path.
+    QueryStationVersion(QueryStationVersion),
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +57,17 @@ pub struct ControlReceipt {
 pub struct DeviceReadSetting {
     pub device_id: u8,
     pub read_enabled: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StationModuleTypeSetting {
+    pub device_id: u8,
+    pub module_type: ModuleType,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct QueryStationVersion {
+    pub device_id: u8,
 }
 
 /// 发送到设备的原始数据。
@@ -183,6 +199,11 @@ mod tests {
                 device_id: 255,
                 read_enabled: false,
             }),
+            CommandType::StationModuleTypeSetting(StationModuleTypeSetting {
+                device_id: 255,
+                module_type: ModuleType::Domestic,
+            }),
+            CommandType::QueryStationVersion(QueryStationVersion { device_id: 255 }),
         ];
         for (index, variant) in variants.into_iter().enumerate() {
             let bytes = bincode::serialize(&variant).unwrap();

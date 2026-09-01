@@ -1,8 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ApiError, request } from './client';
 import { queryKeys } from './queries';
+import type { ModuleType } from './types';
 
-export type OperationFeature = 'acquisition' | 'configuration' | 'logs';
+export type OperationFeature = 'acquisition' | 'configuration' | 'logs' | 'station_versions';
 export interface OperationsTarget { id: string; revision: number }
 export interface OperationsCapabilities {
   source_id: string;
@@ -22,6 +23,19 @@ export interface AcquisitionDevice {
   applied_read_enabled: boolean;
   communication_ok: boolean;
   last_data_at?: string;
+  configured_module_type?: ModuleType;
+  detected_module_type?: ModuleType;
+  type_mismatch?: boolean;
+  communication_module_version?: string;
+  communication_module_version_raw?: number;
+  plc_version?: string;
+  plc_version_raw?: number;
+  version_payload?: string | number[];
+  version_state?: string;
+  last_version_attempt_at?: string;
+  last_version_success_at?: string;
+  last_version_error?: string;
+  stale?: boolean;
 }
 export interface AcquisitionPort {
   port_id: string;
@@ -39,6 +53,11 @@ export interface AcquisitionSnapshot {
   source_revision: number;
   schema_version: number;
   revision: string;
+  station_revision?: string;
+  software_version?: string;
+  build_commit?: string;
+  status?: 'Applied' | 'Pending' | 'Unchanged';
+  station_operation_revision?: string;
   ports: AcquisitionPort[];
 }
 export type AcquisitionApplyResult = AcquisitionSnapshot & { status: 'Applied' | 'Pending'; operation_revision?: string };
@@ -113,15 +132,41 @@ async function scopedResponse<T extends { source_id: string; source_revision: nu
   return result;
 }
 
+// During the rolling upgrade some lower builds nest station_version while the
+// final additive schema flattens those fields onto each device. Normalize at
+// the transport edge so the acquisition UI and mutation results have one safe
+// shape throughout a mixed-version deployment.
+function normalizeAcquisition<T extends AcquisitionSnapshot>(snapshot: T): T {
+  return {
+    ...snapshot,
+    ports: snapshot.ports.map((port) => ({
+      ...port,
+      devices: port.devices.map((device) => {
+        const nested = (device as AcquisitionDevice & { station_version?: Partial<AcquisitionDevice> }).station_version;
+        if (!nested) return device;
+        const flattened = { ...device, ...nested } as AcquisitionDevice & { station_version?: Partial<AcquisitionDevice> };
+        delete flattened.station_version;
+        return flattened;
+      }),
+    })),
+  };
+}
+
 export const operationsApi = {
   capabilities: (id: string, signal?: AbortSignal, revision?: number) => scopedResponse(id, operationRequest<OperationsCapabilities>(`${prefix(id)}/capabilities`, { signal }), revision),
-  status: (id: string, signal?: AbortSignal, revision?: number) => scopedResponse(id, operationRequest<AcquisitionSnapshot>(`${prefix(id)}/status`, { signal }), revision),
-  port: (target: OperationsTarget, revision: string, portId: string, enabled: boolean) => operationRequest<AcquisitionApplyResult>(`${prefix(target.id)}/port`, {
+  status: async (id: string, signal?: AbortSignal, revision?: number) => normalizeAcquisition(await scopedResponse(id, operationRequest<AcquisitionSnapshot>(`${prefix(id)}/status`, { signal }), revision)),
+  port: async (target: OperationsTarget, revision: string, portId: string, enabled: boolean) => normalizeAcquisition(await operationRequest<AcquisitionApplyResult>(`${prefix(target.id)}/port`, {
     method: 'PUT', headers: { 'If-Match': JSON.stringify(revision) }, body: JSON.stringify({ source_revision: target.revision, port_id: portId, enabled }),
-  }),
-  deviceRead: (target: OperationsTarget, revision: string, portId: string, deviceId: string, enabled: boolean) => operationRequest<AcquisitionApplyResult>(`${prefix(target.id)}/device-read`, {
+  })),
+  deviceRead: async (target: OperationsTarget, revision: string, portId: string, deviceId: string, enabled: boolean) => normalizeAcquisition(await operationRequest<AcquisitionApplyResult>(`${prefix(target.id)}/device-read`, {
     method: 'PUT', headers: { 'If-Match': JSON.stringify(revision) }, body: JSON.stringify({ source_revision: target.revision, port_id: portId, device_id: deviceId, enabled }),
-  }),
+  })),
+  deviceModuleType: async (target: OperationsTarget, stationRevision: string, portId: string, deviceId: string, moduleType: ModuleType) => normalizeAcquisition(await scopedResponse(target.id, operationRequest<AcquisitionSnapshot>(`${prefix(target.id)}/device-module-type`, {
+    method: 'PUT', headers: { 'If-Match': JSON.stringify(stationRevision) }, body: JSON.stringify({ source_revision: target.revision, station_revision: stationRevision, port_id: portId, device_id: deviceId, module_type: moduleType }),
+  }), target.revision)),
+  queryDeviceVersion: async (target: OperationsTarget, stationRevision: string, portId: string, deviceId: string) => normalizeAcquisition(await scopedResponse(target.id, operationRequest<AcquisitionSnapshot>(`${prefix(target.id)}/device-version/query`, {
+    method: 'POST', headers: { 'If-Match': JSON.stringify(stationRevision) }, body: JSON.stringify({ source_revision: target.revision, station_revision: stationRevision, port_id: portId, device_id: deviceId }),
+  }), target.revision)),
   configs: (id: string, signal?: AbortSignal, revision?: number) => scopedResponse(id, operationRequest<ConfigFiles>(`${prefix(id)}/configs`, { signal }), revision),
   config: (id: string, name: string, backupId = '', signal?: AbortSignal, revision?: number) => {
     const params = new URLSearchParams({ name });
@@ -186,6 +231,30 @@ export function useAcquisitionMutation(target: OperationsTarget) {
     onSettled: async () => { await Promise.all([
       client.invalidateQueries({ queryKey: operationKeys.status(target) }),
       client.invalidateQueries({ queryKey: queryKeys.allSources }),
+      client.invalidateQueries({ queryKey: queryKeys.allManagementAudit }),
+    ]); },
+  });
+}
+
+export type DeviceVersionMutationInput = {
+  target: OperationsTarget;
+  stationRevision: string;
+  portId: string;
+  deviceId: string;
+  deferInvalidation?: boolean;
+} & ({ action: 'set_type'; moduleType: ModuleType } | { action: 'query' });
+
+export function useDeviceVersionMutation() {
+  const client = useQueryClient();
+  return useMutation({
+    retry: false,
+    mutationFn: (input: DeviceVersionMutationInput) => input.action === 'set_type'
+      ? operationsApi.deviceModuleType(input.target, input.stationRevision, input.portId, input.deviceId, input.moduleType)
+      : operationsApi.queryDeviceVersion(input.target, input.stationRevision, input.portId, input.deviceId),
+    onSuccess: (result, input) => { client.setQueryData(operationKeys.status(input.target), result); },
+    onSettled: async (_result, _error, input) => { if (input.deferInvalidation) return; await Promise.all([
+      client.invalidateQueries({ queryKey: operationKeys.status(input.target) }),
+      client.invalidateQueries({ queryKey: queryKeys.allDeviceVersions }),
       client.invalidateQueries({ queryKey: queryKeys.allManagementAudit }),
     ]); },
   });

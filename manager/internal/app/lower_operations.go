@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -19,9 +20,11 @@ import (
 const lowerOperationsTimeout = 15 * time.Second
 
 type lowerOperationsTarget struct {
-	source domain.Source
-	client opc.LowerOperationsClient
-	epoch  uint64
+	source              domain.Source
+	client              opc.LowerOperationsClient
+	epoch               uint64
+	connectionEpoch     uint64
+	topologyFingerprint string
 }
 
 // configMu must be held. Never retain it during an OPC round trip: a slow
@@ -41,6 +44,7 @@ func (r *Runtime) lowerOperationsTargetLocked(id string) (lowerOperationsTarget,
 	r.mu.RLock()
 	handle, exists := r.lowers[id]
 	status := r.statuses[id]
+	topologyFingerprint := domain.SourceTopologyFingerprint(r.catalogs[id].Topology)
 	r.mu.RUnlock()
 	if !exists || status.Connection != opc.ConnectionConnected || status.Session != opc.SessionActive {
 		return target, unavailableLowerOperation()
@@ -49,7 +53,11 @@ func (r *Runtime) lowerOperationsTargetLocked(id string) (lowerOperationsTarget,
 	if !ok {
 		return target, &domain.OperationError{Code: "unsupported", Message: "该下级尚未提供运维能力"}
 	}
-	target.client, target.epoch = client, status.Epoch
+	target.client, target.epoch, target.connectionEpoch = client, status.Epoch, status.Epoch
+	if topologyFingerprint == "" {
+		topologyFingerprint = unverifiedStationTopology
+	}
+	target.topologyFingerprint = topologyFingerprint
 	if status.Epoch>>32 == handle.generation {
 		target.epoch = status.Epoch & 0xffffffff
 	}
@@ -105,7 +113,7 @@ func (r *Runtime) ExecuteSourceOperation(ctx context.Context, id string, sourceR
 		target, err = r.lowerOperationsTargetLocked(id)
 	}
 	if err == nil && request.Mutates() {
-		if request.Feature() == "acquisition" {
+		if request.Feature() == "acquisition" || request.Feature() == "station_versions" {
 			if r.physicalPortCommandPending(id, request.PortID) {
 				err = domain.ErrCommandPending
 			}
@@ -150,6 +158,11 @@ func (r *Runtime) ExecuteSourceOperation(ctx context.Context, id string, sourceR
 	err = normalizeLowerOperationError(operationContext, err, request.Mutates())
 	if err == nil {
 		result, err = bindOperationSource(result, target.source)
+		if err == nil {
+			if cacheErr := r.cacheStationVersionResult(request, result, target.source, target.connectionEpoch, target.topologyFingerprint); cacheErr != nil {
+				slog.Error("cache station versions", "source_id", id, "error", cacheErr)
+			}
+		}
 	}
 	if request.Mutates() {
 		completed := make(map[string]any, len(auditDetails)+3)
@@ -169,9 +182,10 @@ func (r *Runtime) ExecuteSourceOperation(ctx context.Context, id string, sourceR
 			}
 		} else {
 			var status struct {
-				Status            string `json:"status"`
-				Revision          string `json:"revision"`
-				OperationRevision string `json:"operation_revision"`
+				Status                   string `json:"status"`
+				Revision                 string `json:"revision"`
+				OperationRevision        string `json:"operation_revision"`
+				StationOperationRevision string `json:"station_operation_revision"`
 			}
 			if json.Unmarshal(result, &status) == nil {
 				completed["lower_revision"] = status.Revision
@@ -185,6 +199,14 @@ func (r *Runtime) ExecuteSourceOperation(ctx context.Context, id string, sourceR
 				}
 				if status.Status == "Pending" {
 					completed["outcome"] = "pending"
+				}
+				if status.StationOperationRevision != "" {
+					completed["station_operation_revision"] = status.StationOperationRevision
+				}
+			}
+			if request.Feature() == "station_versions" {
+				for key, value := range stationOperationAuditResult(result, request) {
+					completed[key] = value
 				}
 			}
 		}
@@ -249,6 +271,12 @@ func operationAuditDetails(request domain.OperationRequest) map[string]any {
 	}
 	if request.Enabled != nil {
 		details["enabled"] = *request.Enabled
+	}
+	if request.ModuleType != "" {
+		details["module_type"] = request.ModuleType
+	}
+	if request.ExpectedStationRevision != "" {
+		details["expected_station_revision"] = request.ExpectedStationRevision
 	}
 	if request.Name != "" {
 		details["file"] = request.Name

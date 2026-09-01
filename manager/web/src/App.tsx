@@ -7,6 +7,7 @@ const OverviewPage = lazy(() => import('./pages/OverviewPage'));
 const GroupsPage = lazy(() => import('./pages/GroupsPage'));
 const SourcesPage = lazy(() => import('./pages/SourcesPage'));
 const PointsPage = lazy(() => import('./pages/PointsPage'));
+const DeviceVersionsPage = lazy(() => import('./pages/DeviceVersionsPage'));
 const CommandsPage = lazy(() => import('./pages/CommandsPage'));
 const OperationsPage = lazy(() => import('./pages/OperationsPage'));
 const SettingsPage = lazy(() => import('./pages/SettingsPage'));
@@ -19,6 +20,7 @@ export default function App() {
         <Route path="groups" element={<Suspense fallback={<LoadingState />}><GroupsPage /></Suspense>} />
         <Route path="sources" element={<Suspense fallback={<LoadingState />}><SourcesPage /></Suspense>} />
         <Route path="points" element={<Suspense fallback={<LoadingState />}><PointsPage /></Suspense>} />
+        <Route path="device-versions" element={<Suspense fallback={<LoadingState />}><DeviceVersionsPage /></Suspense>} />
         <Route path="commands" element={<Suspense fallback={<LoadingState />}><CommandsPage /></Suspense>} />
         <Route path="operations" element={<Suspense fallback={<LoadingState />}><OperationsPage /></Suspense>} />
         <Route path="settings" element={<Suspense fallback={<LoadingState />}><SettingsPage /></Suspense>} />

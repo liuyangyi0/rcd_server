@@ -2,8 +2,10 @@ package opc
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -316,7 +318,7 @@ func (s *UpstreamServer) reconcileManagementLocked(catalog domain.CatalogUnion, 
 		s.finishGroupCatalogUpdateLocked(catalogRevision)
 	}
 	for _, source := range sources {
-		if err := s.addSourceManagementLocked(source); err != nil {
+		if err := s.addSourceManagementLocked(source, catalog.SourceTopologies[source.ID]); err != nil {
 			return err
 		}
 	}
@@ -346,6 +348,12 @@ func (s *UpstreamServer) reconcileManagementLocked(catalog domain.CatalogUnion, 
 	for key := range s.memberCoverageSnapshots {
 		if _, keep := desiredGroups[key.groupID]; !keep {
 			delete(s.memberCoverageSnapshots, key)
+		}
+	}
+	for sourceID := range s.sourceVersionTreeHashes {
+		if _, keep := desiredSources[sourceID]; !keep {
+			delete(s.sourceVersionTreeHashes, sourceID)
+			delete(s.sourceVersionTreeRoots, sourceID)
 		}
 	}
 	return nil
@@ -530,7 +538,7 @@ func (s *UpstreamServer) updateGroupPointSnapshotLocked(groupID string, identifi
 	return store
 }
 
-func (s *UpstreamServer) addSourceManagementLocked(source domain.Source) error {
+func (s *UpstreamServer) addSourceManagementLocked(source domain.Source, topology *domain.SourceTopology) error {
 	objectID := awu.NewNodeIDString(s.managementNS, "Sources/"+source.ID)
 	object, exists := s.management[objectID.String()]
 	if !exists {
@@ -544,6 +552,24 @@ func (s *UpstreamServer) addSourceManagementLocked(source domain.Source) error {
 	status := func() LowerStatus { value, _ := s.backend.LowerStatus(source.ID); return value }
 	pointStats := func() PointStatistics { return s.backend.SourcePointStatistics(source.ID) }
 	definitions := []managementVariable{
+		{name: "RcdSoftwareVersion", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) {
+			if snapshot, ok := sourceStationVersions(s.backend, source.ID); ok {
+				return snapshot.SoftwareVersion, awu.Good
+			}
+			return "", sourceStationMissingStatus(s.backend, source.ID)
+		}},
+		{name: "RcdBuildCommit", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) {
+			if snapshot, ok := sourceStationVersions(s.backend, source.ID); ok {
+				return snapshot.BuildCommit, awu.Good
+			}
+			return "", sourceStationMissingStatus(s.backend, source.ID)
+		}},
+		{name: "StationVersionRevision", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) {
+			if snapshot, ok := sourceStationVersions(s.backend, source.ID); ok {
+				return snapshot.StationRevision, awu.Good
+			}
+			return "", sourceStationMissingStatus(s.backend, source.ID)
+		}},
 		{name: "ConnectionState", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return string(status().Connection), awu.Good }},
 		{name: "SessionState", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return string(status().Session), awu.Good }},
 		{name: "SubscriptionState", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return string(status().Subscription), awu.Good }},
@@ -583,7 +609,207 @@ func (s *UpstreamServer) addSourceManagementLocked(source domain.Source) error {
 			return err
 		}
 	}
+	return s.reconcileSourceStationVersionTreeLocked(source, topology)
+}
+
+func sourceStationVersions(backend UpstreamBackend, sourceID string) (domain.SourceStationVersions, bool) {
+	if known, supported := sourceStationVersionSupport(backend, sourceID); known && !supported {
+		return domain.SourceStationVersions{}, false
+	}
+	provider, ok := backend.(StationVersionBackend)
+	if !ok {
+		return domain.SourceStationVersions{}, false
+	}
+	return provider.StationVersions(sourceID)
+}
+
+func sourceStationVersionSupport(backend UpstreamBackend, sourceID string) (known, supported bool) {
+	provider, ok := backend.(StationVersionCapabilityBackend)
+	if !ok {
+		return false, false
+	}
+	return provider.StationVersionSupport(sourceID)
+}
+
+func sourceStationOnline(backend UpstreamBackend, sourceID string) bool {
+	status, ok := backend.LowerStatus(sourceID)
+	return ok && status.Connection == ConnectionConnected && status.Session == SessionActive
+}
+
+func sourceStationMissingStatus(backend UpstreamBackend, sourceID string) awu.StatusCode {
+	if known, supported := sourceStationVersionSupport(backend, sourceID); known && !supported {
+		return awu.BadNotSupported
+	}
+	if sourceStationOnline(backend, sourceID) {
+		return awu.BadWaitingForInitialData
+	}
+	return awu.BadNoCommunication
+}
+
+func (s *UpstreamServer) reconcileSourceStationVersionTreeLocked(source domain.Source, topology *domain.SourceTopology) error {
+	fingerprint := domain.SourceTopologyFingerprint(topology)
+	if current, exists := s.sourceVersionTreeHashes[source.ID]; exists && current == fingerprint {
+		return nil
+	}
+	if root := s.sourceVersionTreeRoots[source.ID]; root != nil {
+		if err := s.server.NamespaceManager().DeleteNode(root, true); err != nil {
+			return fmt.Errorf("remove source station version tree: %w", err)
+		}
+		delete(s.sourceVersionTreeRoots, source.ID)
+		for key, node := range s.management {
+			if _, exists := s.server.NamespaceManager().FindNode(node.NodeID()); !exists {
+				delete(s.management, key)
+			}
+		}
+	}
+	s.sourceVersionTreeHashes[source.ID] = fingerprint
+	if topology == nil {
+		return nil
+	}
+	rootID := awu.NewNodeIDString(s.managementNS, "Sources/"+source.ID+"/Ports")
+	root := newObject(s.server, rootID, awu.NewQualifiedName(s.managementNS, "Ports"), "Ports", awu.NewNodeIDString(s.managementNS, "Sources/"+source.ID))
+	if err := s.server.NamespaceManager().AddNode(root); err != nil {
+		return err
+	}
+	s.management[rootID.String()] = root
+	s.sourceVersionTreeRoots[source.ID] = root
+	for _, topologyPort := range topology.Ports {
+		port := topologyPort
+		portToken := url.PathEscape(port.PortID)
+		portPath := "Sources/" + source.ID + "/Ports/" + portToken
+		portID := awu.NewNodeIDString(s.managementNS, portPath)
+		portObject := newObject(s.server, portID, awu.NewQualifiedName(s.managementNS, port.PortName), port.PortName, rootID)
+		if err := s.server.NamespaceManager().AddNode(portObject); err != nil {
+			return err
+		}
+		s.management[portID.String()] = portObject
+		for _, definition := range []managementVariable{
+			{name: "PortId", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return port.PortID, awu.Good }},
+			{name: "PortName", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return port.PortName, awu.Good }},
+		} {
+			if err := s.addManagementVariableLocked(portID, portPath+"/"+definition.name, definition); err != nil {
+				return err
+			}
+		}
+		devicesPath := portPath + "/Devices"
+		devicesID := awu.NewNodeIDString(s.managementNS, devicesPath)
+		devicesObject := newObject(s.server, devicesID, awu.NewQualifiedName(s.managementNS, "Devices"), "Devices", portID)
+		if err := s.server.NamespaceManager().AddNode(devicesObject); err != nil {
+			return err
+		}
+		s.management[devicesID.String()] = devicesObject
+		for _, topologyDevice := range port.Devices {
+			device := topologyDevice
+			devicePath := devicesPath + "/" + device.DeviceID
+			deviceID := awu.NewNodeIDString(s.managementNS, devicePath)
+			deviceObject := newObject(s.server, deviceID, awu.NewQualifiedName(s.managementNS, device.DeviceID), device.Name, devicesID)
+			if err := s.server.NamespaceManager().AddNode(deviceObject); err != nil {
+				return err
+			}
+			s.management[deviceID.String()] = deviceObject
+			if err := s.addSourceStationDeviceVariablesLocked(source.ID, port.PortID, device, deviceID, devicePath); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
+}
+
+func (s *UpstreamServer) addSourceStationDeviceVariablesLocked(sourceID, portID string, topologyDevice domain.TopologyDevice, parent awu.NodeID, path string) error {
+	for _, definition := range sourceStationDeviceVariables(s.backend, sourceID, portID, topologyDevice) {
+		if err := s.addManagementVariableLocked(parent, path+"/"+definition.name, definition); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sourceStationDeviceVariables(backend UpstreamBackend, sourceID, portID string, topologyDevice domain.TopologyDevice) []managementVariable {
+	lookup := func() (domain.StationVersion, bool) {
+		snapshot, ok := sourceStationVersions(backend, sourceID)
+		if !ok {
+			return domain.StationVersion{}, false
+		}
+		_, device, ok := snapshot.Device(portID, topologyDevice.DeviceID)
+		return device, ok
+	}
+	metadata := func(value func(domain.StationVersion) any, zero any) func(string) (any, awu.StatusCode) {
+		return func(string) (any, awu.StatusCode) {
+			device, ok := lookup()
+			if !ok {
+				return zero, sourceStationMissingStatus(backend, sourceID)
+			}
+			return value(device), awu.Good
+		}
+	}
+	version := func(value func(domain.StationVersion) any, zero any) func(string) (any, awu.StatusCode) {
+		return func(string) (any, awu.StatusCode) {
+			device, ok := lookup()
+			if !ok {
+				return zero, sourceStationMissingStatus(backend, sourceID)
+			}
+			return value(device), stationVersionStatus(backend, sourceID, device)
+		}
+	}
+	return []managementVariable{
+		{name: "PortId", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return portID, awu.Good }},
+		{name: "DeviceId", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return topologyDevice.DeviceID, awu.Good }},
+		{name: "DeviceName", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return topologyDevice.Name, awu.Good }},
+		{name: "ConfiguredModuleType", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: metadata(func(v domain.StationVersion) any { return v.ConfiguredModuleType }, "")},
+		{name: "DetectedModuleType", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: metadata(func(v domain.StationVersion) any { return v.DetectedModuleType }, "")},
+		{name: "TypeMismatch", dataType: awu.DataTypeIDBoolean, valueRank: awu.ValueRankScalar, read: metadata(func(v domain.StationVersion) any { return v.TypeMismatch }, false)},
+		{name: "CommunicationModuleVersion", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: version(func(v domain.StationVersion) any { return v.CommunicationModuleVersion }, "")},
+		{name: "CommunicationModuleVersionRaw", dataType: awu.DataTypeIDUInt16, valueRank: awu.ValueRankScalar, read: version(func(v domain.StationVersion) any { return stationRawValue(v.CommunicationModuleVersionRaw) }, uint16(0))},
+		{name: "PLCVersion", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: version(func(v domain.StationVersion) any { return v.PLCVersion }, "")},
+		{name: "PLCVersionRaw", dataType: awu.DataTypeIDUInt16, valueRank: awu.ValueRankScalar, read: version(func(v domain.StationVersion) any { return stationRawValue(v.PLCVersionRaw) }, uint16(0))},
+		{name: "VersionPayload", dataType: awu.DataTypeIDByteString, valueRank: awu.ValueRankScalar, read: version(func(v domain.StationVersion) any {
+			payload, _ := hex.DecodeString(v.VersionPayload)
+			return awu.ByteString(string(payload))
+		}, awu.ByteString(""))},
+		{name: "VersionState", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: metadata(func(v domain.StationVersion) any { return v.VersionState }, "")},
+		{name: "LastVersionAttemptAt", dataType: awu.DataTypeIDDateTime, valueRank: awu.ValueRankScalar, read: metadata(func(v domain.StationVersion) any { return v.LastVersionAttemptAt }, time.Time{})},
+		{name: "LastVersionSuccessAt", dataType: awu.DataTypeIDDateTime, valueRank: awu.ValueRankScalar, read: version(func(v domain.StationVersion) any { return v.LastVersionSuccessAt }, time.Time{})},
+		{name: "LastVersionError", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: metadata(func(v domain.StationVersion) any { return v.LastVersionError }, "")},
+		{name: "ConsecutiveFailures", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, read: metadata(func(v domain.StationVersion) any { return v.ConsecutiveFailures }, uint32(0))},
+		{name: "Stale", dataType: awu.DataTypeIDBoolean, valueRank: awu.ValueRankScalar, read: metadata(func(v domain.StationVersion) any { return v.Stale || !sourceStationOnline(backend, sourceID) }, true)},
+	}
+}
+
+func stationVersionStatus(backend UpstreamBackend, sourceID string, device domain.StationVersion) awu.StatusCode {
+	if known, supported := sourceStationVersionSupport(backend, sourceID); known && !supported {
+		return awu.BadNotSupported
+	}
+	if device.ConfiguredModuleType == domain.ModuleTypeLegacyRussian {
+		return awu.BadNotSupported
+	}
+	if device.TypeMismatch || (device.ConfiguredModuleType == domain.ModuleTypeDomestic && device.DetectedModuleType == domain.ModuleTypeLegacyRussian) {
+		return awu.BadConfigurationError
+	}
+	hasValue := device.CommunicationModuleVersionRaw != nil || device.PLCVersionRaw != nil || device.VersionPayload != "" || !device.LastVersionSuccessAt.IsZero()
+	if !sourceStationOnline(backend, sourceID) {
+		if hasValue {
+			return awu.UncertainLastUsableValue
+		}
+		return awu.BadNoCommunication
+	}
+	state := strings.ToLower(device.VersionState)
+	if (state == "success" || state == "ready") && device.CommunicationOK && !device.Stale && device.ConsecutiveFailures == 0 {
+		return awu.Good
+	}
+	if hasValue {
+		return awu.UncertainLastUsableValue
+	}
+	if !device.CommunicationOK || device.Stale || device.ConsecutiveFailures > 0 || state == "failed" || state == "timeout" || state == "error" {
+		return awu.BadNoCommunication
+	}
+	return awu.BadWaitingForInitialData
+}
+
+func stationRawValue(value *uint16) uint16 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 type managementVariable struct {

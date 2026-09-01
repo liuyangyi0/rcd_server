@@ -668,6 +668,17 @@ func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, 
 			r.catalogPersistError = ""
 		}
 		r.mu.Unlock()
+		if resetCatalog {
+			if clearErr := r.repo.ClearSourceStationVersions(ctx, id); clearErr != nil {
+				r.mu.Lock()
+				r.stationPersistError = clearErr.Error()
+				r.mu.Unlock()
+			}
+			r.mu.Lock()
+			delete(r.stationVersions, id)
+			delete(r.stationVersionEpoch, id)
+			r.mu.Unlock()
+		}
 	}
 	if restartRequired && updated.Enabled && r.running.Load() {
 		if err := r.startLower(updated); err != nil {
@@ -743,6 +754,12 @@ func (r *Runtime) DeleteSource(ctx context.Context, id string, revision uint64) 
 	r.index = candidateIndex
 	r.conflictCount = candidateConflictCount
 	delete(r.statuses, id)
+	delete(r.stationVersions, id)
+	delete(r.stationVersionEpoch, id)
+	delete(r.stationRefreshPending, id)
+	delete(r.stationRefreshDirty, id)
+	delete(r.stationFeatureEpoch, id)
+	delete(r.stationFeatureSupported, id)
 	delete(r.dirtyCatalogs, id)
 	delete(r.quarantinedSources, id)
 	for key := range r.ackSequences {
@@ -916,6 +933,7 @@ func (r *Runtime) Health(ctx context.Context) api.HealthStatus {
 	commandError := r.commandPersistError
 	auditError := r.auditPersistError
 	statusError := r.statusPersistError
+	stationError := r.stationPersistError
 	upstreamError := r.upstreamReconcileError
 	r.mu.RUnlock()
 	if catalogError == "" {
@@ -943,7 +961,12 @@ func (r *Runtime) Health(ctx context.Context) api.HealthStatus {
 	} else {
 		checks["status_history_persistence"] = statusError
 	}
-	ok := err == nil && catalogError == "" && commandError == "" && auditError == "" && statusError == "" && upstreamError == ""
+	if stationError == "" {
+		checks["station_version_persistence"] = "ok"
+	} else {
+		checks["station_version_persistence"] = stationError
+	}
+	ok := err == nil && catalogError == "" && commandError == "" && auditError == "" && statusError == "" && stationError == "" && upstreamError == ""
 	return api.HealthStatus{OK: ok, Status: ternary(ok, "ok", "unhealthy"), Checks: checks, Time: time.Now().UTC()}
 }
 

@@ -2,6 +2,7 @@ import {
   normalizeAlarm,
   normalizeCommand,
   normalizeConfigurationImport,
+  normalizeDeviceVersionPage,
   normalizeGroup,
   normalizeList,
   normalizeManagementAudit,
@@ -21,6 +22,8 @@ import type {
   CommandAudit,
   ConfigurationDocument,
   ConfigurationImportResult,
+  DeviceVersionPage,
+  DeviceVersionParams,
   Group,
   GroupInput,
   ListParams,
@@ -73,6 +76,18 @@ export function queryString(params: ListParams): string {
   if (params.deviceId) query.set('device_id', params.deviceId);
   const value = query.toString();
   return value ? `?${value}` : '';
+}
+
+export function deviceVersionQueryString(params: DeviceVersionParams): string {
+  const query = new URLSearchParams();
+  query.set('page', String(Math.max(1, params.page ?? 1)));
+  query.set('page_size', String(Math.max(1, params.pageSize ?? 50)));
+  if (params.query) query.set('q', params.query);
+  if (params.sourceId) query.set('source_id', params.sourceId);
+  if (params.portId) query.set('port_id', params.portId);
+  if (params.moduleType) query.set('module_type', params.moduleType);
+  if (params.status) query.set('status', params.status);
+  return `?${query.toString()}`;
 }
 
 async function parseResponse(response: Response): Promise<unknown> {
@@ -189,6 +204,10 @@ export const api = {
 
   async points(params: ListParams, signal?: AbortSignal): Promise<PageResult<Point>> {
     return normalizePage(await request(`/points${queryString(params)}`, { signal }), normalizePoint);
+  },
+
+  async deviceVersions(params: DeviceVersionParams, signal?: AbortSignal): Promise<DeviceVersionPage> {
+    return normalizeDeviceVersionPage(await request(`/device-versions${deviceVersionQueryString(params)}`, { signal }));
   },
 
   async commands(params: ListParams): Promise<PageResult<CommandAudit>> {

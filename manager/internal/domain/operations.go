@@ -20,30 +20,35 @@ const (
 // OperationRequest is a bounded, library-independent lower operations request.
 // SourceID is intentionally absent: Runtime pins that physical target before I/O.
 type OperationRequest struct {
-	Action           string  `json:"action"`
-	PortID           string  `json:"port_id,omitempty"`
-	DeviceID         string  `json:"device_id,omitempty"`
-	Enabled          *bool   `json:"enabled,omitempty"`
-	ExpectedRevision string  `json:"expected_revision,omitempty"`
-	Name             string  `json:"name,omitempty"`
-	BackupID         string  `json:"backup_id,omitempty"`
-	Content          *string `json:"content,omitempty"`
-	Generation       string  `json:"generation,omitempty"`
-	Offset           *int64  `json:"offset,omitempty"`
-	Limit            int64   `json:"limit,omitempty"`
-	Query            string  `json:"query,omitempty"`
-	Level            string  `json:"level,omitempty"`
-	Tail             bool    `json:"tail,omitempty"`
+	Action                  string  `json:"action"`
+	PortID                  string  `json:"port_id,omitempty"`
+	DeviceID                string  `json:"device_id,omitempty"`
+	ModuleType              string  `json:"module_type,omitempty"`
+	Enabled                 *bool   `json:"enabled,omitempty"`
+	ExpectedRevision        string  `json:"expected_revision,omitempty"`
+	ExpectedStationRevision string  `json:"expected_station_revision,omitempty"`
+	Name                    string  `json:"name,omitempty"`
+	BackupID                string  `json:"backup_id,omitempty"`
+	Content                 *string `json:"content,omitempty"`
+	Generation              string  `json:"generation,omitempty"`
+	Offset                  *int64  `json:"offset,omitempty"`
+	Limit                   int64   `json:"limit,omitempty"`
+	Query                   string  `json:"query,omitempty"`
+	Level                   string  `json:"level,omitempty"`
+	Tail                    bool    `json:"tail,omitempty"`
 }
 
 func (r OperationRequest) Mutates() bool {
-	return r.Action == "set_port_enabled" || r.Action == "set_device_read_enabled" || r.Action == "write_config"
+	return r.Action == "set_port_enabled" || r.Action == "set_device_read_enabled" ||
+		r.Action == "set_device_module_type" || r.Action == "query_device_version" || r.Action == "write_config"
 }
 
 func (r OperationRequest) Feature() string {
 	switch r.Action {
 	case "status", "set_port_enabled", "set_device_read_enabled":
 		return "acquisition"
+	case "set_device_module_type", "query_device_version":
+		return "station_versions"
 	case "list_configs", "read_config", "validate_config", "write_config":
 		return "configuration"
 	case "list_logs", "read_log":
@@ -61,19 +66,34 @@ func (r OperationRequest) Validate() error {
 	if r.Mutates() && !ValidOperationRevision(r.ExpectedRevision) {
 		return invalid("revision", "a lower revision is required")
 	}
-	if r.Action == "set_port_enabled" || r.Action == "set_device_read_enabled" {
+	if r.Action == "set_port_enabled" || r.Action == "set_device_read_enabled" ||
+		r.Action == "set_device_module_type" || r.Action == "query_device_version" {
 		if strings.TrimSpace(r.PortID) == "" || len(r.PortID) > 1024 || strings.ContainsAny(r.PortID, "\x00\r\n") {
 			return invalid("port_id", "invalid physical port identifier")
 		}
+	}
+	if r.Action == "set_port_enabled" || r.Action == "set_device_read_enabled" {
 		if r.Enabled == nil {
 			return invalid("enabled", "a Boolean value is required")
 		}
 	}
-	if r.Action == "set_device_read_enabled" {
+	if r.Action == "set_device_read_enabled" || r.Action == "set_device_module_type" || r.Action == "query_device_version" {
 		value, err := strconv.ParseUint(r.DeviceID, 10, 8)
 		if err != nil || strconv.FormatUint(value, 10) != r.DeviceID {
 			return invalid("device_id", "must be a canonical station address in 0..255")
 		}
+	}
+	if r.Action == "set_device_module_type" || r.Action == "query_device_version" {
+		if !ValidStationRevision(r.ExpectedStationRevision) {
+			return invalid("station_revision", "an exact station version revision is required")
+		}
+	}
+	if r.Action == "set_device_module_type" {
+		if !ValidModuleType(r.ModuleType) {
+			return invalid("module_type", "must be unknown, domestic or legacy_russian")
+		}
+	} else if r.ModuleType != "" {
+		return invalid("module_type", "is only valid for set_device_module_type")
 	}
 	switch r.Action {
 	case "read_config", "validate_config", "write_config", "read_log":

@@ -85,6 +85,7 @@ pub fn spawn_serial_worker(
                 let _ = manager.set_device_read_enabled(id, false);
             }
         }
+        manager.schedule_configured_domestic_version_queries();
         manager.refresh_operations_state();
 
         info!(
@@ -129,12 +130,17 @@ pub fn spawn_serial_worker(
                         &port_name,
                         "serial worker panicked before confirmation",
                     );
+                    operations.fail_inflight_station_queries(
+                        &port_name,
+                        "station version query interrupted by serial worker panic",
+                    );
                     reject_queued_commands(&mut manager, None, &ack_status_tx, "worker_panic");
                     if cancel.is_cancelled() {
                         break;
                     }
                     std::thread::sleep(Duration::from_secs(1));
                     manager.reconnect();
+                    manager.schedule_configured_domestic_version_queries();
                     manager.refresh_operations_state();
                     info!(
                         "[串口worker重启] port={} restart_count={} action=resume_polling",
@@ -145,6 +151,10 @@ pub fn spawn_serial_worker(
         }
         // Drop the physical handle before publishing stopped state.
         manager.port = None;
+        operations.fail_inflight_station_queries(
+            &port_name,
+            "station version query interrupted by serial worker shutdown",
+        );
         operations.worker_stopped(&port_name);
     })
 }
@@ -212,6 +222,8 @@ fn run_worker_loop(
             );
         }
 
+        let completed_normal_slot =
+            matches!(&cycle_result, CycleResult::QuerySent(_) | CycleResult::Idle);
         match cycle_result {
             CycleResult::QuerySent(query) => {
                 let device_id = manager
@@ -255,6 +267,9 @@ fn run_worker_loop(
         // 主机模式：轮询下一个设备；备机模式：index 由 extract_frame 从转发头解析。
         if manager.current_run == RunLocation::Primary {
             manager.index = (manager.index + 1) % manager.port_config.devices.len();
+            if completed_normal_slot && manager.index == 0 {
+                manager.execute_one_scheduled_station_version_query();
+            }
         }
         manager.refresh_operations_state();
         std::thread::sleep(poll_interval);
@@ -370,6 +385,7 @@ fn process_incoming_commands(
                 control_outcome = manager.set_port_enabled(status.device_status);
                 if previous != status.device_status {
                     if status.device_status {
+                        manager.schedule_configured_domestic_version_queries();
                         info!(
                             "[串口已启用] port={} action=wait_for_valid_device_frames",
                             manager.serial_config.port_name
@@ -402,6 +418,14 @@ fn process_incoming_commands(
                     manager.device_states[index].is_enabled = setting.device_status;
                     if previous != setting.device_status {
                         if setting.device_status {
+                            if manager.operations.as_ref().is_some_and(|operations| {
+                                operations.initial_module_type(
+                                    &manager.port_config.port_number,
+                                    setting.device_id,
+                                ) == crate::model::ModuleType::Domestic
+                            }) {
+                                manager.schedule_station_version_query(setting.device_id);
+                            }
                             info!(
                                 "[串口设备已启用] port={} device_id={} index={} action=wait_for_valid_frame",
                                 manager.serial_config.port_name,
@@ -436,6 +460,37 @@ fn process_incoming_commands(
             CommandType::DeviceReadSetting(setting) => {
                 control_outcome =
                     manager.set_device_read_enabled(setting.device_id, setting.read_enabled);
+                if setting.read_enabled
+                    && manager.operations.as_ref().is_some_and(|operations| {
+                        operations.initial_module_type(
+                            &manager.port_config.port_number,
+                            setting.device_id,
+                        ) == crate::model::ModuleType::Domestic
+                    })
+                {
+                    manager.schedule_station_version_query(setting.device_id);
+                }
+            }
+            CommandType::StationModuleTypeSetting(setting) => {
+                if setting.module_type == crate::model::ModuleType::Domestic {
+                    manager.schedule_station_version_query(setting.device_id);
+                } else {
+                    manager.cancel_scheduled_station_version_query(setting.device_id);
+                }
+            }
+            CommandType::QueryStationVersion(query) => {
+                let result = manager.perform_station_version_query(query.device_id);
+                control_outcome = manager
+                    .operations
+                    .as_ref()
+                    .ok_or_else(|| "operations state is unavailable".to_string())
+                    .and_then(|operations| {
+                        operations.report_station_query_result(
+                            &manager.port_config.port_number,
+                            query.device_id,
+                            result,
+                        )
+                    });
             }
         }
         if let Some(receipt) = control_receipt {

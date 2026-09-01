@@ -24,6 +24,48 @@ describe('lower operations API contract', () => {
     expect(JSON.parse(String(fetchMock.mock.calls[1][1].body))).toEqual({ source_revision: 7, port_id: '/dev/ttyS0', device_id: '2', enabled: false });
   });
 
+  it('sends source and station revisions for module type and version queries', async () => {
+    const response = { source_id: target.id, source_revision: target.revision, schema_version: 1, revision: '2', station_revision: '12', status: 'Pending', station_operation_revision: '13', ports: [] };
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(json(response)));
+    vi.stubGlobal('fetch', fetchMock);
+    const moduleResult = await operationsApi.deviceModuleType(target, '11', '/dev/ttyWCH0', '12', 'domestic');
+    await operationsApi.queryDeviceVersion(target, '12', '/dev/ttyWCH0', '12');
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/sources/lower%2Fa%20b/operations/device-module-type');
+    expect(fetchMock.mock.calls[0][1].headers).toMatchObject({ 'If-Match': '"11"' });
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1].body))).toEqual({ source_revision: 7, station_revision: '11', port_id: '/dev/ttyWCH0', device_id: '12', module_type: 'domestic' });
+    expect(fetchMock.mock.calls[1][0]).toBe('/api/v1/sources/lower%2Fa%20b/operations/device-version/query');
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1].body))).toEqual({ source_revision: 7, station_revision: '12', port_id: '/dev/ttyWCH0', device_id: '12' });
+    expect(moduleResult).toMatchObject({ status: 'Pending', station_operation_revision: '13' });
+  });
+
+  it('flattens rolling-upgrade station_version records at the transport edge', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(json({
+      source_id: target.id,
+      source_revision: target.revision,
+      schema_version: 1,
+      revision: '1',
+      station_revision: '1',
+      ports: [{
+        port_id: 'p1',
+        devices: [{
+          device_id: '1',
+          name: 'D1',
+          read_enabled: true,
+          applied_read_enabled: true,
+          communication_ok: true,
+          station_version: {
+            configured_module_type: 'domestic',
+            communication_module_version: 'V1.4',
+            version_state: 'success',
+          },
+        }],
+      }],
+    })));
+    const status = await operationsApi.status(target.id, undefined, target.revision);
+    expect(status.ports[0].devices[0]).toMatchObject({ device_id: '1', configured_module_type: 'domestic', communication_module_version: 'V1.4', version_state: 'success' });
+    expect(status.ports[0].devices[0]).not.toHaveProperty('station_version');
+  });
+
   it('keeps validation read-only and saves with the current file revision', async () => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(json({ valid: true, source_id: target.id, source_revision: target.revision })));
     vi.stubGlobal('fetch', fetchMock);

@@ -39,6 +39,8 @@ describe('point query invalidation', () => {
     expect(eventInvalidatesOperations('command.changed', status)).toBe(true);
     expect(eventInvalidatesOperations('command.changed', config)).toBe(false);
     expect(eventInvalidatesOperations('source.sample', status)).toBe(false);
+    expect(eventInvalidatesOperations('station_versions_changed', status)).toBe(true);
+    expect(eventInvalidatesOperations('station_versions_changed', config)).toBe(false);
     expect(eventInvalidatesOperations('source.operation', queryKeys.allPoints)).toBe(false);
   });
 });
@@ -67,6 +69,20 @@ describe('SSE query refreshes', () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['source-operations', 'lower-a'], predicate: expect.any(Function), refetchType: 'active' });
     expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ['source-operations', 'lower-b'], predicate: expect.any(Function), refetchType: 'active' });
     expect(invalidate).not.toHaveBeenCalledWith({ queryKey: queryKeys.allPoints, refetchType: 'active' });
+  });
+
+  it('refreshes only active station inventory and the matching lower status on a version event', () => {
+    const { invalidate, source } = setup();
+    act(() => source.emit('station_versions_changed', { source_id: 'lower-a', station_revision: '12' }));
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.allDeviceVersions, refetchType: 'active' });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['source-operations', 'lower-a'], predicate: expect.any(Function), refetchType: 'active' });
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: queryKeys.allPoints, refetchType: 'active' });
+  });
+
+  it('refreshes station inventory when a lower goes online or offline', () => {
+    const { invalidate, source } = setup();
+    act(() => source.emit('source.status', { source_id: 'lower-a', connection_state: 'Disconnected' }));
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.allDeviceVersions, refetchType: 'active' });
   });
 
   it('refreshes group command locks on both command start and completion events', () => {

@@ -22,6 +22,12 @@ pub mod cmd {
     pub const STATUS_PAGE: u8 = 0x30;
     /// 状态偏移。
     pub const STATUS_OFFSET: u8 = 0x10;
+    /// 国产通信模块版本寄存器页。
+    pub const VERSION_PAGE: u8 = 0x50;
+    /// 国产通信模块版本寄存器偏移。
+    pub const VERSION_OFFSET: u8 = 0x10;
+    /// 通信模块版本 + PLC 版本共四字节。
+    pub const VERSION_LENGTH: u8 = 0x04;
 }
 
 /// 各类阈值常量。
@@ -68,6 +74,19 @@ impl DataPacket {
     }
 }
 
+/// 严格校验后的通信模块版本响应。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StationVersionResponse {
+    /// 国产模块：前两字节为通信模块版本，后两字节为 PLC 版本，均为大端。
+    Domestic {
+        payload: [u8; 4],
+        communication_module_version: u16,
+        plc_version: u16,
+    },
+    /// 俄供模块以四字节全 `0xFF` 响应该寄存器。
+    LegacyRussian { payload: [u8; 4] },
+}
+
 // ============================================================
 //  协议解析函数
 // ============================================================
@@ -81,6 +100,50 @@ pub fn verify_checksum(data: &[u8]) -> bool {
         .iter()
         .fold(0u8, |acc, &x| acc.wrapping_add(x));
     sum == data[data.len() - 1]
+}
+
+/// 构造通信模块版本查询：`[Addr,08,02,50,10,04,Checksum]`。
+pub fn build_station_version_query(device_address: u8) -> [u8; 7] {
+    let mut frame = [
+        device_address,
+        cmd::READ_STATUS,
+        cmd::READ_SUBCMD,
+        cmd::VERSION_PAGE,
+        cmd::VERSION_OFFSET,
+        cmd::VERSION_LENGTH,
+        0,
+    ];
+    frame[6] = frame[..6]
+        .iter()
+        .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+    frame
+}
+
+/// 严格解析固定 9 字节版本响应：
+/// `00 00 04 (08|80) <module-hi> <module-lo> <plc-hi> <plc-lo> <checksum>`。
+///
+/// 只有完整帧头、长度和累加和均正确时，四字节全 `FF` 才会被识别为俄供模块。
+pub fn parse_station_version_response(
+    frame: &[u8],
+) -> Result<StationVersionResponse, &'static str> {
+    if frame.len() != 9 {
+        return Err("版本响应长度必须为 9 字节");
+    }
+    if frame[..3] != [0x00, 0x00, 0x04] || !matches!(frame[3], 0x08 | 0x80) {
+        return Err("版本响应帧头不匹配");
+    }
+    if !verify_checksum(frame) {
+        return Err("版本响应校验和不匹配");
+    }
+    let payload = [frame[4], frame[5], frame[6], frame[7]];
+    if payload == [0xFF; 4] {
+        return Ok(StationVersionResponse::LegacyRussian { payload });
+    }
+    Ok(StationVersionResponse::Domestic {
+        payload,
+        communication_module_version: u16::from_be_bytes([payload[0], payload[1]]),
+        plc_version: u16::from_be_bytes([payload[2], payload[3]]),
+    })
 }
 
 /// 解析响应帧：`[Addr][CMD][Len][Status...][CRC]`。
@@ -239,6 +302,66 @@ mod tests {
     fn verify_checksum_wrapping() {
         // 0xFF + 0x02 = 0x01 (wrapping)
         assert!(verify_checksum(&[0xFF, 0x02, 0x01]));
+    }
+
+    #[test]
+    fn station_version_query_matches_protocol_example_with_full_sum() {
+        assert_eq!(
+            build_station_version_query(0x44),
+            [0x44, 0x08, 0x02, 0x50, 0x10, 0x04, 0xB2]
+        );
+    }
+
+    #[test]
+    fn station_version_response_parses_domestic_versions() {
+        assert_eq!(
+            parse_station_version_response(&[0x00, 0x00, 0x04, 0x08, 0x01, 0x04, 0x00, 0x05, 0x16])
+                .unwrap(),
+            StationVersionResponse::Domestic {
+                payload: [0x01, 0x04, 0x00, 0x05],
+                communication_module_version: 0x0104,
+                plc_version: 0x0005,
+            }
+        );
+    }
+
+    #[test]
+    fn station_version_response_accepts_real_device_80_header() {
+        assert_eq!(
+            parse_station_version_response(&[0x00, 0x00, 0x04, 0x80, 0x01, 0x03, 0x00, 0x00, 0x88])
+                .unwrap(),
+            StationVersionResponse::Domestic {
+                payload: [0x01, 0x03, 0x00, 0x00],
+                communication_module_version: 0x0103,
+                plc_version: 0x0000,
+            }
+        );
+    }
+
+    #[test]
+    fn station_version_response_recognizes_only_valid_all_ff_payload() {
+        assert_eq!(
+            parse_station_version_response(&[0x00, 0x00, 0x04, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0x08])
+                .unwrap(),
+            StationVersionResponse::LegacyRussian { payload: [0xFF; 4] }
+        );
+        assert!(parse_station_version_response(&[
+            0x00, 0x00, 0x04, 0x08, 0xFF, 0xFF, 0xFF, 0xFE, 0x07
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn station_version_response_rejects_bad_shape_and_checksum() {
+        assert!(parse_station_version_response(&[0; 8]).is_err());
+        assert!(parse_station_version_response(&[
+            0x00, 0x00, 0x04, 0x09, 0x01, 0x04, 0x00, 0x05, 0x17
+        ])
+        .is_err());
+        assert!(parse_station_version_response(&[
+            0x00, 0x00, 0x04, 0x08, 0x01, 0x04, 0x00, 0x05, 0x14
+        ])
+        .is_err());
     }
 
     // ---- parse_data_packet ----

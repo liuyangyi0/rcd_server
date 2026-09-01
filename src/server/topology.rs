@@ -11,11 +11,13 @@ use opcua::nodes::AccessLevel;
 use opcua::server::address_space::{AddressSpace, ReferenceDirection, Variable};
 use opcua::server::node_manager::memory::SimpleNodeManager;
 use opcua::types::{
-    DataTypeId, NodeId, QualifiedName, ReferenceTypeId, UAString, VariableTypeId, Variant,
+    ByteString, DataTypeId, DataValue, DateTime as UaDateTime, NodeId, QualifiedName,
+    ReferenceTypeId, StatusCode, UAString, VariableTypeId, Variant,
 };
 use serde::Serialize;
 
 use crate::calc_engine::engine::CalcEngine;
+use crate::operations::StationVersionsSnapshot;
 use crate::serial::port_config::SerialPortConfig;
 
 use super::opcua::{opc_port_stem, opc_send_method_name, opc_send_node_name};
@@ -196,7 +198,7 @@ impl TopologyManifest {
     }
 
     pub(super) fn metadata_variable_count(&self) -> usize {
-        2 + self.ports.len() * 5 + self.device_count() * 4 + self.calculations.len() * 2
+        2 + self.ports.len() * 5 + self.device_count() * 18 + self.calculations.len() * 2
     }
 
     /// 每个采集点和计算点恰好列出一次；命令节点单独由端口标识。
@@ -346,6 +348,7 @@ fn create_topology_nodes(
                 Variant::Byte(device.device_address),
                 &device_node,
             )?;
+            add_station_version_nodes(address_space, ns, &device_path, &device_node)?;
             let points = add_folder(
                 address_space,
                 ns,
@@ -467,6 +470,295 @@ fn create_topology_nodes(
         }
     }
     Ok(())
+}
+
+fn add_station_version_nodes(
+    address_space: &mut AddressSpace,
+    ns: u16,
+    device_path: &str,
+    parent: &NodeId,
+) -> io::Result<()> {
+    for (name, data_type, value) in [
+        (
+            "ConfiguredModuleType",
+            DataTypeId::String,
+            Variant::String("unknown".into()),
+        ),
+        (
+            "DetectedModuleType",
+            DataTypeId::String,
+            Variant::String("unknown".into()),
+        ),
+        (
+            "CommunicationModuleVersion",
+            DataTypeId::String,
+            Variant::String("".into()),
+        ),
+        ("PLCVersion", DataTypeId::String, Variant::String("".into())),
+        (
+            "VersionState",
+            DataTypeId::String,
+            Variant::String("never_queried".into()),
+        ),
+        (
+            "LastVersionError",
+            DataTypeId::String,
+            Variant::String("".into()),
+        ),
+    ] {
+        add_scalar(
+            address_space,
+            ns,
+            &format!("{device_path}/{name}"),
+            name,
+            data_type,
+            value,
+            parent,
+        )?;
+    }
+    for name in ["LastVersionAttemptAt", "LastVersionSuccessAt"] {
+        add_scalar(
+            address_space,
+            ns,
+            &format!("{device_path}/{name}"),
+            name,
+            DataTypeId::DateTime,
+            Variant::DateTime(Box::default()),
+            parent,
+        )?;
+    }
+    for (name, value) in [("TypeMismatch", false), ("Stale", false)] {
+        add_scalar(
+            address_space,
+            ns,
+            &format!("{device_path}/{name}"),
+            name,
+            DataTypeId::Boolean,
+            Variant::Boolean(value),
+            parent,
+        )?;
+    }
+    for name in ["CommunicationModuleVersionRaw", "PLCVersionRaw"] {
+        add_scalar(
+            address_space,
+            ns,
+            &format!("{device_path}/{name}"),
+            name,
+            DataTypeId::UInt16,
+            Variant::UInt16(0),
+            parent,
+        )?;
+    }
+    add_scalar(
+        address_space,
+        ns,
+        &format!("{device_path}/VersionPayload"),
+        "VersionPayload",
+        DataTypeId::ByteString,
+        Variant::ByteString(ByteString::from(Vec::new())),
+        parent,
+    )?;
+    add_scalar(
+        address_space,
+        ns,
+        &format!("{device_path}/ConsecutiveFailures"),
+        "ConsecutiveFailures",
+        DataTypeId::UInt32,
+        Variant::UInt32(0),
+        parent,
+    )
+}
+
+/// Build owned updates so the caller can submit all station metadata under one address-space lock.
+pub(super) fn station_version_updates(
+    ns: u16,
+    snapshot: &StationVersionsSnapshot,
+) -> Vec<(NodeId, DataValue)> {
+    let mut updates = Vec::new();
+    for port in &snapshot.ports {
+        let port_path = path_component(&port.port_id);
+        for device in &port.devices {
+            let base = format!("Topology/Ports/{port_path}/Devices/{}", device.device_id);
+            let record = &device.station_version;
+            let version_status = station_version_status(port.open, device.communication_ok, record);
+            let good = StatusCode::Good;
+            push_station_update(
+                &mut updates,
+                ns,
+                &base,
+                "ConfiguredModuleType",
+                Variant::String(record.configured_module_type.as_str().into()),
+                good,
+            );
+            push_station_update(
+                &mut updates,
+                ns,
+                &base,
+                "DetectedModuleType",
+                Variant::String(record.detected_module_type.as_str().into()),
+                good,
+            );
+            push_station_update(
+                &mut updates,
+                ns,
+                &base,
+                "TypeMismatch",
+                Variant::Boolean(record.type_mismatch),
+                good,
+            );
+            push_station_update(
+                &mut updates,
+                ns,
+                &base,
+                "CommunicationModuleVersion",
+                Variant::String(record.communication_module_version.as_str().into()),
+                version_status,
+            );
+            push_station_update(
+                &mut updates,
+                ns,
+                &base,
+                "CommunicationModuleVersionRaw",
+                Variant::UInt16(record.communication_module_version_raw.unwrap_or(0)),
+                version_status,
+            );
+            push_station_update(
+                &mut updates,
+                ns,
+                &base,
+                "PLCVersion",
+                Variant::String(record.plc_version.as_str().into()),
+                version_status,
+            );
+            push_station_update(
+                &mut updates,
+                ns,
+                &base,
+                "PLCVersionRaw",
+                Variant::UInt16(record.plc_version_raw.unwrap_or(0)),
+                version_status,
+            );
+            push_station_update(
+                &mut updates,
+                ns,
+                &base,
+                "VersionPayload",
+                Variant::ByteString(ByteString::from(decode_payload(&record.version_payload))),
+                version_status,
+            );
+            for (name, value) in [
+                ("VersionState", record.version_state.as_str()),
+                ("LastVersionError", record.last_version_error.as_str()),
+            ] {
+                push_station_update(
+                    &mut updates,
+                    ns,
+                    &base,
+                    name,
+                    Variant::String(value.into()),
+                    good,
+                );
+            }
+            push_station_update(
+                &mut updates,
+                ns,
+                &base,
+                "LastVersionAttemptAt",
+                Variant::DateTime(Box::new(opc_datetime(
+                    record.last_version_attempt_at.as_deref(),
+                ))),
+                good,
+            );
+            push_station_update(
+                &mut updates,
+                ns,
+                &base,
+                "LastVersionSuccessAt",
+                Variant::DateTime(Box::new(opc_datetime(
+                    record.last_version_success_at.as_deref(),
+                ))),
+                version_status,
+            );
+            push_station_update(
+                &mut updates,
+                ns,
+                &base,
+                "ConsecutiveFailures",
+                Variant::UInt32(record.consecutive_failures),
+                good,
+            );
+            push_station_update(
+                &mut updates,
+                ns,
+                &base,
+                "Stale",
+                Variant::Boolean(record.stale),
+                good,
+            );
+        }
+    }
+    updates
+}
+
+fn push_station_update(
+    updates: &mut Vec<(NodeId, DataValue)>,
+    ns: u16,
+    base: &str,
+    name: &str,
+    value: Variant,
+    status: StatusCode,
+) {
+    updates.push((
+        NodeId::new(ns, format!("{base}/{name}")),
+        DataValue {
+            value: Some(value),
+            status: Some(status),
+            source_timestamp: None,
+            source_picoseconds: None,
+            server_timestamp: Some(UaDateTime::now()),
+            server_picoseconds: Some(0),
+        },
+    ));
+}
+
+fn station_version_status(
+    port_open: bool,
+    communication_ok: bool,
+    record: &crate::model::StationVersionRecord,
+) -> StatusCode {
+    if record.configured_module_type == crate::model::ModuleType::LegacyRussian {
+        return StatusCode::BadNotSupported;
+    }
+    if record.type_mismatch {
+        return StatusCode::BadConfigurationError;
+    }
+    if record.version_state == "success" && port_open && communication_ok {
+        return StatusCode::Good;
+    }
+    if record.has_last_version() {
+        return StatusCode::UncertainLastUsableValue;
+    }
+    if !port_open || record.version_state == "failed" {
+        return StatusCode::BadNoCommunication;
+    }
+    StatusCode::BadWaitingForInitialData
+}
+
+fn decode_payload(value: &str) -> Vec<u8> {
+    if value.len() != 8 || !value.is_ascii() {
+        return Vec::new();
+    }
+    (0..8)
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_default()
+}
+
+fn opc_datetime(value: Option<&str>) -> UaDateTime {
+    value
+        .and_then(|timestamp| timestamp.parse::<UaDateTime>().ok())
+        .unwrap_or_default()
 }
 
 fn add_folder(
@@ -734,7 +1026,7 @@ mod tests {
         );
         assert_eq!(manifest.device_count(), 3);
         assert_eq!(manifest.data_node_ids().count(), 5);
-        assert_eq!(manifest.metadata_variable_count(), 26);
+        assert_eq!(manifest.metadata_variable_count(), 68);
     }
 
     #[test]
@@ -935,6 +1227,55 @@ mod tests {
                 )
                 .value,
             Some(Variant::String("Methods".into()))
+        );
+        for name in [
+            "ConfiguredModuleType",
+            "DetectedModuleType",
+            "CommunicationModuleVersion",
+            "PLCVersion",
+            "VersionPayload",
+            "VersionState",
+            "Stale",
+        ] {
+            let id = NodeId::new(7, format!("Topology/Ports/%2Fdev%2FttyS0/Devices/1/{name}"));
+            let Some(NodeType::Variable(variable)) = address_space.find_node(&id) else {
+                panic!("missing station version node {name}")
+            };
+            assert_eq!(
+                variable.access_level().bits(),
+                AccessLevel::CURRENT_READ.bits()
+            );
+        }
+    }
+
+    #[test]
+    fn station_version_quality_follows_config_and_last_value_rules() {
+        let mut record = crate::model::StationVersionRecord::default();
+        assert_eq!(
+            station_version_status(true, true, &record),
+            StatusCode::BadWaitingForInitialData
+        );
+        record.configured_module_type = crate::model::ModuleType::LegacyRussian;
+        assert_eq!(
+            station_version_status(true, true, &record),
+            StatusCode::BadNotSupported
+        );
+        record.configured_module_type = crate::model::ModuleType::Domestic;
+        record.detected_module_type = crate::model::ModuleType::Domestic;
+        record.communication_module_version_raw = Some(0x0104);
+        record.version_state = "success".into();
+        assert_eq!(
+            station_version_status(true, true, &record),
+            StatusCode::Good
+        );
+        assert_eq!(
+            station_version_status(false, false, &record),
+            StatusCode::UncertainLastUsableValue
+        );
+        record.type_mismatch = true;
+        assert_eq!(
+            station_version_status(true, true, &record),
+            StatusCode::BadConfigurationError
         );
     }
 }

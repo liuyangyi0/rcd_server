@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from './client';
-import type { ListParams, RevisionMutation } from './types';
+import type { DeviceVersionParams, ListParams, RevisionMutation } from './types';
 
 export const queryKeys = {
   overview: ['overview'] as const,
@@ -13,6 +13,8 @@ export const queryKeys = {
   points: (params: ListParams) => ['points', params] as const,
   pointComparison: (left: ListParams, right: ListParams) => ['points', 'comparison', left, right] as const,
   allPoints: ['points'] as const,
+  deviceVersions: (params: DeviceVersionParams) => ['device-versions', params] as const,
+  allDeviceVersions: ['device-versions'] as const,
   commands: (params: ListParams) => ['commands', params] as const,
   allCommands: ['commands'] as const,
   alarms: (params: ListParams) => ['alarms', params] as const,
@@ -49,6 +51,15 @@ export function usePoints(params: ListParams, enabled = true) {
     queryKey: queryKeys.points(params),
     queryFn: ({ signal }) => api.points(params, signal),
     enabled,
+  });
+}
+
+export function useDeviceVersions(params: DeviceVersionParams) {
+  return useQuery({
+    queryKey: queryKeys.deviceVersions(params),
+    queryFn: ({ signal }) => api.deviceVersions(params, signal),
+    placeholderData: (previous) => previous,
+    refetchInterval: 30_000,
   });
 }
 

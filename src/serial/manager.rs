@@ -39,6 +39,8 @@ const OUTPUT_QUEUE_POLL_INTERVAL: Duration = Duration::from_micros(250);
 const MIN_TRANSMIT_IO_SLACK: Duration = Duration::from_millis(50);
 const MAX_TRANSMIT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_COMPLETION_GUARD: Duration = Duration::from_millis(5);
+const STATION_VERSION_RESPONSE_LEN: usize = 9;
+const STATION_VERSION_LATE_FRAME_QUARANTINE: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeviceFailureKind {
@@ -507,6 +509,8 @@ pub(crate) struct SerialManager {
     pub(crate) port: Option<Box<dyn SerialPort>>,
     pub(crate) operations: Option<crate::operations::Operations>,
     pub(crate) command_queue: Arc<Mutex<VecDeque<QueuedCommand>>>,
+    /// 启动/重新启用/改为国产后的一次性版本查询；同一设备去重。
+    station_version_query_queue: VecDeque<u8>,
     pub(crate) serial_config: SerialConfig,
     pub(crate) port_config: SerialPortConfig,
     pub(crate) broadcaster: Broadcaster,
@@ -593,6 +597,7 @@ impl SerialManager {
             port,
             operations: None,
             command_queue: Arc::new(Mutex::new(VecDeque::new())),
+            station_version_query_queue: VecDeque::new(),
             serial_config,
             port_config,
             broadcaster,
@@ -926,6 +931,213 @@ impl SerialManager {
                 pending_truncated,
             );
         }
+    }
+
+    pub(crate) fn schedule_station_version_query(&mut self, device_id: u8) {
+        if !self
+            .station_version_query_queue
+            .iter()
+            .any(|queued| *queued == device_id)
+        {
+            self.station_version_query_queue.push_back(device_id);
+        }
+    }
+
+    pub(crate) fn cancel_scheduled_station_version_query(&mut self, device_id: u8) {
+        self.station_version_query_queue
+            .retain(|queued| *queued != device_id);
+    }
+
+    pub(crate) fn schedule_configured_domestic_version_queries(&mut self) {
+        let Some(operations) = self.operations.clone() else {
+            return;
+        };
+        for device_id in operations.startup_version_query_devices(&self.port_config.port_number) {
+            self.schedule_station_version_query(device_id);
+        }
+    }
+
+    /// 每轮完整的普通站点扫描后最多执行一个启动/重新启用查询。
+    pub(crate) fn execute_one_scheduled_station_version_query(&mut self) {
+        let Some(device_id) = self.station_version_query_queue.pop_front() else {
+            return;
+        };
+        let Some(operations) = self.operations.clone() else {
+            return;
+        };
+        match operations.begin_automatic_station_query(&self.port_config.port_number, device_id) {
+            Ok(true) => {
+                let result = self.perform_station_version_query(device_id);
+                if let Err(error) = operations.report_station_query_result(
+                    &self.port_config.port_number,
+                    device_id,
+                    result,
+                ) {
+                    error!(
+                        "[版本查询状态保存失败] port={} device_id={} error={:?}",
+                        self.serial_config.port_name, device_id, error
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(error) => error!(
+                "[版本查询启动失败] port={} device_id={} error={:?}",
+                self.serial_config.port_name, device_id, error
+            ),
+        }
+    }
+
+    /// 执行专用版本寄存器事务。该路径不修改普通轮询 index、故障计数或 KKS 缓存。
+    pub(crate) fn perform_station_version_query(
+        &mut self,
+        device_id: u8,
+    ) -> Result<protocol::StationVersionResponse, String> {
+        let index = self
+            .port_config
+            .devices
+            .iter()
+            .position(|device| device.config.device_id == device_id)
+            .ok_or_else(|| "unknown device".to_string())?;
+        if !self.port_config.status
+            || !self.device_states[index].is_enabled
+            || !self.device_states[index].read_enabled
+        {
+            return Err("port or device acquisition is disabled".into());
+        }
+        if self.current_run != RunLocation::Primary {
+            return Err("standby gateway must not actively query station version".into());
+        }
+        if self.port.is_none() {
+            self.reconnect();
+        }
+        if self.port.is_none() {
+            return Err("serial port is not open".into());
+        }
+
+        self.prepare_automatic_query(device_id, index);
+        let request = protocol::build_station_version_query(device_id);
+        info!(
+            "[版本查询发送] port={} device_id={} frame_hex={:?}",
+            self.serial_config.port_name,
+            device_id,
+            format_hex(&request),
+        );
+        if !self.send_command(SendData {
+            device_id: u32::from(device_id),
+            command: request.to_vec(),
+        }) {
+            // A transport error can occur after the driver accepted part or all
+            // of the frame.  If reconnect succeeded, isolate a possible late
+            // response before ordinary acquisition resumes on the new handle.
+            if self.port.is_some() {
+                self.quarantine_late_station_version_response();
+            }
+            return Err("could not send station version query".into());
+        }
+
+        let mut received = Vec::with_capacity(STATION_VERSION_RESPONSE_LEN);
+        let mut deadline = Instant::now() + self.serial_config.read_timeout;
+        let mut completion_deadline_extended = false;
+        let read_result: io::Result<()> = loop {
+            if received.len() >= STATION_VERSION_RESPONSE_LEN {
+                break Ok(());
+            }
+            let result = {
+                let port = self.port.as_mut().expect("version query checked open port");
+                read_before_deadline(port.as_mut(), &mut self.read_buf, deadline)
+            };
+            match result {
+                Ok(0) => {
+                    break Err(io::Error::new(
+                        ErrorKind::TimedOut,
+                        "empty version response",
+                    ))
+                }
+                Ok(count) => {
+                    received.extend_from_slice(&self.read_buf[..count]);
+                    if !completion_deadline_extended {
+                        deadline = Instant::now()
+                            + wire_duration(
+                                STATION_VERSION_RESPONSE_LEN,
+                                self.serial_config.baud_rate,
+                            )
+                            .saturating_add(RESPONSE_COMPLETION_GUARD);
+                        completion_deadline_extended = true;
+                    }
+                }
+                Err(error) => break Err(error),
+            }
+        };
+
+        match read_result {
+            Ok(()) => {
+                if received.len() != STATION_VERSION_RESPONSE_LEN {
+                    let message = format!(
+                        "station version response length must be exactly {STATION_VERSION_RESPONSE_LEN} bytes, got {}",
+                        received.len()
+                    );
+                    if logging::serial_frame_logs_enabled() || !received.is_empty() {
+                        info!(
+                            "[版本查询响应] port={} device_id={} frame_len={} frame_hex={:?} valid=false",
+                            self.serial_config.port_name,
+                            device_id,
+                            received.len(),
+                            format_hex(&received),
+                        );
+                    }
+                    self.quarantine_late_station_version_response();
+                    return Err(message);
+                }
+                let frame = &received[..STATION_VERSION_RESPONSE_LEN];
+                let result =
+                    protocol::parse_station_version_response(frame).map_err(str::to_string);
+                info!(
+                    "[版本查询响应] port={} device_id={} frame_len={} frame_hex={:?} valid={}",
+                    self.serial_config.port_name,
+                    device_id,
+                    received.len(),
+                    format_hex(&received),
+                    result.is_ok(),
+                );
+                if result.is_err() {
+                    self.quarantine_late_station_version_response();
+                } else {
+                    self.rx_pending.clear();
+                }
+                result
+            }
+            Err(error) if error.kind() == ErrorKind::TimedOut => {
+                self.quarantine_late_station_version_response();
+                Err(format!(
+                    "station version query timed out after {} ms",
+                    self.serial_config.read_timeout.as_millis()
+                ))
+            }
+            Err(error) => {
+                let message = format!("station version read failed: {error}");
+                self.port = None;
+                self.rx_pending.clear();
+                self.reconnect();
+                if self.port.is_some() {
+                    self.quarantine_late_station_version_response();
+                }
+                Err(message)
+            }
+        }
+    }
+
+    fn quarantine_late_station_version_response(&mut self) {
+        self.rx_pending.clear();
+        std::thread::sleep(STATION_VERSION_LATE_FRAME_QUARANTINE);
+        if let Some(port) = self.port.as_ref() {
+            if let Err(error) = port.clear(ClearBuffer::Input) {
+                warn!(
+                    "[版本查询迟到帧清理失败] port={} error={:?}",
+                    self.serial_config.port_name, error
+                );
+            }
+        }
+        self.rx_pending.clear();
     }
 
     /// 记录一条系统日志。
@@ -2663,6 +2875,7 @@ mod tests {
             port: None,
             operations: None,
             command_queue: Arc::new(Mutex::new(VecDeque::new())),
+            station_version_query_queue: VecDeque::new(),
             serial_config: SerialConfig::new(
                 "COM1".to_string(),
                 28_800,
@@ -2964,6 +3177,71 @@ mod tests {
         manager.prepare_automatic_query(query.device_id as u8, manager.index);
         assert!(manager.send_command(query.clone()));
         manager.receive_query_with_retry(query, retry_count);
+    }
+
+    #[test]
+    fn station_version_transaction_accepts_fragmented_valid_response_without_poll_side_effects() {
+        let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+        let observations = install_scripted_port(
+            &mut manager,
+            vec![
+                ReadStep::Data(vec![0x00, 0x00, 0x04, 0x08]),
+                ReadStep::Data(vec![0x01, 0x04, 0x00, 0x05, 0x16]),
+            ],
+            vec![true],
+        );
+        manager.device_states[0].timeout_count = 2;
+        manager.device_states[0].parse_fail_count = 3;
+        let original_index = manager.index;
+
+        let result = manager.perform_station_version_query(1).unwrap();
+
+        assert_eq!(
+            result,
+            protocol::StationVersionResponse::Domestic {
+                payload: [1, 4, 0, 5],
+                communication_module_version: 0x0104,
+                plc_version: 0x0005,
+            }
+        );
+        assert_eq!(manager.index, original_index);
+        assert_eq!(manager.device_states[0].timeout_count, 2);
+        assert_eq!(manager.device_states[0].parse_fail_count, 3);
+        let observations = observations.lock().unwrap();
+        assert_eq!(
+            observations.writes,
+            vec![protocol::build_station_version_query(1).to_vec()]
+        );
+    }
+
+    #[test]
+    fn station_version_timeout_is_isolated_from_normal_device_failure_counters() {
+        let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+        manager.serial_config.read_timeout = Duration::from_millis(1);
+        let observations = install_scripted_port(&mut manager, vec![ReadStep::Timeout], vec![true]);
+        manager.device_states[0].timeout_count = 2;
+        manager.device_states[0].parse_fail_count = 3;
+
+        let error = manager.perform_station_version_query(1).unwrap_err();
+
+        assert!(error.contains("timed out"));
+        assert_eq!(manager.device_states[0].timeout_count, 2);
+        assert_eq!(manager.device_states[0].parse_fail_count, 3);
+        assert!(observations.lock().unwrap().input_clears >= 2);
+    }
+
+    #[test]
+    fn station_version_transaction_rejects_extra_bytes_as_non_strict_frame() {
+        let mut manager = test_manager(RunLocation::Primary, RunLocation::Primary);
+        let mut response = vec![0x00, 0x00, 0x04, 0x08, 0x01, 0x04, 0x00, 0x05, 0x16];
+        response.push(0x00);
+        let observations =
+            install_scripted_port(&mut manager, vec![ReadStep::Data(response)], vec![true]);
+
+        let error = manager.perform_station_version_query(1).unwrap_err();
+
+        assert!(error.contains("exactly 9 bytes"));
+        assert!(observations.lock().unwrap().input_clears >= 2);
     }
 
     #[test]

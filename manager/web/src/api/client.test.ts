@@ -62,6 +62,13 @@ describe('API client contract', () => {
     expect(init.headers).toMatchObject({ 'X-RCD-Operator': 'Alice' });
   });
 
+  it('uses the dedicated page contract for the station version inventory', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ items: [], page: 3, page_size: 50, total: 0, summary: {} }));
+    vi.stubGlobal('fetch', fetchMock);
+    await api.deviceVersions({ page: 3, pageSize: 50, query: 'V1.4', sourceId: 'lower-a', portId: '/dev/ttyWCH0', moduleType: 'domestic', status: 'success' });
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/device-versions?page=3&page_size=50&q=V1.4&source_id=lower-a&port_id=%2Fdev%2FttyWCH0&module_type=domestic&status=success');
+  });
+
   it('forwards point-query cancellation to fetch without turning cancellation into an API outage', async () => {
     const controller = new AbortController();
     const cancelled = new DOMException('Query superseded', 'AbortError');

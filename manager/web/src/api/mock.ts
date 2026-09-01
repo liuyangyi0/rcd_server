@@ -1,4 +1,4 @@
-import type { Alarm, CommandAudit, ConfigurationDocument, Group, ManagementAudit, Overview, Point, Source, SourceEvent, SystemInfo, UaSession } from './types';
+import type { Alarm, CommandAudit, ConfigurationDocument, DeviceVersion, Group, ManagementAudit, ModuleType, Overview, Point, Source, SourceEvent, SystemInfo, UaSession } from './types';
 import { ApiError } from './client';
 import { normalizeSource } from './normalizers';
 import { sameBindings, sourceGroupIds, sourceHasGroup } from '../lib/sourceGroups';
@@ -82,6 +82,47 @@ const overview: Overview = {
   managerState: 'running', uptimeSeconds: 1565051, opcEndpoint: 'opc.tcp://0.0.0.0:4840/', connectedSources: 5, abnormalSources: 1, unknownSources: 0, totalSources: 6, goodPoints: 10609, badPoints: 24, totalPoints: 10633, recentSelectionAt: new Date(Date.now() - 120000).toISOString(), recentSelectionCount: 1, sessionCount: 12, subscriptionCount: 28, openAlarms: 2, unacknowledgedAlarms: 1, version: 'v0.1.0', gitSha: 'devmock', systemTime: new Date().toISOString(), webApiState: '正常',
 };
 
+const deviceVersions: DeviceVersion[] = sources.flatMap((source, sourceIndex) => Array.from({ length: sourceIndex % 2 === 0 ? 4 : 3 }, (_, index) => {
+  const configuredModuleType: ModuleType = index === 0 ? 'domestic' : index === 1 ? 'legacy_russian' : 'unknown';
+  const online = source.connectionState === 'Connected';
+  const success = configuredModuleType === 'domestic' && index !== 3;
+  return {
+    sourceId: source.id,
+    sourceName: source.name,
+    sourceRevision: source.revision,
+    rcdSoftwareVersion: '0.2.0',
+    rcdBuildCommit: 'demo4a2f',
+    portId: source.id === 'rcd-a-02' ? '/dev/ttyUSB1' : '/dev/ttyS0',
+    portName: source.id === 'rcd-a-02' ? 'ttyUSB1' : 'ttyS0',
+    deviceId: String(index + 1),
+    deviceName: `站点 ${index + 1}`,
+    configuredModuleType,
+    detectedModuleType: success ? 'domestic' : configuredModuleType === 'legacy_russian' ? 'legacy_russian' : 'unknown',
+    typeMismatch: false,
+    communicationModuleVersion: success ? `V1.${4 + index}` : undefined,
+    communicationModuleVersionRaw: success ? 0x0104 + index : undefined,
+    plcVersion: success ? 'V0.5' : undefined,
+    plcVersionRaw: success ? 0x0005 : undefined,
+    versionPayload: success ? `01 ${String(4 + index).padStart(2, '0')} 00 05` : undefined,
+    versionState: success ? 'success' : configuredModuleType === 'legacy_russian' ? 'unsupported' : 'never_queried',
+    lastVersionAttemptAt: success ? new Date(Date.now() - (index + 1) * 3600000).toISOString() : undefined,
+    lastVersionSuccessAt: success ? new Date(Date.now() - (index + 1) * 3600000).toISOString() : undefined,
+    stationRevision: String(sourceIndex + 1),
+    versionSupported: true,
+    sourceOnline: online,
+    cached: !online,
+    stale: !online && success,
+    portEnabled: true,
+    portAppliedEnabled: true,
+    portOpen: true,
+    deviceReadEnabled: true,
+    appliedDeviceReadEnabled: true,
+    communicationOK: online,
+    controlPending: false,
+    pendingCommands: 0,
+  };
+}));
+
 function bodyOf(init: RequestInit): Record<string, unknown> {
   if (typeof init.body !== 'string') return {};
   return JSON.parse(init.body) as Record<string, unknown>;
@@ -132,6 +173,30 @@ export async function mockRequest(path: string, init: RequestInit): Promise<unkn
       (!catalogSource || sourceHasGroup(catalogSource, point.groupId)) && (!portId || point.portId === portId) && (!deviceId || point.deviceId === deviceId));
     return page(filtered, url);
   }
+  if (method === 'GET' && url.pathname === '/device-versions') {
+    const query = (url.searchParams.get('q') ?? '').toLowerCase();
+    const sourceId = url.searchParams.get('source_id') ?? '';
+    const portId = url.searchParams.get('port_id') ?? '';
+    const moduleType = url.searchParams.get('module_type') ?? '';
+    const status = url.searchParams.get('status') ?? '';
+    const filtered = deviceVersions.filter((item) => (!sourceId || item.sourceId === sourceId) && (!portId || item.portId === portId) && (!moduleType || item.configuredModuleType === moduleType) && (!query || [item.sourceId, item.sourceName, item.portId, item.portName, item.deviceId, item.deviceName, item.communicationModuleVersion, item.plcVersion].some((value) => String(value ?? '').toLowerCase().includes(query))) && versionStatusMatches(item, status));
+    const pageNumber = Math.max(1, Number(url.searchParams.get('page') || 1));
+    const pageSize = Math.max(1, Number(url.searchParams.get('page_size') || 50));
+    const start = (pageNumber - 1) * pageSize;
+    return {
+      items: filtered.slice(start, start + pageSize), page: pageNumber, page_size: pageSize, total: filtered.length,
+      summary: {
+        total: deviceVersions.length,
+        domestic: deviceVersions.filter((item) => item.configuredModuleType === 'domestic').length,
+        legacy_russian: deviceVersions.filter((item) => item.configuredModuleType === 'legacy_russian').length,
+        unknown: deviceVersions.filter((item) => item.configuredModuleType === 'unknown').length,
+        mismatch: deviceVersions.filter((item) => item.typeMismatch).length,
+        failed: deviceVersions.filter((item) => item.versionState === 'failed').length,
+        offline_cached: deviceVersions.filter((item) => !item.sourceOnline && item.cached).length,
+        lower_software_versions: lowerSoftwareVersionSummary(deviceVersions),
+      },
+    };
+  }
   if (method === 'GET' && url.pathname === '/commands') return page(commands, url);
   if (method === 'GET' && url.pathname === '/alarms') return page(alarms.filter((alarm) => !url.searchParams.get('status') || alarm.state === url.searchParams.get('status')), url);
   if (method === 'GET' && url.pathname === '/source-events') return page(sourceEvents, url);
@@ -152,6 +217,42 @@ export async function mockRequest(path: string, init: RequestInit): Promise<unkn
     source.subscriptionState = 'Inactive';
     source.reconnectCount += 1;
     return source;
+  }
+  if (segments[0] === 'sources' && segments[2] === 'operations' && ((method === 'PUT' && segments[3] === 'device-module-type') || (method === 'POST' && segments[3] === 'device-version' && segments[4] === 'query'))) {
+    const sourceId = decodeURIComponent(segments[1]);
+    const body = bodyOf(init);
+    const row = deviceVersions.find((item) => item.sourceId === sourceId && item.portId === String(body.port_id ?? '') && item.deviceId === String(body.device_id ?? ''));
+    if (!row) throw new ApiError(404, { message: '站点不存在' }, '站点不存在');
+    if (new Headers(init.headers).get('If-Match') !== JSON.stringify(row.stationRevision) || body.station_revision !== row.stationRevision) throw new ApiError(409, { message: '站点版本配置已变化' }, '站点版本冲突');
+    const sourceRows = deviceVersions.filter((item) => item.sourceId === sourceId);
+    const revisionNumber = Math.max(...sourceRows.map((item) => Number(item.stationRevision) || 0)) + 1;
+    const nextRevision = String(revisionNumber);
+    for (const item of sourceRows) item.stationRevision = nextRevision;
+    if (method === 'PUT') {
+      row.configuredModuleType = String(body.module_type ?? 'unknown') as ModuleType;
+      row.versionState = row.configuredModuleType === 'domestic' ? 'waiting' : row.configuredModuleType === 'legacy_russian' ? 'not_supported' : 'not_queried';
+    } else {
+      if (row.configuredModuleType !== 'domestic') throw new ApiError(409, { message: '仅国产模块允许查询版本' }, '模块类型不允许查询');
+      row.detectedModuleType = 'domestic';
+      row.communicationModuleVersion = 'V1.4';
+      row.communicationModuleVersionRaw = 0x0104;
+      row.plcVersion = 'V0.5';
+      row.plcVersionRaw = 0x0005;
+      row.versionPayload = '01 04 00 05';
+      row.versionState = 'success';
+      row.lastVersionAttemptAt = new Date().toISOString();
+      row.lastVersionSuccessAt = row.lastVersionAttemptAt;
+      row.lastVersionError = undefined;
+      row.stale = false;
+    }
+    const source = sources.find((item) => item.id === sourceId)!;
+    return {
+      source_id: sourceId, source_revision: source.revision, schema_version: 1, revision: String(revisionNumber), station_revision: nextRevision, status: 'Applied', station_operation_revision: nextRevision, software_version: row.rcdSoftwareVersion, build_commit: row.rcdBuildCommit,
+      ports: [...new Set(sourceRows.map((item) => item.portId))].map((currentPort) => ({
+        port_id: currentPort, port_name: sourceRows.find((item) => item.portId === currentPort)?.portName ?? currentPort, enabled: true, applied_enabled: true, open: true,
+        devices: sourceRows.filter((item) => item.portId === currentPort).map((item) => ({ device_id: item.deviceId, name: item.deviceName, read_enabled: item.deviceReadEnabled, applied_read_enabled: item.deviceReadEnabled, communication_ok: item.sourceOnline, ...stationVersionPayload(item) })),
+      })),
+    };
   }
   if (method === 'PUT' && segments[0] === 'sources' && segments.length === 2) {
     const index = sources.findIndex((item) => item.id === decodeURIComponent(segments[1]));
@@ -208,4 +309,38 @@ export async function mockRequest(path: string, init: RequestInit): Promise<unkn
   }
 
   throw new Error(`mock 未实现 ${method} ${path}`);
+}
+
+function versionStatusMatches(item: DeviceVersion, status: string): boolean {
+  if (!status) return true;
+  if (status === 'success') return item.versionState === 'success';
+  if (status === 'mismatch') return item.typeMismatch;
+  if (status === 'failed') return ['failed', 'error', 'timeout'].some((value) => item.versionState.toLowerCase().includes(value));
+  if (status === 'stale') return item.stale;
+  if (status === 'offline_cached') return !item.sourceOnline && item.cached;
+  return item.versionState === status;
+}
+
+function stationVersionPayload(item: DeviceVersion) {
+  return {
+    configured_module_type: item.configuredModuleType, detected_module_type: item.detectedModuleType, type_mismatch: item.typeMismatch,
+    communication_module_version: item.communicationModuleVersion, communication_module_version_raw: item.communicationModuleVersionRaw,
+    plc_version: item.plcVersion, plc_version_raw: item.plcVersionRaw, version_payload: item.versionPayload, version_state: item.versionState,
+    last_version_attempt_at: item.lastVersionAttemptAt, last_version_success_at: item.lastVersionSuccessAt, last_version_error: item.lastVersionError, stale: item.stale,
+  };
+}
+
+function lowerSoftwareVersionSummary(rows: DeviceVersion[]) {
+  const sources = new Map<string, { software_version: string; build_commit: string }>();
+  for (const row of rows) {
+    if (!sources.has(row.sourceId)) sources.set(row.sourceId, { software_version: row.rcdSoftwareVersion, build_commit: row.rcdBuildCommit });
+  }
+  const versions = new Map<string, { software_version: string; build_commit: string; source_count: number }>();
+  for (const source of sources.values()) {
+    const key = `${source.software_version}\u0000${source.build_commit}`;
+    const current = versions.get(key);
+    if (current) current.source_count += 1;
+    else versions.set(key, { ...source, source_count: 1 });
+  }
+  return [...versions.values()].sort((left, right) => `${left.software_version}\u0000${left.build_commit}`.localeCompare(`${right.software_version}\u0000${right.build_commit}`));
 }

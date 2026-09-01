@@ -27,7 +27,18 @@ func validateOperationResult(request domain.OperationRequest, result json.RawMes
 	}
 	switch request.Action {
 	case "status", "set_port_enabled", "set_device_read_enabled":
-		return validateAcquisitionResult(request, object)
+		if err := validateAcquisitionResult(request, object); err != nil {
+			return err
+		}
+		if _, present := object["station_revision"]; present {
+			return validateStationVersionResult(request, object)
+		}
+		return nil
+	case "set_device_module_type", "query_device_version":
+		if err := validateAcquisitionResult(request, object); err != nil {
+			return err
+		}
+		return validateStationVersionResult(request, object)
 	case "list_configs":
 		items, err := operationArray(object, "items")
 		if err != nil {
@@ -163,7 +174,7 @@ func validateAcquisitionResult(request domain.OperationRequest, object operation
 		if err != nil {
 			return err
 		}
-		if status != "Applied" && status != "Pending" {
+		if status != "Applied" && status != "Pending" && status != "Unchanged" {
 			return invalidOperationField("status")
 		}
 		if _, exists := object["operation_revision"]; exists {
@@ -242,6 +253,111 @@ func validateAcquisitionResult(request domain.OperationRequest, object operation
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+func validateStationVersionResult(request domain.OperationRequest, object operationResultObject) error {
+	stationRevision, err := operationRevision(object, "station_revision", false)
+	if err != nil {
+		return err
+	}
+	if !domain.ValidStationRevision(stationRevision) {
+		return invalidOperationField("station_revision")
+	}
+	if raw, exists := object["station_operation_revision"]; exists && strings.TrimSpace(string(raw)) != "null" {
+		operationRevisionValue, err := operationRevision(object, "station_operation_revision", false)
+		if err != nil {
+			return err
+		}
+		if !domain.ValidStationRevision(operationRevisionValue) {
+			return invalidOperationField("station_operation_revision")
+		}
+	}
+	for _, field := range []string{"software_version", "build_commit"} {
+		if _, err := operationString(object, field, 256, true); err != nil {
+			return err
+		}
+	}
+	ports, err := operationArray(object, "ports")
+	if err != nil {
+		return err
+	}
+	targetFound := request.Action == "status" || request.Action == "set_port_enabled" || request.Action == "set_device_read_enabled"
+	for _, rawPort := range ports {
+		port, err := operationObject(rawPort)
+		if err != nil {
+			return err
+		}
+		portID, err := operationString(port, "port_id", 1024, false)
+		if err != nil {
+			return err
+		}
+		devices, err := operationArray(port, "devices")
+		if err != nil {
+			return err
+		}
+		for _, rawDevice := range devices {
+			device, err := operationObject(rawDevice)
+			if err != nil {
+				return err
+			}
+			deviceID, err := operationString(device, "device_id", 3, false)
+			if err != nil {
+				return err
+			}
+			configured, err := operationString(device, "configured_module_type", 32, false)
+			if err != nil || !domain.ValidModuleType(configured) {
+				return invalidOperationField("configured_module_type")
+			}
+			detected, err := operationString(device, "detected_module_type", 32, true)
+			if err != nil || (detected != "" && !domain.ValidModuleType(detected)) {
+				return invalidOperationField("detected_module_type")
+			}
+			for _, field := range []string{"type_mismatch", "stale"} {
+				var value bool
+				if err := operationField(device, field, &value); err != nil {
+					return err
+				}
+			}
+			for _, field := range []string{"communication_module_version", "plc_version"} {
+				if _, err := operationString(device, field, 64, true); err != nil {
+					return err
+				}
+			}
+			for _, field := range []string{"communication_module_version_raw", "plc_version_raw"} {
+				var value uint16
+				if err := operationOptionalField(device, field, &value); err != nil {
+					return err
+				}
+			}
+			payload, err := operationString(device, "version_payload", 8, true)
+			if err != nil || !domain.ValidVersionPayload(payload) {
+				return invalidOperationField("version_payload")
+			}
+			if _, err := operationString(device, "version_state", 64, false); err != nil {
+				return err
+			}
+			if err := operationTime(device, "last_version_attempt_at", true); err != nil {
+				return err
+			}
+			if err := operationTime(device, "last_version_success_at", true); err != nil {
+				return err
+			}
+			if value, err := operationString(device, "last_version_error", 16384, true); err != nil || len(value) > 16384 {
+				return invalidOperationField("last_version_error")
+			}
+			var failures uint32
+			if err := operationField(device, "consecutive_failures", &failures); err != nil {
+				return err
+			}
+			if portID == request.PortID && deviceID == request.DeviceID {
+				targetFound = true
+			}
+		}
+	}
+	if !targetFound {
+		return invalidOperationField("target_device")
 	}
 	return nil
 }

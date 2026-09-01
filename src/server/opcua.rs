@@ -39,8 +39,10 @@ use log::{debug, info, warn};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use super::operations::{publish_operations, OPERATIONS_NAMESPACE_URI};
-use super::topology::{publish_topology, TopologyManifest, TOPOLOGY_NAMESPACE_URI};
+use super::operations::{operations_version_updates, publish_operations, OPERATIONS_NAMESPACE_URI};
+use super::topology::{
+    publish_topology, station_version_updates, TopologyManifest, TOPOLOGY_NAMESPACE_URI,
+};
 use crate::broadcast::Broadcaster;
 use crate::calc_engine::config::{normalize_data_type, CalcDataType};
 use crate::calc_engine::engine::CalcEngine;
@@ -459,8 +461,8 @@ pub async fn run_opcua_server(
             product_uri: "urn:SerialServer".into(),
             manufacturer_name: "Rust Serial OPC UA Server".into(),
             product_name: "Serial OPC UA Server".into(),
-            software_version: "0.1.0".into(),
-            build_number: "1".into(),
+            software_version: crate::operations::software_version().into(),
+            build_number: crate::operations::build_commit().into(),
             build_date: UaDateTime::now(),
         })
         .with_node_manager(simple_node_manager(
@@ -589,7 +591,7 @@ pub async fn run_opcua_server(
 
     // ---- 注册 Method 回调 ----
     register_send_methods(&node_manager, ns, &serial_ports, &txs, operations.clone())?;
-    publish_operations(&operations_manager, operations_ns, operations)?;
+    publish_operations(&operations_manager, operations_ns, operations.clone())?;
     publish_topology(
         &topology_manager,
         &node_manager,
@@ -606,6 +608,15 @@ pub async fn run_opcua_server(
         topology.calculations.len(),
         topology_json.len(),
     );
+    let initial_station_snapshot = operations.station_versions_snapshot();
+    apply_station_metadata_updates(
+        &topology_manager,
+        &operations_manager,
+        &subscriptions,
+        topology_ns,
+        operations_ns,
+        &initial_station_snapshot,
+    )?;
     register_send_node_write_callbacks(
         &node_manager,
         &send_node_ids,
@@ -724,6 +735,38 @@ pub async fn run_opcua_server(
         }
     });
 
+    // ---- 任务 3: station_versions.json/runtime -> 只读版本元数据 ----
+    let nm_station_topology = topology_manager.clone();
+    let nm_station_operations = operations_manager.clone();
+    let subs_station = subscriptions.clone();
+    let operations_station = operations.clone();
+    let cancel_station = cancel.clone();
+    let mut previous_station_key = station_snapshot_update_key(&initial_station_snapshot);
+    let mut task_station = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel_station.cancelled() => return Ok::<(), String>(()),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+            let snapshot = operations_station.station_versions_snapshot();
+            let key = station_snapshot_update_key(&snapshot);
+            if key == previous_station_key {
+                continue;
+            }
+            apply_station_metadata_updates(
+                &nm_station_topology,
+                &nm_station_operations,
+                &subs_station,
+                topology_ns,
+                operations_ns,
+                &snapshot,
+            )
+            .map_err(|error| error.to_string())?;
+            previous_station_key = key;
+        }
+    });
+
     // 外部取消信号 → OPC UA 服务器自身取消（Ctrl+C 已在 main 注册）
     {
         let handle_c = handle.clone();
@@ -736,6 +779,7 @@ pub async fn run_opcua_server(
 
     let mut update_task_completed = false;
     let mut ack_task_completed = false;
+    let mut station_task_completed = false;
     let result = tokio::select! {
         server_result = server.run_with(listener) => {
             server_result.map_err(|e| io::Error::other(format!("OPC UA 服务器错误: {e}")))
@@ -756,6 +800,14 @@ pub async fn run_opcua_server(
                 Err(background_task_error("command_ack", ack_result))
             }
         }
+        station_result = &mut task_station => {
+            station_task_completed = true;
+            if cancel.is_cancelled() && matches!(&station_result, Ok(Ok(()))) {
+                Ok(())
+            } else {
+                Err(background_task_error("station_versions", station_result))
+            }
+        }
     };
 
     // 服务器退出后，确保取消信号触发 + 等待子任务收尾
@@ -767,8 +819,59 @@ pub async fn run_opcua_server(
     if !ack_task_completed {
         log_background_task_shutdown("command_ack", task_ack.await);
     }
+    if !station_task_completed {
+        log_background_task_shutdown("station_versions", task_station.await);
+    }
 
     result
+}
+
+fn station_snapshot_update_key(snapshot: &crate::operations::StationVersionsSnapshot) -> String {
+    let mut key = snapshot.station_revision.clone();
+    for port in &snapshot.ports {
+        key.push('|');
+        key.push_str(&port.port_id);
+        key.push(if port.open { '+' } else { '-' });
+        for device in &port.devices {
+            key.push(',');
+            key.push_str(&device.device_id);
+            key.push(if device.communication_ok { '+' } else { '-' });
+        }
+    }
+    key
+}
+
+fn apply_station_metadata_updates(
+    topology_manager: &Arc<SimpleNodeManager>,
+    operations_manager: &Arc<SimpleNodeManager>,
+    subscriptions: &Arc<SubscriptionCache>,
+    topology_ns: u16,
+    operations_ns: u16,
+    snapshot: &crate::operations::StationVersionsSnapshot,
+) -> io::Result<()> {
+    let topology_updates = station_version_updates(topology_ns, snapshot);
+    topology_manager
+        .set_values(
+            subscriptions,
+            topology_updates
+                .iter()
+                .map(|(node_id, value)| (node_id, None::<&NumericRange>, value.clone())),
+        )
+        .map_err(|error| {
+            io::Error::other(format!("update station topology metadata: {error:?}"))
+        })?;
+    let operation_updates = operations_version_updates(operations_ns, snapshot);
+    operations_manager
+        .set_values(
+            subscriptions,
+            operation_updates
+                .iter()
+                .map(|(node_id, value)| (node_id, None::<&NumericRange>, value.clone())),
+        )
+        .map_err(|error| {
+            io::Error::other(format!("update station operation metadata: {error:?}"))
+        })?;
+    Ok(())
 }
 
 fn log_background_task_shutdown(
@@ -1676,7 +1779,9 @@ fn forward_hex_command(
         CommandType::SendData(data) | CommandType::SendDataWithAck(data) => data.device_id,
         CommandType::PortStatus(_)
         | CommandType::DeviceSetting(_)
-        | CommandType::DeviceReadSetting(_) => 0,
+        | CommandType::DeviceReadSetting(_)
+        | CommandType::StationModuleTypeSetting(_)
+        | CommandType::QueryStationVersion(_) => 0,
     };
     tx.send(cmd)
         .map_err(|e| format!("转发命令到串口失败: {:?}", e))?;

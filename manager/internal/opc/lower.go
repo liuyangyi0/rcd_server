@@ -2,6 +2,7 @@ package opc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -34,17 +35,19 @@ type LowerSupervisor struct {
 	cfg  LowerConfig
 	sink LowerSink
 
-	mu             sync.RWMutex
-	runContext     context.Context
-	client         *gopcua.Client
-	namespaces     map[string]uint16
-	nodes          map[string]observedNode
-	versions       map[string]observedVersion
-	status         LowerStatus
-	running        atomic.Bool
-	epoch          atomic.Uint64
-	commandMu      sync.Mutex
-	operationCalls atomic.Int32
+	mu                   sync.RWMutex
+	runContext           context.Context
+	client               *gopcua.Client
+	namespaces           map[string]uint16
+	nodes                map[string]observedNode
+	versions             map[string]observedVersion
+	status               LowerStatus
+	running              atomic.Bool
+	epoch                atomic.Uint64
+	commandMu            sync.Mutex
+	stationRevisionEpoch uint64
+	stationRevision      string
+	operationCalls       atomic.Int32
 
 	lastStatusEmit atomic.Int64
 	rng            *rand.Rand
@@ -237,6 +240,7 @@ func (s *LowerSupervisor) runConnection(parent context.Context, epoch uint64) er
 	s.status.LastError = ""
 	s.mu.Unlock()
 	s.sink.OnCatalog(catalog)
+	stationRevisionNode := s.discoverStationVersionRevisionNode(parent, client, namespaces)
 
 	runCtx, cancelRun := context.WithCancel(parent)
 	defer cancelRun()
@@ -252,7 +256,7 @@ func (s *LowerSupervisor) runConnection(parent context.Context, epoch uint64) er
 		}
 	})
 
-	subs, err := s.subscribeBatches(runCtx, monitorClient, nodes, epoch, monitorErr)
+	subs, err := s.subscribeBatches(runCtx, monitorClient, nodes, stationRevisionNode, epoch, monitorErr)
 	if err != nil {
 		return err
 	}
@@ -457,6 +461,7 @@ func (s *LowerSupervisor) subscribeBatches(
 	ctx context.Context,
 	m *monitor.NodeMonitor,
 	nodes map[string]observedNode,
+	stationRevisionNode string,
 	epoch uint64,
 	errCh chan<- error,
 ) ([]*monitor.Subscription, error) {
@@ -471,7 +476,7 @@ func (s *LowerSupervisor) subscribeBatches(
 		MaxKeepAliveCount:          3000,
 		MaxNotificationsPerPublish: 10000,
 	}
-	if len(ids) == 0 {
+	if len(ids) == 0 && stationRevisionNode == "" {
 		return nil, nil
 	}
 	// A source owns one Subscription. MonitoredItems are still added in bounded
@@ -486,6 +491,10 @@ func (s *LowerSupervisor) subscribeBatches(
 				default:
 				}
 			}
+			return
+		}
+		if stationRevisionNode != "" && msg.NodeID.String() == stationRevisionNode {
+			s.emitStationVersionRevision(msg.DataValue, epoch)
 			return
 		}
 		observed, ok := nodes[msg.NodeID.String()]
@@ -524,7 +533,77 @@ func (s *LowerSupervisor) subscribeBatches(
 			return nil, fmt.Errorf("monitor batch %d-%d: %w", start, end, err)
 		}
 	}
+	if stationRevisionNode != "" {
+		nodeID, parseErr := gu.ParseNodeID(stationRevisionNode)
+		if parseErr != nil {
+			_ = sub.Unsubscribe(ctx)
+			return nil, fmt.Errorf("parse station version revision NodeId %q: %w", stationRevisionNode, parseErr)
+		}
+		_, _ = sub.AddMonitorItems(ctx, monitor.Request{
+			NodeID: nodeID, MonitoringMode: gu.MonitoringModeReporting,
+			MonitoringParameters: &gu.MonitoringParameters{SamplingInterval: 1000, QueueSize: 1, DiscardOldest: true},
+		})
+		// This management invalidation is optional. Any monitored-item rejection
+		// must leave the business subscription healthy; the 60 s status poll is
+		// the bounded fallback for old or resource-constrained lower servers.
+	}
 	return []*monitor.Subscription{sub}, nil
+}
+
+func (s *LowerSupervisor) discoverStationVersionRevisionNode(parent context.Context, client opcValueReader, namespaces map[string]uint16) string {
+	ns, ok := namespaces[domain.OperationsNamespaceURI]
+	if !ok {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(parent, s.cfg.OperationTimeout)
+	defer cancel()
+	capabilityID := gu.NewStringNodeID(ns, "Operations/Capabilities")
+	response, err := client.Read(ctx, &gu.ReadRequest{TimestampsToReturn: gu.TimestampsToReturnNeither,
+		NodesToRead: []*gu.ReadValueID{{NodeID: capabilityID, AttributeID: gu.AttributeIDValue}}})
+	if err != nil || response == nil || len(response.Results) != 1 || response.Results[0] == nil ||
+		response.Results[0].Status != gu.StatusOK || response.Results[0].Value == nil {
+		return ""
+	}
+	content, ok := response.Results[0].Value.Value().(string)
+	if !ok || len(content) > 16384 {
+		return ""
+	}
+	var capabilities domain.OperationsCapabilities
+	if json.Unmarshal([]byte(content), &capabilities) != nil || capabilities.SchemaVersion != 1 || !capabilities.HasFeature("station_versions") {
+		return ""
+	}
+	revisionID := gu.NewStringNodeID(ns, "Operations/StationVersionRevision")
+	response, err = client.Read(ctx, &gu.ReadRequest{TimestampsToReturn: gu.TimestampsToReturnNeither,
+		NodesToRead: []*gu.ReadValueID{{NodeID: revisionID, AttributeID: gu.AttributeIDValue}}})
+	if err != nil || response == nil || len(response.Results) != 1 || response.Results[0] == nil ||
+		response.Results[0].Status != gu.StatusOK || response.Results[0].Value == nil {
+		return ""
+	}
+	revision, ok := response.Results[0].Value.Value().(string)
+	if !ok || !domain.ValidStationRevision(revision) {
+		return ""
+	}
+	return revisionID.String()
+}
+
+func (s *LowerSupervisor) emitStationVersionRevision(value *gu.DataValue, epoch uint64) {
+	if value == nil || value.Value == nil || s.epoch.Load() != epoch {
+		return
+	}
+	revision, ok := value.Value.Value().(string)
+	if !ok || !domain.ValidStationRevision(revision) {
+		return
+	}
+	s.mu.Lock()
+	if s.stationRevisionEpoch == epoch && s.stationRevision == revision {
+		s.mu.Unlock()
+		return
+	}
+	s.stationRevisionEpoch, s.stationRevision = epoch, revision
+	s.mu.Unlock()
+	if sink, ok := s.sink.(LowerStationVersionSink); ok {
+		sink.OnStationVersionRevision(s.cfg.Source.ID, revision, epoch)
+	}
 }
 
 func (s *LowerSupervisor) Read(ctx context.Context, key domain.NodeKey) (domain.Sample, error) {

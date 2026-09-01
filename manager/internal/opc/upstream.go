@@ -87,6 +87,8 @@ type UpstreamServer struct {
 	management              map[string]awserver.Node
 	managementGroups        map[string]awserver.Node
 	managementSources       map[string]awserver.Node
+	sourceVersionTreeHashes map[string]string
+	sourceVersionTreeRoots  map[string]awserver.Node
 	memberTreeHashes        map[string]string
 	memberTreeNodeIDs       map[string]map[string]awu.NodeID
 	memberTreeRouteIDs      map[string][]awu.NodeID
@@ -150,6 +152,8 @@ func NewUpstreamServer(cfg UpstreamConfig, backend UpstreamBackend) (*UpstreamSe
 		management:              make(map[string]awserver.Node),
 		managementGroups:        make(map[string]awserver.Node),
 		managementSources:       make(map[string]awserver.Node),
+		sourceVersionTreeHashes: make(map[string]string),
+		sourceVersionTreeRoots:  make(map[string]awserver.Node),
 		memberTreeHashes:        make(map[string]string),
 		memberTreeNodeIDs:       make(map[string]map[string]awu.NodeID),
 		memberTreeRouteIDs:      make(map[string][]awu.NodeID),

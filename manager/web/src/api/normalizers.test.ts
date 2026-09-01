@@ -1,7 +1,25 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeAlarm, normalizeCommand, normalizeOverview, normalizePage, normalizePoint, normalizeSession, normalizeSource, normalizeSourceProbe, normalizeSourceTopology, normalizeSystemInfo } from './normalizers';
+import { normalizeAlarm, normalizeCommand, normalizeDeviceVersionPage, normalizeOverview, normalizePage, normalizePoint, normalizeSession, normalizeSource, normalizeSourceProbe, normalizeSourceTopology, normalizeSystemInfo } from './normalizers';
 
 describe('API normalizers', () => {
+  it('normalizes station version inventory without losing raw firmware values', () => {
+    const page = normalizeDeviceVersionPage({
+      items: [{ source_id: 'lower-a', source_revision: 7, port_id: '/dev/ttyWCH0', device_id: '12', configured_module_type: 'domestic', detected_module_type: 'domestic', communication_module_version: 'V1.4', communication_module_version_raw: 0x0104, plc_version: 'V0.5', plc_version_raw: 5, version_payload: [1, 4, 0, 5], version_state: 'ready', station_revision: '9', version_supported: true, source_online: true, communication_ok: true }],
+      page: 2, page_size: 50, total: 71, summary: { total: 71, domestic: 20, legacy_russian: 31, unknown: 20, mismatch: 1, failed: 2, offline_cached: 3, lower_software_versions: [{ software_version: '0.2.0', build_commit: 'abc123', source_count: 3 }] },
+    });
+    expect(page).toMatchObject({ page: 2, pageSize: 50, total: 71, summary: { domestic: 20, legacyRussian: 31, offlineCached: 3, lowerSoftwareVersions: [{ softwareVersion: '0.2.0', buildCommit: 'abc123', sourceCount: 3 }] } });
+    expect(page.items[0]).toMatchObject({ sourceId: 'lower-a', sourceRevision: 7, configuredModuleType: 'domestic', communicationModuleVersionRaw: 0x0104, plcVersionRaw: 5, versionPayload: '01 04 00 05', stationRevision: '9', versionSupported: true, sourceOnline: true, communicationOK: true });
+  });
+
+  it('keeps a valid raw V0.0 distinct from an unqueried null version', () => {
+    const page = normalizeDeviceVersionPage({
+      items: [{ source_id: 'lower-a', port_id: 'p1', device_id: '1', communication_module_version_raw: 0, plc_version_raw: null, version_supported: true }],
+      page: 1, page_size: 50, total: 1,
+    });
+    expect(page.items[0].communicationModuleVersionRaw).toBe(0);
+    expect(page.items[0].plcVersionRaw).toBeUndefined();
+  });
+
   it('maps device bindings and distinguishes configured from discovered group membership', () => {
     const source = normalizeSource({ id: 'lower-1', group_id: 'fallback', group_bindings: [{ group_id: 'device-a', port_id: '/dev/ttyS0', device_id: '1' }], available_group_ids: ['fallback', 'device-a'] });
     expect(source.groupId).toBe('fallback');

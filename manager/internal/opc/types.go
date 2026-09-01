@@ -91,6 +91,13 @@ type LowerSink interface {
 	OnSample(sourceID string, key domain.NodeKey, sample domain.Sample)
 }
 
+// LowerStationVersionSink receives the lower's lightweight version revision
+// invalidation. It is intentionally separate from OnSample so this management
+// node can never enter the business KKS cache.
+type LowerStationVersionSink interface {
+	OnStationVersionRevision(sourceID, revision string, epoch uint64)
+}
+
 type NopLowerSink struct{}
 
 func (NopLowerSink) OnLowerStatus(LowerStatus)                      {}
@@ -145,6 +152,20 @@ type UpstreamBackend interface {
 	SourcePointStatistics(sourceID string) PointStatistics
 	GroupForNode(identifier string) (string, bool)
 	PendingCount(groupID string) int
+}
+
+// StationVersionBackend is optional so existing adapters and older test
+// backends remain source-compatible. Values are physical-source metadata and
+// are never resolved through an upstream Session route.
+type StationVersionBackend interface {
+	StationVersions(sourceID string) (domain.SourceStationVersions, bool)
+}
+
+// StationVersionCapabilityBackend lets an active old lower explicitly
+// quarantine a cached snapshot created by a newer build. Unknown capability
+// state is distinct from a confirmed unsupported current connection epoch.
+type StationVersionCapabilityBackend interface {
+	StationVersionSupport(sourceID string) (known, supported bool)
 }
 
 // GroupCommandBackend exposes unambiguous logical-device commands without

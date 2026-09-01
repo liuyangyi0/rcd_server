@@ -103,6 +103,13 @@ func (s *LowerSupervisor) ExecuteOperation(ctx context.Context, request domain.O
 	if response == nil || response.StatusCode != gu.StatusOK || len(response.OutputArguments) != 1 || response.OutputArguments[0] == nil {
 		return nil, invalidOperationsResponse("下级运维方法调用失败或返回参数无效")
 	}
+	// The call may have completed on a Session that was detached while it was
+	// in flight. Re-check the pinned epoch before accepting any result so a late
+	// old-Session status cannot escape to the caller or overwrite manager state.
+	currentClient, _, currentErr := s.operationsTarget(epoch)
+	if currentErr != nil || currentClient != client {
+		return nil, ErrLowerUnavailable
+	}
 	content, ok := response.OutputArguments[0].Value().(string)
 	if !ok || len(content) > domain.MaxOperationJSONBytes {
 		return nil, invalidOperationsResponse("下级运维返回文本无效或超限")

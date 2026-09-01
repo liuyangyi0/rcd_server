@@ -2,6 +2,9 @@ import type {
   Alarm,
   CommandAudit,
   ConfigurationImportResult,
+  DeviceVersion,
+  DeviceVersionPage,
+  ModuleType,
   Group,
   HealthState,
   ManagementAudit,
@@ -244,6 +247,114 @@ export function normalizeSourceTopology(payload: unknown): SourceTopology {
       };
     }) : [],
   };
+}
+
+function moduleType(value: unknown): ModuleType {
+  const normalized = text(value, 'unknown').trim().toLowerCase().replaceAll('-', '_');
+  if (['domestic', 'self_developed', 'cn', '国产', '自研'].includes(normalized)) return 'domestic';
+  if (['legacy_russian', 'legacy', 'russian', '俄供', '原模块'].includes(normalized)) return 'legacy_russian';
+  return 'unknown';
+}
+
+function payloadText(value: unknown): string | undefined {
+  if (Array.isArray(value)) {
+    const bytes = value.map((item) => number(item, -1));
+    if (bytes.every((item) => item >= 0 && item <= 255)) return bytes.map((item) => item.toString(16).padStart(2, '0').toUpperCase()).join(' ');
+  }
+  return text(value).trim() || undefined;
+}
+
+export function normalizeDeviceVersion(payload: unknown): DeviceVersion {
+  const body = record(payload);
+  const nested = record(first(body, 'station_version', 'stationVersion'));
+  const version = { ...body, ...nested };
+  const communicationRaw = first(version, 'communication_module_version_raw', 'communicationModuleVersionRaw');
+  const plcRaw = first(version, 'plc_version_raw', 'plcVersionRaw');
+  const communicationVersion = text(first(version, 'communication_module_version', 'communicationModuleVersion'));
+  const plcVersion = text(first(version, 'plc_version', 'plcVersion'));
+  const versionPayload = payloadText(first(version, 'version_payload', 'versionPayload', 'payload'));
+  const stationRevision = text(first(body, 'station_revision', 'stationRevision') ?? first(version, 'station_revision', 'stationRevision'));
+  const portEnabled = bool(first(body, 'port_enabled', 'portEnabled'), true);
+  const deviceReadEnabled = bool(first(body, 'device_read_enabled', 'deviceReadEnabled', 'read_enabled', 'readEnabled'), true);
+  return {
+    sourceId: text(first(body, 'source_id', 'sourceId')),
+    sourceName: text(first(body, 'source_name', 'sourceName')),
+    sourceRevision: number(first(body, 'source_revision', 'sourceRevision')),
+    rcdSoftwareVersion: text(first(body, 'rcd_software_version', 'rcdSoftwareVersion', 'software_version', 'softwareVersion')),
+    rcdBuildCommit: text(first(body, 'rcd_build_commit', 'rcdBuildCommit', 'build_commit', 'buildCommit')),
+    portId: text(first(body, 'port_id', 'portId')),
+    portName: text(first(body, 'port_name', 'portName')),
+    deviceId: text(first(body, 'device_id', 'deviceId')),
+    deviceName: text(first(body, 'device_name', 'deviceName', 'name')),
+    configuredModuleType: moduleType(first(version, 'configured_module_type', 'configuredModuleType')),
+    detectedModuleType: moduleType(first(version, 'detected_module_type', 'detectedModuleType')),
+    typeMismatch: bool(first(version, 'type_mismatch', 'typeMismatch')),
+    communicationModuleVersion: communicationVersion || undefined,
+    communicationModuleVersionRaw: rawVersionValue(communicationRaw),
+    plcVersion: plcVersion || undefined,
+    plcVersionRaw: rawVersionValue(plcRaw),
+    versionPayload,
+    versionState: text(first(version, 'version_state', 'versionState', 'state'), 'unknown'),
+    lastVersionAttemptAt: timestamp(first(version, 'last_version_attempt_at', 'lastVersionAttemptAt')),
+    lastVersionSuccessAt: timestamp(first(version, 'last_version_success_at', 'lastVersionSuccessAt')),
+    lastVersionError: text(first(version, 'last_version_error', 'lastVersionError', 'error')) || undefined,
+    stationRevision,
+    versionSupported: bool(first(body, 'version_supported', 'versionSupported'), Boolean(stationRevision)),
+    sourceOnline: bool(first(body, 'source_online', 'sourceOnline', 'online')),
+    cached: bool(first(body, 'cached', 'from_cache', 'fromCache')),
+    stale: bool(first(body, 'stale', 'version_stale', 'versionStale')),
+    portEnabled,
+    portAppliedEnabled: bool(first(body, 'port_applied_enabled', 'portAppliedEnabled', 'applied_enabled', 'appliedEnabled'), portEnabled),
+    portOpen: bool(first(body, 'port_open', 'portOpen', 'open'), portEnabled),
+    deviceReadEnabled,
+    appliedDeviceReadEnabled: bool(first(body, 'applied_device_read_enabled', 'appliedDeviceReadEnabled', 'applied_read_enabled', 'appliedReadEnabled'), deviceReadEnabled),
+    communicationOK: bool(first(body, 'communication_ok', 'communicationOK', 'communicationOk')),
+    controlPending: bool(first(body, 'control_pending', 'controlPending')),
+    pendingCommands: number(first(body, 'pending_commands', 'pendingCommands')),
+  };
+}
+
+function rawVersionValue(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  return number(value);
+}
+
+export function normalizeDeviceVersionPage(payload: unknown): DeviceVersionPage {
+  const page = normalizePage(payload, normalizeDeviceVersion);
+  const body = record(unwrap(payload));
+  const rawSummary = record(first(body, 'summary'));
+  const count = (snake: string, camel: string, fallback: number) => {
+    const value = first(rawSummary, snake, camel);
+    return value === undefined ? fallback : number(value);
+  };
+  const current = page.items;
+  const rawSoftwareVersions = first(rawSummary, 'lower_software_versions', 'lowerSoftwareVersions');
+  const lowerSoftwareVersions = Array.isArray(rawSoftwareVersions) ? rawSoftwareVersions.map((item) => {
+    const version = record(item);
+    return {
+      softwareVersion: text(first(version, 'software_version', 'softwareVersion')),
+      buildCommit: text(first(version, 'build_commit', 'buildCommit')),
+      sourceCount: number(first(version, 'source_count', 'sourceCount')),
+    };
+  }).filter((item) => item.sourceCount > 0 || item.softwareVersion || item.buildCommit) : [];
+  return {
+    ...page,
+    summary: {
+      total: count('total', 'total', page.total),
+      domestic: count('domestic', 'domestic', current.filter((item) => item.configuredModuleType === 'domestic').length),
+      legacyRussian: count('legacy_russian', 'legacyRussian', current.filter((item) => item.configuredModuleType === 'legacy_russian').length),
+      unknown: count('unknown', 'unknown', current.filter((item) => item.configuredModuleType === 'unknown').length),
+      mismatch: count('mismatch', 'mismatch', current.filter((item) => item.typeMismatch).length),
+      failed: count('failed', 'failed', current.filter((item) => deviceVersionFailed(item.versionState)).length),
+      offlineCached: count('offline_cached', 'offlineCached', current.filter((item) => !item.sourceOnline && item.cached).length),
+      lowerSoftwareVersions,
+    },
+  };
+}
+
+function deviceVersionFailed(state: string): boolean {
+  const normalized = state.toLowerCase();
+  return normalized.includes('fail') || normalized.includes('error') || normalized.includes('timeout');
 }
 
 export function normalizePoint(payload: unknown): Point {

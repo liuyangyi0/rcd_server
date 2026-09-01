@@ -7,13 +7,18 @@ pub mod command;
 pub mod device;
 pub mod message;
 pub mod state;
+pub mod station_version;
 pub mod value;
 
 // 重新导出常用类型，方便外部引用
-pub use command::{Command, CommandAckStatus, CommandAckUpdate, CommandType, SendData};
+pub use command::{
+    Command, CommandAckStatus, CommandAckUpdate, CommandType, QueryStationVersion, SendData,
+    StationModuleTypeSetting,
+};
 pub use device::DeviceStatus;
 pub use message::MessageType;
 pub use state::{PortRuntimeState, SystemState};
+pub use station_version::{display_version, ModuleType, StationVersionRecord};
 pub use value::Value;
 
 /// 计算字节数组的累加和校验值（溢出自动回绕）。

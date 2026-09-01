@@ -6,7 +6,7 @@ import type { EventEnvelope } from '../api/types';
 
 export type StreamState = 'connecting' | 'connected' | 'disconnected' | 'mock';
 
-const EVENT_NAMES = ['source.status', 'source.sample', 'source.event', 'source.operation', 'group.changed', 'selection.changed', 'session.changed', 'command.changed', 'catalog.changed', 'alarm.changed', 'management.audit', 'configuration.changed', 'resync'];
+const EVENT_NAMES = ['source.status', 'source.sample', 'source.event', 'source.operation', 'station_versions_changed', 'group.changed', 'selection.changed', 'session.changed', 'command.changed', 'catalog.changed', 'alarm.changed', 'management.audit', 'configuration.changed', 'resync'];
 
 export function eventInvalidatesPoints(type: string): boolean {
   return type.includes('sample') || type.includes('catalog') || type.includes('selection') ||
@@ -23,7 +23,7 @@ export function eventInvalidatesManagementAudit(type: string): boolean {
 
 export function eventInvalidatesOperations(type: string, key: readonly unknown[]): boolean {
   if (key[0] !== 'source-operations') return false;
-  return type === 'source.operation' || type === 'source.status' || (type === 'command.changed' && key[3] === 'status');
+  return type === 'source.operation' || type === 'source.status' || (type === 'station_versions_changed' && key[3] === 'status') || (type === 'command.changed' && key[3] === 'status');
 }
 
 export function useEventStream(): StreamState {
@@ -55,7 +55,7 @@ export function useEventStream(): StreamState {
         void queryClient.invalidateQueries({ queryKey: queryKeys.groups });
         void queryClient.invalidateQueries({ queryKey: queryKeys.allAlarms });
       }
-      if (type === 'source.operation' || type === 'source.status' || type === 'command.changed') {
+      if (type === 'source.operation' || type === 'source.status' || type === 'station_versions_changed' || type === 'command.changed') {
         // Keep the maintenance feature lazy: only its key prefix is needed.
         // Never fan sample traffic into config/log reads. Command events affect
         // the physical port lock, not file contents, and refresh status only.
@@ -64,6 +64,12 @@ export function useEventStream(): StreamState {
           predicate: (query) => eventInvalidatesOperations(type, query.queryKey),
           refetchType: 'active',
         });
+      }
+      if (type === 'station_versions_changed' || type === 'source.status') {
+        // Connection changes alter source_online/cached/stale and whether a
+        // physical version operation is currently reachable, even when the
+        // station revision itself does not change.
+        void queryClient.invalidateQueries({ queryKey: queryKeys.allDeviceVersions, refetchType: 'active' });
       }
       if (type.includes('catalog')) {
         void queryClient.invalidateQueries({ queryKey: envelope.sourceId ? queryKeys.sourceTopology(envelope.sourceId) : queryKeys.allTopologies });

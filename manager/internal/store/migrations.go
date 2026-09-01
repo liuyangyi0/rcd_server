@@ -149,6 +149,47 @@ var migrations = []string{
 	CREATE UNIQUE INDEX process_control_pending_idx ON process_control_operations(source_id)
 		WHERE state NOT IN ('succeeded','failed');
 	CREATE INDEX process_control_history_idx ON process_control_operations(source_id, created_at DESC);`,
+	`CREATE TABLE source_station_version_state (
+		source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+		topology_fingerprint TEXT NOT NULL,
+		lower_revision TEXT NOT NULL,
+		station_revision TEXT NOT NULL,
+		software_version TEXT NOT NULL DEFAULT '',
+		build_commit TEXT NOT NULL DEFAULT '',
+		observed_at TEXT NOT NULL
+	);
+	CREATE TABLE station_version_cache (
+		source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+		topology_fingerprint TEXT NOT NULL,
+		port_id TEXT NOT NULL,
+		port_name TEXT NOT NULL DEFAULT '',
+		port_enabled INTEGER NOT NULL CHECK(port_enabled IN (0,1)),
+		port_applied_enabled INTEGER NOT NULL CHECK(port_applied_enabled IN (0,1)),
+		port_open INTEGER NOT NULL CHECK(port_open IN (0,1)),
+		control_pending INTEGER NOT NULL CHECK(control_pending IN (0,1)),
+		pending_commands INTEGER NOT NULL CHECK(pending_commands >= 0),
+		device_id TEXT NOT NULL,
+		device_name TEXT NOT NULL DEFAULT '',
+		read_enabled INTEGER NOT NULL CHECK(read_enabled IN (0,1)),
+		applied_read_enabled INTEGER NOT NULL CHECK(applied_read_enabled IN (0,1)),
+		communication_ok INTEGER NOT NULL CHECK(communication_ok IN (0,1)),
+		configured_module_type TEXT NOT NULL,
+		detected_module_type TEXT NOT NULL DEFAULT '',
+		type_mismatch INTEGER NOT NULL CHECK(type_mismatch IN (0,1)),
+		communication_module_version TEXT NOT NULL DEFAULT '',
+		communication_module_version_raw INTEGER,
+		plc_version TEXT NOT NULL DEFAULT '',
+		plc_version_raw INTEGER,
+		version_payload TEXT NOT NULL DEFAULT '',
+		version_state TEXT NOT NULL,
+		last_version_attempt_at TEXT,
+		last_version_success_at TEXT,
+		last_version_error TEXT NOT NULL DEFAULT '',
+		consecutive_failures INTEGER NOT NULL DEFAULT 0,
+		stale INTEGER NOT NULL CHECK(stale IN (0,1)),
+		PRIMARY KEY(source_id, topology_fingerprint, port_id, device_id)
+	);
+	CREATE INDEX station_version_cache_source_idx ON station_version_cache(source_id, topology_fingerprint, port_id, device_id);`,
 }
 
 func migrate(ctx context.Context, db *sql.DB) error {

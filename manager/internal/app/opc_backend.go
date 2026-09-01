@@ -52,6 +52,12 @@ func (b OPCBackend) GroupForNode(identifier string) (string, bool) {
 	return b.Runtime.GroupForNode(identifier)
 }
 func (b OPCBackend) PendingCount(groupID string) int { return b.Runtime.routes.PendingCount(groupID) }
+func (b OPCBackend) StationVersions(sourceID string) (domain.SourceStationVersions, bool) {
+	return b.Runtime.StationVersions(sourceID)
+}
+func (b OPCBackend) StationVersionSupport(sourceID string) (bool, bool) {
+	return b.Runtime.StationVersionSupport(sourceID)
+}
 
 func (b OPCBackend) ReadGroupCommand(sessionID, groupID string) domain.Sample {
 	return b.Runtime.ReadGroupCommand(sessionID, groupID)

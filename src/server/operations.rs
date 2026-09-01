@@ -9,11 +9,14 @@ use opcua::server::address_space::{
 };
 use opcua::server::node_manager::memory::SimpleNodeManager;
 use opcua::types::{
-    DataTypeId, NodeId, ObjectId, ObjectTypeId, QualifiedName, ReferenceTypeId, UAString,
-    VariableTypeId, Variant,
+    DataTypeId, DataValue, DateTime as UaDateTime, NodeId, ObjectId, ObjectTypeId, QualifiedName,
+    ReferenceTypeId, StatusCode, UAString, VariableTypeId, Variant,
 };
 
-use crate::operations::{capabilities, OperationError, Operations};
+use crate::operations::{
+    build_commit, capabilities, software_version, OperationError, Operations,
+    StationVersionsSnapshot,
+};
 
 pub const OPERATIONS_NAMESPACE_URI: &str = "urn:SerialServer:operations";
 pub const OPERATIONS_OBJECT_ID: &str = "Operations";
@@ -63,6 +66,14 @@ pub(super) fn publish_operations(
             &NodeId::from(VariableTypeId::BaseDataVariableType),
             ReferenceTypeId::HasTypeDefinition,
         );
+        let initial_station_revision = operations.station_versions_snapshot().station_revision;
+        for (name, value) in [
+            ("SoftwareVersion", software_version()),
+            ("BuildCommit", build_commit()),
+            ("StationVersionRevision", initial_station_revision.as_str()),
+        ] {
+            add_read_only_string(&mut address_space, ns, &root, name, value)?;
+        }
         if !MethodBuilder::new(&method, QualifiedName::new(ns, "Execute"), "Execute")
             .executable(true)
             .user_executable(true)
@@ -94,4 +105,69 @@ pub(super) fn publish_operations(
         Ok(vec![Variant::String(UAString::from(response))])
     });
     Ok(())
+}
+
+fn add_read_only_string(
+    address_space: &mut opcua::server::address_space::AddressSpace,
+    ns: u16,
+    parent: &NodeId,
+    name: &str,
+    value: &str,
+) -> io::Result<()> {
+    let id = NodeId::new(ns, format!("Operations/{name}"));
+    let mut variable = Variable::new_data_value(
+        &id,
+        QualifiedName::new(ns, name),
+        name,
+        NodeId::from(DataTypeId::String),
+        Some(-1),
+        None,
+        Variant::String(value.into()),
+    );
+    variable.set_access_level(AccessLevel::CURRENT_READ);
+    variable.set_user_access_level(AccessLevel::CURRENT_READ);
+    if !address_space.insert(
+        variable,
+        Some(&[(
+            parent,
+            &ReferenceTypeId::HasComponent,
+            ReferenceDirection::Inverse,
+        )]),
+    ) {
+        return Err(io::Error::other(format!(
+            "could not create operations {name}"
+        )));
+    }
+    address_space.insert_reference(
+        &id,
+        &NodeId::from(VariableTypeId::BaseDataVariableType),
+        ReferenceTypeId::HasTypeDefinition,
+    );
+    Ok(())
+}
+
+pub(super) fn operations_version_updates(
+    ns: u16,
+    snapshot: &StationVersionsSnapshot,
+) -> Vec<(NodeId, DataValue)> {
+    [
+        ("SoftwareVersion", snapshot.software_version.as_str()),
+        ("BuildCommit", snapshot.build_commit.as_str()),
+        ("StationVersionRevision", snapshot.station_revision.as_str()),
+    ]
+    .into_iter()
+    .map(|(name, value)| {
+        (
+            NodeId::new(ns, format!("Operations/{name}")),
+            DataValue {
+                value: Some(Variant::String(value.into())),
+                status: Some(StatusCode::Good),
+                source_timestamp: None,
+                source_picoseconds: None,
+                server_timestamp: Some(UaDateTime::now()),
+                server_picoseconds: Some(0),
+            },
+        )
+    })
+    .collect()
 }

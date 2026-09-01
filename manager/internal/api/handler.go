@@ -65,6 +65,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("POST /api/v1/sources/{id}/reconnect", h.reconnectSource)
 	h.mux.HandleFunc("POST /api/v1/sources/{id}/rediscover", h.rediscoverSource)
 	h.lowerOperationRoutes()
+	h.deviceVersionRoutes()
 	h.processControlRoutes()
 
 	h.mux.HandleFunc("GET /api/v1/sessions", h.listSessions)

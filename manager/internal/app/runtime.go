@@ -85,6 +85,7 @@ type Runtime struct {
 	commandMu               sync.Mutex
 	statusPersistMu         sync.Mutex
 	statusRetryMu           sync.Mutex
+	stationCacheMu          sync.Mutex
 	mu                      sync.RWMutex
 	catalogs                map[string]domain.SourceCatalog
 	index                   *catalogIndex
@@ -96,6 +97,12 @@ type Runtime struct {
 	dirtyAudits             map[string]domain.AuditEntry
 	dirtySourceEvents       []domain.SourceEvent
 	dirtyAlarmStatuses      map[string]opc.LowerStatus
+	stationVersions         map[string]domain.SourceStationVersions
+	stationVersionEpoch     map[string]uint64
+	stationRefreshPending   map[string]bool
+	stationRefreshDirty     map[string]bool
+	stationFeatureEpoch     map[string]uint64
+	stationFeatureSupported map[string]bool
 	quarantinedSources      map[string]string
 	pendingCommandMeta      map[string]pendingCommandMeta
 	ackSequences            map[string]uint64
@@ -105,6 +112,7 @@ type Runtime struct {
 	commandPersistError     string
 	auditPersistError       string
 	statusPersistError      string
+	stationPersistError     string
 	upstreamReconcileError  string
 	upstreamReconcileDirty  bool
 	conflictCount           int
@@ -121,6 +129,7 @@ type Runtime struct {
 	refreshSession          func(sessionID, groupID string)
 	refreshQueue            chan sessionRefreshRequest
 	statusPersistWake       chan struct{}
+	stationRefreshQueue     chan string
 	catalogValidator        CatalogPublisher
 	catalogReconciler       CatalogPublisher
 	sessionViews            func() map[string]api.SessionView
@@ -258,6 +267,22 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 	if err := repo.PruneOperationalHistory(ctx, now.Add(-options.AuditRetention), options.MaxAuditRows); err != nil {
 		return nil, fmt.Errorf("prune operational history: %w", err)
 	}
+	stationVersions := make(map[string]domain.SourceStationVersions)
+	for _, source := range sources {
+		snapshot, loadErr := repo.LoadSourceStationVersions(ctx, source.ID)
+		if errors.Is(loadErr, domain.ErrNotFound) {
+			continue
+		}
+		if loadErr != nil {
+			return nil, fmt.Errorf("load station versions for %s: %w", source.ID, loadErr)
+		}
+		fingerprint := domain.SourceTopologyFingerprint(catalogs[source.ID].Topology)
+		if fingerprint == "" || snapshot.TopologyFingerprint != fingerprint {
+			continue
+		}
+		snapshot.Cached = true
+		stationVersions[source.ID] = snapshot
+	}
 	runtime := &Runtime{
 		repo: repo, routes: routes, broker: api.NewBroker(), cache: newSampleCache(), options: options,
 		catalogs: catalogs, index: index, statuses: make(map[string]opc.LowerStatus),
@@ -265,13 +290,17 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 		dirtyCatalogs: dirtyCatalogs,
 		dirtyCommands: make(map[string]domain.PendingCommand), dirtyAudits: make(map[string]domain.AuditEntry),
 		dirtyAlarmStatuses: make(map[string]opc.LowerStatus),
-		quarantinedSources: quarantinedSources,
-		pendingCommandMeta: make(map[string]pendingCommandMeta),
-		ackSequences:       make(map[string]uint64),
-		ackEpochs:          make(map[string]uint64),
-		refreshQueue:       make(chan sessionRefreshRequest, 256),
-		statusPersistWake:  make(chan struct{}, 1),
-		conflictCount:      conflicts, selectionCount: selectionCount, lastSelectionAt: lastSelectionAt,
+		stationVersions:    stationVersions, stationVersionEpoch: make(map[string]uint64),
+		stationRefreshPending: make(map[string]bool), stationRefreshDirty: make(map[string]bool),
+		stationFeatureEpoch: make(map[string]uint64), stationFeatureSupported: make(map[string]bool),
+		quarantinedSources:  quarantinedSources,
+		pendingCommandMeta:  make(map[string]pendingCommandMeta),
+		ackSequences:        make(map[string]uint64),
+		ackEpochs:           make(map[string]uint64),
+		refreshQueue:        make(chan sessionRefreshRequest, 256),
+		statusPersistWake:   make(chan struct{}, 1),
+		stationRefreshQueue: make(chan string, 64),
+		conflictCount:       conflicts, selectionCount: selectionCount, lastSelectionAt: lastSelectionAt,
 		groupLastSelectedAt: groupLastSelectedAt, startedAt: now,
 		sourceProcessOperations: make(map[string]string), processExecuting: make(map[string]string),
 	}
@@ -350,6 +379,8 @@ func (r *Runtime) Start(ctx context.Context) error {
 	go r.retentionSweeper()
 	r.wg.Add(1)
 	go r.processControlWorker()
+	r.wg.Add(1)
+	go r.stationVersionRefreshWorker()
 	return nil
 }
 
@@ -726,12 +757,22 @@ func (p lowerSinkProxy) OnSample(_ string, key domain.NodeKey, sample domain.Sam
 	p.runtime.onSample(p.sourceID, key, sample, p.generation)
 }
 
+func (p lowerSinkProxy) OnStationVersionRevision(_ string, _ string, _ uint64) {
+	p.runtime.mu.RLock()
+	current := p.runtime.generations[p.sourceID]
+	p.runtime.mu.RUnlock()
+	if current == p.generation {
+		p.runtime.queueStationVersionRefresh(p.sourceID)
+	}
+}
+
 func (r *Runtime) OnLowerStatus(status opc.LowerStatus) {
 	r.onLowerStatus(status, 0)
 }
 
 func (r *Runtime) onLowerStatus(status opc.LowerStatus, generation uint64) {
 	var refreshGroups []string
+	refreshStationVersions := false
 	if status.Catalog == domain.CatalogConflict {
 		r.configMu.Lock()
 		defer func() {
@@ -768,6 +809,8 @@ func (r *Runtime) onLowerStatus(status opc.LowerStatus, generation uint64) {
 		}
 	}
 	r.statuses[status.SourceID] = status
+	refreshStationVersions = status.Connection == opc.ConnectionConnected && status.Session == opc.SessionActive &&
+		status.Subscription == opc.SubscriptionActive && (!existed || previous.Subscription != opc.SubscriptionActive || previous.Epoch != status.Epoch)
 	meaningfulChange := !existed || lowerStatusControlChanged(previous, status)
 	publish := meaningfulChange || now.Sub(r.lastSampleEventAt) >= time.Second
 	if publish {
@@ -789,6 +832,9 @@ func (r *Runtime) onLowerStatus(status opc.LowerStatus, generation uint64) {
 	}
 	if publish {
 		r.broker.Publish(api.Event{Type: "source.status", Data: status})
+	}
+	if refreshStationVersions {
+		r.queueStationVersionRefresh(status.SourceID)
 	}
 }
 
@@ -961,6 +1007,8 @@ func (r *Runtime) onCatalog(sourceID string, generation uint64, discovered domai
 		}
 	}
 	r.broker.Publish(api.Event{Type: "catalog.changed", Data: map[string]any{"source_id": sourceID}})
+	r.invalidateStationVersionsForTopology(sourceID, discovered.Topology)
+	r.queueStationVersionRefresh(sourceID)
 }
 
 func (r *Runtime) OnSample(sourceID string, key domain.NodeKey, sample domain.Sample) {

@@ -181,6 +181,76 @@ export interface ListParams {
   deviceId?: string;
 }
 
+export type ModuleType = 'unknown' | 'domestic' | 'legacy_russian';
+
+export interface DeviceVersion {
+  sourceId: string;
+  sourceName: string;
+  sourceRevision: number;
+  rcdSoftwareVersion: string;
+  rcdBuildCommit: string;
+  portId: string;
+  portName: string;
+  deviceId: string;
+  deviceName: string;
+  configuredModuleType: ModuleType;
+  detectedModuleType: ModuleType;
+  typeMismatch: boolean;
+  communicationModuleVersion?: string;
+  communicationModuleVersionRaw?: number;
+  plcVersion?: string;
+  plcVersionRaw?: number;
+  versionPayload?: string;
+  versionState: string;
+  lastVersionAttemptAt?: string;
+  lastVersionSuccessAt?: string;
+  lastVersionError?: string;
+  stationRevision: string;
+  versionSupported: boolean;
+  sourceOnline: boolean;
+  cached: boolean;
+  stale: boolean;
+  portEnabled: boolean;
+  portAppliedEnabled: boolean;
+  portOpen: boolean;
+  deviceReadEnabled: boolean;
+  appliedDeviceReadEnabled: boolean;
+  communicationOK: boolean;
+  controlPending: boolean;
+  pendingCommands: number;
+}
+
+export interface LowerSoftwareVersionSummary {
+  softwareVersion: string;
+  buildCommit: string;
+  sourceCount: number;
+}
+
+export interface DeviceVersionSummary {
+  total: number;
+  domestic: number;
+  legacyRussian: number;
+  unknown: number;
+  mismatch: number;
+  failed: number;
+  offlineCached: number;
+  lowerSoftwareVersions: LowerSoftwareVersionSummary[];
+}
+
+export interface DeviceVersionPage extends PageResult<DeviceVersion> {
+  summary: DeviceVersionSummary;
+}
+
+export interface DeviceVersionParams {
+  page?: number;
+  pageSize?: number;
+  query?: string;
+  sourceId?: string;
+  portId?: string;
+  moduleType?: ModuleType | '';
+  status?: string;
+}
+
 export interface Alarm {
   id: number;
   sourceId?: string;
