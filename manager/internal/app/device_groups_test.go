@@ -22,11 +22,18 @@ type deviceRecordingLower struct {
 
 func (f *deviceRecordingLower) Write(_ context.Context, key domain.NodeKey, value any) (domain.StatusCode, error) {
 	f.recordMu.Lock()
-	defer f.recordMu.Unlock()
 	f.writeKey = key
 	f.payload = value.(string)
 	f.writes++
-	return domain.StatusGood, nil
+	f.recordMu.Unlock()
+	f.mu.Lock()
+	hook := f.writeHook
+	status := f.writeStatus
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return status, nil
 }
 func (f *deviceRecordingLower) Call(_ context.Context, key domain.NodeKey, payload string) (string, domain.StatusCode, error) {
 	f.recordMu.Lock()
@@ -172,8 +179,11 @@ func TestGroupCommandAndRecentLegacyStatusFollowActualTarget(t *testing.T) {
 	_ = runtime.openSession("s")
 	_, _ = runtime.selectSource("s", "device-one", "b", 1, "test")
 	backend := OPCBackend{Runtime: runtime}
+	clients["b"].writeHook = func() {
+		runtime.OnSample("b", testKey("ttyb_Send"), domain.Sample{Type: domain.DataTypeString, Value: "1", StatusCode: domain.StatusGood, Epoch: 1})
+	}
 	result, status, err := backend.CallGroupCommand(context.Background(), "s", "device-one", "01 03 00 01")
-	if err != nil || status != domain.StatusGood || result != "OK" || clients["b"].callKey.Identifier != "ttyb_SendCommand" {
+	if err != nil || status != domain.StatusGood || result != "1" || clients["b"].writeKey.Identifier != "ttyb_Send" || clients["b"].callKey.Identifier != "" {
 		t.Fatalf("group method result=%q status=%x err=%v", result, status, err)
 	}
 	_, status, err = backend.CallGroupCommand(context.Background(), "s", "device-one", "02 03 00 01")

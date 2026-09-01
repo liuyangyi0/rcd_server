@@ -58,6 +58,7 @@ type pendingCommandMeta struct {
 	baselineSequence uint64
 	armed            bool
 	terminal         *pendingCommandTerminal
+	done             chan pendingCommandTerminal
 }
 
 type pendingCommandTerminal struct {
@@ -1152,7 +1153,7 @@ func (r *Runtime) onSample(sourceID string, key domain.NodeKey, sample domain.Sa
 		sourceNode.Class != domain.NodeClassVariable || !sampleMatchesCatalogNode(sample, sourceNode) {
 		r.mu.Unlock()
 		if ackPort != "" {
-			r.completeWriteFromAck(sourceID, ackPort, sample, ackSequence)
+			r.completeCommandFromAck(sourceID, ackPort, sample, ackSequence)
 		}
 		return
 	}
@@ -1176,7 +1177,7 @@ func (r *Runtime) onSample(sourceID string, key domain.NodeKey, sample domain.Sa
 	}
 	r.mu.Unlock()
 	if ackPort != "" {
-		r.completeWriteFromAck(sourceID, ackPort, sample, ackSequence)
+		r.completeCommandFromAck(sourceID, ackPort, sample, ackSequence)
 	}
 	if publishSampleEvent {
 		r.broker.Publish(api.Event{Type: "source.sample", Data: map[string]any{"source_id": sourceID}})

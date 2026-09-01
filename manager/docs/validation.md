@@ -353,6 +353,18 @@ node web/scripts/lower-operations-qa.mjs
 需分别在零 Session 与两个真实在线 Session 下复跑，以覆盖映射往返和 Session 定向切源；
 两轮各自有意跳过的场景必须由另一轮实际覆盖，不能把跳过当作通过。
 
+### 2026-09-01 上级 Method 真实串口结果反馈
+
+修复前，管理器把下级 `_SendCommand` RPC 返回当作命令成功；Rust 下级实际采用 fire-and-forget Method，串口随后打不开或执行失败时，上级 Call 仍可能得到 `Good`。修复后，上级 Method 保留原 NodeId 和 `String -> String` 签名，但管理器向下改走 `_Send`，以来源、物理串口、connection epoch、ACK sequence 和写前 ServerTimestamp 固定本次事务，并同步等待设备 `1/3`。
+
+全部构建和测试在 `192.168.10.46:/home/lenovo/code/rcd_command_ack_20260901_a` 完成：`go test ./...`、`go test -race ./...`、`go vet ./...` 以及新增成功、快速 `3`、下级立即坏状态和超时测试均通过。真实验收连接正在运行的 Rust 下级 `127.0.0.1:4841`，隔离管理器使用 OPC `14840`、Web `18087`：
+
+- 暂停 `/dev/ttyWCH5` 后调用 `ttyWCH5_SendCommand("3D01")`：Method=`BadOutOfService`，同 Session `ttyWCH5_Send="3"/BadOutOfService`，审计=`Failed`；
+- 恢复为 `enabled=true/open=true` 后下发读取类报文 `3D0802501004`，设备未返回通用命令 ACK：Method=`BadUnexpectedError`，`_Send="3"/BadUnexpectedError`，审计=`Failed`，约 210 ms 返回；
+- 串口配置最终恢复为 revision `5`、`enabled=true`、`open=true`、`pending_commands=0`。
+
+真实验收日志保存在 `/home/lenovo/code/rcd_http_logs_20260901-113254/test-logs/manager-command-ack-smoke-20260901.log`。本轮验证命令结果反馈，不代替长期稳定性或全负载延迟验收。
+
 ### 原有 Web 与服务检查
 
 使用支持的桌面浏览器逐项验证：

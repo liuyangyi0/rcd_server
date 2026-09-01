@@ -116,9 +116,10 @@ KKS 精确反查逻辑组，再通过成员的 `ProvidedPointNodeIds` / `Missing
 无新拓扑/无设备 bindings 的旧配置仍按原单组规则处理。
 pending 保持 `source_id + physical port`，同一物理串口跨设备仍互斥；选源锁针对本次命中的逻辑组。
 `_Send` 写入保持 pending 至设备 ACK 或超时；ACK 绑定已固定的 source/port/epoch，
-Session 关闭不重定向正在执行的命令。`SendCommand` 保留原下级的同步 RPC 语义，
-锁在 RPC 返回/超时后释放；其 `Received` / `1` 仅表示代理调用完成，不代表设备执行成功。
-需要跟踪设备实际回执时使用 `_Send` 写入链路。
+Session 关闭不重定向正在执行的命令。上级 `SendCommand` 保留原方法签名，但管理器将其转换为
+所选下级 `_Send` 写入并同步等待设备 ACK：只有 ACK `1` 返回 `Good` 和 Result `"1"`，ACK `3`
+返回坏状态，串口停用/不可服务保留下级状态，等待超时返回 `BadTimeout`。其 pending 锁同样保持到
+设备终态，不再把下级 OPC 入队成功当作设备执行成功。
 旧共享 `_Send` 读取优先显示该 Session 最近一次该节点命令的结果，按 command ID
 独立保存 `2`（等待）与 `1` / `3`（成功 / 失败）；其他 Session 或同串口另一设备的
 后续 ACK 不得覆盖它。历史仅在进程内保存，Session 关闭后清除。原本 Good 的历史会叠加

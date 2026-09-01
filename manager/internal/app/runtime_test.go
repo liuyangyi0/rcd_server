@@ -511,6 +511,132 @@ func TestRuntimeWriteAcceptsImmediateFailureAckWithoutWaiting(t *testing.T) {
 	}
 }
 
+func TestRuntimeMethodWaitsForPhysicalAckAndUsesSendVariable(t *testing.T) {
+	runtime := seededRuntime(t)
+	if err := runtime.openSession("session"); err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeLowerClient{writeStatus: domain.StatusGood}
+	client.writeHook = func() {
+		runtime.OnSample("source-a", testKey("COM1_Send"), domain.Sample{
+			Type: domain.DataTypeString, Value: "1", StatusCode: domain.StatusGood, Epoch: 9,
+		})
+	}
+	runtime.mu.Lock()
+	runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+	runtime.statuses["source-a"] = connectedStatus("source-a", 9)
+	runtime.mu.Unlock()
+	primeWriteAck(runtime, "source-a", "COM1", 9)
+
+	result, status, err := runtime.CallCommand(context.Background(), "session", testKey("COM1_SendCommand"), "01 06")
+	if err != nil || status != domain.StatusGood || result != "1" {
+		t.Fatalf("method result=%q status=%#x err=%v", result, status, err)
+	}
+	client.mu.Lock()
+	written := client.lastWrite
+	client.mu.Unlock()
+	if written != "01 06" {
+		t.Fatalf("method did not use lower _Send variable: %#v", written)
+	}
+	if sample := runtime.ReadSample("session", testKey("COM1_Send")); sample.Value != "1" || sample.StatusCode != domain.StatusGood {
+		t.Fatalf("method terminal sample=%#v", sample)
+	}
+	commands, total, listErr := runtime.repo.ListCommands(context.Background(), 10, 0)
+	if listErr != nil || total != 1 || len(commands) != 1 || commands[0].Kind != "Call" || commands[0].State != domain.CommandReceived {
+		t.Fatalf("commands=%#v total=%d err=%v", commands, total, listErr)
+	}
+}
+
+func TestRuntimeMethodReportsClosedSerialFailureToCallerAndSessionValue(t *testing.T) {
+	runtime := seededRuntime(t)
+	if err := runtime.openSession("session"); err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeLowerClient{writeStatus: domain.StatusGood}
+	client.writeHook = func() {
+		// A lower worker that cannot open/write its serial port publishes the
+		// terminal ACK value 3 immediately after accepting the OPC Write.
+		runtime.OnSample("source-a", testKey("COM1_Send"), domain.Sample{
+			Type: domain.DataTypeString, Value: "3", StatusCode: domain.StatusGood, Epoch: 10,
+		})
+	}
+	runtime.mu.Lock()
+	runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+	runtime.statuses["source-a"] = connectedStatus("source-a", 10)
+	runtime.mu.Unlock()
+	primeWriteAck(runtime, "source-a", "COM1", 10)
+
+	result, status, err := runtime.CallCommand(context.Background(), "session", testKey("COM1_SendCommand"), "01 06")
+	if result != "" || status != domain.StatusBadUnexpectedError || err == nil {
+		t.Fatalf("closed serial method result=%q status=%#x err=%v", result, status, err)
+	}
+	if sample := runtime.ReadSample("session", testKey("COM1_Send")); sample.Value != "3" || sample.StatusCode != domain.StatusBadUnexpectedError {
+		t.Fatalf("closed serial terminal sample=%#v", sample)
+	}
+	if pending := runtime.routes.PendingCount("line"); pending != 0 {
+		t.Fatalf("closed serial left pending=%d", pending)
+	}
+	commands, total, listErr := runtime.repo.ListCommands(context.Background(), 10, 0)
+	if listErr != nil || total != 1 || len(commands) != 1 || commands[0].State != domain.CommandFailed || commands[0].StatusCode != domain.StatusBadUnexpectedError {
+		t.Fatalf("commands=%#v total=%d err=%v", commands, total, listErr)
+	}
+}
+
+func TestRuntimeMethodPreservesImmediateLowerBadStatusAndAuditError(t *testing.T) {
+	runtime := seededRuntime(t)
+	if err := runtime.openSession("session"); err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeLowerClient{writeStatus: domain.StatusBadOutOfService}
+	runtime.mu.Lock()
+	runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+	runtime.statuses["source-a"] = connectedStatus("source-a", 12)
+	runtime.mu.Unlock()
+	primeWriteAck(runtime, "source-a", "COM1", 12)
+
+	result, status, err := runtime.CallCommand(context.Background(), "session", testKey("COM1_SendCommand"), "01 06")
+	if result != "" || status != domain.StatusBadOutOfService || err != nil {
+		t.Fatalf("immediate lower rejection result=%q status=%#x err=%v", result, status, err)
+	}
+	if sample := runtime.ReadSample("session", testKey("COM1_Send")); sample.Value != "3" || sample.StatusCode != domain.StatusBadOutOfService {
+		t.Fatalf("immediate lower rejection sample=%#v", sample)
+	}
+	commands, total, listErr := runtime.repo.ListCommands(context.Background(), 10, 0)
+	if listErr != nil || total != 1 || len(commands) != 1 || commands[0].State != domain.CommandFailed ||
+		commands[0].StatusCode != domain.StatusBadOutOfService || commands[0].Error == "" {
+		t.Fatalf("commands=%#v total=%d err=%v", commands, total, listErr)
+	}
+}
+
+func TestRuntimeMethodAckTimeoutReturnsBadTimeoutAndUnlocksGroup(t *testing.T) {
+	runtime := seededRuntime(t)
+	runtime.options.CommandTimeout = 20 * time.Millisecond
+	if err := runtime.openSession("session"); err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeLowerClient{writeStatus: domain.StatusGood}
+	runtime.mu.Lock()
+	runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+	runtime.statuses["source-a"] = connectedStatus("source-a", 11)
+	runtime.mu.Unlock()
+	primeWriteAck(runtime, "source-a", "COM1", 11)
+
+	result, status, err := runtime.CallCommand(context.Background(), "session", testKey("COM1_SendCommand"), "01 06")
+	if result != "" || status != domain.StatusBadTimeout || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timeout method result=%q status=%#x err=%v", result, status, err)
+	}
+	if pending := runtime.routes.PendingCount("line"); pending != 0 {
+		t.Fatalf("timeout left pending=%d", pending)
+	}
+	if sample := runtime.ReadSample("session", testKey("COM1_Send")); sample.Value != "3" || sample.StatusCode != domain.StatusBadTimeout {
+		t.Fatalf("timeout terminal sample=%#v", sample)
+	}
+	commands, total, listErr := runtime.repo.ListCommands(context.Background(), 10, 0)
+	if listErr != nil || total != 1 || len(commands) != 1 || commands[0].State != domain.CommandTimedOut || commands[0].StatusCode != domain.StatusBadTimeout {
+		t.Fatalf("commands=%#v total=%d err=%v", commands, total, listErr)
+	}
+}
+
 func TestRuntimeWriteTimeoutPersistsTerminalStateAndUnlocksGroup(t *testing.T) {
 	runtime := seededRuntime(t)
 	if err := runtime.openSession("session"); err != nil {

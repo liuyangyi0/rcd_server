@@ -24,7 +24,7 @@ Rust 下级新增“串口 → 设备 → 点位”拓扑，旧点位和命令 N
 
 单设备计算点随该设备组切换；跨设备、常量及归属未知的计算点留在共享兼容组，不在管理器
 内重新计算。命令按报文设备地址路由，同一物理串口互斥；新增管理节点
-`Groups/<group>/Send` / `SendCommand` 可明确指定逻辑组。老下级无拓扑时仍按原单组模式工作。
+`Groups/<group>/Send` / `SendCommand` 可明确指定逻辑组。`SendCommand` 保留兼容签名但等待真实设备 ACK，不再把下级入队当成功；老下级无拓扑时仍按原单组模式工作。
 
 协议详见 [设备拓扑与多逻辑组选源](docs/device-groups.md)，本轮结果见
 [远端验证记录](docs/device-groups-validation.md)。本次构建及测试仅在远端执行。

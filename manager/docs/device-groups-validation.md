@@ -42,9 +42,9 @@
 | 错误/丢失 ACK 与后续恢复 | 通过；`3`/坏质量、失败审计、解锁、下一条命令成功 | `logs/device-groups-faults-1.log` |
 | 命令中途关闭 Session | 通过；其他 Session 仍受组锁约束，回执后解锁，审计保留原发起 Session/来源/串口 | 同上 |
 
-`SendCommand` 保留 Rust 的原有语义：同步代理 Method 返回不等于等待设备执行完成；实际 ACK 成功/失败/丢失由 `_Send` 写入链路验证。
-Method 的 pending 锁持续至 RPC 返回或超时，审计 `Received` / 状态 `1` 表示代理调用完成；
-`_Send` 的 pending 锁才持续至设备 ACK 或超时。
+`SendCommand` 已升级为等待真实设备 ACK：管理器保留上级 Method 的 NodeId 和签名，向下改写为 `_Send`，并在同一来源、物理串口、connection epoch 和 sequence 上等待 `1/3`。Method 的 pending 锁持续至设备 ACK 或超时；只有 `1` 记为 `Received`，`3`、下级拒绝和超时分别记为 `Failed` / `TimedOut`。
+
+2026-09-01 使用真实运行的 Rust 下级补充验证：停用 `/dev/ttyWCH5` 后调用 `ttyWCH5_SendCommand`，Method、同 Session 的 `ttyWCH5_Send` 和命令审计三处均得到 `BadOutOfService` / `3` / `Failed`；恢复端口为 `open=true` 后发送无有效 ACK 的读取类报文，三处均得到 `BadUnexpectedError` / `3` / `Failed`。两次命令分别约 10 ms 和 210 ms 完成，端口最终恢复启用。
 
 单元/集成回归还覆盖：设备映射与 SQLite 缓存恢复、部分缺点并集、跨组冲突及修复恢复、
 非法拓扑隔离、热删除、只读 `*_Send` 合法点名、独立命令结果历史和被动复位。

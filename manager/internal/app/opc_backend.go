@@ -285,10 +285,10 @@ func (r *Runtime) writeCommand(ctx context.Context, sessionID string, key domain
 		if statusIsGood(status) {
 			status = domain.StatusBadNoCommunication
 		}
-		r.finishCommand(command.ID, domain.CommandFailed, status, errorText(err))
+		r.finishCommand(command.ID, domain.CommandFailed, status, commandDispatchError(status, err))
 		return status, err
 	}
-	if terminal := r.armWriteCommand(command.ID); terminal != nil {
+	if terminal, _ := r.armCommand(command.ID); terminal != nil {
 		r.finishCommand(command.ID, terminal.state, terminal.status, terminal.message)
 	}
 	return status, nil
@@ -327,8 +327,20 @@ func (r *Runtime) callCommand(ctx context.Context, sessionID string, key domain.
 		r.configMu.Unlock()
 		return "", domain.StatusCode(0x80010000), fmt.Errorf("persist command before dispatch: %w", err)
 	}
-	target, targetOK := r.captureLowerCommandTarget(command.SourceID, port, false)
+	// A Method call must report the physical serial result, not merely that the
+	// lower OPC server accepted a fire-and-forget RPC. Reuse the lower _Send
+	// variable because it is the compatibility protocol that carries the
+	// correlated 2 -> 1/3 device ACK state.
+	target, targetOK := r.captureLowerCommandTarget(command.SourceID, port, true)
 	r.rememberCommandRoute(sessionID, key.Identifier, route, command, target.globalEpoch)
+	if targetOK {
+		r.commandMu.Lock()
+		r.pendingCommandMeta[command.ID] = pendingCommandMeta{
+			generation: target.generation, epoch: target.globalEpoch, baselineSequence: target.baselineSequence,
+			done: make(chan pendingCommandTerminal, 1),
+		}
+		r.commandMu.Unlock()
+	}
 	r.configMu.Unlock()
 	r.broker.Publish(api.Event{Type: "command.changed", Data: command})
 	if !targetOK {
@@ -337,25 +349,63 @@ func (r *Runtime) callCommand(ctx context.Context, sessionID string, key domain.
 	}
 	operationContext, cancel := context.WithTimeout(ctx, r.options.CommandTimeout)
 	defer cancel()
-	result, status, err := callPinned(operationContext, target, route.Key, hexData)
-	state := domain.CommandReceived
-	message := ""
+	status, err := writePinned(operationContext, target, route.SendKey, hexData)
 	if err != nil || !statusIsGood(status) {
-		state = domain.CommandFailed
-		message = errorText(err)
+		state := domain.CommandFailed
 		if errors.Is(operationContext.Err(), context.DeadlineExceeded) {
+			state = domain.CommandTimedOut
 			status = domain.StatusBadTimeout
 		} else if statusIsGood(status) {
 			status = domain.StatusBadNoCommunication
 		}
+		r.finishCommand(command.ID, state, status, commandDispatchError(status, err))
+		return "", status, err
 	}
-	r.finishCommand(command.ID, state, status, message)
-	return result, status, err
+	terminal, done := r.armCommand(command.ID)
+	if terminal != nil {
+		r.finishCommand(command.ID, terminal.state, terminal.status, terminal.message)
+		return commandCallResult(*terminal)
+	}
+	select {
+	case result := <-done:
+		r.finishCommand(command.ID, result.state, result.status, result.message)
+		return commandCallResult(result)
+	case <-operationContext.Done():
+		// Prefer an ACK that raced with the deadline over recording a false
+		// timeout. The ACK observer signals before the caller persists the audit.
+		select {
+		case result := <-done:
+			r.finishCommand(command.ID, result.state, result.status, result.message)
+			return commandCallResult(result)
+		default:
+		}
+		state := domain.CommandTimedOut
+		status = domain.StatusBadTimeout
+		message := "command timed out waiting for lower serial ACK"
+		if !errors.Is(operationContext.Err(), context.DeadlineExceeded) {
+			state = domain.CommandFailed
+			status = domain.StatusBadUnexpectedError
+			message = "command canceled while waiting for lower serial ACK"
+		}
+		r.finishCommand(command.ID, state, status, message)
+		return "", status, operationContext.Err()
+	}
 }
 
-func (r *Runtime) completeWriteFromAck(sourceID, port string, sample domain.Sample, sequence uint64) {
+func commandCallResult(terminal pendingCommandTerminal) (string, domain.StatusCode, error) {
+	if terminal.state == domain.CommandReceived && terminal.status.IsGood() {
+		return "1", terminal.status, nil
+	}
+	message := terminal.message
+	if message == "" {
+		message = "lower source rejected command"
+	}
+	return "", terminal.status, errors.New(message)
+}
+
+func (r *Runtime) completeCommandFromAck(sourceID, port string, sample domain.Sample, sequence uint64) {
 	command, exists := r.routes.PendingCommand(sourceID, port)
-	if !exists || command.Kind != "Write" || !sample.StatusCode.IsGood() {
+	if !exists || (command.Kind != "Write" && command.Kind != "Call") || !sample.StatusCode.IsGood() {
 		return
 	}
 	ack := strings.TrimSpace(fmt.Sprint(sample.Value))
@@ -388,7 +438,12 @@ func (r *Runtime) completeWriteFromAck(sourceID, port string, sample domain.Samp
 		r.commandMu.Unlock()
 		return
 	}
+	done := meta.done
 	r.commandMu.Unlock()
+	if done != nil {
+		done <- terminal
+		return
+	}
 	r.finishCommand(command.ID, terminal.state, terminal.status, terminal.message)
 }
 
@@ -442,20 +497,20 @@ func (r *Runtime) writePassiveSendValue(ctx context.Context, sessionID string, k
 	return status, err
 }
 
-func (r *Runtime) armWriteCommand(commandID string) *pendingCommandTerminal {
+func (r *Runtime) armCommand(commandID string) (*pendingCommandTerminal, <-chan pendingCommandTerminal) {
 	r.commandMu.Lock()
 	defer r.commandMu.Unlock()
 	meta, exists := r.pendingCommandMeta[commandID]
 	if !exists {
-		return nil
+		return nil, nil
 	}
 	meta.armed = true
 	r.pendingCommandMeta[commandID] = meta
 	if meta.terminal == nil {
-		return nil
+		return nil, meta.done
 	}
 	terminal := *meta.terminal
-	return &terminal
+	return &terminal, meta.done
 }
 
 func (r *Runtime) finishCommand(id string, state domain.CommandState, status domain.StatusCode, message string) {
@@ -839,4 +894,11 @@ func errorText(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func commandDispatchError(status domain.StatusCode, err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return fmt.Sprintf("lower source rejected command with status 0x%08X", uint32(status))
 }

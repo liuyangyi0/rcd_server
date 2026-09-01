@@ -193,10 +193,15 @@ func TestProcessMaintenanceAndAllPortCommandsExcludeEachOther(t *testing.T) {
 	if _, err := r.selectSource("session", "line", "source-b", 1, "test"); err != nil {
 		t.Fatal(err)
 	}
+	client := &fakeLowerClient{writeStatus: domain.StatusGood}
+	client.writeHook = func() {
+		r.OnSample("source-b", testKey("COM1_Send"), domain.Sample{Type: domain.DataTypeString, Value: "1", StatusCode: domain.StatusGood, Epoch: 1})
+	}
 	r.mu.Lock()
-	r.lowers["source-b"] = lowerHandle{client: &fakeLowerClient{writeStatus: domain.StatusGood}, generation: 1}
+	r.lowers["source-b"] = lowerHandle{client: client, generation: 1}
 	r.statuses["source-b"] = connectedStatus("source-b", 1)
 	r.mu.Unlock()
+	primeWriteAck(r, "source-b", "COM1", 1)
 	if _, status, err := r.CallCommand(context.Background(), "session", testKey("COM1_SendCommand"), "01 06"); err != nil || status != domain.StatusGood {
 		t.Fatalf("unrelated physical source blocked %x %v", status, err)
 	}
