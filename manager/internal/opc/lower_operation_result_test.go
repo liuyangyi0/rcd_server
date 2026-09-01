@@ -130,6 +130,33 @@ func TestOperationResultConfigDocumentAndBackupUseCurrentMetadata(t *testing.T) 
 	assertOperationResult(t, request, value, true)
 }
 
+func TestOperationResultCalculationModeValidatesPinnedConfigRevision(t *testing.T) {
+	config := configResultFixture()
+	config["name"], config["kind"] = "config.toml", "software"
+	value := map[string]any{
+		"status": "Saved", "revision": "r2", "active_mode": "local",
+		"configured_mode": "manager", "restart_required": true, "config": config,
+	}
+	request := domain.OperationRequest{Action: "set_calculation_mode", Mode: "manager"}
+	assertOperationResult(t, request, value, true)
+
+	for name, change := range map[string]func(map[string]any){
+		"wrong configured mode": func(v map[string]any) { v["configured_mode"] = "local" },
+		"wrong restart state":   func(v map[string]any) { v["restart_required"] = false },
+		"wrong top revision":    func(v map[string]any) { v["revision"] = "r3" },
+		"missing config":        func(v map[string]any) { delete(v, "config") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			copy := map[string]any{}
+			for key, item := range value {
+				copy[key] = item
+			}
+			change(copy)
+			assertOperationResult(t, request, copy, false)
+		})
+	}
+}
+
 func TestOperationResultRejectsMalformedConfigAndUnconfirmedWrites(t *testing.T) {
 	cases := map[string]func(map[string]any){
 		"wrong name":          func(v map[string]any) { v["name"] = "config.toml" },

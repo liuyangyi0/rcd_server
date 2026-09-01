@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"rcd_manager/internal/calculation"
 	"rcd_manager/internal/domain"
 )
 
@@ -68,6 +69,7 @@ func (h *Handler) routes() {
 	h.deviceVersionRoutes()
 	h.processControlRoutes()
 	h.lowerLogRoutes()
+	h.calculationRoutes()
 
 	h.mux.HandleFunc("GET /api/v1/sessions", h.listSessions)
 	h.mux.HandleFunc("PUT /api/v1/sessions/{session}/groups/{group}/selection", h.setSessionSelection)
@@ -618,6 +620,17 @@ func (h *Handler) respond(w http.ResponseWriter, value any, err error, success i
 }
 
 func mapError(err error) (int, string, any) {
+	var unavailable *calculationServiceError
+	if errors.As(err, &unavailable) {
+		return http.StatusNotImplemented, "calculation_unavailable", nil
+	}
+	if errors.Is(err, calculation.ErrConfigTooLarge) {
+		return http.StatusRequestEntityTooLarge, "calculation_too_large", nil
+	}
+	var validation *calculation.ValidationError
+	if errors.As(err, &validation) {
+		return http.StatusUnprocessableEntity, "calculation_invalid", validation.Problems
+	}
 	var operation *domain.OperationError
 	if errors.As(err, &operation) {
 		status := http.StatusBadGateway

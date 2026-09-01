@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -96,6 +98,142 @@ func TestLiveManagerAnonymousNone(t *testing.T) {
 		defer timer.Stop()
 		<-timer.C
 	}
+}
+
+// TestLiveManagerCentralCalculations checks the deployed management metadata,
+// legacy ns=2 identity (including significant trailing spaces) and an initial
+// subscription notification without changing any lower or calculation config.
+func TestLiveManagerCentralCalculations(t *testing.T) {
+	endpoint := os.Getenv("RCD_MANAGER_LIVE_ENDPOINT")
+	calculationNode := os.Getenv("RCD_MANAGER_CALC_LIVE_NODE")
+	if endpoint == "" || calculationNode == "" {
+		t.Skip("set RCD_MANAGER_LIVE_ENDPOINT and RCD_MANAGER_CALC_LIVE_NODE")
+	}
+	expectedRules := uint32(0)
+	if raw := os.Getenv("RCD_MANAGER_CALC_EXPECT_RULES"); raw != "" {
+		value, err := strconv.ParseUint(raw, 10, 32)
+		if err != nil || value == 0 {
+			t.Fatalf("invalid RCD_MANAGER_CALC_EXPECT_RULES %q", raw)
+		}
+		expectedRules = uint32(value)
+	}
+
+	client, selectedURL := connectLiveManagerAnonymous(t, endpoint, "rcd-manager-central-calculations")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	metadataNames := []string{
+		"RoutingMode", "ActiveRevision", "ConfigHash", "RuleCount", "GoodCount", "BadCount",
+		"DefaultRouteRevision", "LastEvaluationAt", "LastEvaluationDurationMs", "PendingRestart", "CalculationNodeIds",
+	}
+	request := &gu.ReadRequest{TimestampsToReturn: gu.TimestampsToReturnBoth}
+	for _, name := range metadataNames {
+		request.NodesToRead = append(request.NodesToRead, &gu.ReadValueID{
+			NodeID: gu.NewStringNodeID(3, "Calculations/"+name), AttributeID: gu.AttributeIDValue,
+		})
+	}
+	calculationID := gu.NewStringNodeID(2, calculationNode)
+	request.NodesToRead = append(request.NodesToRead,
+		&gu.ReadValueID{NodeID: calculationID, AttributeID: gu.AttributeIDValue},
+		&gu.ReadValueID{NodeID: calculationID, AttributeID: gu.AttributeIDBrowseName},
+		&gu.ReadValueID{NodeID: calculationID, AttributeID: gu.AttributeIDAccessLevel},
+	)
+	response, err := client.Read(ctx, request)
+	if err != nil || response == nil || len(response.Results) != len(request.NodesToRead) {
+		t.Fatalf("read central calculations: response=%#v err=%v", response, err)
+	}
+	for index, name := range metadataNames {
+		if response.Results[index].Status != gu.StatusOK || response.Results[index].Value == nil {
+			t.Fatalf("Calculations/%s=%#v", name, response.Results[index])
+		}
+	}
+	values := func(name string) any {
+		for index, candidate := range metadataNames {
+			if candidate == name {
+				return response.Results[index].Value.Value()
+			}
+		}
+		return nil
+	}
+	if got := values("RoutingMode"); got != "DefaultSources" {
+		t.Fatalf("RoutingMode=%#v", got)
+	}
+	activeRevision, activeOK := values("ActiveRevision").(uint64)
+	ruleCount, countOK := values("RuleCount").(uint32)
+	goodCount, goodOK := values("GoodCount").(uint32)
+	badCount, badOK := values("BadCount").(uint32)
+	if !activeOK || activeRevision == 0 || !countOK || ruleCount == 0 || !goodOK || !badOK || goodCount+badCount != ruleCount {
+		t.Fatalf("invalid calculation counters: revision=%#v rules=%#v good=%#v bad=%#v", values("ActiveRevision"), values("RuleCount"), values("GoodCount"), values("BadCount"))
+	}
+	if expectedRules != 0 && ruleCount != expectedRules {
+		t.Fatalf("RuleCount=%d want=%d", ruleCount, expectedRules)
+	}
+	hash, hashOK := values("ConfigHash").(string)
+	nodeIDs, idsOK := values("CalculationNodeIds").([]string)
+	if !hashOK || len(hash) != 64 || !idsOK || len(nodeIDs) != int(ruleCount) {
+		t.Fatalf("metadata hash/nodes invalid: hash=%#v nodeIDs=%T/%d", values("ConfigHash"), values("CalculationNodeIds"), len(nodeIDs))
+	}
+	found := false
+	for _, nodeID := range nodeIDs {
+		if nodeID == "ns=2;s="+calculationNode {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("CalculationNodeIds does not contain exact %q", calculationNode)
+	}
+	valueIndex := len(metadataNames)
+	if response.Results[valueIndex].Status == gu.StatusBadNodeIDUnknown || response.Results[valueIndex].Value == nil {
+		t.Fatalf("exact calculation node read=%#v", response.Results[valueIndex])
+	}
+	browseValue := response.Results[valueIndex+1].Value.Value()
+	browseName := ""
+	switch value := browseValue.(type) {
+	case gu.QualifiedName:
+		browseName = value.Name
+	case *gu.QualifiedName:
+		if value != nil {
+			browseName = value.Name
+		}
+	}
+	if browseName != calculationNode {
+		t.Fatalf("calculation BrowseName=%#v want exact %q", response.Results[valueIndex+1], calculationNode)
+	}
+	access, ok := response.Results[valueIndex+2].Value.Value().(byte)
+	if !ok || access&byte(gu.AccessLevelTypeCurrentRead) == 0 || access&byte(gu.AccessLevelTypeCurrentWrite) != 0 {
+		t.Fatalf("calculation AccessLevel=%#v", response.Results[valueIndex+2])
+	}
+	if strings.TrimSpace(calculationNode) != calculationNode {
+		trimmed := gu.NewStringNodeID(2, strings.TrimSpace(calculationNode))
+		trimmedResponse, readErr := client.Read(ctx, &gu.ReadRequest{TimestampsToReturn: gu.TimestampsToReturnNeither,
+			NodesToRead: []*gu.ReadValueID{{NodeID: trimmed, AttributeID: gu.AttributeIDValue}}})
+		if readErr != nil || len(trimmedResponse.Results) != 1 || trimmedResponse.Results[0].Status != gu.StatusBadNodeIDUnknown {
+			t.Fatalf("trimmed legacy NodeId unexpectedly resolved: response=%#v err=%v", trimmedResponse, readErr)
+		}
+	}
+
+	notifications := make(chan *gopcua.PublishNotificationData, 8)
+	subscription, err := client.Subscribe(ctx, &gopcua.SubscriptionParameters{Interval: 50 * time.Millisecond}, notifications)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer closeCancel()
+		_ = subscription.Cancel(closeCtx)
+	})
+	monitor := gopcua.NewMonitoredItemCreateRequestWithDefaults(calculationID, gu.AttributeIDValue, 1)
+	monitor.RequestedParameters.SamplingInterval = 50
+	monitorResponse, err := subscription.Monitor(ctx, gu.TimestampsToReturnBoth, monitor)
+	if err != nil || len(monitorResponse.Results) != 1 || monitorResponse.Results[0].StatusCode != gu.StatusOK {
+		t.Fatalf("monitor exact calculation node: response=%#v err=%v", monitorResponse, err)
+	}
+	notificationStatus := awaitDataChange(t, notifications)
+	if notificationStatus == gu.StatusBadNodeIDUnknown {
+		t.Fatalf("calculation subscription status=%s", notificationStatus)
+	}
+	t.Logf("central calculations via %s: revision=%d rules=%d good=%d bad=%d node=%q status=%s",
+		selectedURL, activeRevision, ruleCount, goodCount, badCount, calculationNode, notificationStatus)
 }
 
 // TestLiveManagerRustInterop exercises the business namespace through a live
@@ -342,6 +480,94 @@ func TestLiveManagerNoDefaultRoute(t *testing.T) {
 	}
 }
 
+// TestLiveCentralMatchesLowerCalculations compares the entire active central
+// output set with the still-local Rust engine during the migration overlap.
+// A few retries allow the manager's 50 ms lower subscription to catch up with
+// a raw value that changed between the two read requests.
+func TestLiveCentralMatchesLowerCalculations(t *testing.T) {
+	managerEndpoint := os.Getenv("RCD_MANAGER_LIVE_ENDPOINT")
+	lowerEndpoint := os.Getenv("RCD_LOWER_LIVE_ENDPOINT")
+	if managerEndpoint == "" || lowerEndpoint == "" {
+		t.Skip("set RCD_MANAGER_LIVE_ENDPOINT and RCD_LOWER_LIVE_ENDPOINT")
+	}
+	manager, _ := connectLiveManagerAnonymous(t, managerEndpoint, "rcd-manager-central-parity")
+	lower, _ := connectLiveManagerAnonymous(t, lowerEndpoint, "rcd-lower-central-parity")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	response, err := manager.Read(ctx, &gu.ReadRequest{
+		TimestampsToReturn: gu.TimestampsToReturnNeither,
+		NodesToRead: []*gu.ReadValueID{{
+			NodeID: gu.NewStringNodeID(3, "Calculations/CalculationNodeIds"), AttributeID: gu.AttributeIDValue,
+		}},
+	})
+	if err != nil || len(response.Results) != 1 || response.Results[0].Status != gu.StatusOK || response.Results[0].Value == nil {
+		t.Fatalf("read CalculationNodeIds: response=%#v err=%v", response, err)
+	}
+	texts, ok := response.Results[0].Value.Value().([]string)
+	if !ok || len(texts) == 0 {
+		t.Fatalf("CalculationNodeIds=%T %#v", response.Results[0].Value.Value(), response.Results[0].Value.Value())
+	}
+	ids := make([]*gu.NodeID, 0, len(texts))
+	for _, text := range texts {
+		id, parseErr := gu.ParseNodeID(text)
+		if parseErr != nil {
+			t.Fatalf("parse calculation NodeId %q: %v", text, parseErr)
+		}
+		ids = append(ids, id)
+	}
+
+	pending := append([]*gu.NodeID(nil), ids...)
+	for attempt := 0; attempt < 4 && len(pending) != 0; attempt++ {
+		lowerValues := readLiveValues(t, ctx, lower, pending)
+		// The manager receives lower changes on a 50 ms subscription and then
+		// coalesces calculation work for 10 ms.
+		time.Sleep(120 * time.Millisecond)
+		managerValues := readLiveValues(t, ctx, manager, pending)
+		next := pending[:0]
+		for index, id := range pending {
+			left, right := lowerValues[index], managerValues[index]
+			if left.Status != right.Status || !reflect.DeepEqual(liveVariantValue(left), liveVariantValue(right)) {
+				next = append(next, id)
+			}
+		}
+		pending = append([]*gu.NodeID(nil), next...)
+	}
+	if len(pending) != 0 {
+		preview := make([]string, 0, min(20, len(pending)))
+		for _, id := range pending[:min(20, len(pending))] {
+			preview = append(preview, id.String())
+		}
+		t.Fatalf("central/lower parity mismatches=%d of %d after retries; first=%v", len(pending), len(ids), preview)
+	}
+	t.Logf("central and Rust local engines match for %d live calculation nodes", len(ids))
+}
+
+func readLiveValues(t *testing.T, ctx context.Context, client *gopcua.Client, ids []*gu.NodeID) []*gu.DataValue {
+	t.Helper()
+	result := make([]*gu.DataValue, 0, len(ids))
+	for start := 0; start < len(ids); start += 500 {
+		end := min(start+500, len(ids))
+		request := &gu.ReadRequest{TimestampsToReturn: gu.TimestampsToReturnNeither}
+		for _, id := range ids[start:end] {
+			request.NodesToRead = append(request.NodesToRead, &gu.ReadValueID{NodeID: id, AttributeID: gu.AttributeIDValue})
+		}
+		response, err := client.Read(ctx, request)
+		if err != nil || response == nil || len(response.Results) != len(request.NodesToRead) {
+			t.Fatalf("read %d live values: response=%#v err=%v", len(request.NodesToRead), response, err)
+		}
+		result = append(result, response.Results...)
+	}
+	return result
+}
+
+func liveVariantValue(value *gu.DataValue) any {
+	if value == nil || value.Value == nil {
+		return nil
+	}
+	return value.Value.Value()
+}
+
 func connectLiveManagerAnonymous(t *testing.T, endpoint, sessionName string) (*gopcua.Client, string) {
 	t.Helper()
 	discoveryCtx, cancelDiscovery := context.WithTimeout(context.Background(), 10*time.Second)
@@ -355,7 +581,10 @@ func connectLiveManagerAnonymous(t *testing.T, endpoint, sessionName string) (*g
 		t.Fatalf("select anonymous None endpoint: %v", err)
 	}
 	client, err := gopcua.NewClient(
-		selected.EndpointURL,
+		// Dial the operator-supplied address while retaining the discovered
+		// endpoint's security settings. Real lower configs may advertise the
+		// physical production IP even when acceptance runs on a staging NIC.
+		endpoint,
 		gopcua.SecurityFromEndpoint(selected, gu.UserTokenTypeAnonymous),
 		gopcua.AuthAnonymous(),
 		gopcua.AutoReconnect(false),
@@ -367,7 +596,7 @@ func connectLiveManagerAnonymous(t *testing.T, endpoint, sessionName string) (*g
 	connectCtx, cancelConnect := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := client.Connect(connectCtx); err != nil {
 		cancelConnect()
-		t.Fatalf("connect %s: %v", selected.EndpointURL, err)
+		t.Fatalf("connect %s (advertised %s): %v", endpoint, selected.EndpointURL, err)
 	}
 	cancelConnect()
 	t.Cleanup(func() {

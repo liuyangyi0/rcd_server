@@ -198,6 +198,34 @@ var migrations = []string{
 		PRIMARY KEY(source_id, boot_id)
 	);
 	CREATE INDEX lower_log_ingest_updated_idx ON lower_log_ingest_cursor(source_id, updated_at DESC);`,
+	`CREATE TABLE calculation_draft (
+		id INTEGER PRIMARY KEY CHECK(id = 1),
+		revision INTEGER NOT NULL CHECK(revision > 0),
+		content TEXT NOT NULL,
+		content_hash TEXT NOT NULL,
+		valid INTEGER NOT NULL CHECK(valid IN (0,1)),
+		problems TEXT NOT NULL DEFAULT '[]',
+		updated_at TEXT NOT NULL
+	);
+	CREATE TABLE calculation_versions (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		revision INTEGER NOT NULL UNIQUE CHECK(revision > 0),
+		content TEXT NOT NULL,
+		content_hash TEXT NOT NULL,
+		rule_count INTEGER NOT NULL CHECK(rule_count >= 0),
+		state TEXT NOT NULL CHECK(state IN ('active','archived','pending_restart')),
+		actor TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		activated_at TEXT
+	);
+	CREATE UNIQUE INDEX calculation_one_active_idx ON calculation_versions(state) WHERE state = 'active';
+	CREATE UNIQUE INDEX calculation_one_pending_idx ON calculation_versions(state) WHERE state = 'pending_restart';
+	CREATE INDEX calculation_versions_revision_idx ON calculation_versions(revision DESC);
+	INSERT INTO calculation_draft(id, revision, content, content_hash, valid, problems, updated_at)
+	VALUES(1, 1, '', '', 0, '[]', strftime('%Y-%m-%dT%H:%M:%fZ','now'));`,
+	`ALTER TABLE calculation_versions ADD COLUMN added_count INTEGER NOT NULL DEFAULT 0 CHECK(added_count >= 0);
+	ALTER TABLE calculation_versions ADD COLUMN removed_count INTEGER NOT NULL DEFAULT 0 CHECK(removed_count >= 0);
+	ALTER TABLE calculation_versions ADD COLUMN changed_count INTEGER NOT NULL DEFAULT 0 CHECK(changed_count >= 0);`,
 }
 
 func migrate(ctx context.Context, db *sql.DB) error {

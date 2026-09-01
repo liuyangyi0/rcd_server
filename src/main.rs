@@ -27,12 +27,13 @@ use rcd_server::csv_parser::{self, DeviceConfig};
 use rcd_server::file_scanner;
 use rcd_server::logging;
 use rcd_server::model::{Command, CommandAckUpdate, SystemState};
-use rcd_server::operations::Operations;
+use rcd_server::operations::{CalculationStatus, Operations};
 use rcd_server::runtime_cache::LatestStatusCache;
 use rcd_server::serial::manager::SerialConfig;
 use rcd_server::serial::port_config::SerialPortConfig;
 use rcd_server::serial::worker::spawn_serial_worker;
 use rcd_server::server::opcua::{command_pending_timeout, run_opcua_server};
+use sha2::{Digest, Sha256};
 
 // ============================================================
 //  程序入口
@@ -99,32 +100,70 @@ async fn run_server() -> tokio::io::Result<()> {
     let system_state = SystemState::new();
     let system_record = Arc::new(Mutex::new(BoundedVecDeque::<String>::new(20000)));
 
-    // 加载计算引擎：配置异常时降级为空引擎，不终止服务
-    let calc_engine = {
+    // manager 模式只保留文件元数据供集中迁移和回滚，不在下级编译或发布计算点。
+    let (calc_engine, calculation_status) = {
         let config_dir = config::config_dir().expect("获取配置目录失败");
         let calc_path = config_dir.join("calc.toml");
-        let calc_config = load_calc_config(&calc_path).unwrap_or_else(|e| {
-            error!("[CalcEngine] 加载计算规则失败: {}，以空规则启动", e);
-            rcd_server::calc_engine::config::CalcConfig { rules: Vec::new() }
-        });
-
-        if calc_config.rules.is_empty() {
-            info!("[CalcEngine] 无计算规则，引擎未启用");
-            Arc::new(CalcEngine::new(vec![]).unwrap())
+        let mode = software_config.calculation.mode;
+        let (config_hash, backup_rule_count, backup_error) = inspect_calc_backup(&calc_path);
+        if mode == config::CalculationMode::Manager {
+            info!(
+                "[CalcEngine] manager 模式：下级不执行 {} 条计算规则",
+                backup_rule_count
+            );
+            (
+                Arc::new(CalcEngine::new(vec![]).unwrap()),
+                CalculationStatus {
+                    active_mode: mode.as_str().into(),
+                    configured_mode: mode.as_str().into(),
+                    rule_count: backup_rule_count,
+                    config_hash,
+                    restart_required: false,
+                    config_error: backup_error,
+                },
+            )
         } else {
-            match CalcEngine::new(calc_config.rules) {
-                Ok(engine) => {
-                    info!(
-                        "[CalcEngine] 初始化成功，共 {} 条规则",
-                        engine.output_names().len()
-                    );
-                    Arc::new(engine)
-                }
+            let (calc_config, mut config_error) = match load_calc_config(&calc_path) {
+                Ok(value) => (value, None),
                 Err(e) => {
-                    error!("[CalcEngine] 构建引擎失败: {}，以空引擎启动", e);
-                    Arc::new(CalcEngine::new(vec![]).unwrap())
+                    error!("[CalcEngine] 加载计算规则失败: {}，以空规则启动", e);
+                    (
+                        rcd_server::calc_engine::config::CalcConfig { rules: Vec::new() },
+                        Some(e),
+                    )
                 }
-            }
+            };
+            let rule_count = calc_config.rules.len();
+            let engine = if calc_config.rules.is_empty() {
+                info!("[CalcEngine] 无计算规则，引擎未启用");
+                Arc::new(CalcEngine::new(vec![]).unwrap())
+            } else {
+                match CalcEngine::new(calc_config.rules) {
+                    Ok(engine) => {
+                        info!(
+                            "[CalcEngine] 初始化成功，共 {} 条规则",
+                            engine.output_names().len()
+                        );
+                        Arc::new(engine)
+                    }
+                    Err(e) => {
+                        error!("[CalcEngine] 构建引擎失败: {}，以空引擎启动", e);
+                        config_error = Some(e);
+                        Arc::new(CalcEngine::new(vec![]).unwrap())
+                    }
+                }
+            };
+            (
+                engine,
+                CalculationStatus {
+                    active_mode: mode.as_str().into(),
+                    configured_mode: mode.as_str().into(),
+                    rule_count,
+                    config_hash,
+                    restart_required: false,
+                    config_error,
+                },
+            )
         }
     };
 
@@ -139,6 +178,7 @@ async fn run_server() -> tokio::io::Result<()> {
         &serial_configs,
         cancel.clone(),
     )?;
+    operations.set_calculation_status(calculation_status);
     if cancel.is_cancelled() {
         return Ok(());
     }
@@ -230,6 +270,28 @@ async fn run_server() -> tokio::io::Result<()> {
     };
 
     result
+}
+
+/// Read only rollback-file metadata for manager mode. Counting explicit TOML
+/// array headers avoids tokenizing, parsing or compiling the local formulas.
+fn inspect_calc_backup(path: &Path) -> (String, usize, Option<String>) {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return (String::new(), 0, None),
+        Err(error) => return (String::new(), 0, Some(error.to_string())),
+    };
+    let hash = format!("{:x}", Sha256::digest(&bytes));
+    match std::str::from_utf8(&bytes) {
+        Ok(content) => (
+            hash,
+            content
+                .lines()
+                .filter(|line| line.trim() == "[[rules]]")
+                .count(),
+            None,
+        ),
+        Err(error) => (hash, 0, Some(format!("calc.toml 不是 UTF-8: {error}"))),
+    }
 }
 
 fn spawn_shutdown_listener(cancel: CancellationToken) -> io::Result<JoinHandle<()>> {
@@ -513,6 +575,18 @@ fn load_and_group_csv_configs_from_dir(config_dir: &Path) -> io::Result<Vec<Seri
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+
+    #[test]
+    fn manager_backup_metadata_does_not_parse_or_compile_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calc.toml");
+        let content = b"[[rules]]\nkks_calc = 'BROKEN'\nexpression = 'A +'\n\n [[rules]] \n";
+        std::fs::write(&path, content).unwrap();
+        let (hash, count, error) = inspect_calc_backup(&path);
+        assert_eq!(hash, format!("{:x}", Sha256::digest(content)));
+        assert_eq!(count, 2);
+        assert!(error.is_none());
+    }
 
     #[tokio::test]
     async fn shutdown_signal_delivery_cancels_workers_and_admission_token() {

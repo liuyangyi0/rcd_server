@@ -19,6 +19,7 @@ csv = "1.1"
 serialport = { path = "serialport-rs" }
 regex = "1.10.4"
 toml = "0.8.19"
+toml_edit = "0.22.20"
 bounded-vec-deque = "0.1.1"
 chrono = "0.4"
 async-opcua = { version = "0.19", features = ["server"] }

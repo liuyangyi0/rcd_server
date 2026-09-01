@@ -39,6 +39,8 @@ func validateOperationResult(request domain.OperationRequest, result json.RawMes
 			return err
 		}
 		return validateStationVersionResult(request, object)
+	case "set_calculation_mode":
+		return validateCalculationModeResult(request, object)
 	case "list_configs":
 		items, err := operationArray(object, "items")
 		if err != nil {
@@ -71,6 +73,45 @@ func validateOperationResult(request domain.OperationRequest, result json.RawMes
 	default:
 		return invalidOperationField("action")
 	}
+}
+
+func validateCalculationModeResult(request domain.OperationRequest, object operationResultObject) error {
+	status, err := operationString(object, "status", 32, false)
+	if err != nil || status != "Saved" {
+		return invalidOperationField("status")
+	}
+	revision, err := operationRevision(object, "revision", false)
+	if err != nil {
+		return err
+	}
+	active, err := operationString(object, "active_mode", 16, false)
+	if err != nil || active != "local" && active != "manager" {
+		return invalidOperationField("active_mode")
+	}
+	configured, err := operationString(object, "configured_mode", 16, false)
+	if err != nil || configured != request.Mode {
+		return invalidOperationField("configured_mode")
+	}
+	var restart bool
+	if err := operationField(object, "restart_required", &restart); err != nil || restart != (active != configured) {
+		return invalidOperationField("restart_required")
+	}
+	configRaw, exists := object["config"]
+	if !exists {
+		return invalidOperationField("config")
+	}
+	config, err := operationObject(configRaw)
+	if err != nil {
+		return err
+	}
+	if err := validateConfigDocument(domain.OperationRequest{Action: "read_config", Name: "config.toml"}, config); err != nil {
+		return err
+	}
+	configRevision, err := operationRevision(config, "revision", false)
+	if err != nil || configRevision != revision {
+		return invalidOperationField("revision")
+	}
+	return nil
 }
 
 func invalidOperationField(field string) error {

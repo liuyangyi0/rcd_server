@@ -251,6 +251,84 @@ export interface DeviceVersionParams {
   status?: string;
 }
 
+export interface CalculationStatus {
+  routingMode: 'DefaultSources';
+  activeRevision: number;
+  configHash: string;
+  ruleCount: number;
+  goodCount: number;
+  badCount: number;
+  defaultRouteRevision: number;
+  lastEvaluationAt?: string;
+  lastEvaluationDurationMs: number;
+  lastError?: string;
+  pendingRestart: boolean;
+  pendingRevision?: number;
+  pendingHash?: string;
+}
+
+export interface CalculationProblem {
+  ruleIndex?: number;
+  rule?: string;
+  field?: string;
+  message: string;
+}
+
+export interface CalculationDraft {
+  revision: number;
+  content: string;
+  hash: string;
+  valid: boolean;
+  problems: CalculationProblem[];
+  updatedAt?: string;
+}
+
+export interface CalculationResult {
+  nodeId: string;
+  dataType: string;
+  expression: string;
+  value?: unknown;
+  statusCode: number;
+  sourceTimestamp?: string;
+  evaluatedAt?: string;
+  error?: string;
+  dependencyCount: number;
+  configRevision: number;
+  defaultRouteRevision: number;
+}
+
+export interface CalculationRule {
+  index: number;
+  kksCalc: string;
+  dataType: string;
+  expression: string;
+  maxLimit: number;
+  minLimit: number;
+  defaultValue: number;
+  dependencies: string[];
+}
+
+export interface CalculationVersion {
+  id: number;
+  revision: number;
+  hash: string;
+  ruleCount: number;
+  addedCount: number;
+  removedCount: number;
+  changedCount: number;
+  state: 'active' | 'archived' | 'pending_restart';
+  actor: string;
+  createdAt?: string;
+  activatedAt?: string;
+}
+
+export interface CalculationValidation {
+  valid: boolean;
+  hash: string;
+  ruleCount: number;
+  problems: CalculationProblem[];
+}
+
 export interface Alarm {
   id: number;
   sourceId?: string;

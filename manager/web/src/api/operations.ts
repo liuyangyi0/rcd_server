@@ -3,7 +3,7 @@ import { ApiError, request } from './client';
 import { queryKeys } from './queries';
 import type { ModuleType } from './types';
 
-export type OperationFeature = 'acquisition' | 'configuration' | 'logs' | 'station_versions';
+export type OperationFeature = 'acquisition' | 'configuration' | 'logs' | 'station_versions' | 'calculation_mode';
 export interface OperationsTarget { id: string; revision: number }
 export interface OperationsCapabilities {
   source_id: string;
@@ -56,6 +56,14 @@ export interface AcquisitionSnapshot {
   station_revision?: string;
   software_version?: string;
   build_commit?: string;
+  calculation?: {
+    active_mode: 'local' | 'manager';
+    configured_mode: 'local' | 'manager';
+    rule_count: number;
+    config_hash: string;
+    restart_required?: boolean;
+    config_error?: string;
+  };
   status?: 'Applied' | 'Pending' | 'Unchanged';
   station_operation_revision?: string;
   ports: AcquisitionPort[];
@@ -161,6 +169,9 @@ export const operationsApi = {
   deviceRead: async (target: OperationsTarget, revision: string, portId: string, deviceId: string, enabled: boolean) => normalizeAcquisition(await operationRequest<AcquisitionApplyResult>(`${prefix(target.id)}/device-read`, {
     method: 'PUT', headers: { 'If-Match': JSON.stringify(revision) }, body: JSON.stringify({ source_revision: target.revision, port_id: portId, device_id: deviceId, enabled }),
   })),
+	calculationMode: (target: OperationsTarget, revision: string, mode: 'local' | 'manager') => operationRequest<Record<string, unknown>>(`${prefix(target.id)}/calculation-mode`, {
+		method: 'PUT', headers: { 'If-Match': JSON.stringify(revision) }, body: JSON.stringify({ source_revision: target.revision, mode }),
+	}),
   deviceModuleType: async (target: OperationsTarget, stationRevision: string, portId: string, deviceId: string, moduleType: ModuleType) => normalizeAcquisition(await scopedResponse(target.id, operationRequest<AcquisitionSnapshot>(`${prefix(target.id)}/device-module-type`, {
     method: 'PUT', headers: { 'If-Match': JSON.stringify(stationRevision) }, body: JSON.stringify({ source_revision: target.revision, station_revision: stationRevision, port_id: portId, device_id: deviceId, module_type: moduleType }),
   }), target.revision)),

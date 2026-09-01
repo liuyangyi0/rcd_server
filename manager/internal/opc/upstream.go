@@ -103,6 +103,7 @@ type UpstreamServer struct {
 	managerRootID           awu.NodeID
 	groupsRootID            awu.NodeID
 	sourcesRootID           awu.NodeID
+	calculationsRootID      awu.NodeID
 }
 
 type upstreamCatalogPlan struct {
@@ -422,6 +423,31 @@ func (s *UpstreamServer) ForceSessionRefresh(sessionID, groupID string) int {
 	return forceSessionRefreshBatches(nodes, func(batch []awu.NodeID) int {
 		return s.server.ForceResampleSessionNodes(id, batch)
 	})
+}
+
+// ForceCalculationRefresh publishes central calculation changes to every
+// upstream Session. Calculation routing is global, so unlike a group route
+// switch the same changed NodeIds must be resampled for all Sessions.
+func (s *UpstreamServer) ForceCalculationRefresh(identifiers []string) int {
+	if len(identifiers) == 0 {
+		return 0
+	}
+	nodes := make([]awu.NodeID, 0, len(identifiers))
+	s.mu.RLock()
+	for _, identifier := range identifiers {
+		if entry := s.business[identifier]; entry != nil && entry.spec.Class == domain.NodeClassVariable {
+			nodes = append(nodes, entry.node.NodeID())
+		}
+	}
+	s.mu.RUnlock()
+	total := 0
+	for _, session := range s.server.Sessions() {
+		id := session.SessionID
+		total += forceSessionRefreshBatches(nodes, func(batch []awu.NodeID) int {
+			return s.server.ForceResampleSessionNodes(id, batch)
+		})
+	}
+	return total
 }
 
 func forceSessionRefreshBatches(nodes []awu.NodeID, refresh func([]awu.NodeID) int) int {

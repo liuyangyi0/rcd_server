@@ -29,8 +29,26 @@ func (h *Handler) lowerOperationRoutes() {
 	h.mux.HandleFunc("GET "+base+"/log", h.readSourceOperation("read_log"))
 	h.mux.HandleFunc("PUT "+base+"/port", h.setSourceAcquisition("set_port_enabled"))
 	h.mux.HandleFunc("PUT "+base+"/device-read", h.setSourceAcquisition("set_device_read_enabled"))
+	h.mux.HandleFunc("PUT "+base+"/calculation-mode", h.setSourceCalculationMode)
 	h.mux.HandleFunc("POST "+base+"/config/validate", h.validateSourceConfig)
 	h.mux.HandleFunc("PUT "+base+"/config", h.writeSourceConfig)
+}
+
+func (h *Handler) setSourceCalculationMode(w http.ResponseWriter, r *http.Request) {
+	revision, ok := requireOperationRevision(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		SourceRevision uint64 `json:"source_revision"`
+		Mode           string `json:"mode"`
+	}
+	if decodeJSON(w, r, &body) != nil {
+		return
+	}
+	h.executeSourceOperation(w, r, body.SourceRevision, domain.OperationRequest{
+		Action: "set_calculation_mode", Mode: body.Mode, ExpectedRevision: revision,
+	})
 }
 
 func (h *Handler) getSourceOperationsCapabilities(w http.ResponseWriter, r *http.Request) {

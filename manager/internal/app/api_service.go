@@ -240,7 +240,7 @@ func (r *Runtime) DeleteGroup(ctx context.Context, id string, revision uint64) e
 	for _, source := range removedSources {
 		delete(candidateCatalogs, source.ID)
 	}
-	candidateIndex, states, candidateConflictCount, err := validateCatalogs(candidateCatalogs)
+	candidateIndex, states, candidateConflictCount, err := buildCatalogIndexWithCalculations(candidateCatalogs, r.calculationPlan, r.calculationRetiredPoints, candidate)
 	if err != nil {
 		return err
 	}
@@ -357,6 +357,7 @@ func (r *Runtime) setDefault(ctx context.Context, groupID, sourceID string, revi
 	r.recordSelection(groupID)
 	r.audit(ctx, "group.default_source", groupID, persisted.Revision, map[string]any{"source_id": sourceID, "actor": actor})
 	r.broker.Publish(api.Event{Type: "group.changed", Data: persisted})
+	r.calculationRouteChanged()
 	return persisted, nil
 }
 
@@ -460,7 +461,7 @@ func (r *Runtime) CreateSource(ctx context.Context, mutation api.SourceMutation)
 	candidateCatalogs := cloneCatalogMap(r.catalogs)
 	r.mu.RUnlock()
 	candidateCatalogs[source.ID] = domain.SourceCatalog{SourceID: source.ID, GroupID: source.GroupID, State: domain.CatalogDiscovering}
-	candidateIndex, states, candidateConflictCount, err := validateCatalogs(candidateCatalogs)
+	candidateIndex, states, candidateConflictCount, err := buildCatalogIndexWithCalculations(candidateCatalogs, r.calculationPlan, r.calculationRetiredPoints, oldGroups)
 	if err != nil {
 		return api.SourceView{}, err
 	}
@@ -607,7 +608,7 @@ func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, 
 		candidateCatalogs[id] = previous
 		var states map[string]domain.CatalogState
 		var validateErr error
-		candidateIndex, states, candidateConflictCount, validateErr = validateCatalogs(candidateCatalogs)
+		candidateIndex, states, candidateConflictCount, validateErr = buildCatalogIndexWithCalculations(candidateCatalogs, r.calculationPlan, r.calculationRetiredPoints, oldGroups)
 		if validateErr != nil {
 			return api.SourceView{}, validateErr
 		}
@@ -721,7 +722,7 @@ func (r *Runtime) DeleteSource(ctx context.Context, id string, revision uint64) 
 	candidateCatalogs := cloneCatalogMap(r.catalogs)
 	r.mu.RUnlock()
 	delete(candidateCatalogs, id)
-	candidateIndex, states, candidateConflictCount, err := validateCatalogs(candidateCatalogs)
+	candidateIndex, states, candidateConflictCount, err := buildCatalogIndexWithCalculations(candidateCatalogs, r.calculationPlan, r.calculationRetiredPoints, oldGroups)
 	if err != nil {
 		return err
 	}
@@ -859,6 +860,12 @@ func (r *Runtime) ListPoints(_ context.Context, request api.PageRequest) (api.Po
 		points = filtered
 	}
 	makeView := func(point indexedPoint) api.PointView {
+		if point.Node.Kind == "manager_calculation" {
+			sample := r.sampleForSourceAtIndex("", point, index)
+			present := true
+			return api.PointView{GroupID: point.GroupID, SourceIDs: []string{}, Node: point.Node,
+				SelectedSourceID: "default-routes", SourcePresent: &present, Sample: &sample}
+		}
 		group := findGroup(groups, point.GroupID)
 		selected := group.DefaultSourceID
 		if session != nil {
@@ -1027,6 +1034,7 @@ func (r *Runtime) reconcileAfterConfiguration() {
 	if err := r.reconcileUpstream(); err != nil {
 		slog.Error("reconcile upstream after configuration change", "error", err)
 	}
+	r.requestCalculationFull()
 }
 
 func (r *Runtime) source(id string) (domain.Source, error) {
@@ -1037,12 +1045,13 @@ func (r *Runtime) source(id string) (domain.Source, error) {
 }
 
 func (r *Runtime) rebuildIndexLocked() {
-	index, states, conflicts, err := validateCatalogs(r.catalogs)
+	groups := r.routes.Groups()
+	index, states, conflicts, err := buildCatalogIndexWithCalculations(r.catalogs, r.calculationPlan, r.calculationRetiredPoints, groups)
 	if err != nil {
 		return
 	}
 	r.index, r.conflictCount = index, conflicts
-	groups, sources := r.routes.Groups(), r.routes.Sources()
+	sources := r.routes.Sources()
 	for i := range sources {
 		if state, ok := states[sources[i].ID]; ok {
 			sources[i].CatalogState = state

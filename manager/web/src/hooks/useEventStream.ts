@@ -6,7 +6,7 @@ import type { EventEnvelope } from '../api/types';
 
 export type StreamState = 'connecting' | 'connected' | 'disconnected' | 'mock';
 
-const EVENT_NAMES = ['source.status', 'source.sample', 'source.event', 'source.operation', 'station_versions_changed', 'lower_logs_changed', 'group.changed', 'selection.changed', 'session.changed', 'command.changed', 'catalog.changed', 'alarm.changed', 'management.audit', 'configuration.changed', 'resync'];
+const EVENT_NAMES = ['source.status', 'source.sample', 'source.event', 'source.operation', 'station_versions_changed', 'lower_logs_changed', 'calculation_config_changed', 'calculation_results_changed', 'group.changed', 'selection.changed', 'session.changed', 'command.changed', 'catalog.changed', 'alarm.changed', 'management.audit', 'configuration.changed', 'resync'];
 
 export function eventInvalidatesPoints(type: string): boolean {
   return type.includes('sample') || type.includes('catalog') || type.includes('selection') ||
@@ -74,6 +74,15 @@ export function useEventStream(): StreamState {
       if (type === 'lower_logs_changed') {
         void queryClient.invalidateQueries({ queryKey: envelope.sourceId ? ['lower-logs', envelope.sourceId] : ['lower-logs'], refetchType: 'active' });
       }
+	  if (type === 'calculation_config_changed') {
+		void queryClient.invalidateQueries({ queryKey: ['calculations'] });
+		void queryClient.invalidateQueries({ queryKey: queryKeys.allPoints, refetchType: 'active' });
+	  } else if (type === 'calculation_results_changed') {
+		// Results are server-paged. Invalidate only active result/status views;
+		// never copy thousands of values into a global event payload or store.
+		void queryClient.invalidateQueries({ queryKey: ['calculations', 'status'], refetchType: 'active' });
+		void queryClient.invalidateQueries({ queryKey: ['calculations', 'results'], refetchType: 'active' });
+	  }
       if (type.includes('catalog')) {
         void queryClient.invalidateQueries({ queryKey: envelope.sourceId ? queryKeys.sourceTopology(envelope.sourceId) : queryKeys.allTopologies });
       }

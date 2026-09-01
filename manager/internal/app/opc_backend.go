@@ -59,6 +59,10 @@ func (b OPCBackend) StationVersionSupport(sourceID string) (bool, bool) {
 	return b.Runtime.StationVersionSupport(sourceID)
 }
 
+func (b OPCBackend) CalculationMetadata() opc.CalculationMetadata {
+	return b.Runtime.CalculationMetadata()
+}
+
 func (b OPCBackend) ReadGroupCommand(sessionID, groupID string) domain.Sample {
 	return b.Runtime.ReadGroupCommand(sessionID, groupID)
 }
@@ -128,6 +132,9 @@ func (r *Runtime) selectSourceWithContext(ctx context.Context, sessionID, groupI
 }
 
 func (r *Runtime) ReadSample(sessionID string, key domain.NodeKey) domain.Sample {
+	if sample, handled := r.calculationSample(key.Identifier); handled {
+		return sample
+	}
 	if strings.HasSuffix(key.Identifier, "_Send") {
 		if sample, handled := r.readLegacyCommand(sessionID, key.Identifier); handled {
 			return sample
@@ -155,6 +162,12 @@ func (r *Runtime) sampleForSource(sourceID string, point indexedPoint) domain.Sa
 }
 
 func (r *Runtime) sampleForSourceAtIndex(sourceID string, point indexedPoint, index *catalogIndex) domain.Sample {
+	if point.Node.Kind == "manager_calculation" {
+		if sample, handled := r.calculationSample(point.Node.Key.Identifier); handled {
+			return sample
+		}
+		return domain.Sample{Type: point.Node.DataType, Value: zeroValue(point.Node.DataType, point.Node.ValueRank), StatusCode: domain.StatusBadWaitingInitialData}
+	}
 	if sourceID == "" {
 		return domain.Sample{Type: point.Node.DataType, Value: zeroValue(point.Node.DataType, point.Node.ValueRank), StatusCode: domain.StatusBadConfigurationError}
 	}

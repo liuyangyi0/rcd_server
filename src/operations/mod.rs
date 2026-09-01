@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::CalculationMode;
 use crate::model::command::{
     ControlReceipt, DeviceReadSetting, PortStatus, QueryStationVersion, StationModuleTypeSetting,
 };
@@ -59,7 +60,7 @@ impl fmt::Display for OperationError {
 impl std::error::Error for OperationError {}
 
 pub fn capabilities() -> Value {
-    json!({"schema_version":1,"features":["acquisition","configuration","logs","station_versions"],
+    json!({"schema_version":1,"features":["acquisition","configuration","logs","station_versions","calculation_mode"],
         "max_config_bytes":2_097_152,"max_log_bytes":65_536,"configuration_apply":"restart"})
 }
 
@@ -151,6 +152,31 @@ struct Inner {
     state_path: PathBuf,
     station_state_path: PathBuf,
     shutdown: CancellationToken,
+    calculation: Mutex<CalculationStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CalculationStatus {
+    pub active_mode: String,
+    pub configured_mode: String,
+    pub rule_count: usize,
+    pub config_hash: String,
+    pub restart_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_error: Option<String>,
+}
+
+impl Default for CalculationStatus {
+    fn default() -> Self {
+        Self {
+            active_mode: CalculationMode::Local.as_str().into(),
+            configured_mode: CalculationMode::Local.as_str().into(),
+            rule_count: 0,
+            config_hash: String::new(),
+            restart_required: false,
+            config_error: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -338,8 +364,19 @@ impl Operations {
                 state_path,
                 station_state_path,
                 shutdown,
+                calculation: Mutex::new(CalculationStatus::default()),
             }),
         })
+    }
+
+    /// Publish immutable startup calculation metadata through the operations
+    /// status without coupling the serial workers to the calculation engine.
+    pub fn set_calculation_status(&self, status: CalculationStatus) {
+        *self
+            .inner
+            .calculation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = status;
     }
 
     pub fn register_worker(&self, port_id: &str, sender: mpsc::Sender<Command>) {
@@ -412,12 +449,19 @@ impl Operations {
 
     pub fn status(&self) -> Value {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let calculation = self
+            .inner
+            .calculation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         json!({
             "schema_version":1,
             "revision":state.saved.revision,
             "software_version":software_version(),
             "build_commit":build_commit(),
             "station_revision":state.station_saved.revision,
+            "calculation":calculation,
             "ports":state.ports.values().collect::<Vec<_>>()
         })
     }
@@ -458,6 +502,7 @@ impl Operations {
             }
             "set_device_module_type" => self.set_device_module_type(request, CONTROL_WAIT),
             "query_device_version" => self.query_device_version(request, CONTROL_WAIT),
+            "set_calculation_mode" => self.set_calculation_mode(request),
             "list_configs" | "read_config" | "validate_config" | "write_config" | "list_logs"
             | "read_log" => self
                 .inner
@@ -470,6 +515,69 @@ impl Operations {
                 "unsupported operations action",
             )),
         }
+    }
+
+    fn set_calculation_mode(&self, request: &Value) -> Result<Value, OperationError> {
+        let mode = match string_arg(request, "mode")? {
+            "local" => CalculationMode::Local,
+            "manager" => CalculationMode::Manager,
+            _ => {
+                return Err(OperationError::new(
+                    "invalid_request",
+                    "calculation mode must be local or manager",
+                ))
+            }
+        };
+        let expected = string_arg(request, "expected_revision")?;
+        let mut files = self.inner.files.lock().unwrap_or_else(|e| e.into_inner());
+        let current = files.handle(&json!({"action":"read_config", "name":"config.toml"}))?;
+        let current_revision = current["revision"].as_str().unwrap_or_default();
+        if current_revision != expected {
+            return Err(OperationError::new("conflict", "配置已被修改，请重新读取")
+                .with_revision(current_revision.to_string()));
+        }
+        let content = current["content"].as_str().ok_or_else(|| {
+            OperationError::new("operation_failed", "config.toml content missing")
+        })?;
+        let mut document = content.parse::<toml_edit::DocumentMut>().map_err(|error| {
+            OperationError::new("invalid_request", format!("config.toml: {error}"))
+        })?;
+        if !document.as_table().contains_key("calculation") {
+            document["calculation"] = toml_edit::table();
+        }
+        let calculation = document["calculation"].as_table_mut().ok_or_else(|| {
+            OperationError::new("invalid_request", "[calculation] must be a table")
+        })?;
+        calculation["mode"] = toml_edit::value(mode.as_str());
+        // DocumentMut retains the operator's comments, spacing and unrelated
+        // key order. Only the calculation mode is intentionally changed.
+        let updated = document.to_string();
+        let written = files.write_calculation_mode(&updated, expected)?;
+        drop(files);
+        {
+            let mut status = self
+                .inner
+                .calculation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            status.configured_mode = mode.as_str().into();
+            status.restart_required = status.active_mode != status.configured_mode;
+        }
+        let active_mode = self
+            .inner
+            .calculation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active_mode
+            .clone();
+        Ok(json!({
+            "status":"Saved",
+            "revision":written["revision"],
+            "active_mode":active_mode,
+            "configured_mode":mode.as_str(),
+            "restart_required":active_mode != mode.as_str(),
+            "config":written,
+        }))
     }
 
     fn set_device_module_type(
@@ -1524,6 +1632,33 @@ mod tests {
     use crate::csv_parser::{Config, DeviceConfig};
     use std::sync::Barrier;
 
+    const APPLICATION_CONFIG: &str = r#"
+# 现场运维注释必须在切换计算模式后保留
+[server]
+primary_ip = "127.0.0.1:11001"
+secondary_ip = "127.0.0.1:11002"
+run_on = "primary"
+current_run = "primary"
+
+[serial]
+baud_rate = 28800
+data_bits = "Eight"
+parity = "None"
+stop_bits = "One"
+flow_control = "none"
+
+[settings]
+timeout = 50
+poll_interval_ms = 1
+command_retry_count = 3
+query_retry_count = 0
+parity_switch_delay_ms = 1
+transmit_settle_guard_ms = 1
+
+[calculation]
+mode = "local"
+"#;
+
     fn fixture() -> (
         tempfile::TempDir,
         Operations,
@@ -1600,6 +1735,74 @@ mod tests {
             "expected_revision":"1",
             "expected_station_revision":station_revision
         })
+    }
+
+    #[test]
+    fn calculation_mode_is_saved_with_config_cas_and_requires_restart() {
+        let (root, operations, _ports, _rx) = fixture();
+        fs::write(root.path().join("config/config.toml"), APPLICATION_CONFIG).unwrap();
+        fs::write(root.path().join("config/calc.toml"), "rules = []\n").unwrap();
+        // Existing deployments use the runtime-compatible historical header
+        // spellings. The generic Web editor intentionally rejects these, but
+        // they must not prevent the dedicated config.toml mode switch.
+        fs::write(
+            root.path().join("config/legacy.csv"),
+            "COM,/dev/ttyWCH0,,,,,,,\nBaudRate,28800,,,,,,,\n",
+        )
+        .unwrap();
+        operations.set_calculation_status(CalculationStatus {
+            active_mode: "local".into(),
+            configured_mode: "local".into(),
+            rule_count: 6_683,
+            config_hash: "deployed-hash".into(),
+            restart_required: false,
+            config_error: None,
+        });
+
+        let before = operations
+            .execute(&json!({"action":"read_config", "name":"config.toml"}))
+            .unwrap();
+        let revision = before["revision"].as_str().unwrap();
+        let response = operations
+            .execute(&json!({
+                "action":"set_calculation_mode",
+                "mode":"manager",
+                "expected_revision":revision,
+            }))
+            .unwrap();
+        assert_eq!(response["active_mode"], "local");
+        assert_eq!(response["configured_mode"], "manager");
+        assert_eq!(response["restart_required"], true);
+        assert_ne!(response["revision"], revision);
+        let saved: crate::config::Config =
+            toml::from_str(&fs::read_to_string(root.path().join("config/config.toml")).unwrap())
+                .unwrap();
+        assert_eq!(saved.calculation.mode, CalculationMode::Manager);
+        assert!(fs::read_to_string(root.path().join("config/config.toml"))
+            .unwrap()
+            .contains("# 现场运维注释必须在切换计算模式后保留"));
+        assert_eq!(operations.status()["calculation"]["active_mode"], "local");
+        assert_eq!(
+            operations.status()["calculation"]["configured_mode"],
+            "manager"
+        );
+
+        let stale = operations
+            .execute(&json!({
+                "action":"set_calculation_mode",
+                "mode":"local",
+                "expected_revision":revision,
+            }))
+            .unwrap_err();
+        assert_eq!(stale.code, "conflict");
+        assert_eq!(
+            stale.current_revision.as_deref(),
+            response["revision"].as_str()
+        );
+        let still_saved: crate::config::Config =
+            toml::from_str(&fs::read_to_string(root.path().join("config/config.toml")).unwrap())
+                .unwrap();
+        assert_eq!(still_saved.calculation.mode, CalculationMode::Manager);
     }
 
     #[test]

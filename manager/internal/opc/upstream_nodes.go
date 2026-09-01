@@ -23,14 +23,53 @@ func (s *UpstreamServer) addRoots() error {
 	s.managerRootID = awu.NewNodeIDString(s.managementNS, "RcdManager")
 	s.groupsRootID = awu.NewNodeIDString(s.managementNS, "RcdManager/Groups")
 	s.sourcesRootID = awu.NewNodeIDString(s.managementNS, "RcdManager/Sources")
+	s.calculationsRootID = awu.NewNodeIDString(s.managementNS, "RcdManager/Calculations")
 	nodes := []awserver.Node{
 		newObject(s.server, s.devicesID, awu.NewQualifiedName(s.businessNS, "Devices"), "Devices", awu.ObjectIDObjectsFolder),
 		newObjectWithType(s.server, s.methodsID, awu.NewQualifiedName(s.businessNS, "Methods"), "Methods", awu.ObjectIDObjectsFolder, awu.ObjectTypeIDBaseObjectType),
 		newObject(s.server, s.managerRootID, awu.NewQualifiedName(s.managementNS, "RcdManager"), "RcdManager", awu.ObjectIDObjectsFolder),
 		newObject(s.server, s.groupsRootID, awu.NewQualifiedName(s.managementNS, "Groups"), "Groups", s.managerRootID),
 		newObject(s.server, s.sourcesRootID, awu.NewQualifiedName(s.managementNS, "Sources"), "Sources", s.managerRootID),
+		newObject(s.server, s.calculationsRootID, awu.NewQualifiedName(s.managementNS, "Calculations"), "Calculations", s.managerRootID),
 	}
-	return s.server.NamespaceManager().AddNodes(nodes...)
+	if err := s.server.NamespaceManager().AddNodes(nodes...); err != nil {
+		return err
+	}
+	return s.addCalculationManagementLocked()
+}
+
+func (s *UpstreamServer) addCalculationManagementLocked() error {
+	metadata := func() CalculationMetadata {
+		if backend, ok := s.backend.(CalculationBackend); ok {
+			return backend.CalculationMetadata()
+		}
+		return CalculationMetadata{RoutingMode: "DefaultSources"}
+	}
+	definitions := []managementVariable{
+		{name: "RoutingMode", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return metadata().RoutingMode, awu.Good }},
+		{name: "ActiveRevision", dataType: awu.DataTypeIDUInt64, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return metadata().ActiveRevision, awu.Good }},
+		{name: "ConfigHash", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return metadata().ConfigHash, awu.Good }},
+		{name: "RuleCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return metadata().RuleCount, awu.Good }},
+		{name: "GoodCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return metadata().GoodCount, awu.Good }},
+		{name: "BadCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return metadata().BadCount, awu.Good }},
+		{name: "DefaultRouteRevision", dataType: awu.DataTypeIDUInt64, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return metadata().DefaultRouteRevision, awu.Good }},
+		{name: "LastEvaluationAt", dataType: awu.DataTypeIDDateTime, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) {
+			value := metadata().LastEvaluationAt
+			if value.IsZero() {
+				return time.Time{}, awu.BadWaitingForInitialData
+			}
+			return value, awu.Good
+		}},
+		{name: "LastEvaluationDurationMs", dataType: awu.DataTypeIDDouble, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return metadata().LastEvaluationDurationMS, awu.Good }},
+		{name: "PendingRestart", dataType: awu.DataTypeIDBoolean, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return metadata().PendingRestart, awu.Good }},
+		{name: "CalculationNodeIds", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankOneDimension, minimumSamplingInterval: 1000, read: func(string) (any, awu.StatusCode) { return metadata().CalculationNodeIDs, awu.Good }},
+	}
+	for _, definition := range definitions {
+		if err := s.addManagementVariableLocked(s.calculationsRootID, "Calculations/"+definition.name, definition); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func newObject(srv *awserver.Server, id awu.NodeID, browseName awu.QualifiedName, display string, parent awu.NodeID) *awserver.ObjectNode {

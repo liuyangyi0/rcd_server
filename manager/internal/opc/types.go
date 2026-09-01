@@ -168,6 +168,24 @@ type StationVersionCapabilityBackend interface {
 	StationVersionSupport(sourceID string) (known, supported bool)
 }
 
+type CalculationMetadata struct {
+	RoutingMode              string
+	ActiveRevision           uint64
+	ConfigHash               string
+	RuleCount                uint32
+	GoodCount                uint32
+	BadCount                 uint32
+	DefaultRouteRevision     uint64
+	LastEvaluationAt         time.Time
+	LastEvaluationDurationMS float64
+	PendingRestart           bool
+	CalculationNodeIDs       []string
+}
+
+type CalculationBackend interface {
+	CalculationMetadata() CalculationMetadata
+}
+
 // GroupCommandBackend exposes unambiguous logical-device commands without
 // changing the legacy physical-port NodeIds. Implementations must retain the
 // same per-source physical-port lock used by the legacy command handlers.

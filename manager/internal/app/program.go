@@ -80,6 +80,12 @@ func RunProgram(ctx context.Context, cfg config.Config) error {
 		}
 		slog.Info("session route refresh queued", "session_id", sessionID, "group_id", groupID, "monitored_items", refreshed)
 	})
+	runtime.SetCalculationRefreshHandler(func(identifiers []string) {
+		refreshed := upstream.ForceCalculationRefresh(identifiers)
+		if refreshed > 0 {
+			slog.Debug("calculation refresh queued", "changed_nodes", len(identifiers), "monitored_items", refreshed)
+		}
+	})
 	runtime.SetSubscriptionCountHandler(upstream.SubscriptionCount)
 	if err := runtime.SetCatalogHandlers(upstream.ValidateCatalog, upstream.ReconcileCatalog); err != nil {
 		_ = upstream.Close()

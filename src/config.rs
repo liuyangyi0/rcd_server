@@ -3,7 +3,7 @@
 //! 从 `config/config.toml` 文件中加载串口参数、服务器参数和全局设置。
 
 use log::info;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serialport::{DataBits, Parity, StopBits};
 use std::net::SocketAddr;
 
@@ -56,6 +56,36 @@ pub enum RunLocation {
     Primary,
     #[serde(rename = "secondary")]
     Secondary,
+}
+
+/// 计算规则的执行位置。缺省保持旧版的下级本地计算行为。
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CalculationMode {
+    Local,
+    Manager,
+}
+
+impl Default for CalculationMode {
+    fn default() -> Self {
+        Self::Local
+    }
+}
+
+impl CalculationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Manager => "manager",
+        }
+    }
+}
+
+/// 下级是否执行并发布 calc.toml 中的计算点。
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct Calculation {
+    pub mode: CalculationMode,
 }
 
 /// 服务器网络与主备切换配置。
@@ -165,6 +195,9 @@ pub struct Config {
     /// 日志设置。
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// 计算可以保留在单机下级，也可以由管理 OPC 集中执行。
+    #[serde(default)]
+    pub calculation: Calculation,
 }
 
 fn default_poll_interval_ms() -> u64 {
@@ -290,6 +323,40 @@ serial_frame_logs = true
         assert_eq!(config.settings.transmit_settle_guard_ms, 3);
         assert_eq!(config.logging.level, "debug");
         assert!(config.logging.serial_frame_logs);
+    }
+
+    #[test]
+    fn calculation_mode_defaults_to_local_and_accepts_manager() {
+        let local: Config = toml::from_str(&format!(
+            r#"{BASE_CONFIG}
+[settings]
+timeout = 300
+"#
+        ))
+        .unwrap();
+        assert_eq!(local.calculation.mode, CalculationMode::Local);
+
+        let manager: Config = toml::from_str(&format!(
+            r#"{BASE_CONFIG}
+[settings]
+timeout = 300
+[calculation]
+mode = "manager"
+"#
+        ))
+        .unwrap();
+        assert_eq!(manager.calculation.mode, CalculationMode::Manager);
+    }
+
+    #[test]
+    fn calculation_mode_rejects_unknown_values_and_fields() {
+        for calculation in [
+            "[calculation]\nmode = \"automatic\"\n",
+            "[calculation]\nmode = \"manager\"\nautomatic = true\n",
+        ] {
+            let content = format!("{BASE_CONFIG}\n[settings]\ntimeout = 300\n{calculation}");
+            assert!(toml::from_str::<Config>(&content).is_err());
+        }
     }
 
     #[test]

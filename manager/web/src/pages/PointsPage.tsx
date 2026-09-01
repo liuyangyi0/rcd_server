@@ -144,7 +144,7 @@ export default function PointsPage() {
                       <td>{point.groupId}</td>
                       <td>{point.selectedSourceId ?? '—'}{!point.sourcePresent ? <span className="sub-cell text-bad">选中源缺少该点</span> : null}</td>
                       <td><PointOwnership point={point} /></td>
-                      <td>{isMethod ? 'Method' : point.dataType}{point.kind ? <span className="sub-cell">{point.kind === 'calculation' ? '下级计算点' : point.kind === 'command' ? '命令' : '采集点'}</span> : null}</td>
+                      <td>{isMethod ? 'Method' : point.dataType}{point.kind ? <span className="sub-cell">{point.kind === 'manager_calculation' ? '管理端计算' : point.kind === 'calculation' ? '下级计算点' : point.kind === 'command' ? '命令' : '采集点'}</span> : null}</td>
                       <td className="value-cell">{isMethod ? '—' : displayValue(point.value)}</td>
                       <td className={isMethod ? 'text-muted' : isBadStatus(point.statusCode) ? 'text-bad' : 'text-good'}>{isMethod ? '—' : statusCodeLabel(point.statusCode)}</td>
                       <td>{isMethod ? '—' : formatDateTime(point.sourceTimestamp)}</td>
@@ -185,7 +185,7 @@ function ComparisonValue({ point }: { point?: Point }) {
 function PointOwnership({ point }: { point: Point }) {
   if (!point.sourcePresent) return <span className="text-muted">选中源无此点</span>;
   if (point.portId) return <>{point.portId}<span className="sub-cell">{point.deviceId ? `设备 ${point.deviceId}` : point.kind === 'command' ? '共享串口命令' : '未指定设备'}</span></>;
-  return <span className="text-muted">{point.kind === 'calculation' ? '跨设备 / 无设备计算' : point.kind === 'command' ? '共享命令' : '未提供归属'}</span>;
+  return <span className="text-muted">{point.kind === 'manager_calculation' ? '按默认来源集中计算' : point.kind === 'calculation' ? '跨设备 / 无设备计算' : point.kind === 'command' ? '共享命令' : '未提供归属'}</span>;
 }
 
 function ComparisonQuality({ point }: { point?: Point }) {

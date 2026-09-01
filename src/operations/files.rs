@@ -15,6 +15,12 @@ use sha2::{Digest, Sha256};
 use super::OperationError;
 
 const MAX_CONFIG_BYTES: usize = 2 * 1024 * 1024;
+// Deployed calc.toml files contain a small number of generated expressions
+// larger than the original operations-editor guard (16 KiB / 512 tokens).
+// The runtime engine already accepts them. Keep the editor bounded while
+// allowing the existing 6,683-rule production configuration to round-trip.
+const MAX_CALC_EXPRESSION_BYTES: usize = 64 * 1024;
+const MAX_CALC_TOKENS: usize = 8_192;
 const MAX_LOG_SCAN: usize = 256 * 1024 - 2048;
 const MAX_LOG_TEXT: usize = 64 * 1024;
 // Matching context is a separate, bounded backward read. It never advances the
@@ -182,6 +188,48 @@ impl FileRepository {
         let name = config_name(request)?;
         let content = config_content(request)?;
         let expected = required_string(request, "expected_revision")?;
+        self.write_config_checked(name, content, expected, |candidate| {
+            let validation = validate_set(candidate);
+            if validation.errors.is_empty() {
+                Ok(())
+            } else {
+                Err(OperationError::new(
+                    "invalid_request",
+                    validation.errors.join("\n"),
+                ))
+            }
+        })
+    }
+
+    /// Persist the dedicated calculation-mode edit without revalidating
+    /// unrelated legacy CSV/calc files. The running process already parsed the
+    /// current application config; the caller changes only one typed field.
+    /// CAS, writer locking, backup and whole-set concurrency checks remain the
+    /// same as the general configuration editor.
+    pub(super) fn write_calculation_mode(
+        &self,
+        content: &str,
+        expected: &str,
+    ) -> OperationResult<Value> {
+        if content.len() > MAX_CONFIG_BYTES {
+            return Err(OperationError::new("too_large", "配置文件最大为 2 MiB"));
+        }
+        toml::from_str::<crate::config::Config>(content).map_err(|error| {
+            OperationError::new("invalid_request", format!("config.toml: {error}"))
+        })?;
+        self.write_config_checked("config.toml", content, expected, |_| Ok(()))
+    }
+
+    fn write_config_checked<F>(
+        &self,
+        name: &str,
+        content: &str,
+        expected: &str,
+        validate: F,
+    ) -> OperationResult<Value>
+    where
+        F: FnOnce(&BTreeMap<String, ConfigFile>) -> OperationResult<()>,
+    {
         if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(OperationError::new(
                 "invalid_request",
@@ -208,13 +256,7 @@ impl FileRepository {
                 }),
             );
         }
-        let validation = validate_set(&candidate);
-        if !validation.errors.is_empty() {
-            return Err(OperationError::new(
-                "invalid_request",
-                validation.errors.join("\n"),
-            ));
-        }
+        validate(&candidate)?;
         self.ensure_config_set_unchanged(&original)?;
         if content.as_bytes() == current.bytes.as_slice() {
             return self.read_config(&json!({ "name": name }));
@@ -866,8 +908,8 @@ fn validate_set(files: &BTreeMap<String, ConfigFile>) -> Validation {
                 "calc.toml {name}: 上下限/默认值必须为有限数，且 min_limit <= max_limit"
             ));
         }
-        if rule.expression.len() > 16 * 1024 {
-            result.error(format!("calc.toml {name}: 单个表达式最大 16 KiB"));
+        if rule.expression.len() > MAX_CALC_EXPRESSION_BYTES {
+            result.error(format!("calc.toml {name}: 单个表达式最大 64 KiB"));
             continue;
         }
         let tokens = match tokenizer::tokenize(&rule.expression) {
@@ -880,8 +922,8 @@ fn validate_set(files: &BTreeMap<String, ConfigFile>) -> Validation {
         // The runtime parser and AST traversal are recursive. Bound validation
         // before parsing so an accidentally pasted deeply nested expression cannot
         // overflow the operations worker stack.
-        if tokens.len() > 512 {
-            result.error(format!("calc.toml {name}: 单个表达式最多 512 个词法单元"));
+        if tokens.len() > MAX_CALC_TOKENS {
+            result.error(format!("calc.toml {name}: 单个表达式最多 8192 个词法单元"));
             continue;
         }
         let ast = match parser::parse(tokens) {
@@ -1605,6 +1647,35 @@ transmit_settle_guard_ms = 1
             .config_dir
             .join(BACKUP_DIRECTORY)
             .exists());
+    }
+
+    #[test]
+    fn deployed_size_expressions_can_round_trip_but_remain_bounded() {
+        let mut fixture = Fixture::new();
+        let before = fixture.read("calc.toml");
+        // This is deliberately beyond the former 16 KiB/512-token editor
+        // guard, while remaining below the deployed-compatible hard limits.
+        let deployed_expression = format!("{}0", "D1_TEMP+".repeat(2_500));
+        assert!(deployed_expression.len() > 16 * 1024);
+        let accepted = format!(
+            "[[rules]]\nkks_calc='OUT'\ndata_type='uint'\nexpression='{deployed_expression}'\n"
+        );
+        let saved = fixture
+            .write("calc.toml", &accepted, before["revision"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(saved["content"], accepted);
+
+        let oversized_expression = format!("{}0", "D1_TEMP+".repeat(8_193));
+        assert!(oversized_expression.len() > MAX_CALC_EXPRESSION_BYTES);
+        let rejected = format!(
+            "[[rules]]\nkks_calc='OUT'\ndata_type='uint'\nexpression='{oversized_expression}'\n"
+        );
+        let error = fixture
+            .write("calc.toml", &rejected, saved["revision"].as_str().unwrap())
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_request");
+        assert!(error.message.contains("64 KiB"));
+        assert_eq!(fixture.read("calc.toml")["content"], accepted);
     }
 
     #[test]

@@ -128,7 +128,7 @@ func (r *Runtime) ImportConfiguration(ctx context.Context, request api.Configura
 	for _, source := range persistedSources {
 		catalogs[source.ID] = domain.SourceCatalog{SourceID: source.ID, GroupID: source.GroupID, State: domain.CatalogDiscovering}
 	}
-	index, _, conflicts, err := validateCatalogs(catalogs)
+	index, _, conflicts, err := buildCatalogIndexWithCalculations(catalogs, r.calculationPlan, r.calculationRetiredPoints, persistedGroups)
 	if err != nil {
 		return api.ConfigurationImportResult{}, err
 	}

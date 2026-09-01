@@ -572,6 +572,49 @@ i { font-style: normal; }
   .topology-footer .button { width: 100%; }
 }
 
+/* Central calculation center */
+.calculation-page > .inline-notice { margin-bottom: 14px; }
+.calculation-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 14px; border: 1px solid var(--border); background: #fff; }
+.calculation-summary > div { min-height: 92px; padding: 15px 17px; border-right: 1px solid var(--border); display: flex; flex-direction: column; justify-content: center; gap: 4px; }
+.calculation-summary > div:nth-child(4), .calculation-summary > div:last-child { border-right: 0; }
+.calculation-summary span { color: var(--muted); font-size: 11px; font-weight: 650; }
+.calculation-summary strong { color: var(--navy); font-size: 20px; font-weight: 650; }
+.calculation-summary small { color: var(--muted); overflow-wrap: anywhere; }
+.calculation-summary .calculation-summary-warning { grid-column: 1 / -1; min-height: 58px; flex-direction: row; align-items: center; justify-content: flex-start; border-top: 1px solid #efd690; border-right: 0; background: #fff9e8; color: #8c6200; }
+.calculation-summary-warning strong { margin-left: auto; color: #8c6200; font-size: 13px; }
+.calculation-tabs { display: flex; gap: 3px; margin-bottom: 14px; padding: 4px; border: 1px solid var(--border); background: #edf2f7; }
+.calculation-tabs button { min-height: 38px; padding: 0 16px; border: 0; background: transparent; color: #526176; display: inline-flex; align-items: center; gap: 8px; font-weight: 650; cursor: pointer; }
+.calculation-tabs button:hover { background: #fff; color: var(--blue); }
+.calculation-tabs button.active { background: #fff; color: var(--blue); box-shadow: 0 1px 4px rgba(31, 54, 83, .13); }
+.calculation-tab-panel { min-width: 0; }
+.calculation-results-table { min-width: 1220px; }
+.calculation-results-table td { vertical-align: top; }
+.calculation-results-table th:nth-child(1) { width: 220px; }
+.calculation-results-table th:nth-child(2) { width: 360px; }
+.calculation-expression { display: block; max-width: 430px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #304661; }
+.calculation-config-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 9px; margin-bottom: 12px; padding: 12px; border: 1px solid var(--border); background: #fff; }
+.calculation-file-button { position: relative; overflow: hidden; }
+.calculation-file-button input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.calculation-config-meta { margin-left: auto; padding: 8px 0; color: var(--muted); font-size: 12px; }
+.calculation-editor-layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 12px; min-height: 610px; }
+.calculation-editor { width: 100%; min-height: 610px; resize: vertical; padding: 14px 16px; border: 1px solid #afbdcf; border-radius: 2px; background: #0f1b2a; color: #dce8f5; font: 12px/1.65 Consolas, "Cascadia Mono", monospace; tab-size: 2; white-space: pre; overflow: auto; }
+.calculation-editor:focus { outline: 2px solid #8abaff; outline-offset: 1px; }
+.calculation-validation-panel { min-width: 0; max-height: 610px; padding: 14px; overflow: auto; border: 1px solid var(--border); background: #fff; }
+.calculation-validation-panel h3 { margin: 0 0 10px; color: var(--navy); font-size: 15px; }
+.calculation-validation-panel > p { color: var(--muted); line-height: 1.6; }
+.calculation-validation-panel ol { margin: 0; padding: 0; list-style: none; }
+.calculation-validation-panel li { content-visibility: auto; contain-intrinsic-size: auto 68px; border-top: 1px solid var(--border); }
+.calculation-validation-panel li button { width: 100%; padding: 10px 4px; border: 0; background: transparent; text-align: left; cursor: pointer; }
+.calculation-validation-panel li button:hover { color: var(--blue); background: var(--blue-soft); }
+.calculation-validation-panel li strong, .calculation-validation-panel li span { display: block; }
+.calculation-validation-panel li span { margin-top: 3px; color: var(--muted); overflow-wrap: anywhere; }
+.calculation-valid { min-height: 180px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; color: var(--green); text-align: center; }
+.calculation-valid code { color: var(--muted); }
+.calculation-config-actions { position: sticky; bottom: 26px; z-index: 2; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 12px; padding: 11px; border: 1px solid var(--border); background: rgba(255,255,255,.96); box-shadow: 0 -2px 9px rgba(31, 54, 83, .08); }
+.inline-confirm { display: flex; flex-wrap: wrap; gap: 6px; }
+@media (max-width: 1100px) { .calculation-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } .calculation-summary > div { border-bottom: 1px solid var(--border); } .calculation-summary > div:nth-child(2) { border-right: 0; } .calculation-editor-layout { grid-template-columns: 1fr; } .calculation-validation-panel { max-height: 360px; } }
+@media (max-width: 640px) { .calculation-summary { grid-template-columns: 1fr; } .calculation-summary > div { border-right: 0; } .calculation-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); } .calculation-tabs button { justify-content: center; padding: 0 8px; } .calculation-editor, .calculation-editor-layout { min-height: 480px; } .calculation-config-actions .button { flex: 1 1 150px; } }
+
 /* Per-station module firmware. This inventory is source-oriented and never
    implies or changes an OPC Session route. */
 .device-version-summary-area { display: grid; gap: 10px; margin-bottom: 14px; }

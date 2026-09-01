@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
+import { Link } from 'react-router-dom';
 import { Download, RefreshCw, Save, ShieldCheck } from 'lucide-react';
 import { ApiError, apiErrorMessage } from '../../api/client';
-import { MAX_CONFIG_BYTES, operationKeys, operationsApi, useOperationConfig, useOperationConfigs, useSaveOperationConfig, useValidateOperationConfig, type ConfigDocument, type ConfigFiles, type ConfigValidation, type OperationsTarget } from '../../api/operations';
+import { MAX_CONFIG_BYTES, operationKeys, operationsApi, useAcquisitionStatus, useOperationConfig, useOperationConfigs, useSaveOperationConfig, useValidateOperationConfig, type ConfigDocument, type ConfigFiles, type ConfigValidation, type OperationsTarget } from '../../api/operations';
 import type { ConfigRestartIntent } from '../../api/process';
 import { InlineNotice } from '../../components/InlineNotice';
 import { EmptyState, ErrorState, LoadingState } from '../../components/PageState';
@@ -13,14 +14,17 @@ interface Props { target: OperationsTarget; writable: boolean; maxBytes: number;
 
 export function ConfigurationTab(props: Props) {
   const files = useOperationConfigs(props.target);
+	const status = useAcquisitionStatus(props.target);
+	const managerMode = status.data?.calculation?.active_mode === 'manager';
   return <div className="operations-tab-content">
     <InlineNotice tone="warning"><strong>保存后需重启下级，不自动重启。</strong><p>配置校验不等于保存。备份仅载入编辑草稿，核对并校验后才可显式保存；采集页的运行状态不代表新文件已应用。</p></InlineNotice>
     {files.error ? <ErrorState error={files.error} title="无法刷新配置文件列表" onRetry={() => void files.refetch()} /> : null}
-    {!files.data && files.isPending ? <LoadingState label="正在读取配置文件列表…" /> : files.data ? <ConfigWorkspace {...props} files={files.data} refreshing={files.isFetching} refreshFiles={() => void files.refetch()} /> : null}
+	{managerMode ? <InlineNotice><strong>此下级的 calc.toml 当前未生效，由管理端接管。</strong><p>本机文件保留为回滚副本并以只读方式显示；请到<Link to="/calculations?tab=config">计算中心</Link>编辑、校验和激活中央规则。</p></InlineNotice> : null}
+    {!files.data && files.isPending ? <LoadingState label="正在读取配置文件列表…" /> : files.data ? <ConfigWorkspace {...props} managerMode={managerMode} files={files.data} refreshing={files.isFetching} refreshFiles={() => void files.refetch()} /> : null}
   </div>;
 }
 
-function ConfigWorkspace({ target, writable, maxBytes, onDirtyChange, onBusyChange, onRestartRequested, files, refreshing, refreshFiles }: Props & { files: ConfigFiles; refreshing: boolean; refreshFiles: () => void }) {
+function ConfigWorkspace({ target, writable, managerMode, maxBytes, onDirtyChange, onBusyChange, onRestartRequested, files, refreshing, refreshFiles }: Props & { managerMode: boolean; files: ConfigFiles; refreshing: boolean; refreshFiles: () => void }) {
   // Pick once after the list arrives. Background list additions/reordering must
   // not change the edited filename and silently unmount a dirty editor.
   const [selected, setSelected] = useState(() => files.items[0]?.name || '');
@@ -36,7 +40,7 @@ function ConfigWorkspace({ target, writable, maxBytes, onDirtyChange, onBusyChan
       <button className="button button-secondary button-small" type="button" disabled={refreshing} onClick={refreshFiles}><RefreshCw size={15} aria-hidden="true" />刷新文件列表</button>
     </div>
     {dirty ? <p className="operations-muted">有未保存草稿。保存或明确放弃后，才能切换文件或标签页；后台刷新不会覆盖编辑内容。</p> : null}
-    {!name ? <EmptyState title={files.items.length ? '请选择配置文件' : '没有可管理的配置文件'} description="只编辑下级公布的配置文件；不会自动创建或猜测文件路径。" /> : <ConfigFilePane key={name} target={target} name={name} writable={writable} maxBytes={maxBytes} onDirtyChange={reportDirty} onBusyChange={reportBusy} onRestartRequested={onRestartRequested} />}
+    {!name ? <EmptyState title={files.items.length ? '请选择配置文件' : '没有可管理的配置文件'} description="只编辑下级公布的配置文件；不会自动创建或猜测文件路径。" /> : <ConfigFilePane key={name} target={target} name={name} writable={writable && !(managerMode && name === 'calc.toml')} maxBytes={maxBytes} onDirtyChange={reportDirty} onBusyChange={reportBusy} onRestartRequested={onRestartRequested} />}
   </>;
 }
 
@@ -132,7 +136,8 @@ function ConfigEditor({ target, document, writable, maxBytes, refreshing, refres
     {loadedBackup ? <InlineNotice>已将备份 {loadedBackup} 载入草稿，尚未保存或应用。请校验并显式保存。</InlineNotice> : null}
     <div className="operations-backups"><label className="field"><span>自动备份版本</span><select aria-label="自动备份版本" value={backupId} onChange={(event) => setBackupId(event.target.value)} disabled={busy}><option value="">{document.backups.length ? '选择备份，只载入草稿' : '暂无自动备份'}</option>{document.backups.map((backup) => <option value={backup.id} key={backup.id}>{formatDateTime(backup.created_at)} · {backup.id} · {byteSize(backup.size_bytes)}</option>)}</select></label><button className="button button-small button-outline" type="button" disabled={!backupId || busy || !writable} onClick={() => void loadBackup()}>{loadingBackup ? '正在读取备份…' : '载入备份为草稿'}</button></div>
     {document.backups_truncated ? <p className="operations-muted">仅列出最近 200 份自动备份，旧备份未删除。</p> : null}
-    <label className="field operations-code-field"><span>配置内容 · {baseline.name}{dirty ? ' · 未保存' : ''}</span><textarea aria-label={`配置内容 ${baseline.name}`} spellCheck={false} value={draft} disabled={save.isPending || loadingBackup || reloading} onChange={(event) => edit(event.target.value)} /></label>
+	{!writable && baseline.name === 'calc.toml' ? <InlineNotice>只读回滚副本：当前下级为 manager 模式，请在计算中心维护活动规则。</InlineNotice> : null}
+    <label className="field operations-code-field"><span>配置内容 · {baseline.name}{dirty ? ' · 未保存' : ''}</span><textarea aria-label={`配置内容 ${baseline.name}`} spellCheck={false} value={draft} disabled={!writable || save.isPending || loadingBackup || reloading} onChange={(event) => edit(event.target.value)} /></label>
     <p className="operations-muted">UTF-8 文本，最多 {byteSize(limit)}。页面刷新、校验和备份预览都不会自动写入文件。</p>
     {localError ? <div className="top-error" role="alert">{localError}</div> : null}
     {validate.error ? <div className="top-error" role="alert">校验请求失败，未保存配置。{apiErrorMessage(validate.error)}</div> : null}

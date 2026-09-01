@@ -3,6 +3,7 @@ module rcd_manager
 go 1.26
 
 require (
+	github.com/BurntSushi/toml v1.4.0
 	github.com/awcullen/opcua v1.4.0
 	github.com/gopcua/opcua v0.9.1
 	golang.org/x/sys v0.47.0
