@@ -11,6 +11,7 @@ pub mod calc_engine;
 pub mod config;
 pub mod csv_parser;
 pub mod file_scanner;
+mod log_push;
 pub mod logging;
 pub mod model;
 pub mod operations;

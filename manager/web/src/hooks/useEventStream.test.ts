@@ -85,6 +85,13 @@ describe('SSE query refreshes', () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.allDeviceVersions, refetchType: 'active' });
   });
 
+  it('refreshes only the matching central lower log query', () => {
+    const { invalidate, source } = setup();
+    act(() => source.emit('lower_logs_changed', { source_id: 'lower-a', accepted_through: 10 }));
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['lower-logs', 'lower-a'], refetchType: 'active' });
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: queryKeys.allPoints, refetchType: 'active' });
+  });
+
   it('refreshes group command locks on both command start and completion events', () => {
     const { invalidate, source } = setup();
     for (const state of ['Pending', 'Completed']) {

@@ -6,7 +6,7 @@ import type { EventEnvelope } from '../api/types';
 
 export type StreamState = 'connecting' | 'connected' | 'disconnected' | 'mock';
 
-const EVENT_NAMES = ['source.status', 'source.sample', 'source.event', 'source.operation', 'station_versions_changed', 'group.changed', 'selection.changed', 'session.changed', 'command.changed', 'catalog.changed', 'alarm.changed', 'management.audit', 'configuration.changed', 'resync'];
+const EVENT_NAMES = ['source.status', 'source.sample', 'source.event', 'source.operation', 'station_versions_changed', 'lower_logs_changed', 'group.changed', 'selection.changed', 'session.changed', 'command.changed', 'catalog.changed', 'alarm.changed', 'management.audit', 'configuration.changed', 'resync'];
 
 export function eventInvalidatesPoints(type: string): boolean {
   return type.includes('sample') || type.includes('catalog') || type.includes('selection') ||
@@ -70,6 +70,9 @@ export function useEventStream(): StreamState {
         // physical version operation is currently reachable, even when the
         // station revision itself does not change.
         void queryClient.invalidateQueries({ queryKey: queryKeys.allDeviceVersions, refetchType: 'active' });
+      }
+      if (type === 'lower_logs_changed') {
+        void queryClient.invalidateQueries({ queryKey: envelope.sourceId ? ['lower-logs', envelope.sourceId] : ['lower-logs'], refetchType: 'active' });
       }
       if (type.includes('catalog')) {
         void queryClient.invalidateQueries({ queryKey: envelope.sourceId ? queryKeys.sourceTopology(envelope.sourceId) : queryKeys.allTopologies });

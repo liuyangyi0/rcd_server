@@ -96,6 +96,18 @@ keep_files = 30                   # 保留滚动日志文件数；0 表示不清
 write_mode = "buffer_and_flush"   # direct/buffer_and_flush/buffer_dont_flush
 serial_frame_logs = false         # 是否记录串口收发原始帧
 opcua_transport_errors = false    # 是否保留 OPC UA 客户端断开类传输噪声
+
+# 可选：批量推送到管理程序。默认关闭，启用前必须与管理端来源 ID 一致。
+[logging.http_push]
+enabled = true
+url = "http://192.168.10.46:8087/api/v1/lower-ingest/logs"
+source_id = "lower-a"
+batch_interval_ms = 500           # 常规日志最多等待 500 ms；WARN/ERROR 立即唤醒
+batch_size = 100                  # 每批最多 100 条（管理端上限 500）
+queue_capacity = 10000            # 内存队列有界；任何情况下不阻塞串口
+spool_directory = "push-spool"   # 相对日志目录，用于断网补发
+spool_max_bytes = 16777216        # 补发文件上限 16 MiB
+request_timeout_ms = 3000
 ```
 
 ### 配置项说明
@@ -111,6 +123,11 @@ opcua_transport_errors = false    # 是否保留 OPC UA 客户端断开类传输
 | `logging.level` | 否 | 默认 `info`，可配置为 `warn`、`debug` 或模块级 log spec |
 | `logging.keep_files` | 否 | 默认保留 30 个滚动日志文件，`0` 表示不清理 |
 | `logging.serial_frame_logs` | 否 | 默认关闭，高频原始帧日志只在定位串口问题时打开 |
+| `logging.http_push.enabled` | 否 | 默认关闭；启用后由独立线程通过 HTTP 批量推送，本地滚动日志仍保留 |
+| `logging.http_push.source_id` | 启用时必填 | 必须与管理程序“下级 OPC”中配置的稳定来源 ID 完全一致 |
+| `logging.http_push.url` | 启用时必填 | 管理端固定接收路径 `/api/v1/lower-ingest/logs`；当前内网实现使用 `http://` |
+
+管理端不可达不会暂停采集。待推送日志进入有界磁盘补发文件，按 1–30 秒指数退避；恢复后按 `boot_id + sequence` 自动补发和去重。管理 Web 的“下级日志”显示集中日志；下级本地日志仍是完整原始记录，并可通过“下级 OPC → 运维 → 日志”远程读取。也可用环境变量 `RCD_LOG_PUSH_URL` 和 `RCD_LOG_PUSH_SOURCE_ID` 临时覆盖 URL 与来源 ID。
 
 ---
 

@@ -934,6 +934,7 @@ func (r *Runtime) Health(ctx context.Context) api.HealthStatus {
 	auditError := r.auditPersistError
 	statusError := r.statusPersistError
 	stationError := r.stationPersistError
+	lowerLogError := r.lowerLogPersistError
 	upstreamError := r.upstreamReconcileError
 	r.mu.RUnlock()
 	if catalogError == "" {
@@ -966,7 +967,12 @@ func (r *Runtime) Health(ctx context.Context) api.HealthStatus {
 	} else {
 		checks["station_version_persistence"] = stationError
 	}
-	ok := err == nil && catalogError == "" && commandError == "" && auditError == "" && statusError == "" && stationError == "" && upstreamError == ""
+	if lowerLogError == "" {
+		checks["central_lower_log_persistence"] = "ok"
+	} else {
+		checks["central_lower_log_persistence"] = lowerLogError
+	}
+	ok := err == nil && catalogError == "" && commandError == "" && auditError == "" && statusError == "" && stationError == "" && lowerLogError == "" && upstreamError == ""
 	return api.HealthStatus{OK: ok, Status: ternary(ok, "ok", "unhealthy"), Checks: checks, Time: time.Now().UTC()}
 }
 

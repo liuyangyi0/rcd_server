@@ -745,6 +745,28 @@ i { font-style: normal; }
 .operations-log-text { height: min(440px, 55vh); margin: 0; padding: 14px; border: 1px solid var(--border); overflow: auto; color: #172a43; background: #fff; font: 12px/1.7 Consolas, "Cascadia Mono", monospace; white-space: pre; tab-size: 4; }
 .operations-log-text:focus { outline: 2px solid #9bc5ff; outline-offset: 1px; }
 .operations-log-pagination { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+.lower-log-status { min-height: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0; margin: 14px 0; padding: 0; overflow: hidden; }
+.lower-log-status > div { min-height: 88px; padding: 15px 17px; border-right: 1px solid var(--border); display: flex; flex-direction: column; justify-content: center; gap: 5px; }
+.lower-log-status > div:last-child { border-right: 0; }
+.lower-log-status span { color: var(--muted); font-size: 11px; }
+.lower-log-status strong { color: var(--ink); font-size: 19px; line-height: 1.2; }
+.lower-log-status small { color: var(--muted); overflow-wrap: anywhere; }
+.lower-log-filters { align-items: flex-end; flex-wrap: wrap; }
+.lower-log-filters .search-field { flex: 1 1 300px; }
+.lower-log-filters .field input { width: 150px; }
+.lower-log-table tbody tr { content-visibility: auto; contain-intrinsic-size: 52px; }
+.lower-log-table td { vertical-align: top; }
+.lower-log-table td:first-child { white-space: nowrap; }
+.lower-log-table code { font-size: 11px; overflow-wrap: anywhere; }
+.lower-log-message { min-width: 320px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.lower-log-message > span, .lower-log-message > code { display: block; }
+.lower-log-message > code { margin-top: 5px; color: var(--muted); }
+.log-level { display: inline-flex; min-width: 48px; justify-content: center; padding: 3px 7px; border-radius: 3px; font: 700 10px/1.2 Consolas, monospace; letter-spacing: .04em; color: #42526a; background: #e8edf3; }
+.log-warn { color: #855900; background: #fff1c2; }
+.log-error { color: #a61b1b; background: #ffe0e0; }
+.log-debug, .log-trace { color: #54657a; background: #edf1f5; }
+@media (max-width: 900px) { .lower-log-status { grid-template-columns: repeat(2, minmax(0, 1fr)); } .lower-log-status > div:nth-child(2) { border-right: 0; } .lower-log-status > div:nth-child(-n+2) { border-bottom: 1px solid var(--border); } }
+@media (max-width: 560px) { .lower-log-status { grid-template-columns: 1fr; } .lower-log-status > div { border-right: 0; border-bottom: 1px solid var(--border); } .lower-log-status > div:last-child { border-bottom: 0; } }
 .operations-process-card { min-width: 0; padding: 15px; margin: 14px 0; background: #fff; border: 1px solid var(--border); }
 .operations-process-confirm { min-width: 0; overflow-wrap: anywhere; }
 .operations-process-card h3 { margin: 0; color: var(--navy); font-size: 14px; }

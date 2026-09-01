@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	"rcd_manager/internal/api"
 	"rcd_manager/internal/domain"
+	"rcd_manager/internal/lowerlogs"
 	"rcd_manager/internal/opc"
 	"rcd_manager/internal/store"
 )
@@ -86,6 +88,7 @@ type Runtime struct {
 	statusPersistMu         sync.Mutex
 	statusRetryMu           sync.Mutex
 	stationCacheMu          sync.Mutex
+	lowerLogMu              sync.Mutex
 	mu                      sync.RWMutex
 	catalogs                map[string]domain.SourceCatalog
 	index                   *catalogIndex
@@ -103,6 +106,7 @@ type Runtime struct {
 	stationRefreshDirty     map[string]bool
 	stationFeatureEpoch     map[string]uint64
 	stationFeatureSupported map[string]bool
+	lowerLogs               *lowerlogs.Store
 	quarantinedSources      map[string]string
 	pendingCommandMeta      map[string]pendingCommandMeta
 	ackSequences            map[string]uint64
@@ -113,6 +117,7 @@ type Runtime struct {
 	auditPersistError       string
 	statusPersistError      string
 	stationPersistError     string
+	lowerLogPersistError    string
 	upstreamReconcileError  string
 	upstreamReconcileDirty  bool
 	conflictCount           int
@@ -283,6 +288,13 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 		snapshot.Cached = true
 		stationVersions[source.ID] = snapshot
 	}
+	var centralLogs *lowerlogs.Store
+	if strings.TrimSpace(options.LogDir) != "" {
+		centralLogs, err = lowerlogs.Open(filepath.Join(options.LogDir, "lower-sources"))
+		if err != nil {
+			return nil, fmt.Errorf("open central lower log store: %w", err)
+		}
+	}
 	runtime := &Runtime{
 		repo: repo, routes: routes, broker: api.NewBroker(), cache: newSampleCache(), options: options,
 		catalogs: catalogs, index: index, statuses: make(map[string]opc.LowerStatus),
@@ -293,6 +305,7 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 		stationVersions:    stationVersions, stationVersionEpoch: make(map[string]uint64),
 		stationRefreshPending: make(map[string]bool), stationRefreshDirty: make(map[string]bool),
 		stationFeatureEpoch: make(map[string]uint64), stationFeatureSupported: make(map[string]bool),
+		lowerLogs:           centralLogs,
 		quarantinedSources:  quarantinedSources,
 		pendingCommandMeta:  make(map[string]pendingCommandMeta),
 		ackSequences:        make(map[string]uint64),

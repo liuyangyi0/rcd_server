@@ -12,6 +12,8 @@ use flexi_logger::{
 };
 use serde::Deserialize;
 
+use crate::log_push::{HttpLogPushConfig, HttpLogPushGuard, HttpLogSink};
+
 const DEFAULT_LOG_SPEC: &str = "warn,rcd_server=info";
 const DEFAULT_LOG_BASENAME: &str = "rcd_server";
 const SERIAL_FRAME_LOG_ENV: &str = "RCD_LOG_SERIAL_FRAMES";
@@ -55,6 +57,8 @@ pub struct LoggingConfig {
     pub serial_frame_logs: bool,
     /// 是否保留 OPC UA 客户端断开连接类传输错误。
     pub opcua_transport_errors: bool,
+    /// 可选的管理端 HTTP 批量日志推送；默认关闭。
+    pub http_push: HttpLogPushConfig,
 }
 
 impl Default for LoggingConfig {
@@ -70,6 +74,7 @@ impl Default for LoggingConfig {
             write_mode: "buffer_and_flush".to_string(),
             serial_frame_logs: false,
             opcua_transport_errors: false,
+            http_push: HttpLogPushConfig::default(),
         }
     }
 }
@@ -84,14 +89,14 @@ struct LoggingFileConfig {
 ///
 /// 默认读取可执行文件同级 `config/config.toml` 的 `[logging]` 段。
 /// `RUST_LOG` 会覆盖 `logging.level`，便于现场临时调整模块级别。
-pub fn init() -> Option<LoggerHandle> {
+pub fn init() -> LoggingRuntime {
     init_with_config(load_config_from_file().unwrap_or_else(|e| {
         eprintln!("读取日志配置失败，使用默认日志配置: {e}");
         LoggingConfig::default()
     }))
 }
 
-pub fn init_with_config(config: LoggingConfig) -> Option<LoggerHandle> {
+pub fn init_with_config(config: LoggingConfig) -> LoggingRuntime {
     SERIAL_FRAME_LOGS_ENABLED.store(config.serial_frame_logs, Ordering::Relaxed);
     OPCUA_TRANSPORT_ERRORS_ENABLED.store(config.opcua_transport_errors, Ordering::Relaxed);
 
@@ -99,7 +104,23 @@ pub fn init_with_config(config: LoggingConfig) -> Option<LoggerHandle> {
         Ok(dir) => dir,
         Err(e) => {
             eprintln!("获取日志目录失败，将只输出到控制台: {e}");
-            return init_console_logger();
+            return LoggingRuntime {
+                logger: init_console_logger(None),
+                push: None,
+            };
+        }
+    };
+
+    let (push_sink, push_guard) = match HttpLogPushGuard::start(config.http_push.clone(), &log_dir)
+    {
+        Ok((sink, guard)) => {
+            eprintln!("HTTP 日志批量推送已启用，串口采集不会等待网络发送");
+            (Some(sink), Some(guard))
+        }
+        Err(reason) if reason == "disabled" => (None, None),
+        Err(reason) => {
+            eprintln!("HTTP 日志推送配置无效，继续使用本地滚动日志: {reason}");
+            (None, None)
         }
     };
 
@@ -120,14 +141,40 @@ pub fn init_with_config(config: LoggingConfig) -> Option<LoggerHandle> {
                     .duplicate_to_stderr(duplicate),
                 &config,
             );
-            with_opcua_transport_filter(logger)
+            with_log_filter(logger, push_sink.clone())
         })
         .and_then(|logger| logger.start())
     {
-        Ok(handle) => Some(handle),
+        Ok(handle) => LoggingRuntime {
+            logger: Some(handle),
+            push: push_guard,
+        },
         Err(e) => {
             eprintln!("初始化文件日志失败，将只输出到控制台: {e}");
-            init_console_logger()
+            LoggingRuntime {
+                logger: init_console_logger(push_sink),
+                push: push_guard,
+            }
+        }
+    }
+}
+
+/// Keeps the file writer and HTTP worker alive for the entire process. On
+/// shutdown the local logger is flushed first, then the HTTP worker persists
+/// any unsent events to its bounded spool.
+pub struct LoggingRuntime {
+    logger: Option<LoggerHandle>,
+    push: Option<HttpLogPushGuard>,
+}
+
+impl Drop for LoggingRuntime {
+    fn drop(&mut self) {
+        if let Some(logger) = self.logger.take() {
+            logger.flush();
+            logger.shutdown();
+        }
+        if let Some(mut push) = self.push.take() {
+            push.shutdown();
         }
     }
 }
@@ -161,10 +208,10 @@ pub fn write_startup_failure(message: &str) {
     }
 }
 
-fn init_console_logger() -> Option<LoggerHandle> {
+fn init_console_logger(push: Option<HttpLogSink>) -> Option<LoggerHandle> {
     // 不再读取配置或 RUST_LOG，确保正是这些值格式错误时仍能保留诊断日志。
     match Logger::try_with_str("warn")
-        .map(|logger| with_opcua_transport_filter(logger.log_to_stderr().format(log_format)))
+        .map(|logger| with_log_filter(logger.log_to_stderr().format(log_format), push))
         .and_then(|logger| logger.start())
     {
         Ok(handle) => Some(handle),
@@ -324,12 +371,11 @@ fn parse_bool_flag(value: &str) -> Option<bool> {
     }
 }
 
-fn with_opcua_transport_filter(logger: Logger) -> Logger {
-    if opcua_transport_errors_enabled() {
-        logger
-    } else {
-        logger.filter(Box::new(OpcuaTransportDisconnectFilter))
-    }
+fn with_log_filter(logger: Logger, push: Option<HttpLogSink>) -> Logger {
+    logger.filter(Box::new(CombinedLogFilter {
+        suppress_opcua_transport: !opcua_transport_errors_enabled(),
+        push,
+    }))
 }
 
 fn opcua_transport_errors_enabled() -> bool {
@@ -337,24 +383,32 @@ fn opcua_transport_errors_enabled() -> bool {
         .unwrap_or_else(|| OPCUA_TRANSPORT_ERRORS_ENABLED.load(Ordering::Relaxed))
 }
 
-struct OpcuaTransportDisconnectFilter;
+struct CombinedLogFilter {
+    suppress_opcua_transport: bool,
+    push: Option<HttpLogSink>,
+}
 
-impl LogLineFilter for OpcuaTransportDisconnectFilter {
+impl LogLineFilter for CombinedLogFilter {
     fn write(
         &self,
         now: &mut DeferredNow,
         record: &Record,
         log_line_writer: &dyn LogLineWriter,
     ) -> std::io::Result<()> {
-        if !is_async_opcua_transport_target(record.target()) {
-            return log_line_writer.write(now, record);
+        if self.suppress_opcua_transport && is_async_opcua_transport_target(record.target()) {
+            let message = record.args().to_string();
+            if should_suppress_opcua_transport_log(record.target(), &message, false) {
+                return Ok(());
+            }
         }
-        let message = record.args().to_string();
-        if should_suppress_opcua_transport_log(record.target(), &message, false) {
-            Ok(())
-        } else {
-            log_line_writer.write(now, record)
+        if let Some(push) = &self.push {
+            // The worker never writes through `log`, but keep this guard so a
+            // later diagnostic cannot accidentally create a feedback loop.
+            if record.target() != "rcd_server::log_push" {
+                push.enqueue(record);
+            }
         }
+        log_line_writer.write(now, record)
     }
 }
 

@@ -67,6 +67,7 @@ func (h *Handler) routes() {
 	h.lowerOperationRoutes()
 	h.deviceVersionRoutes()
 	h.processControlRoutes()
+	h.lowerLogRoutes()
 
 	h.mux.HandleFunc("GET /api/v1/sessions", h.listSessions)
 	h.mux.HandleFunc("PUT /api/v1/sessions/{session}/groups/{group}/selection", h.setSessionSelection)

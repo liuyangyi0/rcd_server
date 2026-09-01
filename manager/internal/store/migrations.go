@@ -190,6 +190,14 @@ var migrations = []string{
 		PRIMARY KEY(source_id, topology_fingerprint, port_id, device_id)
 	);
 	CREATE INDEX station_version_cache_source_idx ON station_version_cache(source_id, topology_fingerprint, port_id, device_id);`,
+	`CREATE TABLE lower_log_ingest_cursor (
+		source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+		boot_id TEXT NOT NULL,
+		accepted_through INTEGER NOT NULL DEFAULT 0 CHECK(accepted_through >= 0),
+		updated_at TEXT NOT NULL,
+		PRIMARY KEY(source_id, boot_id)
+	);
+	CREATE INDEX lower_log_ingest_updated_idx ON lower_log_ingest_cursor(source_id, updated_at DESC);`,
 }
 
 func migrate(ctx context.Context, db *sql.DB) error {

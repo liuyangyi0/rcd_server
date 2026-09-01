@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
-import { Bell, Boxes, ChevronLeft, ClipboardList, Cpu, DatabaseZap, Gauge, Menu, ServerCog, Settings, Tags, TriangleAlert, X } from 'lucide-react';
+import { Bell, Boxes, ChevronLeft, ClipboardList, Cpu, DatabaseZap, Gauge, Menu, ScrollText, ServerCog, Settings, Tags, TriangleAlert, X } from 'lucide-react';
 import { useOverview } from '../api/queries';
 import { useEventStream } from '../hooks/useEventStream';
 import { formatNumber } from '../lib/format';
@@ -15,6 +15,7 @@ const NAV_SECTIONS = [
     { to: '/points', label: '点位浏览', icon: Tags },
     { to: '/device-versions', label: '设备版本', icon: Cpu },
     { to: '/commands', label: '命令记录', icon: ClipboardList },
+    { to: '/lower-logs', label: '下级日志', icon: ScrollText },
   ] },
   { label: '维护', items: [
     { to: '/operations', label: '告警与审计', icon: TriangleAlert },
