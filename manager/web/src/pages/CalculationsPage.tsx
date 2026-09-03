@@ -21,6 +21,7 @@ import { EmptyState, ErrorState, LoadingState } from '../components/PageState';
 import { PageHeader } from '../components/PageHeader';
 import { Pagination } from '../components/Pagination';
 import { formatDateTime, formatNumber } from '../lib/format';
+import { statusCodeHex, statusCodeLabel } from '../lib/labels';
 
 const CalculationEditor = lazy(() => import('../features/calculations/CalculationEditor'));
 const PAGE_SIZE = 50;
@@ -96,7 +97,7 @@ function ResultsTab() {
     </form>
     <section className="table-panel content-panel">
       {results.error ? <ErrorState error={results.error} onRetry={() => void results.refetch()} /> : results.isPending && !results.data ? <LoadingState label="正在读取中央计算结果…" /> : !results.data?.items.length ? <EmptyState title="暂无中央计算结果" description="导入并激活 calc.toml 后，计算结果会显示在这里。" /> : <>
-        <div className={`table-scroll${results.isFetching ? ' is-refreshing' : ''}`}><table className="data-table calculation-results-table"><thead><tr><th>KKS</th><th>表达式</th><th>当前值</th><th>类型</th><th>质量</th><th>求值时间</th><th>依赖</th><th>默认路由版本</th></tr></thead><tbody>{results.data.items.map((item) => <tr className="virtual-row" key={item.nodeId}><td><strong>{item.nodeId}</strong>{item.error ? <span className="sub-cell text-bad">{item.error}</span> : null}</td><td><code className="calculation-expression">{item.expression}</code></td><td>{formatValue(item.value)}</td><td>{item.dataType}</td><td><Quality code={item.statusCode} /></td><td>{formatDateTime(item.evaluatedAt)}{item.sourceTimestamp ? <span className="sub-cell">源：{formatDateTime(item.sourceTimestamp)}</span> : null}</td><td>{item.dependencyCount}</td><td>{item.defaultRouteRevision}</td></tr>)}</tbody></table></div>
+        <div className={`table-scroll${results.isFetching ? ' is-refreshing' : ''}`}><table className="data-table calculation-results-table"><thead><tr><th>KKS</th><th>表达式</th><th>当前值</th><th>类型</th><th>质量</th><th>求值时间</th><th>依赖</th><th>默认路由版本</th></tr></thead><tbody>{results.data.items.map((item) => <tr className="virtual-row" key={item.nodeId}><td><strong>{item.nodeId}</strong>{item.error ? <span className="sub-cell text-bad">{item.error}</span> : null}</td><td><code className="calculation-expression">{item.expression}</code></td><td><CalculationValue value={item.value} code={item.statusCode} /></td><td>{item.dataType}</td><td><Quality code={item.statusCode} /></td><td>{formatDateTime(item.evaluatedAt)}{item.sourceTimestamp ? <span className="sub-cell">源：{formatDateTime(item.sourceTimestamp)}</span> : null}</td><td>{item.dependencyCount}</td><td>{item.defaultRouteRevision}</td></tr>)}</tbody></table></div>
         <Pagination page={results.data.page} pageSize={results.data.pageSize} total={results.data.total} onPageChange={(next) => update({ page: next })} />
       </>}
     </section>
@@ -235,8 +236,14 @@ function LowerModesTab({ centralHash }: { centralHash: string }) {
 }
 
 function Quality({ code }: { code: number }) {
-  const good = (code & 0xc0000000) === 0;
-  return <span className={good ? 'text-good' : 'text-bad'}>{good ? 'Good' : `0x${(code >>> 0).toString(16).padStart(8, '0').toUpperCase()}`}</span>;
+  const severity = ((code >>> 0) & 0xc0000000) >>> 0;
+  const encoded = code === 0 ? 'Good' : statusCodeHex(code);
+  return <span className={severity === 0 ? 'text-good' : severity === 0x40000000 ? 'text-warning' : 'text-bad'}>{statusCodeLabel(encoded)}</span>;
+}
+
+function CalculationValue({ value, code }: { value: unknown; code: number }) {
+  const bad = (((code >>> 0) & 0xc0000000) >>> 0) === 0x80000000;
+  return <>{formatValue(value)}{bad ? <span className="sub-cell text-bad">坏质量，已清零</span> : null}</>;
 }
 
 function parseTab(value: string | null): Tab { return value === 'config' || value === 'versions' || value === 'lowers' ? value : 'results'; }

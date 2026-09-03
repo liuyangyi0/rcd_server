@@ -301,12 +301,12 @@ func TestRuntimeWritePinsRouteAndLocksGroupUntilAck(t *testing.T) {
 		t.Fatalf("selection during pending command error = %v", err)
 	}
 	runtime.OnSample("source-a", testKey("COM1_Send"), domain.Sample{Type: domain.DataTypeString, Value: "2", StatusCode: domain.StatusGood, Epoch: 1})
-	runtime.OnSample("source-a", testKey("COM1_Send"), domain.Sample{Type: domain.DataTypeString, Value: "1", StatusCode: domain.StatusGood, Epoch: 1})
+	runtime.OnSample("source-a", testKey("COM1_Send"), domain.Sample{Type: domain.DataTypeString, Value: "1", StatusCode: domain.StatusCode(0x00000080), Epoch: 1})
 	if _, err := runtime.selectSource("session", "line", "source-b", 1, "test"); err != nil {
 		t.Fatalf("selection after ACK: %v", err)
 	}
 	commands, total, err := runtime.repo.ListCommands(context.Background(), 10, 0)
-	if err != nil || total != 1 || commands[0].State != domain.CommandReceived || commands[0].SourceID != "source-a" {
+	if err != nil || total != 1 || commands[0].State != domain.CommandReceived || commands[0].SourceID != "source-a" || commands[0].StatusCode != domain.StatusGood {
 		t.Fatalf("command audit total=%d commands=%#v err=%v", total, commands, err)
 	}
 }

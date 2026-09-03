@@ -186,6 +186,15 @@ func TestLiveManagerCentralCalculations(t *testing.T) {
 	if response.Results[valueIndex].Status == gu.StatusBadNodeIDUnknown || response.Results[valueIndex].Value == nil {
 		t.Fatalf("exact calculation node read=%#v", response.Results[valueIndex])
 	}
+	if os.Getenv("RCD_MANAGER_CALC_EXPECT_BAD_ZERO") != "" {
+		calculationValue := response.Results[valueIndex]
+		if !domain.StatusCode(calculationValue.Status).IsBad() {
+			t.Fatalf("calculation status=%s, want Bad quality", calculationValue.Status)
+		}
+		if !liveCalculationValueIsZero(calculationValue.Value.Value()) {
+			t.Fatalf("Bad calculation value=%#v, want typed zero", calculationValue.Value.Value())
+		}
+	}
 	browseValue := response.Results[valueIndex+1].Value.Value()
 	browseName := ""
 	switch value := browseValue.(type) {
@@ -234,6 +243,21 @@ func TestLiveManagerCentralCalculations(t *testing.T) {
 	}
 	t.Logf("central calculations via %s: revision=%d rules=%d good=%d bad=%d node=%q status=%s",
 		selectedURL, activeRevision, ruleCount, goodCount, badCount, calculationNode, notificationStatus)
+}
+
+func liveCalculationValueIsZero(value any) bool {
+	switch value := value.(type) {
+	case bool:
+		return !value
+	case uint32:
+		return value == 0
+	case float32:
+		return value == 0
+	case float64:
+		return value == 0
+	default:
+		return false
+	}
 }
 
 // TestLiveManagerRustInterop exercises the business namespace through a live

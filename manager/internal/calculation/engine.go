@@ -375,12 +375,20 @@ func (r *Runner) evaluate(affected []bool, configRevision, routeRevision uint64)
 			} else {
 				errorText = "expression produced NaN or Infinity"
 			}
-			// Runtime failures use the rule default but retain the latest source
-			// timestamp from every input that was actually evaluated.
+			// Retain the configured fallback while classifying the evaluation
+			// failure; the Bad-quality publication policy below then clears the
+			// externally visible value without losing the actual-path timestamp.
 			value.value = floatValue(rule.DefaultValue)
 			value.status = domain.StatusBadConfigurationError
 		}
 		typed := convertOutput(value.value, rule)
+		// A calculated value with Bad quality must not expose a stale or
+		// fallback number as if it were usable process data. Keep the Bad
+		// StatusCode and timestamps for diagnostics, but publish the zero value
+		// for the rule's declared type to REST, Web, OPC, and downstream rules.
+		if value.status.IsBad() {
+			typed = typedZero(rule.DataType)
+		}
 		result := Result{NodeID: rule.Output, DataType: rule.DataType, Expression: rule.Expression, Value: typed, StatusCode: value.status,
 			SourceTimestamp: value.sourceTimestamp, EvaluatedAt: now, Error: errorText, DependencyCount: len(rule.variables), ConfigRevision: configRevision, DefaultRouteRevision: routeRevision}
 		previous := r.results[index]

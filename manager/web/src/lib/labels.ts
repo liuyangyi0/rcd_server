@@ -3,12 +3,13 @@ const STATE_LABELS: Record<string, string> = {
   active: '已激活', inactive: '未激活', creating: '创建中',
   running: '运行中', stopped: '已停止', closed: '已关闭', enabled: '已启用', disabled: '已停用', unknown: '未知',
   ready: '就绪', cached: '缓存目录', discovering: '发现中', catalogconflict: '目录冲突',
-  waiting: '等待响应', received: '已接收', failed: '失败', timedout: '超时',
+  waiting: '等待响应', received: '成功', failed: '失败', timedout: '超时',
   open: '未恢复', resolved: '已恢复', warning: '警告', critical: '严重',
 };
 
 const STATUS_LABELS: Record<string, string> = {
   Good: '正常',
+  BadUnexpectedError: '执行失败',
   BadNoCommunication: '通信中断',
   BadWaitingForInitialData: '等待首值',
   BadConfigurationError: '配置错误',
@@ -16,6 +17,17 @@ const STATUS_LABELS: Record<string, string> = {
   BadWaitingForResponse: '等待命令响应',
   BadTimeout: '超时',
 };
+
+const STATUS_NAMES_BY_BASE = new Map<number, string>([
+  [0x00000000, 'Good'],
+  [0x80010000, 'BadUnexpectedError'],
+  [0x80310000, 'BadNoCommunication'],
+  [0x80320000, 'BadWaitingForInitialData'],
+  [0x80890000, 'BadConfigurationError'],
+  [0x808d0000, 'BadOutOfService'],
+  [0x80b20000, 'BadWaitingForResponse'],
+  [0x800a0000, 'BadTimeout'],
+]);
 
 const KIND_LABELS: Record<string, string> = {
   connection: '连接状态', session: '下级会话', subscription: '订阅状态', catalog: '目录状态', error: '错误信息',
@@ -39,7 +51,22 @@ export function stateLabel(value: string): string {
 }
 
 export function statusCodeLabel(value: string): string {
-  return STATUS_LABELS[value] ? `${STATUS_LABELS[value]}（${value}）` : value;
+  if (STATUS_LABELS[value]) return `${STATUS_LABELS[value]}（${value}）`;
+  if (!/^0x[0-9a-f]{8}$/i.test(value)) return value;
+
+  const code = Number.parseInt(value.slice(2), 16) >>> 0;
+  const base = (code & 0xffff0000) >>> 0;
+  const name = STATUS_NAMES_BY_BASE.get(base);
+  const severity = (code & 0xc0000000) >>> 0;
+  const severityName = severity === 0 ? 'Good' : severity === 0x40000000 ? 'Uncertain' : severity === 0x80000000 ? 'Bad' : '保留状态';
+  const label = name ? STATUS_LABELS[name] : severity === 0 ? '正常' : severity === 0x40000000 ? '质量不确定' : '异常';
+  const detail = [name ?? severityName];
+  if ((code & 0x80) !== 0) detail.push('通知队列溢出');
+  return `${label}（${detail.join('，')} · ${statusCodeHex(code)}）`;
+}
+
+export function statusCodeHex(value: number): string {
+  return `0x${(value >>> 0).toString(16).padStart(8, '0').toUpperCase()}`;
 }
 
 export function kindLabel(value: string): string {

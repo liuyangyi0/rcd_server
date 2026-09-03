@@ -95,8 +95,8 @@ expression = "KKS001 * 2"
 		Session: opc.SessionInactive, Subscription: opc.SubscriptionInactive, Catalog: domain.CatalogReady, Epoch: 1})
 	runtime.runCalculationBatch()
 	got := runtime.ReadSample("selected-session", testKey("CENTRAL"))
-	if got.Value != 50.0 || got.StatusCode != domain.StatusBadNoCommunication || !got.SourceTimestamp.Equal(secondAt) {
-		t.Fatalf("offline default source did not retain value/quality: %#v", got)
+	if got.Value != 0.0 || got.StatusCode != domain.StatusBadNoCommunication || !got.SourceTimestamp.Equal(secondAt) {
+		t.Fatalf("offline default source did not clear the Bad calculation value: %#v", got)
 	}
 }
 

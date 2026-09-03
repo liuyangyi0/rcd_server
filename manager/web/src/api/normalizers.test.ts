@@ -81,6 +81,11 @@ describe('API normalizers', () => {
 		expect(command.statusCode).toBe('BadTimeout');
 	});
 
+	it('preserves a Good status with lower notification overflow information', () => {
+		const command = normalizeCommand({ state: 'Received', status_code: 0x00000080 });
+		expect(command.statusCode).toBe('0x00000080');
+	});
+
   it('converts limit and offset into a UI page', () => {
     const result = normalizePage({ items: [{ id: 1 }], total: 101, limit: 50, offset: 100 }, (item) => item);
     expect(result.page).toBe(3);

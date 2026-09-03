@@ -38,3 +38,12 @@ export function isBadStatus(code: string): boolean {
   }
   return false;
 }
+
+export function isGoodStatus(code: string): boolean {
+  const normalized = code.trim().toLowerCase();
+  if (normalized === 'good' || normalized.startsWith('good')) return true;
+  if (/^0x[0-9a-f]{8}$/.test(normalized)) {
+    return (Number.parseInt(normalized.slice(2), 16) & 0xc0000000) === 0;
+  }
+  return false;
+}

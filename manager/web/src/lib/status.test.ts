@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Source } from '../api/types';
-import { isActiveState, isBadStatus, sourceHealth } from './status';
+import { isActiveState, isBadStatus, isGoodStatus, sourceHealth } from './status';
 
 const source = (overrides: Partial<Source> = {}): Source => ({
   id: 'source-a', name: 'source-a', groupId: 'group-a', endpoint: 'opc.tcp://127.0.0.1:4840',
@@ -31,5 +31,13 @@ describe('source status', () => {
     expect(isBadStatus('0x40000000')).toBe(true);
     expect(isBadStatus('0x40920000')).toBe(true);
     expect(isBadStatus('0x00000000')).toBe(false);
+  });
+
+  it('classifies Good status information bits by severity instead of exact equality', () => {
+    expect(isGoodStatus('Good')).toBe(true);
+    expect(isGoodStatus('0x00000080')).toBe(true);
+    expect(isGoodStatus('0x00000480')).toBe(true);
+    expect(isGoodStatus('0x40000000')).toBe(false);
+    expect(isGoodStatus('BadNoCommunication')).toBe(false);
   });
 });

@@ -341,9 +341,7 @@ func (r *Runtime) activateCalculationConfigLocked(ctx context.Context, config ca
 			}
 			result := oldResults[node.Key.Identifier]
 			result.NodeID, result.DataType = node.Key.Identifier, node.DataType
-			if result.Value == nil {
-				result.Value = zeroValue(node.DataType, -1)
-			}
+			result.Value = zeroValue(node.DataType, -1)
 			result.StatusCode = domain.StatusBadOutOfService
 			result.EvaluatedAt = now
 			result.Error = "calculation output removed by active configuration"
@@ -358,6 +356,7 @@ func (r *Runtime) activateCalculationConfigLocked(ctx context.Context, config ca
 	r.calculationResults = make(map[string]calculation.Result, plan.RuleCount())
 	for id, value := range oldRetiredResults {
 		if _, active := newOutputs[id]; !active {
+			value.Value = zeroValue(value.DataType, -1)
 			retired[id] = value
 		}
 	}

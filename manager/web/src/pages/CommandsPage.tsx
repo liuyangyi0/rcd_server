@@ -9,6 +9,7 @@ import { Pagination } from '../components/Pagination';
 import { formatDateTime, shortSessionId } from '../lib/format';
 import { stateLabel, statusCodeLabel } from '../lib/labels';
 import { sourceHasGroup } from '../lib/sourceGroups';
+import { isGoodStatus } from '../lib/status';
 
 const PAGE_SIZE = 50;
 
@@ -43,7 +44,7 @@ export default function CommandsPage() {
         <label className="search-field"><Search aria-hidden="true" size={17} /><input value={draft} placeholder="搜索命令、来源、端口或 Session" onChange={(event) => setDraft(event.target.value)} /><button type="submit">搜索</button></label>
         <label className="field inline-field"><span>分组</span><select value={groupId} onChange={(event) => update({ group: event.target.value, source: '', page: 1 })}><option value="">全部分组</option>{(groups.data ?? []).map((group) => <option key={group.id} value={group.id}>{group.name || group.id}</option>)}</select></label>
         <label className="field inline-field"><span>来源</span><select value={sourceId} onChange={(event) => update({ source: event.target.value, page: 1 })}><option value="">全部来源</option>{groupSources.map((source) => <option key={source.id} value={source.id}>{source.name || source.id}</option>)}</select></label>
-        <label className="field inline-field"><span>结果</span><select value={status} onChange={(event) => update({ status: event.target.value, page: 1 })}><option value="">全部结果</option><option value="Waiting">等待响应</option><option value="Received">已接收</option><option value="Failed">失败</option><option value="TimedOut">超时</option></select></label>
+        <label className="field inline-field"><span>结果</span><select value={status} onChange={(event) => update({ status: event.target.value, page: 1 })}><option value="">全部结果</option><option value="Waiting">等待响应</option><option value="Received">成功</option><option value="Failed">失败</option><option value="TimedOut">超时</option></select></label>
         <button className="button button-secondary" type="button" onClick={() => void commandsQuery.refetch()}><RefreshCw aria-hidden="true" size={16} />刷新</button>
       </form>
       <section className="table-panel content-panel">
@@ -63,7 +64,7 @@ export default function CommandsPage() {
                       <td>{formatDateTime(command.createdAt)}</td><td><strong>{command.operation}</strong><span className="sub-cell">{command.id}</span></td>
                       <td>{command.groupId}<span className="sub-cell">{command.sourceId}</span></td><td>{command.port}</td><td>{command.sessionId ? shortSessionId(command.sessionId) : '—'}</td>
                       <td className={succeeded ? 'text-good' : waiting ? 'text-warning' : 'text-bad'}>{stateLabel(command.result)}</td>
-                      <td className={command.statusCode && command.statusCode !== 'Good' ? 'text-bad' : ''}>{command.statusCode ? statusCodeLabel(command.statusCode) : '—'}<span className="sub-cell">{command.durationMs !== undefined ? `${command.durationMs} ms` : '—'}</span></td><td className="message-cell text-bad">{command.error ?? '—'}</td>
+                      <td className={command.statusCode ? isGoodStatus(command.statusCode) ? 'text-good' : waiting ? 'text-warning' : 'text-bad' : ''}>{command.statusCode ? statusCodeLabel(command.statusCode) : '—'}<span className="sub-cell">{command.durationMs !== undefined ? `${command.durationMs} ms` : '—'}</span></td><td className="message-cell text-bad">{command.error ?? '—'}</td>
                     </tr>
                   );
                 })}</tbody>

@@ -428,7 +428,11 @@ func (r *Runtime) completeCommandFromAck(sourceID, port string, sample domain.Sa
 	// 250 ms sampling window. QueueSize=1 then exposes only the terminal 1.
 	// Exact source, epoch and a sequence newer than the pre-dispatch baseline
 	// already reject retained/late ACKs, so observing 2 is useful but optional.
-	terminal := pendingCommandTerminal{state: domain.CommandReceived, status: sample.StatusCode}
+	// The ACK DataValue can carry lower-server notification information bits
+	// (notably 0x80 when Waiting and Received share one publish interval).
+	// Those bits describe the monitored-item queue, not the command outcome.
+	// Persist a canonical Good status for a successful terminal ACK.
+	terminal := pendingCommandTerminal{state: domain.CommandReceived, status: domain.StatusGood}
 	if ack == "3" {
 		terminal = pendingCommandTerminal{state: domain.CommandFailed, status: domain.StatusBadUnexpectedError, message: "lower source rejected command"}
 	}
