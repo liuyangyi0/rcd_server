@@ -2,6 +2,7 @@ package opc
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"reflect"
 	"strconv"
@@ -186,13 +187,27 @@ func TestLiveManagerCentralCalculations(t *testing.T) {
 	if response.Results[valueIndex].Status == gu.StatusBadNodeIDUnknown || response.Results[valueIndex].Value == nil {
 		t.Fatalf("exact calculation node read=%#v", response.Results[valueIndex])
 	}
-	if os.Getenv("RCD_MANAGER_CALC_EXPECT_BAD_ZERO") != "" {
+	if os.Getenv("RCD_MANAGER_CALC_EXPECT_BAD_QUALITY") != "" {
 		calculationValue := response.Results[valueIndex]
 		if !domain.StatusCode(calculationValue.Status).IsBad() {
 			t.Fatalf("calculation status=%s, want Bad quality", calculationValue.Status)
 		}
-		if !liveCalculationValueIsZero(calculationValue.Value.Value()) {
-			t.Fatalf("Bad calculation value=%#v, want typed zero", calculationValue.Value.Value())
+	}
+	if expected := os.Getenv("RCD_MANAGER_CALC_EXPECT_VALUE"); expected != "" {
+		if actual := fmt.Sprint(response.Results[valueIndex].Value.Value()); actual != expected {
+			t.Fatalf("calculation value=%q, want %q", actual, expected)
+		}
+	}
+	if rawNode := os.Getenv("RCD_MANAGER_RAW_ZERO_LIVE_NODE"); rawNode != "" {
+		rawResponse, readErr := client.Read(ctx, &gu.ReadRequest{TimestampsToReturn: gu.TimestampsToReturnBoth, NodesToRead: []*gu.ReadValueID{{
+			NodeID: gu.NewStringNodeID(2, rawNode), AttributeID: gu.AttributeIDValue,
+		}}})
+		if readErr != nil || rawResponse == nil || len(rawResponse.Results) != 1 || rawResponse.Results[0].Value == nil {
+			t.Fatalf("read communication-failed raw node %q: response=%#v err=%v", rawNode, rawResponse, readErr)
+		}
+		rawValue := rawResponse.Results[0]
+		if gu.StatusCode(uint32(rawValue.Status)&0xffff0000) != gu.StatusBadNoCommunication || !liveScalarValueIsZero(rawValue.Value.Value()) {
+			t.Fatalf("raw node %q=%#v/%s, want typed zero/BadNoCommunication", rawNode, rawValue.Value.Value(), rawValue.Status)
 		}
 	}
 	browseValue := response.Results[valueIndex+1].Value.Value()
@@ -241,11 +256,11 @@ func TestLiveManagerCentralCalculations(t *testing.T) {
 	if notificationStatus == gu.StatusBadNodeIDUnknown {
 		t.Fatalf("calculation subscription status=%s", notificationStatus)
 	}
-	t.Logf("central calculations via %s: revision=%d rules=%d good=%d bad=%d node=%q status=%s",
-		selectedURL, activeRevision, ruleCount, goodCount, badCount, calculationNode, notificationStatus)
+	t.Logf("central calculations via %s: revision=%d rules=%d good=%d bad=%d node=%q value=%v status=%s",
+		selectedURL, activeRevision, ruleCount, goodCount, badCount, calculationNode, response.Results[valueIndex].Value.Value(), notificationStatus)
 }
 
-func liveCalculationValueIsZero(value any) bool {
+func liveScalarValueIsZero(value any) bool {
 	switch value := value.(type) {
 	case bool:
 		return !value

@@ -375,20 +375,13 @@ func (r *Runner) evaluate(affected []bool, configRevision, routeRevision uint64)
 			} else {
 				errorText = "expression produced NaN or Infinity"
 			}
-			// Retain the configured fallback while classifying the evaluation
-			// failure; the Bad-quality publication policy below then clears the
-			// externally visible value without losing the actual-path timestamp.
+			// Runtime failures use the configured fallback. The Bad quality remains
+			// attached so consumers cannot mistake that fallback for live process
+			// data.
 			value.value = floatValue(rule.DefaultValue)
 			value.status = domain.StatusBadConfigurationError
 		}
 		typed := convertOutput(value.value, rule)
-		// A calculated value with Bad quality must not expose a stale or
-		// fallback number as if it were usable process data. Keep the Bad
-		// StatusCode and timestamps for diagnostics, but publish the zero value
-		// for the rule's declared type to REST, Web, OPC, and downstream rules.
-		if value.status.IsBad() {
-			typed = typedZero(rule.DataType)
-		}
 		result := Result{NodeID: rule.Output, DataType: rule.DataType, Expression: rule.Expression, Value: typed, StatusCode: value.status,
 			SourceTimestamp: value.sourceTimestamp, EvaluatedAt: now, Error: errorText, DependencyCount: len(rule.variables), ConfigRevision: configRevision, DefaultRouteRevision: routeRevision}
 		previous := r.results[index]
@@ -404,6 +397,13 @@ func (r *Runner) evaluate(affected []bool, configRevision, routeRevision uint64)
 }
 
 func inputOperand(input Input) operand {
+	// A communications failure means the live acquisition value is no longer
+	// available. Evaluate the expression with the declared type's zero value,
+	// while propagating BadNoCommunication through the actual execution path.
+	// Information bits do not change the underlying OPC UA status code.
+	if input.StatusCode.BaseCode() == domain.StatusBadNoCommunication {
+		input.Value = typedZero(input.Type)
+	}
 	return operand{value: domainValue(input.Value), status: input.StatusCode, sourceTimestamp: input.SourceTimestamp}
 }
 func domainValue(value any) evalValue {

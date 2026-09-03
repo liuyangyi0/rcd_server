@@ -752,7 +752,7 @@ func TestLiveDeviceGroupsDisconnectAndRecoverWithoutFailover(t *testing.T) {
 	await(gu.StatusOK, "101")
 	control["b"]["server_mode"] = "stopped"
 	updateControl()
-	await(gu.StatusBadNoCommunication, "101")
+	await(gu.StatusBadNoCommunication, "0")
 	if value := readValue(3, "Groups/device-a/SelectedSourceId"); value.Status != gu.StatusOK || value.Value.Value() != "lower-b" {
 		t.Fatalf("disconnection silently changed route: %#v", value)
 	}
@@ -762,7 +762,7 @@ func TestLiveDeviceGroupsDisconnectAndRecoverWithoutFailover(t *testing.T) {
 	writeSelection("lower-a")
 	await(gu.StatusOK, "11")
 	writeSelection("lower-b")
-	await(gu.StatusBadNoCommunication, "101")
+	await(gu.StatusBadNoCommunication, "0")
 	control["b"]["server_mode"] = "running"
 	control["b"]["values"] = map[string]int{"1": 103, "2": 202}
 	updateControl()
@@ -772,5 +772,5 @@ func TestLiveDeviceGroupsDisconnectAndRecoverWithoutFailover(t *testing.T) {
 	}
 	publishControl(original)
 	await(gu.StatusOK, "101")
-	t.Log("Rust source stopped/restarted: last value retained with BadNoCommunication, offline source selectable, no automatic failover, new epoch samples restored")
+	t.Log("Rust source stopped/restarted: acquisition value cleared with BadNoCommunication, offline source selectable, no automatic failover, new epoch samples restored")
 }

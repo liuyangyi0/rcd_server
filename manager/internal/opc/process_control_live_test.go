@@ -192,11 +192,11 @@ func TestLiveProcessControlPreservesOPCSessionsAndSubscriptions(t *testing.T) {
 		_, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", before.PID))
 		return errors.Is(err, os.ErrNotExist)
 	})
-	processLiveAwaitPoint(t, ctx, first, 101, false)
-	processLiveAwaitNotification(t, ctx, firstNotifications, 101, false, time.Time{})
+	processLiveAwaitPoint(t, ctx, first, 0, false)
+	processLiveAwaitNotification(t, ctx, firstNotifications, 0, false, time.Time{})
 	processLiveAssertOtherSession(t, ctx, second, secondNotifications)
 	processLiveAssertRoutes(t, ctx, apiURL, first, second, firstSession, secondSession)
-	t.Logf("stop B PID=%d: first Session Read/Subscribe preserve value101 with BadNoCommunication; second stays Good11 and selections are unchanged", before.PID)
+	t.Logf("stop B PID=%d: first Session Read/Subscribe publish zero with BadNoCommunication; second stays Good11 and selections are unchanged", before.PID)
 
 	started, startRequest, err := controller.action(ctx, "start")
 	if err != nil {

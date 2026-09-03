@@ -878,11 +878,16 @@ func (r *Runtime) OnLowerStatus(status opc.LowerStatus) {
 func (r *Runtime) onLowerStatus(status opc.LowerStatus, generation uint64) {
 	var refreshGroups []string
 	refreshStationVersions := false
-	if status.Catalog == domain.CatalogConflict {
+	refreshSelectedSource := false
+	catalogStatusConflict := status.Catalog == domain.CatalogConflict
+	if catalogStatusConflict {
 		r.configMu.Lock()
 		defer func() {
 			r.configMu.Unlock()
 			r.queueGroupRefreshes(refreshGroups...)
+			if refreshSelectedSource {
+				r.queueSourceRefreshes(status.SourceID)
+			}
 		}()
 	}
 	now := time.Now().UTC()
@@ -917,6 +922,7 @@ func (r *Runtime) onLowerStatus(status opc.LowerStatus, generation uint64) {
 	refreshStationVersions = status.Connection == opc.ConnectionConnected && status.Session == opc.SessionActive &&
 		status.Subscription == opc.SubscriptionActive && (!existed || previous.Subscription != opc.SubscriptionActive || previous.Epoch != status.Epoch)
 	meaningfulChange := !existed || lowerStatusControlChanged(previous, status)
+	sampleStateChanged := !existed || lowerStatusSampleStateChanged(previous, status)
 	publish := meaningfulChange || now.Sub(r.lastSampleEventAt) >= time.Second
 	if publish {
 		// LastDataAt-only status ticks and data-change invalidations share one
@@ -927,9 +933,14 @@ func (r *Runtime) onLowerStatus(status opc.LowerStatus, generation uint64) {
 		r.sampleEventPending = true
 	}
 	r.mu.Unlock()
+	// A connection/session/subscription transition changes every sample routed
+	// to this source even when no new lower DataValue can arrive. Refresh only
+	// Sessions that actually selected it; peers using another source in the
+	// same group must not absorb a full-group resample burst.
+	refreshSelectedSource = sampleStateChanged && !quarantined
 	if quarantined {
 		r.applyQuarantinedSourceLocked(status.SourceID)
-		refreshGroups = r.groupsForSources(status.SourceID)
+		refreshGroups = append(refreshGroups, r.groupsForSources(status.SourceID)...)
 		r.broker.Publish(api.Event{Type: "catalog.changed", SourceID: status.SourceID})
 	}
 	if meaningfulChange {
@@ -942,6 +953,12 @@ func (r *Runtime) onLowerStatus(status opc.LowerStatus, generation uint64) {
 	if refreshStationVersions {
 		r.queueStationVersionRefresh(status.SourceID)
 	}
+	if !catalogStatusConflict {
+		r.queueGroupRefreshes(refreshGroups...)
+		if refreshSelectedSource {
+			r.queueSourceRefreshes(status.SourceID)
+		}
+	}
 }
 
 func lowerStatusControlChanged(before, after opc.LowerStatus) bool {
@@ -950,6 +967,11 @@ func lowerStatusControlChanged(before, after opc.LowerStatus) bool {
 		before.Catalog != after.Catalog || before.Epoch != after.Epoch ||
 		before.ReconnectCount != after.ReconnectCount || before.PointCount != after.PointCount ||
 		before.SubscriptionCount != after.SubscriptionCount || before.LastError != after.LastError
+}
+
+func lowerStatusSampleStateChanged(before, after opc.LowerStatus) bool {
+	return before.Connection != after.Connection || before.Session != after.Session ||
+		before.Subscription != after.Subscription || before.Epoch != after.Epoch
 }
 
 func (r *Runtime) OnCatalog(catalog domain.SourceCatalog) {

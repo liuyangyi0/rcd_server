@@ -31,6 +31,17 @@ describe('calculation center', () => {
     expect(row).toHaveTextContent('IF(A, B, C)');
   });
 
+  it('keeps the calculated result while explaining zero-input communication quality', async () => {
+    vi.spyOn(calculationApi, 'results').mockResolvedValue({ items: [{ nodeId: 'CALC_OFFLINE', dataType: 'Double', expression: 'A + 5', value: 5, statusCode: 0x80310000, dependencyCount: 1, configRevision: 4, defaultRouteRevision: 9 }], total: 1, page: 1, pageSize: 50 });
+    setup();
+    expect(screen.getByText(/原始值按类型归零后继续参与计算/)).toBeInTheDocument();
+    const row = await screen.findByRole('row', { name: /CALC_OFFLINE/ });
+    expect(row).toHaveTextContent('5');
+    expect(row).toHaveTextContent('通信中断，输入按 0 计算');
+    expect(row).toHaveTextContent('BadNoCommunication');
+    expect(row).not.toHaveTextContent('已清零');
+  });
+
   it('batch changes only selected supported lowers and leaves restart explicit', async () => {
     vi.spyOn(api, 'sources').mockResolvedValue([source]);
     vi.spyOn(operationsApi, 'capabilities').mockResolvedValue({ source_id: 'lower-a', source_revision: 7, supported: true, schema_version: 1, features: ['calculation_mode'], max_config_bytes: 2_097_152, max_log_bytes: 65_536, configuration_apply: 'restart' });

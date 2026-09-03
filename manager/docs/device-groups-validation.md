@@ -38,7 +38,7 @@
 | 双 Session Read/Subscribe、Web 定向选源 | 通过；设备 A 切源不影响设备 B 或其他 Session；旧 revision 返回 409 | 同上 |
 | 默认源/Session 生命周期 | 默认变更仅影响新 Session；Close 后目标 API 返回 404，新 Session 回到默认 | 同上 |
 | 实际串口命令路由 | 通过；PTY 日志确认原字节不变、目标来源/串口正确、未知设备和同端口并发被拒绝 | 同上及 `runs/fixture-1/commands.jsonl` |
-| 下级停止/重启、离线选源、epoch | 通过；最后值保留并变坏质量，无自动切源，重连后恢复新值 | 同上 |
+| 下级停止/重启、离线选源、epoch | 通过；采集值清零并变为 `BadNoCommunication`，无自动切源，重连后恢复新值 | 同上 |
 | 错误/丢失 ACK 与后续恢复 | 通过；`3`/坏质量、失败审计、解锁、下一条命令成功 | `logs/device-groups-faults-1.log` |
 | 命令中途关闭 Session | 通过；其他 Session 仍受组锁约束，回执后解锁，审计保留原发起 Session/来源/串口 | 同上 |
 

@@ -40,7 +40,7 @@ export default function CalculationsPage() {
 
   return <div className="page calculation-page">
     <PageHeader title="计算中心" description="集中管理 calc.toml、版本与实时计算结果；原始串口和 CSV 点表仍由各下级维护。" />
-    <InlineNotice tone="warning"><strong>计算结果固定按各逻辑组的默认来源生成。</strong><p>上级 OPC Session 单独切换 SelectedSourceId 只影响原始点，不会改变任何中央计算点；系统不自动故障转移。</p></InlineNotice>
+    <InlineNotice tone="warning"><strong>计算结果固定按各逻辑组的默认来源生成。</strong><p>上级 OPC Session 单独切换 SelectedSourceId 只影响原始点，不会改变任何中央计算点；系统不自动故障转移。</p><p>采集通信中断时，原始值按类型归零后继续参与计算；计算点保留公式所得值，并标记 BadNoCommunication。</p></InlineNotice>
     <CalculationSummary status={status.data} loading={status.isPending} />
     <nav className="calculation-tabs" aria-label="计算中心功能">
       <TabButton active={tab === 'results'} onClick={() => setTab('results')} icon={<Sigma size={16} />}>实时结果</TabButton>
@@ -243,7 +243,9 @@ function Quality({ code }: { code: number }) {
 
 function CalculationValue({ value, code }: { value: unknown; code: number }) {
   const bad = (((code >>> 0) & 0xc0000000) >>> 0) === 0x80000000;
-  return <>{formatValue(value)}{bad ? <span className="sub-cell text-bad">坏质量，已清零</span> : null}</>;
+  const baseCode = (((code >>> 0) & 0xffff0000) >>> 0);
+  const detail = baseCode === 0x80310000 ? '通信中断，输入按 0 计算' : bad ? '结果质量异常' : '';
+  return <>{formatValue(value)}{detail ? <span className="sub-cell text-bad">{detail}</span> : null}</>;
 }
 
 function parseTab(value: string | null): Tab { return value === 'config' || value === 'versions' || value === 'lowers' ? value : 'results'; }

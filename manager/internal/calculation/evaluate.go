@@ -335,7 +335,7 @@ func statusPriority(status domain.StatusCode) int {
 	if status.IsUncertain() {
 		return 1
 	}
-	switch status {
+	switch status.BaseCode() {
 	case domain.StatusBadWaitingInitialData:
 		return 2
 	case domain.StatusBadNoCommunication:

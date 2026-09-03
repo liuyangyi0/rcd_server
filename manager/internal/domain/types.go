@@ -31,9 +31,10 @@ const (
 	StatusBadTimeout            StatusCode = 0x800A0000
 )
 
-func (s StatusCode) IsGood() bool      { return s&0xC0000000 == 0 }
-func (s StatusCode) IsUncertain() bool { return s&0xC0000000 == 0x40000000 }
-func (s StatusCode) IsBad() bool       { return s&0xC0000000 == 0x80000000 }
+func (s StatusCode) IsGood() bool         { return s&0xC0000000 == 0 }
+func (s StatusCode) IsUncertain() bool    { return s&0xC0000000 == 0x40000000 }
+func (s StatusCode) IsBad() bool          { return s&0xC0000000 == 0x80000000 }
+func (s StatusCode) BaseCode() StatusCode { return s & 0xFFFF0000 }
 
 // Sample is a value received from one lower OPC UA source. Callers must treat
 // instances as immutable after publication.

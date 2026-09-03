@@ -158,12 +158,12 @@ Web 面板按来源和版本缓存，按标签按需请求，退出后释放配�
 |---|---|
 | 有正常样本且已连接 | 保留下级值、StatusCode、SourceTimestamp；ServerTimestamp 取当前管理程序时间 |
 | 已连接但没有首值 | 对应类型零值 + `BadWaitingForInitialData` |
-| 下级断开且进程内有末值 | 保留末值和 SourceTimestamp，StatusCode 改为 `BadNoCommunication` |
+| 下级断开或采集点返回通信中断 | 对应类型零值，保留可用的 SourceTimestamp，StatusCode 为 `BadNoCommunication` |
 | 缓存目录离线启动且无内存样本 | 对应类型零值 + `BadNoCommunication` |
 | 所选源缺少组并集中的点 | 对应类型零值 + `BadConfigurationError` |
 | 当前进程内热删除点 | 对应类型零值 + `BadOutOfService` |
 
-管理程序不会把下级计算点错误地标为 Bad，也不会把下级自身不准确的 Good 状态“修正”为其他质量；连接正常时忠实转发下级质量。
+除 `BadNoCommunication` 必须把不可用的采集值归零外，管理程序不会把下级自身的 Good 状态“修正”为其他质量；连接正常时忠实转发下级质量。中央计算使用归零后的输入继续执行公式，输出公式所得值，同时沿实际执行路径传播 `BadNoCommunication`。
 
 ## 下级连接与 epoch
 

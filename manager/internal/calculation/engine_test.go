@@ -117,7 +117,7 @@ func TestRunnerMatchesExpressionSemanticsAndActualPathQuality(t *testing.T) {
 	config := testConfig(t, `[[rules]]
 kks_calc="SELECTED"
 data_type="double"
-expression="IF(READY == 1, ANALOG / 2, 4)"
+expression="IF(READY == 1, ANALOG + 5, 4)"
 [[rules]]
 kks_calc="BITS"
 data_type="uint"
@@ -160,8 +160,8 @@ expression="SELECTED >= 4 && !DISABLED"`)
 	if results["SELECTED"].StatusCode != domain.StatusBadNoCommunication || results["FLAG"].StatusCode != domain.StatusBadNoCommunication {
 		t.Fatalf("selected bad path quality was not propagated: %#v %#v", results["SELECTED"], results["FLAG"])
 	}
-	if results["SELECTED"].Value != float64(0) || results["FLAG"].Value != false {
-		t.Fatalf("Bad calculation values were not cleared: %#v %#v", results["SELECTED"], results["FLAG"])
+	if results["SELECTED"].Value != float64(5) || results["FLAG"].Value != true {
+		t.Fatalf("communication-failed input was not evaluated as zero: %#v %#v", results["SELECTED"], results["FLAG"])
 	}
 }
 
@@ -203,7 +203,7 @@ expression="B + 1"`)
 	}
 }
 
-func TestRunnerRuntimeErrorClearsValueAndReportsBadConfiguration(t *testing.T) {
+func TestRunnerRuntimeErrorUsesConfiguredFallbackAndReportsBadConfiguration(t *testing.T) {
 	config := testConfig(t, `[[rules]]
 kks_calc="OUT"
 data_type="uint"
@@ -215,7 +215,7 @@ default_value=9`)
 	}
 	sourceTime := time.Date(2026, 9, 1, 6, 30, 0, 0, time.UTC)
 	result := NewRunner(plan).Reset(map[string]Input{"A": {Type: domain.DataTypeDouble, Value: 2.0, StatusCode: domain.StatusGood, SourceTimestamp: sourceTime}}, 1, 1)[0]
-	if result.Value != uint32(0) || result.StatusCode != domain.StatusBadConfigurationError || result.Error == "" {
+	if result.Value != uint32(9) || result.StatusCode != domain.StatusBadConfigurationError || result.Error == "" {
 		t.Fatalf("unexpected fallback: %#v", result)
 	}
 	if !result.SourceTimestamp.Equal(sourceTime) {

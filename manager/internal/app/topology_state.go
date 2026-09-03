@@ -129,6 +129,19 @@ func (r *Runtime) queueGroupRefreshes(groupIDs ...string) {
 	}
 }
 
+func (r *Runtime) queueSourceRefreshes(sourceID string) {
+	if sourceID == "" {
+		return
+	}
+	for _, session := range r.routes.Sessions() {
+		for groupID, route := range session.Routes {
+			if route.SourceID == sourceID {
+				r.queueSessionRefresh(session.ID, groupID)
+			}
+		}
+	}
+}
+
 func (r *Runtime) sourceGroupsPending(sources ...domain.Source) bool {
 	for _, source := range sources {
 		for _, group := range source.GroupIDs() {

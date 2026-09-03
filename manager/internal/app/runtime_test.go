@@ -48,8 +48,44 @@ func TestRuntimeSessionIsolationAndDataValueRules(t *testing.T) {
 	runtime.OnLowerStatus(opc.LowerStatus{SourceID: "source-b", Connection: opc.ConnectionDisconnected,
 		Session: opc.SessionInactive, Subscription: opc.SubscriptionInactive, Catalog: domain.CatalogReady, Epoch: 1})
 	got := runtime.ReadSample("session-b", testKey("KKS001"))
-	if got.Value != 22.5 || got.StatusCode != domain.StatusBadNoCommunication || got.SourceTimestamp != now {
-		t.Fatalf("offline last value = %#v", got)
+	if got.Value != 0.0 || got.StatusCode != domain.StatusBadNoCommunication || got.SourceTimestamp != now {
+		t.Fatalf("offline sample was not cleared = %#v", got)
+	}
+}
+
+func TestSourceStatusRefreshTargetsOnlySessionsSelectingThatSource(t *testing.T) {
+	runtime := seededRuntime(t)
+	if err := runtime.openSession("session-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.openSession("session-b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.selectSource("session-b", "line", "source-b", 1, "test"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runtime.mu.Lock()
+	runtime.runContext = ctx
+	runtime.mu.Unlock()
+	runtime.SetRefreshHandler(func(string, string) {})
+	runtime.running.Store(true)
+	defer runtime.running.Store(false)
+
+	runtime.queueSourceRefreshes("source-b")
+	select {
+	case request := <-runtime.refreshQueue:
+		if request.sessionID != "session-b" || request.groupID != "line" {
+			t.Fatalf("targeted source refresh=%#v", request)
+		}
+	default:
+		t.Fatal("selected source refresh was not queued")
+	}
+	select {
+	case request := <-runtime.refreshQueue:
+		t.Fatalf("unselected peer Session was also refreshed: %#v", request)
+	default:
 	}
 }
 
@@ -65,7 +101,8 @@ func TestListPointsCanInspectDefaultSessionAndExplicitSourceRoutes(t *testing.T)
 	runtime.OnLowerStatus(connectedStatus("source-a", 1))
 	runtime.OnLowerStatus(connectedStatus("source-b", 1))
 	runtime.OnSample("source-a", testKey("KKS001"), domain.Sample{Type: domain.DataTypeDouble, Value: 10.0, StatusCode: domain.StatusGood, SourceTimestamp: now, Epoch: 1})
-	runtime.OnSample("source-b", testKey("KKS001"), domain.Sample{Type: domain.DataTypeDouble, Value: 20.0, StatusCode: domain.StatusBadNoCommunication, SourceTimestamp: now, Epoch: 1})
+	noCommunicationWithInfo := domain.StatusBadNoCommunication | 0x80
+	runtime.OnSample("source-b", testKey("KKS001"), domain.Sample{Type: domain.DataTypeDouble, Value: 20.0, StatusCode: noCommunicationWithInfo, SourceTimestamp: now, Epoch: 1})
 
 	assertPoint := func(name string, request api.PageRequest, source string, value float64, status domain.StatusCode) {
 		t.Helper()
@@ -82,12 +119,12 @@ func TestListPointsCanInspectDefaultSessionAndExplicitSourceRoutes(t *testing.T)
 	assertPoint("default", base, "source-a", 10.0, domain.StatusGood)
 	sessionRequest := base
 	sessionRequest.SessionID = "session-b"
-	assertPoint("session", sessionRequest, "source-b", 20.0, domain.StatusBadNoCommunication)
+	assertPoint("session", sessionRequest, "source-b", 0.0, noCommunicationWithInfo)
 	routeRequest := base
 	routeRequest.RouteSourceID = "source-b"
-	assertPoint("explicit route", routeRequest, "source-b", 20.0, domain.StatusBadNoCommunication)
+	assertPoint("explicit route", routeRequest, "source-b", 0.0, noCommunicationWithInfo)
 	routeRequest.Status = "Bad"
-	assertPoint("quality filter", routeRequest, "source-b", 20.0, domain.StatusBadNoCommunication)
+	assertPoint("quality filter", routeRequest, "source-b", 0.0, noCommunicationWithInfo)
 	routeRequest.Status = "Good"
 	page, err := runtime.ListPoints(context.Background(), routeRequest)
 	if err != nil || page.Total != 0 || len(page.Items) != 0 {

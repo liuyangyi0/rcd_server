@@ -33,7 +33,7 @@ func TestCentralCalculationUsesGroupDefaultAndIgnoresSessionSelections(t *testin
 	version := activateTestCalculation(t, runtime, `[[rules]]
 kks_calc = "CENTRAL"
 data_type = "double"
-expression = "KKS001 * 2"
+expression = "KKS001 * 2 + 5"
 `)
 	if version.State != "active" {
 		t.Fatalf("initial version state=%q", version.State)
@@ -61,7 +61,7 @@ expression = "KKS001 * 2"
 
 	for _, sessionID := range []string{"default-session", "selected-session"} {
 		got := runtime.ReadSample(sessionID, testKey("CENTRAL"))
-		if got.Value != 20.0 || got.StatusCode != domain.StatusGood || !got.SourceTimestamp.Equal(firstAt) {
+		if got.Value != 25.0 || got.StatusCode != domain.StatusGood || !got.SourceTimestamp.Equal(firstAt) {
 			t.Fatalf("%s central result=%#v; session route leaked into calculation", sessionID, got)
 		}
 	}
@@ -86,7 +86,7 @@ expression = "KKS001 * 2"
 	runtime.runCalculationBatch()
 	for _, sessionID := range []string{"default-session", "selected-session"} {
 		got := runtime.ReadSample(sessionID, testKey("CENTRAL"))
-		if got.Value != 50.0 || got.StatusCode != domain.StatusGood || !got.SourceTimestamp.Equal(secondAt) {
+		if got.Value != 55.0 || got.StatusCode != domain.StatusGood || !got.SourceTimestamp.Equal(secondAt) {
 			t.Fatalf("%s result after default switch=%#v", sessionID, got)
 		}
 	}
@@ -95,8 +95,8 @@ expression = "KKS001 * 2"
 		Session: opc.SessionInactive, Subscription: opc.SubscriptionInactive, Catalog: domain.CatalogReady, Epoch: 1})
 	runtime.runCalculationBatch()
 	got := runtime.ReadSample("selected-session", testKey("CENTRAL"))
-	if got.Value != 0.0 || got.StatusCode != domain.StatusBadNoCommunication || !got.SourceTimestamp.Equal(secondAt) {
-		t.Fatalf("offline default source did not clear the Bad calculation value: %#v", got)
+	if got.Value != 5.0 || got.StatusCode != domain.StatusBadNoCommunication || !got.SourceTimestamp.Equal(secondAt) {
+		t.Fatalf("offline default source was not recalculated from a zero input: %#v", got)
 	}
 }
 

@@ -209,6 +209,14 @@ func (r *Runtime) sampleForSourceAtIndex(sourceID string, point indexedPoint, in
 	if !connected {
 		sample.StatusCode = domain.StatusBadNoCommunication
 	}
+	// Never publish the cached process value as current data after its
+	// communication path is lost. Keep its source timestamp for diagnostics,
+	// but expose the declared type's zero value. Central calculations read this
+	// same normalized sample and therefore continue evaluating with zero while
+	// retaining BadNoCommunication quality.
+	if sample.StatusCode.BaseCode() == domain.StatusBadNoCommunication && sourceNode.Kind != "calculation" {
+		sample.Value = zeroValue(sourceNode.DataType, sourceNode.ValueRank)
+	}
 	return sample
 }
 

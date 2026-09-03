@@ -75,7 +75,7 @@ func RunProgram(ctx context.Context, cfg config.Config) error {
 	runtime.SetRefreshHandler(func(sessionID, groupID string) {
 		refreshed := upstream.ForceSessionRefresh(sessionID, groupID)
 		if refreshed == 0 {
-			slog.Warn("session route refresh matched no monitored items", "session_id", sessionID, "group_id", groupID)
+			slog.Debug("session route refresh matched no monitored items", "session_id", sessionID, "group_id", groupID)
 			return
 		}
 		slog.Info("session route refresh queued", "session_id", sessionID, "group_id", groupID, "monitored_items", refreshed)
