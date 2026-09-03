@@ -97,7 +97,7 @@ function ResultsTab() {
     </form>
     <section className="table-panel content-panel">
       {results.error ? <ErrorState error={results.error} onRetry={() => void results.refetch()} /> : results.isPending && !results.data ? <LoadingState label="正在读取中央计算结果…" /> : !results.data?.items.length ? <EmptyState title="暂无中央计算结果" description="导入并激活 calc.toml 后，计算结果会显示在这里。" /> : <>
-        <div className={`table-scroll${results.isFetching ? ' is-refreshing' : ''}`}><table className="data-table calculation-results-table"><thead><tr><th>KKS</th><th>表达式</th><th>当前值</th><th>类型</th><th>质量</th><th>求值时间</th><th>依赖</th><th>默认路由版本</th></tr></thead><tbody>{results.data.items.map((item) => <tr className="virtual-row" key={item.nodeId}><td><strong>{item.nodeId}</strong>{item.error ? <span className="sub-cell text-bad">{item.error}</span> : null}</td><td><code className="calculation-expression">{item.expression}</code></td><td><CalculationValue value={item.value} code={item.statusCode} /></td><td>{item.dataType}</td><td><Quality code={item.statusCode} /></td><td>{formatDateTime(item.evaluatedAt)}{item.sourceTimestamp ? <span className="sub-cell">源：{formatDateTime(item.sourceTimestamp)}</span> : null}</td><td>{item.dependencyCount}</td><td>{item.defaultRouteRevision}</td></tr>)}</tbody></table></div>
+        <div className={`table-scroll${results.isFetching ? ' is-refreshing' : ''}`}><table className="data-table calculation-results-table"><thead><tr><th>KKS</th><th>表达式</th><th>当前值</th><th>类型</th><th>质量</th><th>求值时间</th><th>依赖</th><th>默认路由版本</th></tr></thead><tbody>{results.data.items.map((item) => <tr className="virtual-row" key={item.nodeId}><td><strong>{item.nodeId}</strong>{item.error ? <span className="sub-cell text-bad">{item.error}</span> : null}</td><td><code className="calculation-expression">{item.expression}</code></td><td><CalculationValue value={item.value} code={item.statusCode} communicationInputs={item.communicationInputs} /></td><td>{item.dataType}</td><td><Quality code={item.statusCode} /></td><td>{formatDateTime(item.evaluatedAt)}{item.sourceTimestamp ? <span className="sub-cell">源：{formatDateTime(item.sourceTimestamp)}</span> : null}</td><td>{item.dependencyCount}</td><td>{item.defaultRouteRevision}</td></tr>)}</tbody></table></div>
         <Pagination page={results.data.page} pageSize={results.data.pageSize} total={results.data.total} onPageChange={(next) => update({ page: next })} />
       </>}
     </section>
@@ -241,11 +241,18 @@ function Quality({ code }: { code: number }) {
   return <span className={severity === 0 ? 'text-good' : severity === 0x40000000 ? 'text-warning' : 'text-bad'}>{statusCodeLabel(encoded)}</span>;
 }
 
-function CalculationValue({ value, code }: { value: unknown; code: number }) {
+function CalculationValue({ value, code, communicationInputs }: { value: unknown; code: number; communicationInputs: string[] }) {
   const bad = (((code >>> 0) & 0xc0000000) >>> 0) === 0x80000000;
   const baseCode = (((code >>> 0) & 0xffff0000) >>> 0);
-  const detail = baseCode === 0x80310000 ? '通信中断，输入按 0 计算' : bad ? '结果质量异常' : '';
-  return <>{formatValue(value)}{detail ? <span className="sub-cell text-bad">{detail}</span> : null}</>;
+  const detail = baseCode === 0x80310000 ? communicationDetail(communicationInputs) : bad ? '结果质量异常' : '';
+  const title = communicationInputs.length ? `通信中断上游：${communicationInputs.join('、')}` : undefined;
+  return <>{formatValue(value)}{detail ? <span className="sub-cell text-bad" title={title}>{detail}</span> : null}</>;
+}
+
+function communicationDetail(inputs: string[]): string {
+  if (inputs.length === 1) return `上游点 ${inputs[0]} 通信中断，按 0 参与计算`;
+  if (inputs.length > 1) return `上游点 ${inputs.slice(0, 2).join('、')}${inputs.length > 2 ? ` 等 ${inputs.length} 个` : ''}通信中断，按 0 参与计算`;
+  return '通信中断，输入按 0 计算';
 }
 
 function parseTab(value: string | null): Tab { return value === 'config' || value === 'versions' || value === 'lowers' ? value : 'results'; }

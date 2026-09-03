@@ -22,7 +22,7 @@ afterEach(() => vi.restoreAllMocks());
 
 describe('calculation center', () => {
   it('explains default-source routing and renders live calculation quality', async () => {
-    vi.spyOn(calculationApi, 'results').mockResolvedValue({ items: [{ nodeId: 'CALC_A', dataType: 'Double', expression: 'IF(A, B, C)', value: 12.5, statusCode: 0, dependencyCount: 3, configRevision: 4, defaultRouteRevision: 9 }], total: 1, page: 1, pageSize: 50 });
+    vi.spyOn(calculationApi, 'results').mockResolvedValue({ items: [{ nodeId: 'CALC_A', dataType: 'Double', expression: 'IF(A, B, C)', value: 12.5, statusCode: 0, communicationInputs: [], dependencyCount: 3, configRevision: 4, defaultRouteRevision: 9 }], total: 1, page: 1, pageSize: 50 });
     setup();
     expect(screen.getByText(/上级 OPC Session 单独切换 SelectedSourceId/)).toBeInTheDocument();
     const row = await screen.findByRole('row', { name: /CALC_A/ });
@@ -32,12 +32,12 @@ describe('calculation center', () => {
   });
 
   it('keeps the calculated result while explaining zero-input communication quality', async () => {
-    vi.spyOn(calculationApi, 'results').mockResolvedValue({ items: [{ nodeId: 'CALC_OFFLINE', dataType: 'Double', expression: 'A + 5', value: 5, statusCode: 0x80310000, dependencyCount: 1, configRevision: 4, defaultRouteRevision: 9 }], total: 1, page: 1, pageSize: 50 });
+    vi.spyOn(calculationApi, 'results').mockResolvedValue({ items: [{ nodeId: 'CALC_OFFLINE', dataType: 'Double', expression: 'A + 5', value: 5, statusCode: 0x80310000, communicationInputs: ['A'], dependencyCount: 1, configRevision: 4, defaultRouteRevision: 9 }], total: 1, page: 1, pageSize: 50 });
     setup();
     expect(screen.getByText(/原始值按类型归零后继续参与计算/)).toBeInTheDocument();
     const row = await screen.findByRole('row', { name: /CALC_OFFLINE/ });
     expect(row).toHaveTextContent('5');
-    expect(row).toHaveTextContent('通信中断，输入按 0 计算');
+    expect(row).toHaveTextContent('上游点 A 通信中断，按 0 参与计算');
     expect(row).toHaveTextContent('BadNoCommunication');
     expect(row).not.toHaveTextContent('已清零');
   });

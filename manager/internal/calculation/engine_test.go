@@ -146,6 +146,9 @@ expression="SELECTED >= 4 && !DISABLED"`)
 	if results["SELECTED"].Value != float64(4) || results["SELECTED"].StatusCode != domain.StatusGood || !results["SELECTED"].SourceTimestamp.Equal(oldTime) {
 		t.Fatalf("unselected bad IF branch polluted result: %#v", results["SELECTED"])
 	}
+	if len(results["SELECTED"].CommunicationInputs) != 0 {
+		t.Fatalf("unselected bad IF branch polluted provenance: %#v", results["SELECTED"].CommunicationInputs)
+	}
 	if results["BITS"].Value != uint32(23) || results["FLAG"].Value != true {
 		t.Fatalf("operator result mismatch: BITS=%#v FLAG=%#v", results["BITS"], results["FLAG"])
 	}
@@ -159,6 +162,9 @@ expression="SELECTED >= 4 && !DISABLED"`)
 	}
 	if results["SELECTED"].StatusCode != domain.StatusBadNoCommunication || results["FLAG"].StatusCode != domain.StatusBadNoCommunication {
 		t.Fatalf("selected bad path quality was not propagated: %#v %#v", results["SELECTED"], results["FLAG"])
+	}
+	if fmt.Sprint(results["SELECTED"].CommunicationInputs) != "[ANALOG]" || fmt.Sprint(results["FLAG"].CommunicationInputs) != "[ANALOG]" {
+		t.Fatalf("communication provenance was not propagated through calculated values: %#v %#v", results["SELECTED"], results["FLAG"])
 	}
 	if results["SELECTED"].Value != float64(5) || results["FLAG"].Value != true {
 		t.Fatalf("communication-failed input was not evaluated as zero: %#v %#v", results["SELECTED"], results["FLAG"])

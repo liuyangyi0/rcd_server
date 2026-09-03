@@ -62,7 +62,9 @@ function result(value: unknown): CalculationResult {
   const source = record(value);
   return {
     nodeId: text(source.node_id), dataType: text(source.data_type), expression: text(source.expression), value: source.value,
-    statusCode: number(source.status_code), sourceTimestamp: text(source.source_timestamp) || undefined,
+    statusCode: number(source.status_code),
+    communicationInputs: Array.isArray(source.communication_inputs) ? source.communication_inputs.map(text).filter(Boolean) : [],
+    sourceTimestamp: text(source.source_timestamp) || undefined,
     evaluatedAt: text(source.evaluated_at) || undefined, error: text(source.error) || undefined,
     dependencyCount: number(source.dependency_count), configRevision: number(source.config_revision),
     defaultRouteRevision: number(source.default_route_revision),

@@ -71,9 +71,10 @@ func (v evalValue) asInteger() (int64, error) {
 }
 
 type operand struct {
-	value           evalValue
-	status          domain.StatusCode
-	sourceTimestamp time.Time
+	value               evalValue
+	status              domain.StatusCode
+	sourceTimestamp     time.Time
+	communicationInputs []string
 }
 
 var errDivisionByZero = errors.New("division by zero")
@@ -113,7 +114,11 @@ func eval(expr *expression, variables map[string]operand) (operand, error) {
 			return operand{}, err
 		}
 		result, err := evalBinary(expr.binary, left.value, right.value)
-		combined := operand{status: worseStatus(left.status, right.status), sourceTimestamp: laterTime(left.sourceTimestamp, right.sourceTimestamp)}
+		combined := operand{
+			status:              worseStatus(left.status, right.status),
+			sourceTimestamp:     laterTime(left.sourceTimestamp, right.sourceTimestamp),
+			communicationInputs: mergeSortedUniqueStrings(left.communicationInputs, right.communicationInputs),
+		}
 		if err != nil {
 			// Keep the metadata of inputs that were actually evaluated. The
 			// runner replaces only the value/status with the configured fallback.
@@ -134,14 +139,49 @@ func eval(expr *expression, variables map[string]operand) (operand, error) {
 		if err != nil {
 			selected.status = worseStatus(condition.status, selected.status)
 			selected.sourceTimestamp = laterTime(condition.sourceTimestamp, selected.sourceTimestamp)
+			selected.communicationInputs = mergeSortedUniqueStrings(condition.communicationInputs, selected.communicationInputs)
 			return selected, err
 		}
 		selected.status = worseStatus(condition.status, selected.status)
 		selected.sourceTimestamp = laterTime(condition.sourceTimestamp, selected.sourceTimestamp)
+		selected.communicationInputs = mergeSortedUniqueStrings(condition.communicationInputs, selected.communicationInputs)
 		return selected, nil
 	default:
 		return operand{}, errors.New("unknown expression node")
 	}
+}
+
+// mergeSortedUniqueStrings combines immutable, sorted provenance lists without
+// losing the original acquisition point behind a chain of calculated values.
+func mergeSortedUniqueStrings(left, right []string) []string {
+	if len(left) == 0 {
+		return append([]string(nil), right...)
+	}
+	if len(right) == 0 {
+		return append([]string(nil), left...)
+	}
+	result := make([]string, 0, len(left)+len(right))
+	for i, j := 0, 0; i < len(left) || j < len(right); {
+		switch {
+		case i >= len(left):
+			result = append(result, right[j:]...)
+			return result
+		case j >= len(right):
+			result = append(result, left[i:]...)
+			return result
+		case left[i] < right[j]:
+			result = append(result, left[i])
+			i++
+		case right[j] < left[i]:
+			result = append(result, right[j])
+			j++
+		default:
+			result = append(result, left[i])
+			i++
+			j++
+		}
+	}
+	return result
 }
 
 func evalUnary(operator unaryOp, value evalValue) (evalValue, error) {

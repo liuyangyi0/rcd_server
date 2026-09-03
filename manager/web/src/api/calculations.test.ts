@@ -10,13 +10,13 @@ afterEach(() => vi.unstubAllGlobals());
 describe('calculation API contract', () => {
   it('maps server paging and preserves legacy KKS bytes', async () => {
     const fetchMock = vi.fn().mockResolvedValue(json({
-      items: [{ node_id: 'LEGACY ', data_type: 'UInt32', expression: 'A + 1', value: 2, status_code: 0, dependency_count: 1, config_revision: 7, default_route_revision: 9 }],
+      items: [{ node_id: 'LEGACY ', data_type: 'UInt32', expression: 'A + 1', value: 2, status_code: 0x80310000, communication_inputs: ['A'], dependency_count: 1, config_revision: 7, default_route_revision: 9 }],
       total: 1, limit: 50, offset: 50,
     }));
     vi.stubGlobal('fetch', fetchMock);
     const page = await calculationApi.results({ page: 2, pageSize: 50, query: 'LEGACY', status: 'bad', kind: 'UInt32' });
     expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/calculations/results?limit=50&offset=50&q=LEGACY&status=bad&kind=UInt32');
-    expect(page.items[0]).toMatchObject({ nodeId: 'LEGACY ', dataType: 'UInt32', dependencyCount: 1, configRevision: 7, defaultRouteRevision: 9 });
+    expect(page.items[0]).toMatchObject({ nodeId: 'LEGACY ', dataType: 'UInt32', communicationInputs: ['A'], dependencyCount: 1, configRevision: 7, defaultRouteRevision: 9 });
   });
 
   it('pins draft/import revisions and maps immutable version diffs', async () => {

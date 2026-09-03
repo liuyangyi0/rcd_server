@@ -289,6 +289,7 @@ export interface CalculationResult {
   expression: string;
   value?: unknown;
   statusCode: number;
+  communicationInputs: string[];
   sourceTimestamp?: string;
   evaluatedAt?: string;
   error?: string;

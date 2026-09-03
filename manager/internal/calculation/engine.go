@@ -294,6 +294,7 @@ type Result struct {
 	Expression           string            `json:"expression"`
 	Value                any               `json:"value"`
 	StatusCode           domain.StatusCode `json:"status_code"`
+	CommunicationInputs  []string          `json:"communication_inputs,omitempty"`
 	SourceTimestamp      time.Time         `json:"source_timestamp,omitempty,omitzero"`
 	EvaluatedAt          time.Time         `json:"evaluated_at"`
 	Error                string            `json:"error,omitempty"`
@@ -319,7 +320,7 @@ func NewRunner(plan *Plan) *Runner {
 func (r *Runner) Reset(inputs map[string]Input, configRevision, routeRevision uint64) []Result {
 	r.variables = make(map[string]operand, len(inputs)+r.plan.RuleCount())
 	for name, input := range inputs {
-		r.variables[name] = inputOperand(input)
+		r.variables[name] = inputOperand(name, input)
 	}
 	affected := make([]bool, r.plan.RuleCount())
 	for index := range affected {
@@ -333,7 +334,7 @@ func (r *Runner) Update(inputs map[string]Input, configRevision, routeRevision u
 	}
 	queue := make([]string, 0, len(inputs))
 	for name, input := range inputs {
-		r.variables[name] = inputOperand(input)
+		r.variables[name] = inputOperand(name, input)
 		queue = append(queue, name)
 	}
 	affected := make([]bool, r.plan.RuleCount())
@@ -383,26 +384,31 @@ func (r *Runner) evaluate(affected []bool, configRevision, routeRevision uint64)
 		}
 		typed := convertOutput(value.value, rule)
 		result := Result{NodeID: rule.Output, DataType: rule.DataType, Expression: rule.Expression, Value: typed, StatusCode: value.status,
-			SourceTimestamp: value.sourceTimestamp, EvaluatedAt: now, Error: errorText, DependencyCount: len(rule.variables), ConfigRevision: configRevision, DefaultRouteRevision: routeRevision}
+			CommunicationInputs: append([]string(nil), value.communicationInputs...), SourceTimestamp: value.sourceTimestamp, EvaluatedAt: now,
+			Error: errorText, DependencyCount: len(rule.variables), ConfigRevision: configRevision, DefaultRouteRevision: routeRevision}
 		previous := r.results[index]
 		r.results[index] = result
-		r.variables[rule.Output] = operand{value: domainValue(typed), status: result.StatusCode, sourceTimestamp: result.SourceTimestamp}
+		r.variables[rule.Output] = operand{value: domainValue(typed), status: result.StatusCode, sourceTimestamp: result.SourceTimestamp,
+			communicationInputs: result.CommunicationInputs}
 		if previous.NodeID == "" || previous.StatusCode != result.StatusCode || previous.Error != result.Error ||
 			previous.ConfigRevision != result.ConfigRevision || previous.DefaultRouteRevision != result.DefaultRouteRevision ||
-			!previous.SourceTimestamp.Equal(result.SourceTimestamp) || !reflect.DeepEqual(previous.Value, result.Value) {
+			!previous.SourceTimestamp.Equal(result.SourceTimestamp) || !reflect.DeepEqual(previous.Value, result.Value) ||
+			!reflect.DeepEqual(previous.CommunicationInputs, result.CommunicationInputs) {
 			changed = append(changed, result)
 		}
 	}
 	return changed
 }
 
-func inputOperand(input Input) operand {
+func inputOperand(name string, input Input) operand {
 	// A communications failure means the live acquisition value is no longer
 	// available. Evaluate the expression with the declared type's zero value,
 	// while propagating BadNoCommunication through the actual execution path.
 	// Information bits do not change the underlying OPC UA status code.
 	if input.StatusCode.BaseCode() == domain.StatusBadNoCommunication {
 		input.Value = typedZero(input.Type)
+		return operand{value: domainValue(input.Value), status: input.StatusCode, sourceTimestamp: input.SourceTimestamp,
+			communicationInputs: []string{name}}
 	}
 	return operand{value: domainValue(input.Value), status: input.StatusCode, sourceTimestamp: input.SourceTimestamp}
 }
