@@ -1,6 +1,7 @@
-import { lazy, Suspense, useMemo, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { Network, Pencil, Plus, RefreshCw, ScanSearch, Search, TestTube2, Trash2, Wrench } from 'lucide-react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useSearchParams } from 'react-router-dom';
 import { api, apiErrorMessage } from '../api/client';
 import { queryKeys, useGroups, useSources } from '../api/queries';
 import type { Source } from '../api/types';
@@ -19,6 +20,7 @@ const SourceTopologyDrawer = lazy(() => import('../features/config/SourceTopolog
 const SourceOperationsDrawer = lazy(() => import('../features/operations/SourceOperationsDrawer'));
 
 export default function SourcesPage() {
+  const [urlParams, setUrlParams] = useSearchParams();
   const client = useQueryClient();
   const groupsQuery = useGroups();
   const sourcesQuery = useSources();
@@ -30,8 +32,36 @@ export default function SourcesPage() {
   const [deleting, setDeleting] = useState<Source>();
   const [topologySourceId, setTopologySourceId] = useState('');
   const [operationsSelection, setOperationsSelection] = useState<{ source: Source; deleted: boolean }>();
+  const dismissedOperationsId = useRef('');
   const [diagnostics, setDiagnostics] = useState<{ source: Source; mode: 'probe' | 'conflicts' }>();
   const [message, setMessage] = useState('');
+
+  useEffect(() => {
+    const requested = urlParams.get('operations');
+    if (!requested) {
+      dismissedOperationsId.current = '';
+      return;
+    }
+    if (requested === dismissedOperationsId.current || operationsSelection?.source.id === requested) return;
+    const source = sources.find((item) => item.id === requested);
+    if (source) setOperationsSelection({ source, deleted: false });
+  }, [operationsSelection?.source.id, sources, urlParams]);
+
+  const openOperations = (source: Source) => {
+    dismissedOperationsId.current = '';
+    setTopologySourceId('');
+    setOperationsSelection({ source, deleted: false });
+    const next = new URLSearchParams(urlParams);
+    next.set('operations', source.id);
+    setUrlParams(next, { replace: true });
+  };
+  const closeOperations = () => {
+    dismissedOperationsId.current = operationsSelection?.source.id ?? urlParams.get('operations') ?? '';
+    setOperationsSelection(undefined);
+    const next = new URLSearchParams(urlParams);
+    next.delete('operations');
+    setUrlParams(next, { replace: true });
+  };
 
   const filteredSources = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -100,8 +130,8 @@ export default function SourcesPage() {
           <EmptyState title="尚未配置下级 OPC" description={groups.length === 0 ? '请先创建分组。' : '添加来源后，管理程序将自动执行连接与目录发现。'} action={groups.length > 0 ? <button className="button button-primary" type="button" onClick={() => setEditing('new')}><Plus aria-hidden="true" size={16} />添加来源</button> : undefined} />
         ) : filteredSources.length === 0 ? <EmptyState title="没有匹配的来源" description="请调整筛选条件。" /> : (
           <div className="table-scroll">
-            <table className="data-table">
-              <thead><tr><th>Source ID</th><th>默认归属 / 设备组</th><th>Endpoint</th><th>连接 / 会话 / 订阅</th><th>目录</th><th>来源整体质量</th><th>最近活动</th><th>本次重连</th><th className="align-right">操作</th></tr></thead>
+            <table className="data-table responsive-table source-table">
+              <thead><tr><th>Source ID</th><th>默认归属 / 设备组</th><th>Endpoint</th><th>连接链路</th><th>目录</th><th>来源整体质量</th><th>最近活动</th><th>本次重连</th><th className="align-right">操作</th></tr></thead>
               <tbody>{filteredSources.map((source) => {
                 const health = sourceHealth(source);
                 const catalogBad = source.catalogState.toLowerCase().includes('conflict') || source.catalogState.toLowerCase().includes('error');
@@ -111,13 +141,13 @@ export default function SourcesPage() {
                     <td><strong>{source.id}</strong>{source.lastError ? <span className="sub-cell text-bad" title={conflictTitle}>{source.lastError}</span> : null}</td>
                     <td><span>{source.groupId}<span className="sub-cell">默认归属组</span></span>{source.groupBindings?.length ? <span className="sub-cell" title={sourceGroupIds(source).join('、')}>{source.groupBindings.length} 台设备已绑定 · {sourceGroupIds(source).length} 个组</span> : null}</td>
                     <td className="endpoint-cell">{source.endpoint}</td>
-                    <td><StatusBadge state={health} label={`${stateLabel(source.connectionState)} / ${stateLabel(source.sessionState)} / ${stateLabel(source.subscriptionState)}`} /><span className="sub-cell">{formatNumber(source.monitoredCount)} 个监控点</span></td>
+                    <td><div className="status-sequence labelled-status"><span>连接 <b>{stateLabel(source.connectionState)}</b></span><span>会话 <b>{stateLabel(source.sessionState)}</b></span><span>订阅 <b>{stateLabel(source.subscriptionState)}</b></span></div><StatusBadge state={health} label={health === 'good' ? '链路正常' : '链路异常'} compact /><span className="sub-cell">{formatNumber(source.monitoredCount)} 个监控变量</span></td>
                     <td>{catalogBad || source.catalogConflicts?.length ? <button className="table-link text-bad" type="button" onClick={() => setDiagnostics({ source, mode: 'conflicts' })}><StatusBadge state="bad" label={`${stateLabel(source.catalogState)} · ${source.catalogConflicts?.length ?? 0} 项`} compact /></button> : <StatusBadge state={source.catalogState.toLowerCase().includes('ready') ? 'good' : 'warning'} label={stateLabel(source.catalogState)} compact />}</td>
                     <td>{source.qualityKnown ? <span className={source.badPoints ? 'text-bad' : 'text-good'}>{formatNumber(source.goodPoints)} / {formatNumber(source.totalPoints)}</span> : <span>{formatNumber(source.totalPoints)} 点<span className="sub-cell">实时质量未提供</span></span>}</td>
                     <td>数据 {formatRelativeTime(source.lastDataAt)}<span className="sub-cell">探针 {formatRelativeTime(source.lastProbeAt)}</span></td>
                     <td>{source.reconnectCount}</td>
                     <td className="align-right table-actions">
-                      <button className="button button-small button-outline" type="button" aria-label={`运维 ${source.id}`} title="管理此下级的物理采集、配置文件和日志，不是 Session 选源" onClick={() => { setTopologySourceId(''); setOperationsSelection({ source, deleted: false }); }}><Wrench aria-hidden="true" size={15} />运维</button>
+                      <button className="button button-small button-outline" type="button" aria-label={`运维 ${source.id}`} title="管理此下级的物理采集、配置文件和日志，不是 Session 选源" onClick={() => openOperations(source)}><Wrench aria-hidden="true" size={15} />运维</button>
                       <button className="button button-small button-outline" type="button" aria-label={`串口 / 设备映射 ${source.id}`} onClick={() => setTopologySourceId(source.id)}><Network aria-hidden="true" size={15} />串口 / 设备映射</button>
                       <button className="button button-small button-outline" type="button" aria-label={`测试连接 ${source.id}`} title="独立连接测试，不影响在线连接" onClick={() => setDiagnostics({ source, mode: 'probe' })}><TestTube2 aria-hidden="true" size={15} />连接测试</button>
                       <button className="button button-small button-secondary" type="button" disabled={restartMutation.isPending} aria-label={`重新连接并发现目录 ${source.id}`} title="每次重新连接都会重新读取 NamespaceArray、浏览目录并重建订阅" onClick={() => restartMutation.mutate(source)}><ScanSearch aria-hidden="true" size={15} />重连并发现</button>
@@ -135,7 +165,7 @@ export default function SourcesPage() {
       <SourceFormModal open={Boolean(editing)} source={editing === 'new' ? undefined : editing} groups={groups} onClose={() => setEditing(undefined)} onSaved={setMessage} />
       <SourceDiagnosticsModal source={diagnostics?.source} mode={diagnostics?.mode} onClose={() => setDiagnostics(undefined)} />
       {topologySource ? <Suspense fallback={<LoadingState label="正在加载设备映射…" />}><SourceTopologyDrawer key={topologySource.id} source={topologySource} groups={groups} onClose={() => setTopologySourceId('')} onSaved={setMessage} /></Suspense> : null}
-      {operationsSource ? <Suspense fallback={<LoadingState label="正在加载下级运维…" />}><SourceOperationsDrawer key={operationsSource.id} source={operationsSource} sourceDeleted={operationsSourceDeleted} onClose={() => setOperationsSelection(undefined)} /></Suspense> : null}
+      {operationsSource ? <Suspense fallback={<LoadingState label="正在加载下级运维…" />}><SourceOperationsDrawer key={operationsSource.id} source={operationsSource} sourceDeleted={operationsSourceDeleted} onClose={closeOperations} /></Suspense> : null}
       <DeleteConfirmModal open={Boolean(deleting)} title="删除下级 OPC" subject={deleting?.id ?? ''} pending={removeMutation.isPending} error={removeMutation.error ? apiErrorMessage(removeMutation.error) : undefined} onClose={() => setDeleting(undefined)} onConfirm={() => deleting && removeMutation.mutate(deleting)} />
     </div>
   );

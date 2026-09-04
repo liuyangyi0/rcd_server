@@ -11,10 +11,10 @@ import { GroupDetailDrawer } from '../features/selection/GroupDetailDrawer';
 import { EmptyState, ErrorState, LoadingState } from '../components/PageState';
 import { PageHeader } from '../components/PageHeader';
 import { StatusBadge } from '../components/StatusBadge';
-import { formatNumber, formatRelativeTime, shortSessionId } from '../lib/format';
+import { formatNumber, formatRelativeTime, shortClientName, shortSessionId } from '../lib/format';
 import { stateLabel } from '../lib/labels';
 import { sourceHealth } from '../lib/status';
-import { sourceHasGroup } from '../lib/sourceGroups';
+import { sourceHasGroup, sourceSelectableForGroup } from '../lib/sourceGroups';
 import { useSessionSelection } from '../hooks/useSessionSelection';
 
 export default function GroupsPage() {
@@ -58,7 +58,7 @@ export default function GroupsPage() {
       <PageHeader title="分组与选源" description="每个 OPC Session 按整逻辑设备组独立选源；一个下级可提供多个组，不自动故障转移。" actions={<button className="button button-primary" type="button" onClick={() => setFormGroup('new')}><Plus aria-hidden="true" size={17} />新建分组</button>} />
 
       <section className="session-context-bar" aria-label="当前查看会话">
-        <label className="field session-context-picker"><span>当前查看会话</span><select value={sessionId} onChange={(event) => setSessionId(event.target.value)} disabled={sessions.length === 0}><option value="">{sessions.length === 0 ? '暂无在线会话' : '选择在线会话'}</option>{sessionEnded ? <option value={sessionId}>{shortSessionId(sessionId)}（已结束）</option> : null}{sessions.map((session) => <option key={session.id} value={session.id}>{session.clientName} · {shortSessionId(session.id)} · {session.remoteAddress}</option>)}</select></label>
+        <label className="field session-context-picker"><span>当前查看会话</span><select value={sessionId} onChange={(event) => setSessionId(event.target.value)} disabled={sessions.length === 0}><option value="">{sessions.length === 0 ? '暂无在线会话' : '选择在线会话'}</option>{sessionEnded ? <option value={sessionId}>{shortSessionId(sessionId)}（已结束）</option> : null}{sessions.map((session) => <option key={session.id} value={session.id}>{shortClientName(session.clientName)} · {shortSessionId(session.id)} · {session.remoteAddress}</option>)}</select></label>
         <div className="session-context-stat"><span>在线 Session</span><strong>{sessions.length}</strong></div>
         <div className="session-context-stat"><span>路由偏差</span><strong className={effectiveSession ? (deviationCount ? 'text-warning' : 'text-good') : 'text-muted'}>{effectiveSession ? `${deviationCount} / ${groups.length}` : '—'}</strong></div>
         <div className="context-actions"><button className="button button-secondary" type="button" onClick={() => void Promise.all([groupsQuery.refetch(), sourcesQuery.refetch(), sessionsQuery.refetch()])}><RotateCcw aria-hidden="true" size={16} />刷新</button></div>
@@ -70,12 +70,14 @@ export default function GroupsPage() {
 
       <section className="table-panel content-panel groups-route-panel">
         {loading ? <LoadingState /> : firstError ? <ErrorState error={firstError} onRetry={() => void Promise.all([groupsQuery.refetch(), sourcesQuery.refetch(), sessionsQuery.refetch()])} /> : groups.length === 0 ? <EmptyState title="尚未配置分组" description="创建第一个分组后，可在“下级 OPC”中添加来源。" action={<button className="button button-primary" type="button" onClick={() => setFormGroup('new')}><Plus aria-hidden="true" size={16} />新建分组</button>} /> : (
-          <div className="table-scroll"><table className="data-table groups-route-table"><thead><tr><th>逻辑设备组</th><th>此 Session 选中源</th><th>新 Session 默认源</th><th>选中源健康</th><th>本组默认源质量</th><th>来源成员</th><th>待处理命令</th><th>选源版本</th><th className="align-right">操作</th></tr></thead><tbody>{groups.map((group) => {
+          <div className="table-scroll"><table className="data-table responsive-table groups-route-table"><thead><tr><th>逻辑设备组</th><th>此 Session 选中源</th><th>新 Session 默认源</th><th>选中源健康</th><th>本组默认源质量</th><th>来源成员</th><th>待处理命令</th><th>选源版本</th><th className="align-right">操作</th></tr></thead><tbody>{groups.map((group) => {
             const selectedId = effectiveSession ? (effectiveSession.selectedSources[group.id] ?? group.defaultSourceId) : '';
             const source = sourceMap.get(selectedId);
             const health = sourceHealth(source);
             const quality = group;
             const deviated = Boolean(effectiveSession && selectedId !== group.defaultSourceId);
+            const alternativeCount = sources.filter((item) => item.id !== selectedId && sourceHasGroup(item, group.id) && sourceSelectableForGroup(item, group.id)).length;
+            const switchDisabledReason = !effectiveSession ? '请先选择在线 Session' : group.pendingCommandCount > 0 ? '本组有待处理命令，选源已锁定' : alternativeCount === 0 ? '本组没有其他可选来源' : undefined;
             return <tr key={group.id} className={`${detailGroupId === group.id ? 'selected-row ' : ''}health-row health-row-${health}`}>
               <td><button className="group-name-button" type="button" onClick={() => setDetailGroupId(group.id)}><strong>{group.name || group.id}</strong><span>{group.id}</span></button></td>
               <td><span className="session-route-value">{effectiveSession ? selectedId || '未设置' : '—'}</span>{deviated ? <span className="route-deviation route-deviation-block">偏离默认</span> : <span className="sub-cell">{effectiveSession ? '与默认一致' : sessionEnded ? '目标会话已结束' : '尚未选择会话'}</span>}</td>
@@ -85,13 +87,13 @@ export default function GroupsPage() {
               <td>{group.sourceCount} 个<span className="sub-cell">{sources.filter((item) => sourceHasGroup(item, group.id) && sourceHealth(item) === 'good').length} 个健康</span></td>
               <td className={group.pendingCommandCount ? 'text-warning' : ''}>{group.pendingCommandCount ? `${group.pendingCommandCount} · 选源锁定` : '0'}</td>
               <td>{effectiveSession ? (effectiveSession.routeRevisions[group.id] ?? group.selectionRevision) : '—'}<span className="sub-cell">{formatRelativeTime(group.lastSelectedAt)}</span></td>
-              <td className="align-right table-actions"><button className="button button-small button-outline" type="button" disabled={!effectiveSession || group.pendingCommandCount > 0} onClick={() => setSwitchState({ group, mode: 'session', sessionId })}><ArrowLeftRight size={15} />切源</button><button className="icon-button" type="button" title="查看详情" aria-label={`查看 ${group.id}`} onClick={() => setDetailGroupId(group.id)}><ChevronDown size={16} /></button><button className="icon-button" type="button" title="编辑分组" aria-label={`编辑 ${group.id}`} onClick={() => setFormGroup(group)}><Pencil size={16} /></button><button className="icon-button danger-icon" type="button" title="删除分组" aria-label={`删除 ${group.id}`} onClick={() => { removeMutation.reset(); setDeleteGroup(group); }}><Trash2 size={16} /></button></td>
+              <td className="align-right table-actions"><button className="button button-small button-outline" type="button" disabled={Boolean(switchDisabledReason)} title={switchDisabledReason} onClick={() => setSwitchState({ group, mode: 'session', sessionId })}><ArrowLeftRight size={15} />{alternativeCount ? '切源' : '无可切来源'}</button><button className="icon-button" type="button" title="查看详情" aria-label={`查看 ${group.id}`} onClick={() => setDetailGroupId(group.id)}><ChevronDown size={16} /></button><button className="icon-button" type="button" title="编辑分组" aria-label={`编辑 ${group.id}`} onClick={() => setFormGroup(group)}><Pencil size={16} /></button><button className="icon-button danger-icon" type="button" title="删除分组" aria-label={`删除 ${group.id}`} onClick={() => { removeMutation.reset(); setDeleteGroup(group); }}><Trash2 size={16} /></button></td>
             </tr>;
           })}</tbody></table></div>
         )}
       </section>
 
-      {sessions.length > 0 && groups.length > 0 ? <details className="session-route-comparison"><summary>在线 Session 路由对照 <span>查看 {sessions.length} 个 Session 在各分组的实际来源</span></summary><div className="table-scroll"><table className="data-table compact-table"><thead><tr><th>Session</th><th>远端</th>{groups.map((group) => <th key={group.id}>{group.name || group.id}</th>)}<th>最后活动</th></tr></thead><tbody>{sessions.map((session) => <tr key={session.id}><td><strong>{session.clientName}</strong><span className="sub-cell">{shortSessionId(session.id)}</span></td><td>{session.remoteAddress}</td>{groups.map((group) => { const selected = session.selectedSources[group.id] ?? group.defaultSourceId; const different = selected !== group.defaultSourceId; return <td key={group.id} className={different ? 'text-blue' : ''}>{selected || '未设置'}<span className="sub-cell">{different ? '偏离默认' : '与默认一致'}</span></td>; })}<td>{formatRelativeTime(session.lastSeenAt)}</td></tr>)}</tbody></table></div></details> : null}
+      {sessions.length > 0 && groups.length > 0 ? <details className="session-route-comparison"><summary>在线 Session 路由对照 <span>查看 {sessions.length} 个 Session 在各分组的实际来源</span></summary><div className="table-scroll"><table className="data-table compact-table"><thead><tr><th>Session</th><th>远端</th>{groups.map((group) => <th key={group.id}>{group.name || group.id}</th>)}<th>最后活动</th></tr></thead><tbody>{sessions.map((session) => <tr key={session.id}><td title={session.clientName}><strong>{shortClientName(session.clientName)}</strong><span className="sub-cell" title={session.id}>{shortSessionId(session.id)}</span></td><td>{session.remoteAddress}</td>{groups.map((group) => { const selected = session.selectedSources[group.id] ?? group.defaultSourceId; const different = selected !== group.defaultSourceId; return <td key={group.id} className={different ? 'text-blue' : ''}>{selected || '未设置'}<span className="sub-cell">{different ? '偏离默认' : '与默认一致'}</span></td>; })}<td>{formatRelativeTime(session.lastSeenAt)}</td></tr>)}</tbody></table></div></details> : null}
 
       {detailGroup ? <GroupDetailDrawer key={detailGroup.id} group={detailGroup} sources={sources} sessions={sessions} sessionId={sessionId} onSessionChange={setSessionId} onClose={() => setDetailGroupId(undefined)} /> : null}
       <GroupFormModal open={Boolean(formGroup)} group={formGroup === 'new' ? undefined : formGroup} onClose={() => setFormGroup(undefined)} onSaved={setMessage} />

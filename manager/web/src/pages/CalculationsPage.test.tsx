@@ -50,7 +50,7 @@ describe('calculation center', () => {
     const setMode = vi.spyOn(operationsApi, 'calculationMode').mockResolvedValue({ status: 'Saved' });
     const user = setup('/calculations?tab=lowers');
     await user.click(await screen.findByRole('checkbox', { name: '选择 下级 A' }));
-    await user.click(screen.getByRole('button', { name: '批量设为 manager' }));
+    await user.click(screen.getByRole('button', { name: '批量设为管理端计算' }));
     await waitFor(() => expect(setMode).toHaveBeenCalledWith({ id: 'lower-a', revision: 7 }, 'file-r1', 'manager'));
     expect(screen.getByText(/尚未重启/)).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '前往运维重启' })).toBeInTheDocument();

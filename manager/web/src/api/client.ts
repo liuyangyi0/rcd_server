@@ -74,6 +74,8 @@ export function queryString(params: ListParams): string {
   if (params.kind) query.set('kind', params.kind);
   if (params.portId) query.set('port_id', params.portId);
   if (params.deviceId) query.set('device_id', params.deviceId);
+  if (params.from) query.set('from', params.from);
+  if (params.to) query.set('to', params.to);
   const value = query.toString();
   return value ? `?${value}` : '';
 }

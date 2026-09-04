@@ -7,7 +7,7 @@ import type { ListParams, Point } from '../api/types';
 import { EmptyState, ErrorState, LoadingState } from '../components/PageState';
 import { PageHeader } from '../components/PageHeader';
 import { Pagination } from '../components/Pagination';
-import { formatDateTime, displayValue, shortSessionId } from '../lib/format';
+import { formatDateTime, displayValue, shortClientName, shortSessionId } from '../lib/format';
 import { statusCodeLabel } from '../lib/labels';
 import { isBadStatus } from '../lib/status';
 import { sourceHasGroup } from '../lib/sourceGroups';
@@ -81,7 +81,7 @@ export default function PointsPage() {
 
   return (
     <div className="page">
-      <PageHeader title="点位浏览" description="按默认路由、在线 Session 或指定来源查看并集点表，也可并排比较两个来源。" actions={(!compare && routeReady) || (compare && Boolean(groupId && leftSourceId && rightSourceId)) ? <a className="button button-outline" href={`/api/v1/points/export${queryString(exportParams)}`}><Download size={16} />{compare ? `导出 ${leftSourceId}` : '导出当前结果'}</a> : undefined} />
+      <PageHeader title="点位浏览" description="浏览 OPC 目录节点（变量与命令方法）；顶部和页脚的“变量”总数不包含 Method。" actions={(!compare && routeReady) || (compare && Boolean(groupId && leftSourceId && rightSourceId)) ? <a className="button button-outline" href={`/api/v1/points/export${queryString(exportParams)}`}><Download size={16} />{compare ? `导出 ${leftSourceId} 筛选结果` : '导出筛选结果'}</a> : undefined} />
       <form className="toolbar filter-toolbar points-toolbar" onSubmit={(event) => { event.preventDefault(); updateParams({ q: draftQuery.trim(), page: 1 }); }}>
         <label className="search-field"><Search aria-hidden="true" size={17} /><input value={draftQuery} placeholder="搜索 Node ID 或 BrowseName" onChange={(event) => setDraftQuery(event.target.value)} /><button type="submit">搜索</button></label>
         <label className="field inline-field"><span>逻辑组</span><select value={groupId} onChange={(event) => updateParams({ group: event.target.value, page: 1, source: '', catalog_source: '', port: '', device: '', left: '', right: '' })}><option value="">全部分组</option>{(groupsQuery.data ?? []).map((group) => <option key={group.id} value={group.id}>{group.name || group.id}</option>)}</select></label>
@@ -104,7 +104,7 @@ export default function PointsPage() {
       </div> : <div className="route-view-toolbar">
         <strong>样本路由</strong>
         <label className="field inline-field"><span>查看方式</span><select value={view} onChange={(event) => updateParams({ view: event.target.value === 'default' ? '' : event.target.value, page: 1 })}><option value="default">当前默认源</option><option value="session">指定在线 Session</option><option value="source">指定来源（诊断）</option></select></label>
-        {view === 'session' ? <label className="field inline-field route-picker"><span>Session</span><select value={sessionId} onChange={(event) => updateParams({ session: event.target.value, page: 1 })}><option value="">选择 Session</option>{sessionEnded ? <option value={sessionId}>{shortSessionId(sessionId)}（已结束）</option> : null}{(sessionsQuery.data ?? []).map((session) => <option key={session.id} value={session.id}>{session.clientName || '匿名客户端'} · {shortSessionId(session.id)}</option>)}</select></label> : null}
+        {view === 'session' ? <label className="field inline-field route-picker"><span>Session</span><select value={sessionId} onChange={(event) => updateParams({ session: event.target.value, page: 1 })}><option value="">选择 Session</option>{sessionEnded ? <option value={sessionId}>{shortSessionId(sessionId)}（已结束）</option> : null}{(sessionsQuery.data ?? []).map((session) => <option key={session.id} value={session.id}>{shortClientName(session.clientName)} · {shortSessionId(session.id)}</option>)}</select></label> : null}
         {view === 'source' ? <label className="field inline-field route-picker"><span>来源</span><select value={routeSourceId} onChange={(event) => updateParams({ source: event.target.value, page: 1 })}><option value="">选择来源</option>{groupSources.map((source) => <option key={source.id} value={source.id}>{source.name || source.id}</option>)}</select></label> : null}
         <span className="route-view-hint">{view === 'default' ? '显示每个分组当前默认源的数据' : view === 'session' ? '忠实显示该上级 Session 实际读取的路由' : '不修改任何选源，仅用于检查指定下级数据'}</span>
       </div>}
@@ -133,14 +133,13 @@ export default function PointsPage() {
         ) : (
           <>
             <div className={`table-scroll${pointsQuery.isFetching ? ' is-refreshing' : ''}`}>
-              <table className="data-table points-table">
-                <thead><tr><th>Node ID</th><th>BrowseName</th><th>逻辑组</th><th>当前来源</th><th>串口 / 设备</th><th>数据类型</th><th>当前值</th><th>UA 质量</th><th>源时间戳</th></tr></thead>
+              <table className="data-table responsive-table points-table">
+                <thead><tr><th>节点 / BrowseName</th><th>逻辑组</th><th>当前来源</th><th>串口 / 设备</th><th>数据类型</th><th>当前值</th><th>UA 质量</th><th>源时间戳</th></tr></thead>
                 <tbody>{points.map((point) => {
                   const isMethod = point.nodeClass.toLowerCase() === 'method';
                   return (
                     <tr key={`${point.groupId}:${point.nodeId}`} className="virtual-row">
-                      <td><strong>{point.nodeId}</strong>{point.deleted ? <span className="sub-cell text-bad">已退役</span> : null}</td>
-                      <td>{point.browseName}</td>
+                      <td data-label="节点 / BrowseName"><strong>{point.nodeId}</strong>{point.browseName !== point.nodeId ? <span className="sub-cell">{point.browseName}</span> : null}{point.deleted ? <span className="sub-cell text-bad">已退役</span> : null}</td>
                       <td>{point.groupId}</td>
                       <td>{point.selectedSourceId ?? '—'}{!point.sourcePresent ? <span className="sub-cell text-bad">选中源缺少该点</span> : null}</td>
                       <td><PointOwnership point={point} /></td>

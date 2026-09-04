@@ -154,6 +154,9 @@ export interface CommandAudit {
   sourceId: string;
   port: string;
   operation: string;
+  nodeId?: string;
+  request?: string;
+  response?: string;
   result: string;
   statusCode?: string;
   durationMs?: number;
@@ -179,6 +182,8 @@ export interface ListParams {
   kind?: string;
   portId?: string;
   deviceId?: string;
+  from?: string;
+  to?: string;
 }
 
 export type ModuleType = 'unknown' | 'domestic' | 'legacy_russian';

@@ -42,6 +42,27 @@ func TestOperationsAuditRecordsLoggingLevelWithoutConfigBody(t *testing.T) {
 		t.Fatalf("audit=%s", encoded)
 	}
 }
+
+func TestStationOperationOutcomeReflectsHardwareResult(t *testing.T) {
+	tests := []struct {
+		name    string
+		details map[string]any
+		want    string
+	}{
+		{name: "success", details: map[string]any{"version_state": "valid"}, want: "success"},
+		{name: "failed state", details: map[string]any{"version_state": "failed"}, want: "failed"},
+		{name: "hardware error", details: map[string]any{"version_state": "valid", "last_version_error": "frame header mismatch"}, want: "failed"},
+		{name: "mismatch", details: map[string]any{"version_state": "type_mismatch", "type_mismatch": true}, want: "warning"},
+		{name: "pending", details: map[string]any{"version_state": "pending"}, want: "pending"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := stationOperationOutcome(test.details); got != test.want {
+				t.Fatalf("stationOperationOutcome() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
 func (f *operationLowerStub) ExecuteOperation(ctx context.Context, request domain.OperationRequest, epoch uint64) (json.RawMessage, error) {
 	f.calls.Add(1)
 	if f.execute != nil {

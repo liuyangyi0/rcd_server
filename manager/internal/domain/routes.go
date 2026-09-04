@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -399,6 +400,12 @@ func (t *RouteTable) SetDefault(groupID, sourceID string, expectedRevision uint6
 }
 
 func (t *RouteTable) BeginCommand(sessionID, groupID, port, kind string) (PendingCommand, error) {
+	return t.BeginCommandWithDetails(sessionID, groupID, port, kind, "", "")
+}
+
+// BeginCommandWithDetails captures the immutable public target and request at
+// dispatch time. They are audit metadata only and never participate in routing.
+func (t *RouteTable) BeginCommandWithDetails(sessionID, groupID, port, kind, nodeID, request string) (PendingCommand, error) {
 	if port == "" {
 		return PendingCommand{}, &FieldError{Field: "port", Message: "must not be empty"}
 	}
@@ -427,7 +434,7 @@ func (t *RouteTable) BeginCommand(sessionID, groupID, port, kind string) (Pendin
 	id := t.newCommandIDLocked()
 	command := PendingCommand{
 		ID: id, SessionID: sessionID, GroupID: groupID, SourceID: route.SourceID,
-		Port: port, Kind: kind, State: CommandWaiting,
+		Port: port, Kind: kind, NodeID: nodeID, Request: request, State: CommandWaiting,
 		StatusCode: StatusBadWaitingForResponse, StartedAt: t.clock().UTC(),
 	}
 	t.pendingByKey[key] = command
@@ -504,6 +511,7 @@ func (t *RouteTable) PrepareCommandFinish(id string, state CommandState, status 
 	command.State = state
 	command.StatusCode = status
 	command.Error = message
+	command.Response = commandResponse(state, message)
 	command.FinishedAt = finishedAt.UTC()
 	return command, nil
 }
@@ -615,8 +623,20 @@ func (t *RouteTable) finishCommandLocked(key string, state CommandState, status 
 	command.State = state
 	command.StatusCode = status
 	command.Error = message
+	command.Response = commandResponse(state, message)
 	command.FinishedAt = finishedAt
 	return command
+}
+
+func commandResponse(state CommandState, message string) string {
+	switch {
+	case state == CommandReceived:
+		return "1"
+	case state == CommandFailed && strings.Contains(strings.ToLower(message), "rejected command"):
+		return "3"
+	default:
+		return ""
+	}
 }
 
 func (t *RouteTable) PendingCount(groupID string) int {

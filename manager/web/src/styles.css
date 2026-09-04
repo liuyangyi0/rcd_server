@@ -572,6 +572,96 @@ i { font-style: normal; }
   .topology-footer .button { width: 100%; }
 }
 
+/* Keep the consolidated version table and source actions usable after legacy
+   feature-specific rules declared above. */
+.device-version-table { min-width: 1060px; }
+.source-table .table-actions { min-width: 340px; flex-wrap: wrap; }
+.source-table td:last-child { white-space: normal; }
+
+/* Operational clarity and responsive table pass. */
+.content-panel { min-height: 0; }
+.content-panel > .page-state { min-height: 220px; }
+.button-primary:disabled, .button-danger:disabled { border-color: #aeb8c6; background: #aeb8c6; color: #f8fafc; opacity: 1; }
+.button-danger-outline { border-color: #e59699; background: #fff; color: #b91820; }
+.button-danger-outline:hover:not(:disabled) { border-color: var(--red); background: var(--red-soft); }
+.copy-text-button { display: inline-flex; align-items: center; gap: 3px; margin-top: 3px; padding: 1px 3px; border: 0; background: transparent; color: var(--blue); cursor: pointer; font-size: 10px; }
+.copy-text-button:hover { text-decoration: underline; }
+.labelled-status { display: grid; gap: 3px; color: var(--muted); font-size: 10px; }
+.labelled-status > span { display: flex; align-items: center; gap: 5px; }
+.labelled-status b { color: var(--text); font-size: 11px; font-weight: 500; }
+.quality-attention-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 0 0 12px; border: 1px solid var(--border); background: #fff; }
+.quality-attention-strip > * { min-height: 78px; display: flex; flex-direction: column; justify-content: center; gap: 2px; padding: 11px 15px; border-right: 1px solid var(--border); }
+.quality-attention-strip > *:last-child { border-right: 0; }
+.quality-attention-strip a:hover { background: var(--surface-blue); }
+.quality-attention-strip span, .quality-attention-strip small { color: var(--muted); font-size: 11px; }
+.quality-attention-strip strong { color: var(--navy); font-size: 18px; }
+.event-transition-list { display: grid; gap: 3px; margin-top: 4px; color: var(--muted); font-size: 11px; }
+.event-transition-list span { display: grid; grid-template-columns: 90px 1fr; gap: 6px; }
+.event-transition-list b { color: #46556b; font-weight: 600; }
+.audit-details summary, .selection-rules summary, .calculation-routing-details summary, .lower-log-message details summary { color: var(--blue); cursor: pointer; font-size: 11px; }
+.audit-details pre, .lower-log-message pre { max-width: 480px; max-height: 260px; margin: 6px 0 0; padding: 8px; overflow: auto; background: #f5f7fa; color: #42516a; font: 11px/1.5 Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.selection-rules, .calculation-routing-details { margin-top: 6px; }
+.selection-rules p, .calculation-routing-details p { margin: 5px 0 0; }
+.toolbar-order-note { align-self: flex-end; padding: 8px 0; color: var(--muted); font-size: 11px; }
+.command-payload { display: block; max-width: 210px; overflow: hidden; text-overflow: ellipsis; color: #304661; }
+.source-table { min-width: 1120px; }
+.groups-route-table { min-width: 1160px; }
+.device-version-table { min-width: 1060px; }
+.version-pair { display: grid; grid-template-columns: 46px minmax(0, 1fr); gap: 5px; align-items: baseline; }
+.version-pair + .version-pair { margin-top: 4px; }
+.version-pair > b { color: var(--muted); font-size: 10px; font-weight: 600; }
+.operation-disabled-reason { max-width: 190px; white-space: normal; overflow-wrap: anywhere; }
+.calculation-expression-details { max-width: 430px; }
+.calculation-expression-details summary { max-width: 430px; overflow: hidden; color: #304661; cursor: pointer; list-style-position: inside; text-overflow: ellipsis; white-space: nowrap; }
+.calculation-expression-details > code { display: block; margin-top: 6px; padding: 7px; background: #f4f7fa; white-space: pre-wrap; overflow-wrap: anywhere; }
+.calculation-editor-shell { min-width: 0; border: 1px solid #afbdcf; background: #0f1b2a; }
+.calculation-editor-pagination { min-height: 66px; display: grid; grid-template-columns: minmax(180px, 1fr) auto auto; gap: 12px; align-items: center; padding: 9px 12px; border-bottom: 1px solid #314157; background: #17263a; color: #dce8f5; }
+.calculation-editor-pagination > div:first-child { display: grid; }
+.calculation-editor-pagination span, .calculation-editor-pagination small { color: #9fb0c5; font-size: 10px; }
+.calculation-editor-page-controls { display: flex; align-items: center; gap: 6px; }
+.calculation-editor-page-controls select { max-width: 170px; height: 31px; border-color: #60728a; background: #f8fafc; }
+.calculation-editor-shell .calculation-editor { display: block; min-height: 542px; border: 0; border-radius: 0; }
+
+@media (max-width: 980px) {
+  .quality-attention-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .quality-attention-strip > *:nth-child(2) { border-right: 0; }
+  .quality-attention-strip > *:nth-child(-n+2) { border-bottom: 1px solid var(--border); }
+}
+
+@media (max-width: 820px) {
+  :root { --statusbar-height: 0px; }
+  .statusbar { display: none; }
+  .sidebar { bottom: 0; }
+  .mobile-backdrop { bottom: 0; }
+  .page { padding-bottom: 28px; }
+  .responsive-table { min-width: 0 !important; }
+  .responsive-table, .responsive-table tbody, .responsive-table tr, .responsive-table td { display: block; width: 100%; }
+  .responsive-table thead { display: none; }
+  .responsive-table tbody { padding: 8px; }
+  .responsive-table tr { margin-bottom: 10px; border: 1px solid var(--border); border-left: 3px solid #91a0b3; background: #fff; }
+  .responsive-table tr:last-child { margin-bottom: 0; }
+  .responsive-table td { min-height: 0; padding: 8px 10px; border-bottom: 1px solid #e7ebf0 !important; white-space: normal; overflow-wrap: anywhere; }
+  .responsive-table td:last-child { border-bottom: 0 !important; }
+  .responsive-table td[data-label] { display: grid; grid-template-columns: 105px minmax(0, 1fr); gap: 10px; }
+  .responsive-table td[data-label]::before { content: attr(data-label); color: var(--muted); font-size: 11px; font-weight: 600; }
+  .responsive-table .table-actions { justify-content: flex-start; flex-wrap: wrap; }
+  .source-table td::before, .groups-route-table td::before, .points-table td::before, .calculation-results-table td::before { display: block; margin-bottom: 3px; color: var(--muted); font-size: 10px; font-weight: 600; }
+  .source-table td:nth-child(1)::before { content: '来源'; }.source-table td:nth-child(2)::before { content: '设备组'; }.source-table td:nth-child(3)::before { content: 'Endpoint'; }.source-table td:nth-child(4)::before { content: '连接链路'; }.source-table td:nth-child(5)::before { content: '目录'; }.source-table td:nth-child(6)::before { content: '质量'; }.source-table td:nth-child(7)::before { content: '最近活动'; }.source-table td:nth-child(8)::before { content: '重连'; }.source-table td:nth-child(9)::before { content: '操作'; }
+  .groups-route-table td:nth-child(1)::before { content: '逻辑设备组'; }.groups-route-table td:nth-child(2)::before { content: '此 Session 选中源'; }.groups-route-table td:nth-child(3)::before { content: '新 Session 默认源'; }.groups-route-table td:nth-child(4)::before { content: '选中源健康'; }.groups-route-table td:nth-child(5)::before { content: '默认源质量'; }.groups-route-table td:nth-child(6)::before { content: '来源成员'; }.groups-route-table td:nth-child(7)::before { content: '待处理命令'; }.groups-route-table td:nth-child(8)::before { content: '选源版本'; }.groups-route-table td:nth-child(9)::before { content: '操作'; }
+  .points-table td:nth-child(2)::before { content: '逻辑组'; }.points-table td:nth-child(3)::before { content: '当前来源'; }.points-table td:nth-child(4)::before { content: '串口 / 设备'; }.points-table td:nth-child(5)::before { content: '数据类型'; }.points-table td:nth-child(6)::before { content: '当前值'; }.points-table td:nth-child(7)::before { content: 'UA 质量'; }.points-table td:nth-child(8)::before { content: '源时间戳'; }
+  .calculation-results-table td:nth-child(1)::before { content: 'KKS'; }.calculation-results-table td:nth-child(2)::before { content: '表达式'; }.calculation-results-table td:nth-child(3)::before { content: '当前值'; }.calculation-results-table td:nth-child(4)::before { content: '类型'; }.calculation-results-table td:nth-child(5)::before { content: '质量'; }.calculation-results-table td:nth-child(6)::before { content: '求值时间'; }.calculation-results-table td:nth-child(7)::before { content: '依赖'; }.calculation-results-table td:nth-child(8)::before { content: '默认路由版本'; }
+  .health-row td:first-child::before { position: static; width: auto; background: transparent !important; }
+  .calculation-editor-pagination { grid-template-columns: 1fr; }
+  .calculation-editor-page-controls { flex-wrap: wrap; }
+}
+
+@media (max-width: 540px) {
+  .quality-attention-strip { grid-template-columns: 1fr; }
+  .quality-attention-strip > * { border-right: 0; border-bottom: 1px solid var(--border); }
+  .quality-attention-strip > *:last-child { border-bottom: 0; }
+  .responsive-table td[data-label] { grid-template-columns: 86px minmax(0, 1fr); }
+}
+
 /* Central calculation center */
 .calculation-page > .inline-notice { margin-bottom: 14px; }
 .calculation-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 14px; border: 1px solid var(--border); background: #fff; }

@@ -208,12 +208,35 @@ func (r *Runtime) ExecuteSourceOperation(ctx context.Context, id string, sourceR
 				for key, value := range stationOperationAuditResult(result, request) {
 					completed[key] = value
 				}
+				completed["outcome"] = stationOperationOutcome(completed)
 			}
 		}
 		r.audit(ctx, "source.operation.completed", id, target.source.Revision, completed)
 		r.broker.Publish(api.Event{Type: "source.operation", SourceID: id, Data: map[string]any{"source_id": id, "action": request.Action}})
 	}
 	return result, err
+}
+
+func stationOperationOutcome(details map[string]any) string {
+	state := ""
+	if value, ok := details["version_state"]; ok && value != nil {
+		state = strings.ToLower(strings.TrimSpace(fmt.Sprint(value)))
+	}
+	lastError := ""
+	if value, ok := details["last_version_error"]; ok && value != nil {
+		lastError = strings.TrimSpace(fmt.Sprint(value))
+	}
+	mismatch, _ := details["type_mismatch"].(bool)
+	switch {
+	case lastError != "" || strings.Contains(state, "fail") || strings.Contains(state, "error") || strings.Contains(state, "timeout"):
+		return "failed"
+	case mismatch:
+		return "warning"
+	case strings.Contains(state, "pending") || strings.Contains(state, "waiting") || strings.Contains(state, "querying"):
+		return "pending"
+	default:
+		return "success"
+	}
 }
 
 func (r *Runtime) checkSourceOperationLocked(id string) error {

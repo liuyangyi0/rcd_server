@@ -53,6 +53,8 @@ type LowerLogRequest struct {
 	PortID   string
 	DeviceID string
 	Query    string
+	From     time.Time
+	To       time.Time
 	Limit    int
 	Offset   int
 }
@@ -155,6 +157,24 @@ func (h *Handler) listLowerLogs(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid_request", "offset must be non-negative", nil)
 			return
 		}
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("from")); raw != "" {
+		request.From, err = time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "from must be an RFC3339 timestamp", nil)
+			return
+		}
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("to")); raw != "" {
+		request.To, err = time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "to must be an RFC3339 timestamp", nil)
+			return
+		}
+	}
+	if !request.From.IsZero() && !request.To.IsZero() && request.From.After(request.To) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "from must not be after to", nil)
+		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	value, err := service.ListLowerLogs(r.Context(), request)

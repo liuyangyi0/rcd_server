@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react';
 import { ArrowRight, BellRing, CircleAlert, Plus, ServerOff, Split, TriangleAlert } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
-import { useAlarms, useCommands, useGroups, useOverview, useSessions, useSources } from '../api/queries';
+import { useAlarms, useCommands, useDeviceVersions, useGroups, useOverview, useSessions, useSources } from '../api/queries';
+import { useCalculationStatus } from '../api/calculations';
 import type { Group, Source } from '../api/types';
 import { EmptyState, ErrorState, LoadingState } from '../components/PageState';
 import { PageHeader } from '../components/PageHeader';
@@ -31,6 +32,8 @@ export default function OverviewPage() {
   const sessionsQuery = useSessions();
   const commandsQuery = useCommands({ page: 1, pageSize: 5 });
   const alarmsQuery = useAlarms({ page: 1, pageSize: 5, status: 'Open' });
+  const versionsQuery = useDeviceVersions({ page: 1, pageSize: 1 });
+  const calculationQuery = useCalculationStatus();
   const [selectedGroupId, setSelectedGroupId] = useState<string>();
   const [setupOpen, setSetupOpen] = useState(false);
   const [message, setMessage] = useState('');
@@ -50,7 +53,10 @@ export default function OverviewPage() {
     const healthOrder = { bad: 0, warning: 1, unknown: 2, good: 3 } as const;
     return healthOrder[sourceHealth(a)] - healthOrder[sourceHealth(b)] || (b.badPoints - a.badPoints) || a.id.localeCompare(b.id);
   }).slice(0, 5), [sources]);
-  const issueCount = unhealthySources.length + catalogConflicts.length + (data?.unacknowledgedAlarms ?? 0) + (deviations > 0 ? 1 : 0);
+  const rawBadPoints = sources.reduce((count, source) => count + source.badPoints, 0);
+  const calculationBad = calculationQuery.data?.badCount ?? 0;
+  const versionIssues = (versionsQuery.data?.summary.failed ?? 0) + (versionsQuery.data?.summary.mismatch ?? 0) + (versionsQuery.data?.summary.offlineCached ?? 0);
+  const issueCount = [unhealthySources.length, catalogConflicts.length, data?.unacknowledgedAlarms ?? 0, deviations, rawBadPoints, calculationBad, versionIssues].filter((count) => count > 0).length;
   const loading = groupsQuery.isLoading || sourcesQuery.isLoading || sessionsQuery.isLoading;
   const firstError = groupsQuery.error ?? sourcesQuery.error ?? sessionsQuery.error;
 
@@ -66,7 +72,7 @@ export default function OverviewPage() {
         <div className="health-metric"><span>下级连接</span><strong><i className={data?.abnormalSources ? 'text-warning' : 'text-good'}>{data?.connectedSources ?? '—'}</i> / {data?.totalSources ?? '—'}</strong><small>{data?.abnormalSources ?? 0} 个异常</small></div>
         <div className="health-metric health-metric-wide"><span>点位质量</span><strong>{data?.qualityKnown ? <><i className="text-good">{formatNumber(data.goodPoints)} Good</i><em>/</em><i className={data.badPoints ? 'text-bad' : 'text-muted'}>{formatNumber(data.badPoints)} Bad</i></> : formatNumber(data?.totalPoints ?? 0)}</strong><small>{data?.qualityKnown ? `共 ${formatNumber(data.totalPoints)} 点` : '实时质量统计未提供'}</small></div>
         <div className="health-metric"><span>上级 Session</span><strong>{formatNumber(data?.sessionCount ?? 0)}</strong><small>{formatNumber(data?.subscriptionCount ?? 0)} 个订阅</small></div>
-        <div className="health-metric"><span>未确认告警</span><strong className={data?.unacknowledgedAlarms ? 'text-bad' : 'text-good'}>{formatNumber(data?.unacknowledgedAlarms ?? 0)}</strong><small>{data?.openAlarms ?? 0} 个未恢复</small></div>
+        <div className="health-metric"><span>OPC 链路告警</span><strong className={data?.unacknowledgedAlarms ? 'text-bad' : 'text-good'}>{formatNumber(data?.unacknowledgedAlarms ?? 0)}</strong><small>{data?.openAlarms ?? 0} 个未恢复</small></div>
         <NavLink className="button button-primary health-strip-action" to="/operations?tab=alarms&state=Open">查看告警</NavLink>
       </section>
 
@@ -93,7 +99,10 @@ export default function OverviewPage() {
             {catalogConflicts.slice(0, 1).map((source) => <NavLink key={`catalog-${source.id}`} to="/sources" className="attention-item attention-warning"><TriangleAlert size={17} /><div><strong>目录冲突 · {source.name || source.id}</strong><span>{source.catalogConflicts?.[0]?.message || stateLabel(source.catalogState)}</span></div><span>查看</span></NavLink>)}
             {(alarmsQuery.data?.items ?? []).slice(0, 2).map((alarm) => <NavLink key={`alarm-${alarm.id}`} to="/operations?tab=alarms&state=Open" className="attention-item"><BellRing size={17} /><div><strong>未确认告警 · {alarm.sourceId || '系统'}</strong><span>{alarm.message}</span></div><time>{formatRelativeTime(alarm.updatedAt)}</time></NavLink>)}
             {deviations > 0 ? <NavLink to="/groups" className="attention-item attention-warning"><Split size={17} /><div><strong>Session 路由偏离默认</strong><span>{deviations} 条偏离，{selectedRouteCount} 条与默认一致</span></div><span>查看</span></NavLink> : null}
-            {issueCount === 0 ? <div className="attention-empty"><CircleAlert size={21} /><strong>当前无需人工处理</strong><span>连接、目录与告警均正常</span></div> : null}
+            {rawBadPoints > 0 ? <NavLink to="/points?quality=Bad" className="attention-item"><CircleAlert size={17} /><div><strong>采集点质量异常</strong><span>{formatNumber(rawBadPoints)} 个来源点为非 Good</span></div><span>查看</span></NavLink> : null}
+            {calculationBad > 0 ? <NavLink to="/calculations?quality=bad" className="attention-item"><CircleAlert size={17} /><div><strong>计算结果质量异常</strong><span>{formatNumber(calculationBad)} 个计算点为非 Good</span></div><span>查看</span></NavLink> : null}
+            {versionIssues > 0 ? <NavLink to="/device-versions?status=failed" className="attention-item attention-warning"><TriangleAlert size={17} /><div><strong>设备版本需要检查</strong><span>{formatNumber(versionIssues)} 个失败、不一致或离线缓存项</span></div><span>查看</span></NavLink> : null}
+            {issueCount === 0 ? <div className="attention-empty"><CircleAlert size={21} /><strong>当前无需人工处理</strong><span>连接、目录、采集质量、计算质量与设备版本均正常</span></div> : null}
           </div>
           <NavLink className="panel-footer-link" to="/operations">查看全部告警与审计 <ArrowRight size={15} /></NavLink>
         </aside>
@@ -101,7 +110,7 @@ export default function OverviewPage() {
 
       <section className="work-panel source-health-panel">
         <div className="panel-heading"><div><h2>来源健康</h2><p>异常优先，合并展示连接链路、质量和错误摘要</p></div><NavLink to="/sources">查看全部 {sources.length} 个来源 <ArrowRight size={15} /></NavLink></div>
-        {sourcesQuery.isLoading ? <LoadingState label="正在加载来源…" /> : sources.length === 0 ? <EmptyState title="暂无下级 OPC" /> : <div className="table-scroll"><table className="data-table compact-table"><thead><tr><th>来源</th><th>默认归属 / 设备组</th><th>连接 / Session / 订阅</th><th>监控点</th><th>来源整体 Good / Bad</th><th>最近数据</th><th>重连</th><th>错误摘要</th></tr></thead><tbody>{prioritySources.map((source) => <tr key={source.id} className={`health-row health-row-${sourceHealth(source)}`}><td><strong>{source.name || source.id}</strong><span className="sub-cell">{source.id}</span></td><td>{source.groupId}<span className="sub-cell" title={sourceGroupIds(source).join('、')}>{sourceGroupIds(source).length} 个逻辑组</span></td><td><div className="status-sequence"><StatusBadge state={source.connectionState.toLowerCase().includes('connected') && !source.connectionState.toLowerCase().includes('disconnected') ? 'good' : 'bad'} label={stateLabel(source.connectionState)} compact /><StatusBadge state={source.sessionState.toLowerCase().includes('active') ? 'good' : 'bad'} label={stateLabel(source.sessionState)} compact /><StatusBadge state={source.subscriptionState.toLowerCase().includes('active') ? 'good' : 'bad'} label={stateLabel(source.subscriptionState)} compact /></div></td><td>{formatNumber(source.monitoredCount)}</td><td><Quality good={source.goodPoints} bad={source.badPoints} total={source.totalPoints} known={source.qualityKnown} /></td><td>{formatRelativeTime(source.lastDataAt)}</td><td>{source.reconnectCount}</td><td className="message-cell">{source.lastError || <span className="text-muted">—</span>}</td></tr>)}</tbody></table></div>}
+        {sourcesQuery.isLoading ? <LoadingState label="正在加载来源…" /> : sources.length === 0 ? <EmptyState title="暂无下级 OPC" /> : <div className="table-scroll"><table className="data-table compact-table"><thead><tr><th>来源</th><th>默认归属 / 设备组</th><th>连接链路</th><th>监控变量</th><th>来源整体 Good / Bad</th><th>最近数据</th><th>重连</th><th>错误摘要</th></tr></thead><tbody>{prioritySources.map((source) => <tr key={source.id} className={`health-row health-row-${sourceHealth(source)}`}><td><strong>{source.name || source.id}</strong><span className="sub-cell">{source.id}</span></td><td>{source.groupId}<span className="sub-cell" title={sourceGroupIds(source).join('、')}>{sourceGroupIds(source).length} 个逻辑组</span></td><td><div className="status-sequence labelled-status"><span>连接 <StatusBadge state={source.connectionState.toLowerCase().includes('connected') && !source.connectionState.toLowerCase().includes('disconnected') ? 'good' : 'bad'} label={stateLabel(source.connectionState)} compact /></span><span>会话 <StatusBadge state={source.sessionState.toLowerCase().includes('active') ? 'good' : 'bad'} label={stateLabel(source.sessionState)} compact /></span><span>订阅 <StatusBadge state={source.subscriptionState.toLowerCase().includes('active') ? 'good' : 'bad'} label={stateLabel(source.subscriptionState)} compact /></span></div></td><td>{formatNumber(source.monitoredCount)}</td><td><Quality good={source.goodPoints} bad={source.badPoints} total={source.totalPoints} known={source.qualityKnown} /></td><td>{formatRelativeTime(source.lastDataAt)}</td><td>{source.reconnectCount}</td><td className="message-cell">{source.lastError || <span className="text-muted">—</span>}</td></tr>)}</tbody></table></div>}
       </section>
 
       <div className="overview-secondary-grid">

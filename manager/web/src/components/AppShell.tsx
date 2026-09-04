@@ -43,7 +43,7 @@ export function AppShell() {
   return (
     <div className={`app-shell${collapsed ? ' sidebar-collapsed' : ''}`}>
       <header className="topbar">
-        <button className="mobile-menu-button icon-button" type="button" onClick={() => setMobileOpen((value) => !value)} aria-label="打开导航">{mobileOpen ? <X size={21} /> : <Menu size={21} />}</button>
+        <button className="mobile-menu-button icon-button" type="button" onClick={() => setMobileOpen((value) => !value)} aria-label={mobileOpen ? '关闭导航' : '打开导航'}>{mobileOpen ? <X size={21} /> : <Menu size={21} />}</button>
         <div className="brand"><span className="brand-mark" aria-hidden="true"><DatabaseZap size={24} strokeWidth={2.1} /></span><span>RCD OPC 管理中心</span></div>
         <div className="topbar-actions">
           <span className={`global-service-state ${managerGood ? 'state-online' : 'state-offline'}`}><i />管理 OPC {managerGood ? '运行中' : '异常'}</span>
@@ -59,7 +59,7 @@ export function AppShell() {
       </aside>
 
       <main className="main-content"><Outlet /></main>
-      <footer className="statusbar"><span><i className={`status-light ${managerGood ? 'light-good' : 'light-bad'}`} />OPC：{data?.opcEndpoint ?? '无法获取'}</span><span>Web API：{overview.isError ? '异常' : data?.webApiState ?? '连接中'}</span><span>SSE：{streamLabel}</span><span>Session：{data ? formatNumber(data.sessionCount) : '—'}</span><span>订阅：{data ? formatNumber(data.subscriptionCount) : '—'}</span><span>点位：{data ? formatNumber(data.totalPoints) : '—'}</span><span className="statusbar-spacer" /><span>v{data?.version ?? '—'} {data?.gitSha && data.gitSha !== '—' ? `(${data.gitSha.slice(0, 7)})` : ''}</span><span>{now.toLocaleString('zh-CN', { hour12: false })}</span></footer>
+      <footer className="statusbar"><span><i className={`status-light ${managerGood ? 'light-good' : 'light-bad'}`} />OPC：{data?.opcEndpoint ?? '无法获取'}</span><span>SSE：{streamLabel}</span><span>Session：{data ? formatNumber(data.sessionCount) : '—'}</span><span>订阅：{data ? formatNumber(data.subscriptionCount) : '—'}</span><span>变量：{data ? formatNumber(data.totalPoints) : '—'}</span></footer>
     </div>
   );
 }

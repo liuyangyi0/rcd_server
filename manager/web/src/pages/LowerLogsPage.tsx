@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Download, RefreshCw, Search } from 'lucide-react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { apiErrorMessage } from '../api/client';
-import { useLowerLogs, type LowerLogLevel } from '../api/lowerLogs';
+import { useLowerLogs, type LowerLogItem, type LowerLogLevel } from '../api/lowerLogs';
 import { useLoggingLevelMutation, useLoggingStatus, useOperationsCapabilities, type LoggingLevel } from '../api/operations';
 import { useSources } from '../api/queries';
 import type { Source } from '../api/types';
@@ -12,6 +12,7 @@ import { PageHeader } from '../components/PageHeader';
 import { Pagination } from '../components/Pagination';
 import { StatusBadge } from '../components/StatusBadge';
 import { formatDateTime, formatRelativeTime } from '../lib/format';
+import { humanizeTechnicalMessage } from '../lib/labels';
 
 const PAGE_SIZE = 100;
 const LOG_LEVELS: Array<{ value: LoggingLevel; label: string; description: string }> = [
@@ -32,10 +33,15 @@ export default function LowerLogsPage() {
   const query = params.get('q') ?? '';
   const portId = params.get('port') ?? '';
   const deviceId = params.get('device') ?? '';
+  const range = params.get('range') ?? '1h';
+  const customFrom = params.get('from') ?? '';
+  const customTo = params.get('to') ?? '';
   const [draft, setDraft] = useState({ query, portId, deviceId });
-  const logs = useLowerLogs({ sourceId, level, query, portId, deviceId, page, pageSize: PAGE_SIZE });
+  const bounds = useMemo(() => logTimeBounds(range, customFrom, customTo), [range, customFrom, customTo]);
+  const logs = useLowerLogs({ sourceId, level, query, portId, deviceId, ...bounds, page, pageSize: PAGE_SIZE });
+  const groupedLogs = useMemo(() => groupRepeatedLogs(logs.data?.items ?? []), [logs.data?.items]);
   const selectedSource = useMemo(() => sources.data?.find((source) => source.id === sourceId), [sourceId, sources.data]);
-  const hasViewConstraints = Boolean(level || query || portId || deviceId || page > 1);
+  const hasViewConstraints = Boolean(level || query || portId || deviceId || page > 1 || range !== '1h');
 
   useEffect(() => {
     if (!requestedSource && sourceId) {
@@ -67,14 +73,13 @@ export default function LowerLogsPage() {
       : <StatusBadge state="unknown" compact label="尚未收到推送" />;
   const showLatest = () => {
     setDraft({ query: '', portId: '', deviceId: '' });
-    update({ q: '', port: '', device: '', level: '', page: 1 });
+    update({ q: '', port: '', device: '', level: '', range: '1h', from: '', to: '', page: 1 });
   };
 
   return <div className="page lower-logs-page">
     <PageHeader title="下级集中日志" description="下级通过独立 HTTP 队列批量发送；管理端按来源滚动保存，串口采集不会等待网络。" actions={<>
       <button className="button button-outline" type="button" disabled={!logs.data?.items.length} onClick={() => logs.data && exportCurrentPage(selectedSource?.name || sourceId, logs.data.items)}><Download size={16} />导出当前页</button>
       <button className="button button-outline" type="button" disabled={!hasViewConstraints} onClick={showLatest}>显示最新日志</button>
-      <button className="button button-outline" type="button" onClick={() => document.getElementById('lower-log-control')?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })}>调整日志等级</button>
       <button className="button button-secondary" type="button" disabled={logs.isFetching || !sourceId} onClick={() => void logs.refetch()}><RefreshCw size={16} />刷新</button>
     </>} />
 
@@ -87,12 +92,17 @@ export default function LowerLogsPage() {
       <div><span>文件异常行</span><strong className={(logs.data?.invalidLines ?? 0) > 0 ? 'text-warning' : ''}>{logs.data?.invalidLines ?? 0}</strong><small>损坏行会跳过，不影响其他日志</small></div>
     </section>
 
+    <SourceLoggingControl source={selectedSource} />
+
     <form className="toolbar filter-toolbar lower-log-filters" onSubmit={(event) => { event.preventDefault(); update({ q: draft.query.trim(), port: draft.portId.trim(), device: draft.deviceId.trim(), page: 1 }); }}>
       <label className="field inline-field"><span>下级来源</span><select value={sourceId} disabled={sources.isLoading} onChange={(event) => { setDraft({ query: '', portId: '', deviceId: '' }); update({ source: event.target.value, q: '', port: '', device: '', level: '', page: 1 }); }}><option value="">请选择来源</option>{(sources.data ?? []).map((source) => <option key={source.id} value={source.id}>{source.name || source.id} · {source.id}</option>)}</select></label>
       <label className="field inline-field"><span>等级</span><select value={level} onChange={(event) => update({ level: event.target.value, page: 1 })}><option value="">全部</option>{['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'].map((value) => <option key={value}>{value}</option>)}</select></label>
       <label className="field inline-field"><span>串口</span><input value={draft.portId} placeholder="/dev/ttyWCH0" onChange={(event) => setDraft((value) => ({ ...value, portId: event.target.value }))} /></label>
       <label className="field inline-field"><span>站点</span><input value={draft.deviceId} placeholder="13" onChange={(event) => setDraft((value) => ({ ...value, deviceId: event.target.value }))} /></label>
+      <label className="field inline-field"><span>时间范围</span><select value={range} onChange={(event) => update({ range: event.target.value, from: '', to: '', page: 1 })}><option value="1h">最近 1 小时</option><option value="24h">最近 24 小时</option><option value="today8">今天 08:00 起</option><option value="all">全部日志</option><option value="custom">自定义</option></select></label>
+      {range === 'custom' ? <><label className="field inline-field"><span>开始</span><input type="datetime-local" value={logLocalInput(customFrom)} onChange={(event) => update({ from: logISO(event.target.value), page: 1 })} /></label><label className="field inline-field"><span>结束</span><input type="datetime-local" value={logLocalInput(customTo)} onChange={(event) => update({ to: logISO(event.target.value), page: 1 })} /></label></> : null}
       <label className="search-field"><Search size={17} /><input value={draft.query} placeholder="搜索消息、组件、串口或站点" onChange={(event) => setDraft((value) => ({ ...value, query: event.target.value }))} /><button type="submit">筛选</button></label>
+      <span className="toolbar-order-note">最新在前</span>
     </form>
 
     <section className="table-panel content-panel">
@@ -100,18 +110,57 @@ export default function LowerLogsPage() {
         : logs.isLoading && !logs.data ? <LoadingState label="正在读取管理端集中日志…" />
           : logs.error ? <ErrorState error={logs.error} title="无法读取集中日志" onRetry={() => void logs.refetch()} />
             : !logs.data?.items.length ? <EmptyState title="没有匹配的集中日志" description={logs.data?.pushState === 'never_received' ? '该来源尚未向管理端推送日志；原始文件仍可通过下级运维读取。' : '请调整等级、串口、站点或关键字筛选。'} />
-              : <><div className="table-scroll"><table className="data-table lower-log-table"><thead><tr><th>发生时间</th><th>等级</th><th>组件</th><th>串口 / 站点</th><th>日志信息</th><th>接收</th></tr></thead><tbody>{logs.data.items.map((item) => <tr key={`${item.bootId}-${item.sequence}`}>
-                <td>{formatDateTime(item.timestamp)}<span className="sub-cell">#{item.sequence} · {item.bootId.slice(0, 12)}</span></td>
-                <td><span className={`log-level log-${item.level.toLowerCase()}`}>{item.level}</span></td>
-                <td><code>{item.component || '—'}</code></td>
-                <td>{item.portId || '—'}<span className="sub-cell">站点 {item.deviceId || '—'}</span></td>
-                <td className="message-cell lower-log-message"><span>{item.message}</span>{item.fields && Object.keys(item.fields).length ? <code>{JSON.stringify(item.fields)}</code> : null}</td>
-                <td>{formatRelativeTime(item.receivedAt)}<span className="sub-cell">{formatDateTime(item.receivedAt)}</span></td>
+              : <><div className="table-scroll"><table className="data-table responsive-table lower-log-table"><thead><tr><th>发生时间</th><th>等级</th><th>组件</th><th>串口 / 站点</th><th>日志信息</th><th>接收</th></tr></thead><tbody>{groupedLogs.map(({ item, count, oldestAt }) => <tr key={`${item.bootId}-${item.sequence}`}>
+                <td data-label="发生时间">{formatDateTime(item.timestamp)}<span className="sub-cell">#{item.sequence} · {item.bootId.slice(0, 12)}</span>{count > 1 ? <span className="sub-cell">连续 {count} 次 · 至 {formatDateTime(oldestAt)}</span> : null}</td>
+                <td data-label="等级"><span className={`log-level log-${item.level.toLowerCase()}`}>{item.level}</span></td>
+                <td data-label="组件"><code>{item.component || '—'}</code></td>
+                <td data-label="串口 / 站点">{item.portId || '—'}<span className="sub-cell">站点 {item.deviceId || '—'}</span></td>
+                <td data-label="日志信息" className="message-cell lower-log-message"><span>{humanizeTechnicalMessage(item.message)}</span>{item.fields && Object.keys(item.fields).length ? <details><summary>结构化字段</summary><pre>{JSON.stringify(item.fields, null, 2)}</pre></details> : null}</td>
+                <td data-label="接收">{formatRelativeTime(item.receivedAt)}<span className="sub-cell">{formatDateTime(item.receivedAt)}</span></td>
               </tr>)}</tbody></table></div><Pagination page={logs.data.page} pageSize={logs.data.pageSize} total={logs.data.total} onPageChange={(value) => update({ page: value })} /></>}
     </section>
-
-    <SourceLoggingControl source={selectedSource} />
   </div>;
+}
+
+function logTimeBounds(range: string, customFrom: string, customTo: string): { from?: string; to?: string } {
+  const now = new Date();
+  if (range === 'all') return {};
+  if (range === 'custom') return { from: customFrom || undefined, to: customTo || undefined };
+  if (range === 'today8') {
+    const from = new Date(now);
+    from.setHours(8, 0, 0, 0);
+    return { from: from.toISOString(), to: now.toISOString() };
+  }
+  const hours = range === '24h' ? 24 : 1;
+  return { from: new Date(now.getTime() - hours * 3_600_000).toISOString(), to: now.toISOString() };
+}
+
+function logLocalInput(value: string): string {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+}
+
+function logISO(value: string): string {
+  if (!value) return '';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '' : date.toISOString();
+}
+
+function groupRepeatedLogs(items: LowerLogItem[]): Array<{ item: LowerLogItem; count: number; oldestAt: string }> {
+  const result: Array<{ item: LowerLogItem; count: number; oldestAt: string }> = [];
+  for (const item of items) {
+    const signature = JSON.stringify([item.level, item.component, item.portId, item.deviceId, item.message, item.fields ?? {}]);
+    const previous = result[result.length - 1];
+    const previousSignature = previous ? JSON.stringify([previous.item.level, previous.item.component, previous.item.portId, previous.item.deviceId, previous.item.message, previous.item.fields ?? {}]) : '';
+    const closeInTime = previous ? Math.abs(new Date(previous.oldestAt).getTime() - new Date(item.timestamp).getTime()) <= 5 * 60_000 : false;
+    if (previous && signature === previousSignature && closeInTime) {
+      previous.count += 1;
+      previous.oldestAt = item.timestamp;
+    } else result.push({ item, count: 1, oldestAt: item.timestamp });
+  }
+  return result;
 }
 
 function SourceLoggingControl({ source }: { source?: Source }) {

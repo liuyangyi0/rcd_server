@@ -132,13 +132,10 @@ function SourceSwitchForm({ mode, group, sources: allSources, sessions, initialS
         })}
       </fieldset>
 
-      <InlineNotice>
-        <p>{mode === 'session' ? `本次只切换当前目标 Session 的逻辑组 ${group.id}，组内全部点位统一切换；不是单点切换，也不会把该下级提供的其他组一起切换。保留选中源的质量与源时间戳。` : `默认源只影响之后新激活的 Session 在逻辑组 ${group.id} 中的初始选择；现有 Session 和其他组不变。`}</p>
+      <InlineNotice tone={group.pendingCommandCount > 0 ? 'warning' : 'info'}>
+        <strong>{mode === 'session' ? `将当前 Session 的 ${group.id} 整组点位切换到所选来源。` : `默认源只影响之后新激活的 Session。`}</strong>
+        <details className="selection-rules"><summary>查看切换规则</summary><p>{mode === 'session' ? '不是单点切换，也不会改变其他逻辑组或其他 Session；选中来源的质量和源时间戳会原样保留。' : `现有 Session 和其他组保持不变。`}</p><p>执行中命令固定在原来源，待处理期间拒绝切换；离线来源不会触发自动故障转移。</p><p>中央计算始终按各组默认源计算，不跟随 Session 独立选源。</p></details>
       </InlineNotice>
-      <InlineNotice tone="warning">
-        <p>执行中的命令固定在原始下级，直至完成或超时；存在待处理命令时，服务会拒绝切换。</p>
-      </InlineNotice>
-      <InlineNotice><p>单设备计算点随设备归组；跨设备计算保留在默认归属组，不会根据各设备的选源重新混算。离线来源不会触发自动切换。</p></InlineNotice>
       {mode === 'session' && !session ? <InlineNotice tone="warning"><p>原目标 Session 已结束，本次操作已禁用；不会自动切换到其他 Session。</p></InlineNotice> : null}
       {staleSelection && !unavailable ? <InlineNotice tone="warning"><p>该逻辑组的选源版本已变化。请关闭后重新打开弹窗，核对最新路由再提交，不会覆盖其他操作。</p></InlineNotice> : null}
 

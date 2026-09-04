@@ -7,7 +7,8 @@ import { queryKeys, useGroups, useOverview, useSessions, useSystemInfo } from '.
 import { EmptyState, ErrorState, LoadingState } from '../components/PageState';
 import { PageHeader } from '../components/PageHeader';
 import { InlineNotice } from '../components/InlineNotice';
-import { formatDateTime, shortSessionId } from '../lib/format';
+import { CopyTextButton } from '../components/CopyTextButton';
+import { formatDateTime, shortClientName, shortSessionId } from '../lib/format';
 import { getOperatorName, setOperatorName } from '../lib/operator';
 
 function formatBytes(value: number): string {
@@ -50,6 +51,7 @@ export default function SettingsPage() {
   const error = overview.error ?? sessions.error ?? groups.error ?? system.error;
   const info = system.data;
   const canImport = (groups.data?.length ?? 0) === 0;
+  const webPort = window.location.port || (window.location.protocol === 'https:' ? '443' : '80');
 
   const chooseConfiguration = async (file?: File) => {
     setImportMessage('');
@@ -152,14 +154,14 @@ export default function SettingsPage() {
           <section className="settings-section settings-wide">
             <h2>安全边界（保持当前配置）</h2>
             <InlineNotice tone="warning"><p><strong>Web 无登录并允许从所有网卡访问。</strong> OPC 选源与旧命令接口允许匿名控制，只能部署在受信任的隔离内网。</p></InlineNotice>
-            <div className="security-callout"><ShieldAlert aria-hidden="true" size={30} /><div><strong>部署前检查</strong><p>通过 Windows 防火墙或 VLAN 仅允许上级 OPC、运维终端和指定管理网段访问 4840/8080 端口。</p></div></div>
+            <div className="security-callout"><ShieldAlert aria-hidden="true" size={30} /><div><strong>部署前检查</strong><p>通过 Windows 防火墙或 VLAN 仅允许上级 OPC、运维终端和指定管理网段访问 4840/{webPort} 端口。</p></div></div>
             <dl className="settings-list compact-settings-list"><div><dt>None/None</dt><dd>Anonymous</dd></div><div><dt>Basic256Sha256</dt><dd>SignAndEncrypt · Anonymous / Username</dd></div><div><dt>跨域写入</dt><dd>拒绝；仅允许同源浏览器请求</dd></div></dl>
           </section>
 
           <section className="settings-section settings-wide">
             <h2>在线上级 Session</h2>
             {(sessions.data ?? []).length === 0 ? <EmptyState title="暂无在线 Session" description="上级 OPC 客户端激活 Session 后会显示在这里。" /> : (
-              <div className="table-scroll"><table className="data-table"><thead><tr><th>Session ID</th><th>客户端</th><th>远端地址</th><th>激活时间</th><th>最后活动</th><th>已选路由</th></tr></thead><tbody>{(sessions.data ?? []).map((session) => <tr key={session.id}><td><strong>{shortSessionId(session.id)}</strong></td><td>{session.clientName}</td><td>{session.remoteAddress}</td><td>{formatDateTime(session.connectedAt)}</td><td>{formatDateTime(session.lastSeenAt)}</td><td>{Object.keys(session.selectedSources).length} / {(groups.data ?? []).length}</td></tr>)}</tbody></table></div>
+              <div className="table-scroll"><table className="data-table responsive-table"><thead><tr><th>Session ID</th><th>客户端</th><th>远端地址</th><th>激活时间</th><th>最后活动</th><th>已选路由</th></tr></thead><tbody>{(sessions.data ?? []).map((session) => <tr key={session.id}><td data-label="Session ID"><strong title={session.id}>{shortSessionId(session.id)}</strong><CopyTextButton value={session.id} label="复制 Session ID" /></td><td data-label="客户端" title={session.clientName}>{shortClientName(session.clientName)}</td><td data-label="远端地址">{session.remoteAddress}</td><td data-label="激活时间">{formatDateTime(session.connectedAt)}</td><td data-label="最后活动">{formatDateTime(session.lastSeenAt)}</td><td data-label="已选路由">{Object.keys(session.selectedSources).length} / {(groups.data ?? []).length}</td></tr>)}</tbody></table></div>
             )}
           </section>
         </div>

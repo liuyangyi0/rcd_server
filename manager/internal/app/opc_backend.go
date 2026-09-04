@@ -256,7 +256,7 @@ func (r *Runtime) writeCommand(ctx context.Context, sessionID string, key domain
 		return domain.StatusBadWaitingForResponse, err
 	}
 	port := route.Port
-	command, err := r.routes.BeginCommand(sessionID, route.GroupID, port, "Write")
+	command, err := r.routes.BeginCommandWithDetails(sessionID, route.GroupID, port, "Write", key.Identifier, payload)
 	if err != nil {
 		r.configMu.Unlock()
 		return commandErrorStatus(err), err
@@ -325,7 +325,7 @@ func (r *Runtime) callCommand(ctx context.Context, sessionID string, key domain.
 		return "", domain.StatusBadWaitingForResponse, err
 	}
 	port := route.Port
-	command, err := r.routes.BeginCommand(sessionID, route.GroupID, port, "Call")
+	command, err := r.routes.BeginCommandWithDetails(sessionID, route.GroupID, port, "Call", key.Identifier, hexData)
 	if err != nil {
 		r.configMu.Unlock()
 		return "", commandErrorStatus(err), err

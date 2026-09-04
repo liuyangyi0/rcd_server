@@ -735,6 +735,21 @@ func parsePage(r *http.Request) (PageRequest, error) {
 			return PageRequest{}, errors.New("offset must be non-negative")
 		}
 	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("from")); raw != "" {
+		request.From, err = time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			return PageRequest{}, errors.New("from must be an RFC3339 timestamp")
+		}
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("to")); raw != "" {
+		request.To, err = time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			return PageRequest{}, errors.New("to must be an RFC3339 timestamp")
+		}
+	}
+	if !request.From.IsZero() && !request.To.IsZero() && request.From.After(request.To) {
+		return PageRequest{}, errors.New("from must not be after to")
+	}
 	return request, nil
 }
 

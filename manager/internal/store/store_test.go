@@ -112,18 +112,27 @@ func TestRepositoryCatalogAndAuditRoundTrip(t *testing.T) {
 		t.Fatalf("loaded catalog = %#v", loaded)
 	}
 
-	command := domain.PendingCommand{ID: "c", SessionID: "session", GroupID: "g", SourceID: "s", Port: "COM1", Kind: "write", State: domain.CommandWaiting, StartedAt: discovered}
+	command := domain.PendingCommand{ID: "c", SessionID: "session", GroupID: "g", SourceID: "s", Port: "COM1", Kind: "write", NodeID: "COM1_Send", Request: "440102", State: domain.CommandWaiting, StartedAt: discovered}
 	if err := r.SaveCommand(ctx, command); err != nil {
 		t.Fatal(err)
 	}
 	command.State = domain.CommandReceived
+	command.Response = "1"
 	command.FinishedAt = discovered.Add(time.Second)
 	if err := r.SaveCommand(ctx, command); err != nil {
 		t.Fatal(err)
 	}
 	commands, total, err := r.ListCommands(ctx, 10, 0)
-	if err != nil || total != 1 || commands[0].State != domain.CommandReceived {
+	if err != nil || total != 1 || commands[0].State != domain.CommandReceived || commands[0].NodeID != "COM1_Send" || commands[0].Request != "440102" || commands[0].Response != "1" {
 		t.Fatalf("commands = %#v total=%d err=%v", commands, total, err)
+	}
+	commands, total, err = r.ListCommandsFiltered(ctx, CommandFilter{Query: "440102", From: discovered.Add(-time.Second), To: discovered.Add(time.Second), Limit: 10})
+	if err != nil || total != 1 || len(commands) != 1 {
+		t.Fatalf("command detail/time filter = %#v total=%d err=%v", commands, total, err)
+	}
+	commands, total, err = r.ListCommandsFiltered(ctx, CommandFilter{From: discovered.Add(time.Second), Limit: 10})
+	if err != nil || total != 0 || len(commands) != 0 {
+		t.Fatalf("command lower time bound = %#v total=%d err=%v", commands, total, err)
 	}
 	commands, total, err = r.ListCommandsFiltered(ctx, CommandFilter{GroupID: "other", Limit: 10})
 	if err != nil || total != 0 || len(commands) != 0 {

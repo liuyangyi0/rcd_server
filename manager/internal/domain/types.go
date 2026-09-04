@@ -181,6 +181,9 @@ type PendingCommand struct {
 	SourceID   string       `json:"source_id"`
 	Port       string       `json:"port"`
 	Kind       string       `json:"kind"`
+	NodeID     string       `json:"node_id,omitempty"`
+	Request    string       `json:"request,omitempty"`
+	Response   string       `json:"response,omitempty"`
 	State      CommandState `json:"state"`
 	StatusCode StatusCode   `json:"status_code"`
 	Error      string       `json:"error,omitempty"`

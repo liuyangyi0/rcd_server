@@ -66,11 +66,11 @@ func TestRouteReturnsOneSessionRoute(t *testing.T) {
 func TestPendingCommandLocksSelectionButPinsSource(t *testing.T) {
 	table := testRouteTable(t)
 	session, _ := table.OpenSession("s")
-	command, err := table.BeginCommand("s", "g", "COM1", "write")
+	command, err := table.BeginCommandWithDetails("s", "g", "COM1", "write", "COM1_Send", "440102")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if command.SourceID != "a" {
+	if command.SourceID != "a" || command.NodeID != "COM1_Send" || command.Request != "440102" {
 		t.Fatalf("command source = %q", command.SourceID)
 	}
 	_, err = table.Select("s", "g", "b", session.Routes["g"].Revision)
@@ -81,8 +81,12 @@ func TestPendingCommandLocksSelectionButPinsSource(t *testing.T) {
 	if !errors.Is(err, ErrGroupPending) {
 		t.Fatalf("default error = %v, want pending", err)
 	}
-	if _, err := table.FinishCommand(command.ID, CommandReceived, StatusGood, ""); err != nil {
+	finished, err := table.FinishCommand(command.ID, CommandReceived, StatusGood, "")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if finished.Response != "1" {
+		t.Fatalf("command response = %q, want ACK 1", finished.Response)
 	}
 	if _, err := table.Select("s", "g", "b", session.Routes["g"].Revision); err != nil {
 		t.Fatalf("select after finish: %v", err)

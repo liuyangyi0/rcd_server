@@ -44,6 +44,8 @@ type Filter struct {
 	PortID   string
 	DeviceID string
 	Query    string
+	From     time.Time
+	To       time.Time
 	Limit    int
 	Offset   int
 }
@@ -263,6 +265,12 @@ func readFile(path string) ([]Event, int, error) {
 }
 
 func matches(event Event, filter Filter) bool {
+	if !filter.From.IsZero() && event.Timestamp.Before(filter.From) {
+		return false
+	}
+	if !filter.To.IsZero() && event.Timestamp.After(filter.To) {
+		return false
+	}
 	if filter.Level != "" && !strings.EqualFold(event.Level, filter.Level) {
 		return false
 	}

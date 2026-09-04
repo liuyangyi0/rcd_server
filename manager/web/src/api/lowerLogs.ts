@@ -9,6 +9,8 @@ export interface LowerLogParams {
   portId?: string;
   deviceId?: string;
   query?: string;
+  from?: string;
+  to?: string;
   page?: number;
   pageSize?: number;
 }
@@ -54,6 +56,8 @@ export async function listLowerLogs(params: LowerLogParams, signal?: AbortSignal
   if (params.portId) query.set('port_id', params.portId);
   if (params.deviceId) query.set('device_id', params.deviceId);
   if (params.query) query.set('q', params.query);
+  if (params.from) query.set('from', params.from);
+  if (params.to) query.set('to', params.to);
   const raw = await request(`/lower-logs?${query}`, { signal }) as {
     items?: Array<Record<string, unknown>>; total?: number; limit?: number; offset?: number;
     invalid_lines?: number; last_received_at?: string; push_state?: string;

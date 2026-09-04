@@ -45,3 +45,15 @@ export function displayValue(value: unknown): string {
 export function shortSessionId(value: string): string {
   return value.length > 18 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value;
 }
+
+export function shortClientName(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return '匿名客户端';
+  try {
+    const url = new URL(trimmed);
+    return url.hostname || trimmed;
+  } catch {
+    const tail = trimmed.split(/[\\/]/).filter(Boolean).pop() ?? trimmed;
+    return tail.length > 36 ? `${tail.slice(0, 33)}…` : tail;
+  }
+}

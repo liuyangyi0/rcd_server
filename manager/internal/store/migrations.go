@@ -226,6 +226,9 @@ var migrations = []string{
 	`ALTER TABLE calculation_versions ADD COLUMN added_count INTEGER NOT NULL DEFAULT 0 CHECK(added_count >= 0);
 	ALTER TABLE calculation_versions ADD COLUMN removed_count INTEGER NOT NULL DEFAULT 0 CHECK(removed_count >= 0);
 	ALTER TABLE calculation_versions ADD COLUMN changed_count INTEGER NOT NULL DEFAULT 0 CHECK(changed_count >= 0);`,
+	`ALTER TABLE command_audit ADD COLUMN node_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE command_audit ADD COLUMN request TEXT NOT NULL DEFAULT '';
+	ALTER TABLE command_audit ADD COLUMN response TEXT NOT NULL DEFAULT '';`,
 }
 
 func migrate(ctx context.Context, db *sql.DB) error {

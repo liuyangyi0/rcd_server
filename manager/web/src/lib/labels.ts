@@ -4,6 +4,7 @@ const STATE_LABELS: Record<string, string> = {
   running: '运行中', stopped: '已停止', closed: '已关闭', enabled: '已启用', disabled: '已停用', unknown: '未知',
   ready: '就绪', cached: '缓存目录', discovering: '发现中', catalogconflict: '目录冲突',
   waiting: '等待响应', received: '成功', failed: '失败', timedout: '超时',
+  success: '成功', pending: '处理中', manager: '管理端计算', local: '下级本地计算', unsupported: '不支持', offline: '离线',
   open: '未恢复', resolved: '已恢复', warning: '警告', critical: '严重',
 };
 
@@ -37,6 +38,7 @@ const KIND_LABELS: Record<string, string> = {
   'source.delete': '删除来源', 'source.probe': '测试来源', 'source.reconnect': '立即重连',
   'source.rediscover': '重新发现目录', 'session.selection': '修改会话选源',
   'alarm.acknowledge': '确认告警', 'alarm.silence': '静默告警', 'configuration.import': '导入配置',
+  'source.operation.requested': '下级操作已请求', 'source.operation.completed': '下级操作已完成',
 };
 
 const PROBE_LABELS: Record<string, string> = {
@@ -75,4 +77,29 @@ export function kindLabel(value: string): string {
 
 export function probeStageLabel(value: string): string {
   return PROBE_LABELS[value] ?? value;
+}
+
+export function operationLabel(value: string): string {
+  const labels: Record<string, string> = {
+    Write: '变量写入', Call: '方法调用', query_device_version: '查询设备版本',
+    set_device_module_type: '设置模块类型', set_logging_level: '调整日志等级',
+    set_port_enabled: '切换串口', set_device_read_enabled: '切换站点采集',
+    set_calculation_mode: '切换计算模式', restart: '重启下级',
+  };
+  return labels[value] ?? kindLabel(value);
+}
+
+export function humanizeTechnicalMessage(value?: string): string {
+  if (!value) return '—';
+  const substitutions: Array<[RegExp, string]> = [
+    [/station version query timed out after (\d+) ms/i, '设备版本查询在 $1 ms 后超时'],
+    [/frame header mismatch/i, '返回帧头不匹配'],
+    [/checksum mismatch/i, '返回帧校验失败'],
+    [/connection refused/i, '连接被拒绝'],
+    [/context deadline exceeded/i, '操作超时'],
+  ];
+  for (const [pattern, replacement] of substitutions) {
+    if (pattern.test(value)) return value.replace(pattern, replacement);
+  }
+  return value;
 }

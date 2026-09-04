@@ -13,6 +13,7 @@ import { Pagination } from '../components/Pagination';
 import { StatusBadge } from '../components/StatusBadge';
 import { ApiError, apiErrorMessage } from '../api/client';
 import { formatDateTime } from '../lib/format';
+import { humanizeTechnicalMessage } from '../lib/labels';
 
 const PAGE_SIZE = 50;
 const SOURCE_CONCURRENCY = 3;
@@ -116,7 +117,7 @@ export default function DeviceVersionsPage() {
           } else if (action === 'query' && station?.type_mismatch) {
             updateRowOperation(row, { state: 'warning', message: station.last_version_error || '查询完成，但实测模块类型与配置不一致' });
           } else if (action === 'query' && (station?.last_version_error || failed)) {
-            updateRowOperation(row, { state: 'warning', message: station?.last_version_error ? `查询未成功：${station.last_version_error}` : '版本查询未成功，请刷新状态查看详情' });
+            updateRowOperation(row, { state: 'error', message: station?.last_version_error ? `查询未成功：${station.last_version_error}` : '版本查询未成功，请刷新状态查看详情' });
           } else {
             updateRowOperation(row, { state: 'success', message: action === 'query' ? '版本查询完成' : '模块类型已保存' });
           }
@@ -176,23 +177,21 @@ export default function DeviceVersionsPage() {
     <section className="table-panel content-panel">
       {versionsQuery.error ? <ErrorState error={versionsQuery.error} onRetry={() => void versionsQuery.refetch()} /> : versionsQuery.isPending && !versionsQuery.data ? <LoadingState label="正在读取全部下级设备版本…" /> : rows.length === 0 ? <EmptyState title="没有匹配的设备版本" description={params.query || sourceId || portId || moduleType || status ? '请调整搜索或筛选条件。' : '新版下级连接并完成站点发现后，设备会显示在这里。'} /> : <>
         <div className={`table-scroll${versionsQuery.isFetching ? ' is-refreshing' : ''}`}>
-          <table className="data-table device-version-table">
-            <thead><tr><th className="selection-column"><input type="checkbox" aria-label="选择当前页全部站点" checked={allPageSelected} disabled={selectableRows.length === 0} onChange={(event) => setSelected((previous) => togglePage(previous, selectableRows, event.target.checked))} /></th><th>下级 / 程序版本</th><th>串口 / 站点</th><th>配置类型</th><th>实测类型</th><th>通信模块</th><th>PLC</th><th>版本状态</th><th>最后查询</th><th>操作</th></tr></thead>
+          <table className="data-table responsive-table device-version-table">
+            <thead><tr><th className="selection-column"><input type="checkbox" aria-label="选择当前页全部站点" checked={allPageSelected} disabled={selectableRows.length === 0} onChange={(event) => setSelected((previous) => togglePage(previous, selectableRows, event.target.checked))} /></th><th>下级</th><th>串口 / 站点</th><th>模块类型</th><th>版本</th><th>状态</th><th>最后查询</th><th>操作</th></tr></thead>
             <tbody>{rows.map((row) => {
               const key = versionKey(row);
               const operation = rowOperations.get(key);
               const queryDisabledReason = queryDisabled(row);
               return <tr key={key} className="virtual-row">
-                <td className="selection-column"><input type="checkbox" aria-label={`选择 ${row.sourceName || row.sourceId} ${row.portId} ${row.deviceName || row.deviceId}`} checked={selected.has(key)} disabled={!row.versionSupported || !row.stationRevision} title={!row.versionSupported ? '此下级不支持设备版本管理' : !row.stationRevision ? '等待下级返回站点版本状态' : undefined} onChange={(event) => setSelected((previous) => toggleRow(previous, row, event.target.checked))} /></td>
-                <td><strong>{row.sourceName || row.sourceId}</strong><span className="sub-cell">{row.sourceId}</span><span className="sub-cell">RCD {row.rcdSoftwareVersion || '版本未知'}{row.rcdBuildCommit ? ` · ${row.rcdBuildCommit.slice(0, 8)}` : ''}</span>{!row.sourceOnline ? <span className="sub-cell text-warning">下级离线</span> : null}</td>
-                <td><strong>{row.portName || row.portId}</strong><span className="sub-cell">{row.portId}</span><span className="sub-cell">{row.deviceName || '站点'} · {row.deviceId}</span>{row.sourceOnline && !row.communicationOK ? <span className="sub-cell text-warning">站点通信未确认</span> : null}</td>
-                <td>{moduleTypeLabel(row.configuredModuleType)}</td>
-                <td>{moduleTypeLabel(row.detectedModuleType)}{row.typeMismatch ? <span className="sub-cell text-bad">与配置不一致</span> : null}</td>
-                <td><VersionValue value={row.communicationModuleVersion} raw={row.communicationModuleVersionRaw} /></td>
-                <td><VersionValue value={row.plcVersion} raw={row.plcVersionRaw} /></td>
-                <td><VersionState row={row} />{row.versionPayload ? <span className="sub-cell version-payload">{row.versionPayload}</span> : null}{row.lastVersionError ? <span className="sub-cell text-bad version-error">{row.lastVersionError}</span> : null}</td>
-                <td>{formatDateTime(row.lastVersionAttemptAt)}{row.lastVersionSuccessAt && row.lastVersionSuccessAt !== row.lastVersionAttemptAt ? <span className="sub-cell">成功：{formatDateTime(row.lastVersionSuccessAt)}</span> : null}</td>
-                <td><div className="device-version-actions"><button className="table-action-link" type="button" disabled={!row.versionSupported || !row.stationRevision || !row.sourceOnline || batchRunning} title={!row.versionSupported ? '此下级不支持设备版本管理' : !row.stationRevision ? '等待下级返回站点版本状态' : !row.sourceOnline ? '下级来源离线' : undefined} onClick={() => { setTypeTargets([row]); setNextType(row.configuredModuleType); setTypeConfirmed(false); }}><Settings2 size={13} aria-hidden="true" />设置类型</button><button className="table-action-link" type="button" disabled={Boolean(queryDisabledReason) || batchRunning} title={queryDisabledReason} onClick={() => { setQueryTargets([row]); setQueryConfirmed(false); }}><RefreshCw size={13} aria-hidden="true" />查询版本</button></div>{operation ? <RowOperationStatus operation={operation} /> : null}</td>
+                <td data-label="选择" className="selection-column"><input type="checkbox" aria-label={`选择 ${row.sourceName || row.sourceId} ${row.portId} ${row.deviceName || row.deviceId}`} checked={selected.has(key)} disabled={!row.versionSupported || !row.stationRevision} title={!row.versionSupported ? '此下级不支持设备版本管理' : !row.stationRevision ? '等待下级返回站点版本状态' : undefined} onChange={(event) => setSelected((previous) => toggleRow(previous, row, event.target.checked))} /></td>
+                <td data-label="下级"><strong>{row.sourceName || row.sourceId}</strong><span className="sub-cell">{row.sourceId}</span>{!row.sourceOnline ? <span className="sub-cell text-warning">下级离线</span> : null}</td>
+                <td data-label="串口 / 站点"><strong>{row.portName || row.portId}</strong>{row.portName && row.portName !== row.portId ? <span className="sub-cell">{row.portId}</span> : null}<span className="sub-cell">{row.deviceName || '站点'} · {row.deviceId}</span>{row.sourceOnline && !row.communicationOK ? <span className="sub-cell text-warning">站点通信未确认</span> : null}</td>
+                <td data-label="模块类型"><strong>配置：{moduleTypeLabel(row.configuredModuleType)}</strong><span className={row.typeMismatch ? 'sub-cell text-bad' : 'sub-cell'}>实测：{moduleTypeLabel(row.detectedModuleType, true)}{row.typeMismatch ? ' · 不一致' : ''}</span></td>
+                <td data-label="版本"><span className="version-pair"><b>通信</b><VersionValue value={row.communicationModuleVersion} raw={row.communicationModuleVersionRaw} /></span><span className="version-pair"><b>PLC</b><VersionValue value={row.plcVersion} raw={row.plcVersionRaw} /></span></td>
+                <td data-label="状态"><VersionState row={row} />{row.versionPayload ? <span className="sub-cell version-payload">载荷：{row.versionPayload}</span> : null}{row.lastVersionError ? <span className="sub-cell text-bad version-error">{humanizeTechnicalMessage(row.lastVersionError)}</span> : null}</td>
+                <td data-label="最后查询">{formatDateTime(row.lastVersionAttemptAt)}{row.lastVersionSuccessAt && row.lastVersionSuccessAt !== row.lastVersionAttemptAt ? <span className="sub-cell">最近成功：{formatDateTime(row.lastVersionSuccessAt)}</span> : null}</td>
+                <td data-label="操作"><div className="device-version-actions"><button className="table-action-link" type="button" disabled={!row.versionSupported || !row.stationRevision || !row.sourceOnline || batchRunning} title={!row.versionSupported ? '此下级不支持设备版本管理' : !row.stationRevision ? '等待下级返回站点版本状态' : !row.sourceOnline ? '下级来源离线' : undefined} onClick={() => { setTypeTargets([row]); setNextType(row.configuredModuleType); setTypeConfirmed(false); }}><Settings2 size={13} aria-hidden="true" />设置类型</button><button className="table-action-link" type="button" disabled={Boolean(queryDisabledReason) || batchRunning} title={queryDisabledReason} onClick={() => { setQueryTargets([row]); setQueryConfirmed(false); }}><RefreshCw size={13} aria-hidden="true" />查询版本</button></div>{queryDisabledReason ? <span className="sub-cell operation-disabled-reason">{queryDisabledReason}</span> : null}{operation ? <RowOperationStatus operation={operation} /> : null}</td>
               </tr>;
             })}</tbody>
           </table>
@@ -249,17 +248,17 @@ function VersionState({ row }: { row: DeviceVersion }) {
 }
 
 function RowOperationStatus({ operation }: { operation: RowOperation }) {
-  return <span className={`device-version-operation operation-${operation.state}`}>{operation.state === 'success' ? <CheckCircle2 size={12} aria-hidden="true" /> : operation.state === 'error' ? <XCircle size={12} aria-hidden="true" /> : operation.state === 'running' ? <RefreshCw className="spin" size={12} aria-hidden="true" /> : null}{operation.message}</span>;
+  return <span className={`device-version-operation operation-${operation.state}`}>{operation.state === 'success' ? <CheckCircle2 size={12} aria-hidden="true" /> : operation.state === 'error' ? <XCircle size={12} aria-hidden="true" /> : operation.state === 'running' ? <RefreshCw className="spin" size={12} aria-hidden="true" /> : null}{humanizeTechnicalMessage(operation.message)}</span>;
 }
 
 function TargetPreview({ rows }: { rows: DeviceVersion[] }) {
   return <div className="device-version-targets"><strong>操作目标</strong><ul>{rows.slice(0, 8).map((row) => <li key={versionKey(row)}>{row.sourceName || row.sourceId} · {row.portName || row.portId} · {row.deviceName || row.deviceId}</li>)}</ul>{rows.length > 8 ? <span>另有 {rows.length - 8} 个站点</span> : null}</div>;
 }
 
-function moduleTypeLabel(type: ModuleType): string {
+function moduleTypeLabel(type: ModuleType, detected = false): string {
   if (type === 'domestic') return '国产';
   if (type === 'legacy_russian') return '俄供';
-  return '未配置';
+  return detected ? '未检测' : '未配置';
 }
 
 function parseModuleType(value: string | null): ModuleType | '' {

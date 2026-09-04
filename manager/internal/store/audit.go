@@ -16,12 +16,12 @@ func (r *Repository) SaveCommand(ctx context.Context, command domain.PendingComm
 		finished = encodeTime(command.FinishedAt)
 	}
 	_, err := r.db.ExecContext(ctx, `INSERT INTO command_audit
-		(id, session_id, group_id, source_id, port, kind, state, status_code, error, started_at, finished_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, session_id, group_id, source_id, port, kind, node_id, request, response, state, status_code, error, started_at, finished_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET state = excluded.state, status_code = excluded.status_code,
-		error = excluded.error, finished_at = excluded.finished_at`,
+		error = excluded.error, response = excluded.response, finished_at = excluded.finished_at`,
 		command.ID, command.SessionID, command.GroupID, command.SourceID, command.Port, command.Kind,
-		command.State, uint32(command.StatusCode), command.Error, encodeTime(command.StartedAt), finished)
+		command.NodeID, command.Request, command.Response, command.State, uint32(command.StatusCode), command.Error, encodeTime(command.StartedAt), finished)
 	if err != nil {
 		return fmt.Errorf("save command audit: %w", err)
 	}
@@ -37,6 +37,8 @@ type CommandFilter struct {
 	SourceID string
 	Status   string
 	Query    string
+	From     time.Time
+	To       time.Time
 	Limit    int
 	Offset   int
 }
@@ -49,14 +51,17 @@ func (r *Repository) ListCommandsFiltered(ctx context.Context, filter CommandFil
 		filter.Offset = 0
 	}
 	where := ` WHERE (? = '' OR group_id = ?) AND (? = '' OR source_id = ?) AND (? = '' OR state = ?)
-		AND (? = '' OR id LIKE '%' || ? || '%' OR session_id LIKE '%' || ? || '%' OR port LIKE '%' || ? || '%' OR kind LIKE '%' || ? || '%' OR error LIKE '%' || ? || '%')`
+		AND (? = '' OR id LIKE '%' || ? || '%' OR session_id LIKE '%' || ? || '%' OR port LIKE '%' || ? || '%' OR kind LIKE '%' || ? || '%' OR node_id LIKE '%' || ? || '%' OR request LIKE '%' || ? || '%' OR response LIKE '%' || ? || '%' OR error LIKE '%' || ? || '%')
+		AND (? = '' OR started_at >= ?) AND (? = '' OR started_at <= ?)`
+	from, to := encodedTimeBounds(filter.From, filter.To)
 	args := []any{filter.GroupID, filter.GroupID, filter.SourceID, filter.SourceID, filter.Status, filter.Status,
-		filter.Query, filter.Query, filter.Query, filter.Query, filter.Query, filter.Query}
+		filter.Query, filter.Query, filter.Query, filter.Query, filter.Query, filter.Query, filter.Query, filter.Query,
+		filter.Query, from, from, to, to}
 	var total int
 	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM command_audit`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT id, session_id, group_id, source_id, port, kind, state,
+	rows, err := r.db.QueryContext(ctx, `SELECT id, session_id, group_id, source_id, port, kind, node_id, request, response, state,
 		status_code, error, started_at, finished_at FROM command_audit`+where+
 		` ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?`, append(args, filter.Limit, filter.Offset)...)
 	if err != nil {
@@ -70,7 +75,7 @@ func (r *Repository) ListCommandsFiltered(ctx context.Context, filter CommandFil
 		var started string
 		var finished sql.NullString
 		if err := rows.Scan(&command.ID, &command.SessionID, &command.GroupID, &command.SourceID, &command.Port,
-			&command.Kind, &command.State, &code, &command.Error, &started, &finished); err != nil {
+			&command.Kind, &command.NodeID, &command.Request, &command.Response, &command.State, &code, &command.Error, &started, &finished); err != nil {
 			return nil, 0, err
 		}
 		command.StatusCode = domain.StatusCode(code)
@@ -114,6 +119,8 @@ func (r *Repository) ListAudit(ctx context.Context, limit, offset int) ([]domain
 type AuditFilter struct {
 	Kind   string
 	Query  string
+	From   time.Time
+	To     time.Time
 	Limit  int
 	Offset int
 }
@@ -127,8 +134,10 @@ func (r *Repository) ListAuditFiltered(ctx context.Context, filter AuditFilter) 
 		offset = 0
 	}
 	where := ` WHERE (? = '' OR kind = ?) AND (? = '' OR kind LIKE '%' || ? || '%' OR actor LIKE '%' || ? || '%'
-		OR target LIKE '%' || ? || '%' OR details LIKE '%' || ? || '%')`
-	args := []any{filter.Kind, filter.Kind, filter.Query, filter.Query, filter.Query, filter.Query, filter.Query}
+		OR target LIKE '%' || ? || '%' OR details LIKE '%' || ? || '%')
+		AND (? = '' OR occurred_at >= ?) AND (? = '' OR occurred_at <= ?)`
+	from, to := encodedTimeBounds(filter.From, filter.To)
+	args := []any{filter.Kind, filter.Kind, filter.Query, filter.Query, filter.Query, filter.Query, filter.Query, from, from, to, to}
 	var total int
 	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM management_audit`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
@@ -156,4 +165,15 @@ func (r *Repository) ListAuditFiltered(ctx context.Context, filter AuditFilter) 
 		entries = append(entries, entry)
 	}
 	return entries, total, rows.Err()
+}
+
+func encodedTimeBounds(from, to time.Time) (string, string) {
+	var fromText, toText string
+	if !from.IsZero() {
+		fromText = encodeTime(from.UTC())
+	}
+	if !to.IsZero() {
+		toText = encodeTime(to.UTC())
+	}
+	return fromText, toText
 }

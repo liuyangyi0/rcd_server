@@ -77,7 +77,8 @@ func (r *Runtime) ListLowerLogs(ctx context.Context, request api.LowerLogRequest
 	}
 	page, err := r.lowerLogs.Query(lowerlogs.Filter{
 		SourceID: request.SourceID, Level: request.Level, PortID: request.PortID,
-		DeviceID: request.DeviceID, Query: request.Query, Limit: request.Limit, Offset: request.Offset,
+		DeviceID: request.DeviceID, Query: request.Query, From: request.From, To: request.To,
+		Limit: request.Limit, Offset: request.Offset,
 	})
 	if err != nil {
 		r.setLowerLogPersistError(err)

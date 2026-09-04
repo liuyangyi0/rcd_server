@@ -920,7 +920,7 @@ func (r *Runtime) ListCommands(ctx context.Context, request api.PageRequest) (ap
 	limit, offset := normalizePage(request.Limit, request.Offset)
 	items, total, err := r.repo.ListCommandsFiltered(ctx, store.CommandFilter{
 		GroupID: request.GroupID, SourceID: request.SourceID, Status: request.Status,
-		Query: request.Query, Limit: limit, Offset: offset,
+		Query: request.Query, From: request.From, To: request.To, Limit: limit, Offset: offset,
 	})
 	return api.CommandPage{Items: items, Total: total, Limit: limit, Offset: offset}, err
 }

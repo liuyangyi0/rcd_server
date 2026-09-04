@@ -89,6 +89,8 @@ type PageRequest struct {
 	Status        string
 	Kind          string
 	Query         string
+	From          time.Time
+	To            time.Time
 }
 
 type PointPage struct {

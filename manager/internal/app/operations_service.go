@@ -181,7 +181,7 @@ func (r *Runtime) reconcileStatusAlarms(ctx context.Context, status opc.LowerSta
 func (r *Runtime) ListAlarms(ctx context.Context, request api.PageRequest) (api.AlarmPage, error) {
 	limit, offset := normalizePage(request.Limit, request.Offset)
 	items, total, err := r.repo.ListAlarms(ctx, store.AlarmFilter{SourceID: request.SourceID, State: request.Status,
-		Query: request.Query, Limit: limit, Offset: offset})
+		Query: request.Query, From: request.From, To: request.To, Limit: limit, Offset: offset})
 	return api.AlarmPage{Items: items, Total: total, Limit: limit, Offset: offset}, err
 }
 
@@ -212,13 +212,13 @@ func (r *Runtime) SilenceAlarm(ctx context.Context, id int64, revision uint64, u
 func (r *Runtime) ListSourceEvents(ctx context.Context, request api.PageRequest) (api.SourceEventPage, error) {
 	limit, offset := normalizePage(request.Limit, request.Offset)
 	items, total, err := r.repo.ListSourceEvents(ctx, store.SourceEventFilter{SourceID: request.SourceID, Kind: request.Kind,
-		Query: request.Query, Limit: limit, Offset: offset})
+		Query: request.Query, From: request.From, To: request.To, Limit: limit, Offset: offset})
 	return api.SourceEventPage{Items: items, Total: total, Limit: limit, Offset: offset}, err
 }
 
 func (r *Runtime) ListManagementAudit(ctx context.Context, request api.PageRequest) (api.AuditPage, error) {
 	limit, offset := normalizePage(request.Limit, request.Offset)
-	items, total, err := r.repo.ListAuditFiltered(ctx, store.AuditFilter{Kind: request.Kind, Query: request.Query, Limit: limit, Offset: offset})
+	items, total, err := r.repo.ListAuditFiltered(ctx, store.AuditFilter{Kind: request.Kind, Query: request.Query, From: request.From, To: request.To, Limit: limit, Offset: offset})
 	return api.AuditPage{Items: items, Total: total, Limit: limit, Offset: offset}, err
 }
 
