@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { statusCodeHex, statusCodeLabel } from './labels';
+import { stateLabel, statusCodeHex, statusCodeLabel } from './labels';
 
 describe('OPC UA status labels', () => {
   it('translates calculation communication quality', () => {
@@ -12,5 +12,9 @@ describe('OPC UA status labels', () => {
     expect(label).toContain('正常');
     expect(label).toContain('Good');
     expect(label).toContain('通知队列溢出');
+  });
+
+  it('translates the internal command completion state', () => {
+    expect(stateLabel('Received')).toBe('成功');
   });
 });
