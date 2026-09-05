@@ -75,7 +75,7 @@ RCD_OPCUA_PORT=4841 /absolute/path/to/RcdManager agent run \
 
 ## 4. systemd 用户服务（人工安装）
 
-模板在 [rcd-process-agent@.service](../deploy/linux/rcd-process-agent@.service)，环境示例在 [agent.env.example](../deploy/linux/agent.env.example)。本轮未实际安装或验收此模板、自启和 linger。模板仅面向现有用户的 systemd user manager，不创建系统用户、不安装系统级服务，也不修改认证或内网安全策略。
+模板在 [rcd-process-agent@.service](../deploy/linux/rcd-process-agent@.service)，环境示例在 [agent.env.example](../deploy/linux/agent.env.example)。管理端和下级一起固定部署及开机自启的完整步骤见 [Linux 固定路径与开机自启](linux-autostart.md)。模板面向现有用户的 systemd user manager，不创建系统用户、不安装系统级服务，也不修改认证或内网安全策略。
 
 以下步骤用于**首次人工安装**，不直接覆盖已有部署；如目标文件存在，先核对并备份。以实际运行下级、已具有串口访问权限的用户执行，不需要将这些命令改为 `sudo`：
 
