@@ -120,7 +120,8 @@ pub fn build_station_version_query(device_address: u8) -> [u8; 7] {
 }
 
 /// 严格解析固定 9 字节版本响应：
-/// `00 00 04 (08|80) <module-hi> <module-lo> <plc-hi> <plc-lo> <checksum>`。
+/// `00 00 04 <variable-byte> <module-hi> <module-lo> <plc-hi> <plc-lo> <checksum>`。
+/// 第四字节允许变化，不限定取值，但仍参与整帧累加和校验。
 ///
 /// 只有完整帧头、长度和累加和均正确时，四字节全 `FF` 才会被识别为俄供模块。
 pub fn parse_station_version_response(
@@ -129,7 +130,7 @@ pub fn parse_station_version_response(
     if frame.len() != 9 {
         return Err("版本响应长度必须为 9 字节");
     }
-    if frame[..3] != [0x00, 0x00, 0x04] || !matches!(frame[3], 0x08 | 0x80) {
+    if frame[..3] != [0x00, 0x00, 0x04] {
         return Err("版本响应帧头不匹配");
     }
     if !verify_checksum(frame) {
@@ -339,6 +340,45 @@ mod tests {
     }
 
     #[test]
+    fn station_version_response_accepts_81_example() {
+        assert_eq!(
+            parse_station_version_response(&[0x00, 0x00, 0x04, 0x81, 0x01, 0x03, 0x00, 0x0A, 0x93])
+                .unwrap(),
+            StationVersionResponse::Domestic {
+                payload: [0x01, 0x03, 0x00, 0x0A],
+                communication_module_version: 0x0103,
+                plc_version: 0x000A,
+            }
+        );
+    }
+
+    #[test]
+    fn station_version_response_variable_byte_still_requires_checksum() {
+        for variable_byte in 0u8..=u8::MAX {
+            for payload in [[0x01, 0x03, 0x00, 0x0A], [0xFF; 4]] {
+                let mut frame = [0x00, 0x00, 0x04, variable_byte, 0, 0, 0, 0, 0];
+                frame[4..8].copy_from_slice(&payload);
+                frame[8] = frame[..8].iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+                let expected = if payload == [0xFF; 4] {
+                    StationVersionResponse::LegacyRussian { payload }
+                } else {
+                    StationVersionResponse::Domestic {
+                        payload,
+                        communication_module_version: 0x0103,
+                        plc_version: 0x000A,
+                    }
+                };
+                assert_eq!(parse_station_version_response(&frame), Ok(expected));
+                frame[8] ^= 1;
+                assert_eq!(
+                    parse_station_version_response(&frame),
+                    Err("版本响应校验和不匹配")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn station_version_response_recognizes_only_valid_all_ff_payload() {
         assert_eq!(
             parse_station_version_response(&[0x00, 0x00, 0x04, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0x08])
@@ -355,7 +395,7 @@ mod tests {
     fn station_version_response_rejects_bad_shape_and_checksum() {
         assert!(parse_station_version_response(&[0; 8]).is_err());
         assert!(parse_station_version_response(&[
-            0x00, 0x00, 0x04, 0x09, 0x01, 0x04, 0x00, 0x05, 0x17
+            0x00, 0x00, 0x05, 0x08, 0x01, 0x04, 0x00, 0x05, 0x17
         ])
         .is_err());
         assert!(parse_station_version_response(&[
