@@ -111,7 +111,7 @@ SQLite 作业统计为 32 个 succeeded、8 个 failed、非终态 0。failed �
 | `manager/RcdManager`（v3） | `a95e013a4596b411bd8a2617e5251ddb2bddeb29ff5ed11bdd833124a6625966` |
 | `lower/rcd_server`（Rust v1） | `bd96cd84d9ba562ef86af98d4ae8aab6b0a88177c026b0f20d1ac25546b7dbb0` |
 
-包内 `docs/` 共五份：[使用说明](使用说明.md)、[功能说明](功能说明.md)、[下级 OPC 运维](lower-operations.md)、[下级进程管理](lower-process-management.md) 和本验证记录；`deploy/linux/` 放两份用户服务模板，保持详细文档的 `../deploy/` 相对链接。仓库对应 `manager/docs/` 与 `manager/deploy/linux/`。这五份文档的相对链接不依赖额外 `rest-api.md`，完整进程 REST 已在详细协议中列出。
+包内 `docs/` 共五份：[使用说明](../guides/使用说明.md)、[功能说明](../guides/功能说明.md)、[下级 OPC 运维](../guides/lower-operations.md)、[下级进程管理](../guides/lower-process-management.md) 和本验证记录；`deploy/linux/` 放两份用户服务模板，保持详细文档的 `../deploy/` 相对链接。仓库对应 `manager/docs/` 与 `manager/deploy/linux/`。这五份文档的相对链接不依赖额外 `rest-api.md`，完整进程 REST 已在详细协议中列出。
 
 随包 `licenses/` 收录四个本地 vendored 组件的许可文件，不改变文档与部署模板的相对布局。
 

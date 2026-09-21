@@ -71,7 +71,7 @@ NodeKey { NamespaceURI, Identifier }
 5. SecureChannel 短暂断开并重新附着原 Session 时保留路由；
 6. Session Close/Timeout 或服务关闭后删除路由，新 Session 再从默认源开始。
 
-系统不执行自动故障转移。选择离线来源时保持选择，向该 Session 返回坏质量，绝不静默改到其他来源。
+自动故障转移默认关闭。手动固定的 Session 选择离线来源时保持选择并返回坏质量；显式开启组策略且参与自动的 Session 可按故障/健康确认与冷却规则切到完整健康成员，不自动回切。默认源自动切换另有开关，中央计算只随默认源变化。详见 [自动切源与差异告警](../guides/redundancy.md)。
 
 原 Session 重附着还须保持订阅的协议状态：旧 SecureChannel 的 Publish 请求不能消费新通道通知；通知进入重传队列时即占用唯一序号，发送失败也不能让下一条不同数据复用该序号。客户端恢复原 Session 后，应恢复既有订阅的重传及 Publish 循环，而不是另建空订阅来唤醒发布。两个固定依赖的具体补丁及边界测试记录在各自的 `FORK.md` 中。
 
@@ -148,7 +148,7 @@ Runtime 在短配置锁内固定来源配置版本、连接实例和 epoch；网
 
 文件正文不写 SQLite 或审计；管理审计只保存目标、版本、动作、内容哈希、时延与结果。
 Web 面板按来源和版本缓存，按标签按需请求，退出后释放配置/日志查询缓存。协议与 REST
-接口见 [下级运维](lower-operations.md)。
+接口见 [下级运维](../guides/lower-operations.md)。
 
 ## 数据值规则
 

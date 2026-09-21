@@ -1,4 +1,6 @@
 @echo off
+cd /d "%~dp0"
+if errorlevel 1 exit /b 1
 echo ============================================
 echo  Build fuzz_device for Kylin Linux x86_64
 echo ============================================
@@ -34,7 +36,7 @@ if errorlevel 1 (
 echo.
 echo [3/3] Done!
 echo.
-echo Output: tools\output\fuzz_device
+echo Output: tools\fuzz-device\output\fuzz_device
 echo.
 echo On Kylin machine:
 echo   chmod +x fuzz_device

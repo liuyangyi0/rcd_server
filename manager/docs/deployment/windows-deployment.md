@@ -139,7 +139,7 @@ Set-Location 'C:\Program Files\RcdManager'
 | None | None | Anonymous |
 | Basic256Sha256 | SignAndEncrypt | Anonymous 或 Username |
 
-安全 endpoint 应作为正常生产连接入口。但当前需求同时保留 None/None Anonymous，而且两种 endpoint 均允许匿名控制写入/Call；这要求网络层严格隔离，详见 [安全边界](security.md)。
+安全 endpoint 应作为正常生产连接入口。但当前需求同时保留 None/None Anonymous，而且两种 endpoint 均允许匿名控制写入/Call；这要求网络层严格隔离，详见 [安全边界](../reference/security.md)。
 
 默认兼容用户名/密码为 `user1`/`pwd`，必须在部署前覆盖密码。Username 只在 Basic256Sha256/SignAndEncrypt endpoint 上公布。
 

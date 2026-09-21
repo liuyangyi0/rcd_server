@@ -19,9 +19,9 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 PYTHON = sys.executable
-OPC_CLIENT = ROOT / "tools" / "opc_client_test.py"
+OPC_CLIENT = Path(__file__).resolve().with_name("opc_client_test.py")
 
 
 def run_checked(args: list[str], cwd: Path, timeout: float = 120.0) -> subprocess.CompletedProcess:

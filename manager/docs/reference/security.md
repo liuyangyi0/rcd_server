@@ -17,6 +17,8 @@
 - 下级密码在 Windows 上使用 DPAPI `CRYPTPROTECT_LOCAL_MACHINE` 加密保存；
 - REST 不回传下级密码明文，只返回 `has_password`；
 - 浏览器写请求进行同源检查，后端不开放 CORS；
+- 管理 Web/REST、导出、metrics 与 SSE 使用管理员登录会话；密码保存加盐哈希，退出和改密使会话失效；
+- 登录与改密有次数和并发限制；健康探针与下级日志接收维持独立通道；
 - REST 修改使用 revision/`If-Match`，避免无意覆盖并发变更；
 - SQLite 使用外键和事务；配置、命令写入管理/命令审计；
 - Web 静态资源内嵌，运行时不从 CDN 加载代码。
@@ -25,14 +27,14 @@
 
 以下限制是当前实现/需求的组成部分，不能在部署说明中淡化：
 
-- Web/REST 没有登录、token、RBAC 或 API key；
+- Web 目前是单管理员账号，没有 RBAC、多角色或 API key；
 - HTTP 默认是明文 `0.0.0.0:8080`，程序内没有 HTTPS 终止；
-- 不含请求级速率限制；
+- 除登录/改密外，不提供通用请求级速率限制；
 - None/None OPC endpoint 允许 Anonymous；
 - Basic256Sha256/SignAndEncrypt endpoint 也允许 Anonymous；
 - 匿名 OPC Session 拥有 Browse、Read、Write 和 Call 权限；
 - 上级服务端当前使用宽松的客户端证书校验设置，没有在本程序中实现受信任客户端证书白名单；
-- 同源检查只约束正常浏览器语义。脚本、恶意主机或没有 `Origin` 的客户端仍可写；
+- 同源检查只约束正常浏览器语义；脚本访问管理接口同样需要有效登录 cookie，仍不能用同源检查代替身份认证；
 - DPAPI machine scope 保护静态数据库密文，但同机高权限主体以及正在运行的服务仍能解密；
 - 默认兼容凭据 `user1`/`pwd` 是公开弱默认值；
 - 程序没有高可用、审计远传、防篡改日志或独立安全监控。

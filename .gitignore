@@ -15,6 +15,11 @@
 /musl_output/
 /tools/build/
 /tools/output/
+/tools/fuzz-device/build/
+/tools/fuzz-device/output/
+/tools/serial/probe
+/tools/serial/*.jsonl
+/tools/serial/*.err
 /tools/nesting-check/target-build-check/
 
 # Local vendor driver/tester bundles (large third-party binaries)
@@ -23,3 +28,7 @@
 # Python bytecode
 __pycache__/
 *.py[cod]
+
+# Local releases, evidence and recoverable archives; see artifacts/README.md
+/artifacts/*
+!/artifacts/README.md

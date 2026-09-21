@@ -79,7 +79,7 @@ if errorlevel 1 (
 echo.
 echo [3/3] Done!
 echo.
-echo Output: tools\output\fuzz_device.exe
+echo Output: tools\fuzz-device\output\fuzz_device.exe
 echo.
 echo Double-click fuzz_device.exe to run.
 echo.

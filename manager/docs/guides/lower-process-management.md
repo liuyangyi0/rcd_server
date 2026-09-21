@@ -2,7 +2,7 @@
 
 本功能在 Linux 上通过独立进程守护程序管理一个固定的 Rust 下级。守护程序和管理器使用同一个 `RcdManager` 二进制，分别以 `agent run` 和 `run` 启动；不需要另一个 Go 运行时。Windows 进程守护尚未实现、未验收，不可将本说明作为 Windows 服务安装说明。
 
-版本 `0.4.0-process-control`，管理器构建标识 `cc14f5d+lifecycle-v3`。新版已在独立远端实例运行，旧 `operations-v5` 部署未覆盖；最终 OPC、REST、浏览器结果与尚未验收的 systemd 等项目见 [验证记录](process-control-validation.md)。既有配置、采集开关、备份和业务日志协议见 [下级 OPC 运维协议](lower-operations.md)。
+版本 `0.4.0-process-control`，管理器构建标识 `cc14f5d+lifecycle-v3`。新版已在独立远端实例运行，旧 `operations-v5` 部署未覆盖；最终 OPC、REST、浏览器结果与尚未验收的 systemd 等项目见 [验证记录](../validation/process-control-validation.md)。既有配置、采集开关、备份和业务日志协议见 [下级 OPC 运维协议](lower-operations.md)。
 
 ## 1. 两条管理通道
 
@@ -75,7 +75,7 @@ RCD_OPCUA_PORT=4841 /absolute/path/to/RcdManager agent run \
 
 ## 4. systemd 用户服务（人工安装）
 
-模板在 [rcd-process-agent@.service](../deploy/linux/rcd-process-agent@.service)，环境示例在 [agent.env.example](../deploy/linux/agent.env.example)。管理端和下级一起固定部署及开机自启的完整步骤见 [Linux 固定路径与开机自启](linux-autostart.md)。模板面向现有用户的 systemd user manager，不创建系统用户、不安装系统级服务，也不修改认证或内网安全策略。
+模板在 [rcd-process-agent@.service](../../deploy/linux/rcd-process-agent@.service)，环境示例在 [agent.env.example](../../deploy/linux/agent.env.example)。管理端和下级一起固定部署及开机自启的完整步骤见 [Linux 固定路径与开机自启](../deployment/linux-autostart.md)。模板面向现有用户的 systemd user manager，不创建系统用户、不安装系统级服务，也不修改认证或内网安全策略。
 
 以下步骤用于**首次人工安装**，不直接覆盖已有部署；如目标文件存在，先核对并备份。以实际运行下级、已具有串口访问权限的用户执行，不需要将这些命令改为 `sudo`：
 
@@ -204,4 +204,4 @@ POST actions 携带 `If-Match: "刚读取的 agent revision"`，正文例如：
 
 浏览器首轮提前查询的时序问题已修复。远端 ui-v2 六流程、恢复与七个保护进程检查通过；四次真实 POST 各延迟 250 ms，非预期 HTTP/console 错误和提前对账均为 0。桌面/窄屏无横向溢出，并已人工检查关键截图。最终只读审计 14/14：Schema 6、数据库完整性、无 pending、配置生效、双源 Good 及十个登记进程身份核对通过。这是本轮状态核对，不是持续稳定性压测。
 
-最终验收时管理器为 v3（当时 PID 666309），两个 agent 仍运行同后台代码的 v2 EXE，未热替换为 v3；下级使用 Rust v1。本次发布包为管理器 v3 + Rust v1，均动态链接、保留调试信息、不 strip。systemd 安装/自启、Windows agent、真实串口硬件、满负载延迟和 24 小时稳定性未验收；普通启停成功也不代表所有强制停止/守护崩溃场景已在真实 Rust 上验证。完整证据和历史失败见 [验证记录](process-control-validation.md)。
+最终验收时管理器为 v3（当时 PID 666309），两个 agent 仍运行同后台代码的 v2 EXE，未热替换为 v3；下级使用 Rust v1。本次发布包为管理器 v3 + Rust v1，均动态链接、保留调试信息、不 strip。systemd 安装/自启、Windows agent、真实串口硬件、满负载延迟和 24 小时稳定性未验收；普通启停成功也不代表所有强制停止/守护崩溃场景已在真实 Rust 上验证。完整证据和历史失败见 [验证记录](../validation/process-control-validation.md)。

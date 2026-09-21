@@ -1,31 +1,34 @@
-# Repository Guidelines
+# RCD 项目协作约定
 
-## Project Structure & Module Organization
+## 范围与授权
 
-This Rust 2021 project is an RCD serial acquisition gateway that publishes data through OPC UA and TCP. The binary entry point is `src/main.rs`; reusable modules are exposed from `src/lib.rs`. Core modules live under `src/`: `calc_engine/` handles expression parsing and evaluation, `serial/` handles port configuration and workers, `server/` contains OPC UA/TCP services, and `model/` defines shared domain types. Integration tests are in `tests/`, with fixtures in `test_data/`. Tooling and packaging helpers live in `tools/`; `tools/nesting-check/` is a sibling Rust tool. `serialport-rs/` is a local path dependency. Treat `target/`, `musl_output/`, `tools/build/`, and `tools/output/` as generated artifacts.
+- 开始改动前确认 Git 根目录、分支及已有修改；本项目当前开发线为 `codex/opc-device-groups`。路径不符时先核实，不把其它 worktree、归档或现场运行目录当作开发目录。
+- 审查、解释、查日志只做相关只读检查；要求修复时可修改源码并执行相应验证。部署、重启、设备命令、串口开关、现场配置替换及日志清理须在本次明确授权范围内；“内网/测试环境”和过去的部署授权不构成永久许可。
+- 已授权的常规步骤直接完成，不逐步重复询问；只有缺少会改变结果的选择或需要扩大权限时才询问。指令冲突时说明具体文件和条款，区分原文要求与自己的判断；项目说明不覆盖更高优先级指令。
+- 保留用户未提交修改、配置及归档。整理优先可恢复归档；不顺手提交、推送、清空历史、删除依赖或改动其它 worktree。密码、私钥、运行数据库和现场配置不得新增到 Git 或报告中。
 
-## Build, Test, and Development Commands
+## 项目入口
 
-- `cargo build`: compile the main crate in debug mode.
-- `cargo run`: run the gateway locally; ensure required runtime config files and PKI material are available first.
-- `cargo test`: run unit tests in `src/` and integration tests in `tests/`.
-- `cargo test calc_engine_comprehensive`: run the main calculation-engine integration suite.
-- `cargo fmt`: format Rust code with rustfmt.
-- `cargo clippy --all-targets --all-features`: run lint checks across library, binary, and tests.
-- `.\build_musl.ps1`: build a static Linux musl release in Docker and copy it to `musl_output/rcd_server`.
+- Rust 下级：`src/`、`tests/`、`test_data/`，入口 `src/main.rs` / `src/lib.rs`；Go 管理端：`manager/cmd/`、`manager/internal/`；React/TypeScript：`manager/web/`。
+- `serialport-rs/`、`vendor/`、`manager/third_party/` 是本地补丁依赖；`manager/web/dist/` 是嵌入资源入口，不能当普通旧产物删除。目录与文档导航见 [README](README.md)。
+- 遵循所在模块的格式、错误处理和日志惯例；Rust 用 rustfmt，Go 用 gofmt。仅格式化涉及的文件，不夹带无关重构。提交获授权后使用 `fix:` / `feat:` / `chore:` 等简短主题。
 
-## Coding Style & Naming Conventions
+## 验证与交付
 
-Use standard Rust formatting with 4-space indentation via `cargo fmt`. Prefer `snake_case` for functions, modules, variables, and tests; use `PascalCase` for structs, enums, and traits. Keep module boundaries aligned with the current layout. Use `thiserror` or typed errors where possible, and keep logging through `log` macros (`info!`, `warn!`, `error!`).
+- 所有构建、可执行测试、race、前端测试和运行验收在 `192.168.10.46` 执行，不在本机运行。本机可读写源码、查看差异及传输文件。连接不可用时报告未验证项，不改成本机测试。
+- 远端使用隔离的源码、数据、日志和端口；禁止两个采集实例争用真实串口。真实设备验收不能用模拟器结果替代。
+- 按改动风险选检查，完成后仅因新修改、失败或具体未解疑点扩大/重复测试。命令与选择依据见 [验证参考](docs/development/agent-validation.md)。
+- 交付说明实际改动、测试主机/命令/结果、证据路径和未覆盖项；区分“修改完成”“测试通过”“已部署”。不能用旧日志证明当前版本，也不能把已启动长测写成已通过。
 
-## Testing Guidelines
+## 业务约束
 
-Add focused unit tests beside the module under test using `#[test]` or `#[tokio::test]`. Put cross-module tests in `tests/`, and keep fixtures in `test_data/`. For calculation behavior, update `tests/calc_engine_comprehensive.rs` and compare against `tests/calc_expected_oracle.py` or CSV fixtures when relevant.
+以下为现有兼容性边界；需求明确改变它们时先说明影响，并同步实现、测试与文档。
 
-## Commit & Pull Request Guidelines
+- 保持旧 `ns=2` 业务 NodeId、类型和方法签名及管理端固定命名空间；现场管理 OPC `4840`、下级 `4841`、Web `8087` 不擅自更换。Web 登录与 OPC 认证是不同边界，不因“内网”移除现有登录或修改安全策略。
+- 选源粒度是每 OPC Session、每逻辑组；修改默认源不改在线 Session，恢复原 Session 保留选择和参与方式。自动切源默认关闭，仅已启用组策略及参与自动的 Session 可切换；组默认源自动切换单独开关。缺点/冲突不得伪装 Good，数值差异不作为自动切源依据。
+- 中央计算按全局默认来源生成共享结果，Session 选源不影响它；显式状态输入按固定来源或组默认映射取数。采集通信中断时输入清零，计算继续求值并沿实际执行路径传播质量，不把所有坏质量计算输出强制清零。
+- 命令开始时固定来源、物理串口、Session 和 epoch；pending 按来源加串口互斥并锁定目标组选源。入队不等于执行成功；超时/断线不重投、不换目标，迟到 ACK 不得污染新命令。
+- 站点状态、运维及版本属于物理来源，不随 Session 选源。诊断节点 `Good` 表示状态判断有效，设备是否正常看其值。未知/俄供站点不主动发送版本查询。
+- 实时样本留在内存，不进入 SQLite 实时路径；配置写入保留 revision/CAS、迁移及回滚边界。稳定 ID 与显示名称分离，重命名不能改变身份。
 
-Recent history uses concise conventional-style subjects such as `fix: stabilize OPC startup data sync`, `feat: ...`, and `chore: ...`. Keep the first line imperative and scoped to the change. Pull requests should describe behavior changes, list validation commands run, link related issues, and call out config, PKI, serial-port, or protocol compatibility impacts.
-
-## Security & Configuration Tips
-
-Do not commit new private keys, certificates, device configs, or environment-specific serial settings unless explicitly intended. Review changes under `pki/`, `calc.toml`, and runtime config files carefully because they can affect deployed gateway behavior.
+修改相应领域前按需阅读：[OPC 架构](manager/docs/reference/architecture.md)、[设备分组与命令](manager/docs/guides/device-groups.md)、[计算状态输入](manager/docs/guides/calculation-state-inputs.md)、[设备版本](manager/docs/guides/设备版本管理说明.md)。不要一次加载全部历史文档。

@@ -2,7 +2,9 @@
 
 ## 基本约定
 
-默认基地址为 `http://<manager-host>:8080`。接口无登录、无 token，也没有用户权限模型。所有能够访问监听端口的非浏览器客户端都可以调用读写接口，因此必须依赖隔离内网、防火墙/VLAN 和主机访问控制。
+默认基地址为 `http://<manager-host>:8080`，当前测试环境使用 `8087`。自 `0.7.4-web-login.1` 起，管理接口要求管理员登录 cookie，包括导出、诊断、metrics 和 SSE；未登录返回 401。当前为单管理员模式，没有细分角色权限，HTTP 仍不加密，必须继续依赖隔离内网、防火墙/VLAN 和主机访问控制。
+
+登录使用 `POST /api/v1/auth/login`（JSON `username`、`password`），浏览器保存 HttpOnly cookie；`GET /api/v1/auth/session` 返回登录状态；`POST /api/v1/auth/logout` 退出；`POST /api/v1/auth/password` 接收 `current_password` 和 `new_password`，成功后需重新登录。登录/改密过于频繁返回 429。健康探针和 `POST /api/v1/lower-ingest/logs` 不使用浏览器登录，继续沿用各自原有校验。详见 [网页登录说明](../guides/web-login-and-usability.md)。
 
 JSON 写请求必须满足：
 
@@ -12,7 +14,7 @@ JSON 写请求必须满足：
 - 浏览器写请求的 `Origin` 必须与请求 scheme/host 完全一致；
 - `Sec-Fetch-Site` 若存在，只接受 `same-origin` 或 `none`。
 
-服务不开放 CORS。没有 `Origin` 的脚本/设备请求仍然允许，所以同源检查不是身份认证。
+服务不开放 CORS。没有 `Origin` 的脚本请求可以通过同源检查，但管理接口仍要求登录 cookie；同源检查本身不是身份认证。
 
 ## Endpoint 一览
 
@@ -28,7 +30,7 @@ JSON 写请求必须满足：
 | POST | `/api/v1/sources/{id}/probe` | 独立执行 Endpoint、登录、Namespace 和目录浏览测试，不修改在线连接 |
 | POST | `/api/v1/sources/{id}/reconnect` | 立即重启该来源连接监督器；重连过程也会重新浏览目录 |
 | POST | `/api/v1/sources/{id}/rediscover` | 立即重连并重新发现目录；保留用于脚本表达操作意图 |
-| GET/POST/PUT | `/api/v1/sources/{id}/operations/*` | 下级配置、采集开关、日志；能力/路径/版本规则见[下级运维协议](lower-operations.md) |
+| GET/POST/PUT | `/api/v1/sources/{id}/operations/*` | 下级配置、采集开关、日志；能力/路径/版本规则见[下级运维协议](../guides/lower-operations.md) |
 | GET | `/api/v1/sessions` | 当前在线 OPC Session 列表及各组路由 |
 | PUT | `/api/v1/sessions/{session}/groups/{group}/selection` | 修改目标 Session 的组选源 |
 | GET | `/api/v1/points` | 分页点位，可查看默认源、指定 Session 或指定来源样本 |
@@ -309,7 +311,7 @@ GET /api/v1/points?group_id=device-a&source_id=line-a-secure&port_id=COM1&device
 
 响应每行的外层 `group_id` 是逻辑组；`selected_source_id` / `source_present` 说明实际读取源及其是否具有该点。当所选源具有该点时，`node.group_id`、`node.port_id`、`node.device_id`、`node.kind` 描述的是所选源的实际归属，因此返回的串口可能不同于目录筛选来源的串口。`node.kind` 可为 `point`、`calculation`、`command`；无设备归属时相关字段可能省略，不能把跨设备计算伪装成某个设备。`/points/export` 使用相同筛选和路由规则。
 
-浏览器可在请求头发送最多 64 字符的 `X-RCD-Operator`。服务把它与远端 IP 一起写入后续管理审计；该字段只用于内网追溯，不是身份认证，客户端不得把它当作权限凭证。
+管理审计使用已登录账号与远端 IP。`X-RCD-Operator` 属于旧接口兼容字段，不能覆盖已认证操作者，也不能当作权限凭证。
 
 配置导出明确省略下级密码。`POST /configuration/import` 请求体为 `{"document": <导出文档>, "dry_run": true|false}`；`dry_run=true` 始终只校验。已有任何组或来源时，真实导入返回 409，避免覆盖在线路由。Username 来源导入后需要重新填写密码。
 
@@ -343,7 +345,7 @@ binding_revision 和唯一 request_id。202 仅代表非终态；HTTP 200 的作
 state。结果未知时只查询/resolve 原请求，不换新 ID 重试重启。进程作业处理中，来源命令和运维
 修改返回 409；只读状态、配置与日志仍可查询，但 OPC 下级离线时其运维读取返回不可用。
 
-带配置版本的显式重启、完整正文、错误及 agent 协议见 [下级进程管理](lower-process-management.md)。
+带配置版本的显式重启、完整正文、错误及 agent 协议见 [下级进程管理](../guides/lower-process-management.md)。
 
 ## HTTP 错误
 

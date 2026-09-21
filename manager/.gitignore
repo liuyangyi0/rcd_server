@@ -4,6 +4,8 @@
 /coverage/
 /data/
 /logs/
+/output/
+/tmp/
 /web/node_modules/
 /web/coverage/
 /third_party/awcullen-opcua/client/pki/

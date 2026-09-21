@@ -1,5 +1,7 @@
 # RCD OPC Manager
 
+Web 登录、分页筛选及密码恢复参见 [网页登录与操作优化](docs/guides/web-login-and-usability.md)。登录只作用于管理 Web/API，不改变 OPC 客户端认证策略。
+
 `manager/` 是与现有 Rust 采集程序并列的独立 Go 模块。它同时扮演两种角色：
 
 - 作为 OPC UA Client 连接多台下级 RCD 程序，发现并订阅 `urn:SerialServer` 点表；
@@ -9,7 +11,7 @@
 
 两个 OPC 依赖通过 `go.mod` 固定到仓库内的补丁版本：[服务端 v1.4.0](third_party/awcullen-opcua/FORK.md) 与 [客户端 v0.9.1](third_party/gopcua-opcua/FORK.md)。构建、复制源码或升级依赖时应保留两个目录；不要移除 `replace` 后把未修复的上游版本误当成同一发布候选。
 
-面向现场运维，Web 还提供来源独立连接测试、重新连接并发现目录、持久告警与状态历史、管理操作审计、默认源/Session/指定来源点位视图、同组双来源值比较、CSV 导出、配置备份预检恢复、证书/磁盘/队列状态、Prometheus 指标和脱敏诊断包。上述操作都不会启用自动故障转移。
+面向现场运维，Web 还提供来源独立连接测试、重新连接并发现目录、持久告警与状态历史、管理操作审计、默认源/Session/指定来源点位视图、同组双来源值比较、CSV 导出、配置备份预检恢复、证书/磁盘/队列状态、Prometheus 指标和脱敏诊断包。自动切源默认关闭，须通过独立组策略明确启用；后台持续差异告警与切源互相独立，见 [自动切源与差异告警](docs/guides/redundancy.md)。
 
 ## 新版设备分组
 
@@ -22,12 +24,13 @@ Rust 下级新增“串口 → 设备 → 点位”拓扑，旧点位和命令 N
 两边串口名可以不同。逐台保存时可能暂时出现目录冲突，两边映射一致后重新校验恢复。
 修改映射前须关闭在线 Session 并清空相关待处理命令。
 
-单设备计算点随该设备组切换；跨设备、常量及归属未知的计算点留在共享兼容组，不在管理器
-内重新计算。命令按报文设备地址路由，同一物理串口互斥；新增管理节点
+未激活中央计算时，下级单设备计算点随该设备组切换；跨设备、常量及归属未知的下级计算点留在共享兼容组，仅转发。
+激活中央计算后，管理器按全局默认来源计算，所有 Session 共享结果，Session 选源不改变计算点。
+命令按报文设备地址路由，同一物理串口互斥；新增管理节点
 `Groups/<group>/Send` / `SendCommand` 可明确指定逻辑组。`SendCommand` 保留兼容签名但等待真实设备 ACK，不再把下级入队当成功；老下级无拓扑时仍按原单组模式工作。
 
-协议详见 [设备拓扑与多逻辑组选源](docs/device-groups.md)，本轮结果见
-[远端验证记录](docs/device-groups-validation.md)。本次构建及测试仅在远端执行。
+协议详见 [设备拓扑与多逻辑组选源](docs/guides/device-groups.md)，本轮结果见
+[远端验证记录](docs/validation/device-groups-validation.md)。本次构建及测试仅在远端执行。
 
 ## 快速开始
 
@@ -52,17 +55,17 @@ Rust 下级新增“串口 → 设备 → 点位”拓扑，旧点位和命令 N
 修改同时检查管理器来源版本和下级状态/文件版本。来源连接配置发生变化、存在待处理命令、
 或其他页面已改过同一版本时应先刷新核对。请求超时后结果可能已经生效，不能直接重复提交。
 旧版下级没有运维能力时会明确提示，原有采集仍可继续；本功能不新增登录或改变 OPC 安全策略。
-详细协议、范围和错误语义见 [下级运维](docs/lower-operations.md)。
+详细协议、范围和错误语义见 [下级运维](docs/guides/lower-operations.md)。
 
 Linux agent 与管理器共用同一个二进制，以 `RcdManager agent run` 独立运行，只管理自己启动的
 固定 child，不接管现有 PID。启用前须先交接目标下级，避免争用串口。手动停止状态持久保存；
 进程作业与该来源命令/运维修改互斥，未知结果按原 request_id 查询和对账，不重复重启。
 该功能不会重启主机、修改认证设置或自动切换来源。参数、人工安装的 systemd 用户服务模板及
-限制见 [下级进程管理](docs/lower-process-management.md)。Windows agent 尚未实现。
+限制见 [下级进程管理](docs/guides/lower-process-management.md)。Windows agent 尚未实现。
 
 ### 构建和运行
 
-开发机需要 Go 1.26、Node.js/npm 和 PowerShell。Windows 发布构建：
+以下为 Windows 打包入口参考，需要 Go 1.26、Node.js/npm 和 PowerShell；不是在当前本机执行构建的授权。本项目当前验证在远端 Linux 测试机进行，参见 [验证约定](../docs/development/agent-validation.md)。Windows 发布须另行安排相应环境验收。
 
 ```powershell
 Set-Location .\manager
@@ -106,23 +109,23 @@ Web 首页会在空配置时显示首次配置向导。日常排障建议先在�
 .\RcdManager.exe service uninstall
 ```
 
-服务名为 `RcdManager`，显示名为 `RCD OPC Manager`，安装为延迟自动启动。安装时给出的运行参数会写入服务配置。完整部署、升级、备份和证书说明见 [Windows 部署](docs/windows-deployment.md)。
+服务名为 `RcdManager`，显示名为 `RCD OPC Manager`，安装为延迟自动启动。安装时给出的运行参数会写入服务配置。完整部署、升级、备份和证书说明见 [Windows 部署](docs/deployment/windows-deployment.md)。
 
 ## 文档
 
-- [架构与 OPC 行为](docs/architecture.md)
-- [设备拓扑与多逻辑组选源](docs/device-groups.md)
-- [下级配置、串口/站点与日志运维](docs/lower-operations.md)
-- [下级进程启停、重启与守护部署](docs/lower-process-management.md)
-- [设备分组新版远端验证记录](docs/device-groups-validation.md)
-- [REST 与 SSE 接口](docs/rest-api.md)
-- [Windows 部署、配置与 PKI](docs/windows-deployment.md)
-- [安全边界](docs/security.md)
-- [验证命令与发布验收](docs/validation.md)
+- [架构与 OPC 行为](docs/reference/architecture.md)
+- [设备拓扑与多逻辑组选源](docs/guides/device-groups.md)
+- [下级配置、串口/站点与日志运维](docs/guides/lower-operations.md)
+- [下级进程启停、重启与守护部署](docs/guides/lower-process-management.md)
+- [设备分组新版远端验证记录](docs/validation/device-groups-validation.md)
+- [REST 与 SSE 接口](docs/reference/rest-api.md)
+- [Windows 部署、配置与 PKI](docs/deployment/windows-deployment.md)
+- [安全边界](docs/reference/security.md)
+- [验证命令与发布验收](docs/validation/validation.md)
 
 ## 当前真实性边界
 
-仓库内自动测试已经覆盖：两种上级安全端点和匿名/用户名身份、Browse/Read/Write/Call、双 Session 选源隔离、固定命名空间、旧点表黄金元数据、目录冲突与热增删、命令锁和 epoch、SQLite 恢复、REST/SSE 以及浏览器端主要流程。发布脚本也会从生产前端资源生成单一 EXE。具体执行口径见 [验证文档](docs/validation.md)。
+仓库内自动测试已经覆盖：两种上级安全端点和匿名/用户名身份、Browse/Read/Write/Call、双 Session 选源隔离、固定命名空间、旧点表黄金元数据、目录冲突与热增删、命令锁和 epoch、SQLite 恢复、REST/SSE 以及浏览器端主要流程。发布脚本也会从生产前端资源生成单一 EXE。具体执行口径见 [验证文档](docs/validation/validation.md)。
 
 本轮在远端 Linux 主机使用两套真实 Rust 进程和隔离 PTY 完成了设备分组互操作，
 包括旧节点对比、None/匿名下的 Read/Subscribe/Write/Call、断线恢复，以及
