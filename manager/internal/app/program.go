@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"time"
 
 	"rcd_manager/internal/api"
@@ -44,6 +45,11 @@ func RunProgram(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 	defer repository.Close()
+	webAuth, err := api.NewWebAuth(ctx, repository, cfg.DataDir, os.Getenv("RCD_WEB_USERNAME"), os.Getenv("RCD_WEB_PASSWORD"))
+	if err != nil {
+		return fmt.Errorf("initialize web authentication: %w", err)
+	}
+	defer webAuth.Close()
 
 	endpoint, err := advertisedEndpoint(cfg.OPCListen, cfg.OPCAdvertiseHost)
 	if err != nil {
@@ -108,7 +114,7 @@ func RunProgram(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 
-	apiHandler := api.New(runtime, api.Options{Logger: logger})
+	apiHandler := api.New(runtime, api.Options{Logger: logger, Auth: webAuth})
 	mux := http.NewServeMux()
 	mux.Handle("/api/", apiHandler)
 	mux.Handle("/healthz", apiHandler)
@@ -139,6 +145,7 @@ func RunProgram(ctx context.Context, cfg config.Config) error {
 		}
 	}
 	cancel()
+	webAuth.Close()
 	shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer shutdownCancel()
 	type shutdownResult struct {

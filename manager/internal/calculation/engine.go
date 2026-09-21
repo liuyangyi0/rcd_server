@@ -45,6 +45,8 @@ type Plan struct {
 	dependents       map[string][]int
 	baseVariables    []string
 	inputDefinitions map[string]InputDefinition
+	stateInputs      map[string]StateInput
+	statesBySource   map[string][]string
 }
 
 type RuleView struct {
@@ -88,10 +90,48 @@ func ComparePlans(before, after *Plan) DiffSummary {
 			result.Removed++
 		}
 	}
+	oldStates, newStates := map[string]StateInput{}, map[string]StateInput{}
+	if before != nil {
+		for _, v := range before.StateInputs() {
+			oldStates[v.Name] = v
+		}
+	}
+	if after != nil {
+		for _, v := range after.StateInputs() {
+			newStates[v.Name] = v
+		}
+	}
+	for name, v := range newStates {
+		if old, ok := oldStates[name]; !ok {
+			result.Added++
+		} else if !reflect.DeepEqual(old, v) {
+			result.Changed++
+		}
+	}
+	for name := range oldStates {
+		if _, ok := newStates[name]; !ok {
+			result.Removed++
+		}
+	}
 	return result
 }
 
 func Compile(config Config, inputs map[string]InputDefinition) (*Plan, error) {
+	if err := validateStateInputs(config.StateInputs); err != nil {
+		return nil, err
+	}
+	strictInputs := inputs != nil
+	merged := make(map[string]InputDefinition, len(inputs)+len(config.StateInputs))
+	for name, definition := range inputs {
+		merged[name] = definition
+	}
+	for _, input := range config.StateInputs {
+		if _, ok := merged[input.Name]; ok {
+			return nil, &ValidationError{Problems: []Problem{{Field: "state_inputs", Rule: input.Name, Message: "state input conflicts with a lower point or command: " + input.Name}}}
+		}
+		merged[input.Name] = InputDefinition{DataType: domain.DataTypeUInt32, ValueRank: -1}
+	}
+	inputs = merged
 	problems := make([]Problem, 0)
 	outputs := make(map[string]int, len(config.Rules))
 	compiled := make([]compiledRule, len(config.Rules))
@@ -125,7 +165,7 @@ func Compile(config Config, inputs map[string]InputDefinition) (*Plan, error) {
 				continue
 			}
 			definition, exists := inputs[dependency]
-			if inputs != nil && !exists {
+			if strictInputs && !exists {
 				problems = append(problems, Problem{RuleIndex: index + 1, Rule: rule.Output, Field: "expression", Message: fmt.Sprintf("rule %s references missing point %s", rule.Output, dependency)})
 				continue
 			}
@@ -179,6 +219,15 @@ func Compile(config Config, inputs map[string]InputDefinition) (*Plan, error) {
 		sortedRules[index] = compiled[original]
 	}
 	plan := &Plan{config: config, rules: sortedRules, byName: make(map[string]int, len(sortedRules)), dependents: make(map[string][]int), inputDefinitions: make(map[string]InputDefinition)}
+	plan.config.StateInputs = cloneStateInputs(config.StateInputs)
+	plan.stateInputs = make(map[string]StateInput)
+	plan.statesBySource = make(map[string][]string)
+	for _, input := range plan.config.StateInputs {
+		plan.stateInputs[input.Name] = input
+		for _, target := range input.Targets {
+			plan.statesBySource[target.SourceID] = append(plan.statesBySource[target.SourceID], input.Name)
+		}
+	}
 	for name, definition := range inputs {
 		plan.inputDefinitions[name] = definition
 	}

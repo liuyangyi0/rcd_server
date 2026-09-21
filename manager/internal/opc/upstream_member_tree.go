@@ -238,14 +238,14 @@ func (s *UpstreamServer) addGroupMemberLocked(groupID string, parent awu.NodeID,
 	}
 	tracker.object(portsID)
 	for _, port := range member.Ports {
-		if err := s.addGroupMemberPortLocked(portsID, portsPath, port, tracker); err != nil {
+		if err := s.addGroupMemberPortLocked(member.SourceID, portsID, portsPath, port, tracker); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *UpstreamServer) addGroupMemberPortLocked(parent awu.NodeID, parentPath string, port groupMemberTreePortSpec, tracker *memberTreeTracker) error {
+func (s *UpstreamServer) addGroupMemberPortLocked(sourceID string, parent awu.NodeID, parentPath string, port groupMemberTreePortSpec, tracker *memberTreeTracker) error {
 	portPath := parentPath + "/" + managementPathComponent(port.PortID)
 	portID := awu.NewNodeIDString(s.managementNS, portPath)
 	if err := s.ensureMemberObjectLocked(portID, port.PortID, port.PortID, parent); err != nil {
@@ -293,6 +293,7 @@ func (s *UpstreamServer) addGroupMemberPortLocked(parent awu.NodeID, parentPath 
 			// Retain the first-release alias while documenting its precise meaning.
 			{name: "Discovered", dataType: awu.DataTypeIDBoolean, valueRank: awu.ValueRankScalar, read: staticManagementValue(device.PresentInTopology)},
 		}
+		deviceDefinitions = append(deviceDefinitions, stationCommunicationVariables(s.backend, sourceID, port.PortID, device.DeviceID)...)
 		for _, definition := range deviceDefinitions {
 			if err := s.addMemberVariableLocked(tracker, deviceID, devicePath+"/"+definition.name, definition); err != nil {
 				return err

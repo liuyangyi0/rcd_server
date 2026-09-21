@@ -37,6 +37,8 @@ const KIND_LABELS: Record<string, string> = {
   'group.default_source': '修改默认源', 'source.create': '创建来源', 'source.update': '修改来源',
   'source.delete': '删除来源', 'source.probe': '测试来源', 'source.reconnect': '立即重连',
   'source.rediscover': '重新发现目录', 'session.selection': '修改会话选源',
+  'group.redundancy': '修改自动切源与差异策略', 'session.automatic': '修改会话自动参与',
+  'session.automatic_switch': '会话自动切源', 'group.automatic_switch': '默认源自动切换',
   'alarm.acknowledge': '确认告警', 'alarm.silence': '静默告警', 'configuration.import': '导入配置',
   'source.operation.requested': '下级操作已请求', 'source.operation.completed': '下级操作已完成',
 };

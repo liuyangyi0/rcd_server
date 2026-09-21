@@ -80,6 +80,10 @@ func NewRouteTable(groups []Group, sources []Source) (*RouteTable, error) {
 // OpenSession is idempotent. Re-attaching the same OPC UA Session keeps its
 // routes, while a genuinely new Session copies current group defaults.
 func (t *RouteTable) OpenSession(id string) (Session, error) {
+	return t.OpenSessionWithAutomatic(id, nil)
+}
+
+func (t *RouteTable) OpenSessionWithAutomatic(id string, automatic map[string]bool) (Session, error) {
 	if id == "" {
 		return Session{}, &FieldError{Field: "session_id", Message: "must not be empty"}
 	}
@@ -100,7 +104,7 @@ func (t *RouteTable) OpenSession(id string) (Session, error) {
 				sourceID = ""
 			}
 		}
-		s.Routes[groupID] = GroupRoute{GroupID: groupID, SourceID: sourceID, Revision: 1}
+		s.Routes[groupID] = GroupRoute{GroupID: groupID, SourceID: sourceID, Revision: 1, Automatic: automatic[groupID]}
 	}
 	t.sessions[id] = s
 	return cloneSession(*s), nil
@@ -334,7 +338,9 @@ func (t *RouteTable) applyConfigurationLocked(candidate *RouteTable) {
 				// A command pins its originating route until its terminal ACK or
 				// timeout. Catalog state may change concurrently, but must not
 				// rewrite any Session selection while the group lock is active.
-				if t.pendingByGroup[groupID] > 0 {
+				// Automatic routes retain the failed source for timed failover;
+				// reads still expose its bad quality and commands reject it.
+				if t.pendingByGroup[groupID] > 0 || route.Automatic {
 					continue
 				}
 				route.SourceID = ""
@@ -346,6 +352,14 @@ func (t *RouteTable) applyConfigurationLocked(candidate *RouteTable) {
 }
 
 func (t *RouteTable) Select(sessionID, groupID, sourceID string, expectedRevision uint64) (GroupRoute, error) {
+	return t.selectRoute(sessionID, groupID, sourceID, expectedRevision, false)
+}
+
+func (t *RouteTable) SelectAutomatic(sessionID, groupID, sourceID string, expectedRevision uint64) (GroupRoute, error) {
+	return t.selectRoute(sessionID, groupID, sourceID, expectedRevision, true)
+}
+
+func (t *RouteTable) selectRoute(sessionID, groupID, sourceID string, expectedRevision uint64, automatic bool) (GroupRoute, error) {
 	t.configurationMu.RLock()
 	defer t.configurationMu.RUnlock()
 	t.mu.Lock()
@@ -368,6 +382,10 @@ func (t *RouteTable) Select(sessionID, groupID, sourceID string, expectedRevisio
 		return GroupRoute{}, err
 	}
 	route.SourceID = sourceID
+	if automatic && !route.Automatic {
+		return GroupRoute{}, ErrRevisionConflict
+	}
+	route.Automatic = automatic
 	route.Revision++
 	s.Routes[groupID] = route
 	s.LastSeenAt = t.clock().UTC()
@@ -542,7 +560,7 @@ func (t *RouteTable) invalidateUnselectableRoutesLocked(groupID string) []Sessio
 	changes := make([]SessionRouteChange, 0)
 	for sessionID, session := range t.sessions {
 		route, exists := session.Routes[groupID]
-		if !exists || route.SourceID == "" || t.validateSourceLocked(groupID, route.SourceID) == nil {
+		if !exists || route.Automatic || route.SourceID == "" || t.validateSourceLocked(groupID, route.SourceID) == nil {
 			continue
 		}
 		route.SourceID = ""

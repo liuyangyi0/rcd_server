@@ -20,11 +20,13 @@ import (
 )
 
 type Options struct {
+	Auth   *WebAuth
 	Logger *slog.Logger
 	Now    func() time.Time
 }
 
 type Handler struct {
+	auth    *WebAuth
 	service Service
 	logger  *slog.Logger
 	now     func() time.Time
@@ -43,7 +45,7 @@ func New(service Service, options Options) http.Handler {
 	if now == nil {
 		now = time.Now
 	}
-	h := &Handler{service: service, logger: logger, now: now, mux: http.NewServeMux()}
+	h := &Handler{service: service, logger: logger, now: now, mux: http.NewServeMux(), auth: options.Auth}
 	h.routes()
 	return h.middleware(h.mux)
 }
@@ -71,6 +73,7 @@ func (h *Handler) routes() {
 	h.processControlRoutes()
 	h.lowerLogRoutes()
 	h.calculationRoutes()
+	h.redundancyRoutes()
 
 	h.mux.HandleFunc("GET /api/v1/sessions", h.listSessions)
 	h.mux.HandleFunc("PUT /api/v1/sessions/{session}/groups/{group}/selection", h.setSessionSelection)
@@ -125,7 +128,11 @@ func (h *Handler) middleware(next http.Handler) http.Handler {
 				writeError(w, http.StatusInternalServerError, "internal_error", "internal server error", nil)
 			}
 		}()
-		next.ServeHTTP(w, r)
+		if h.auth != nil {
+			h.auth.serve(w, r, next)
+		} else {
+			next.ServeHTTP(w, r)
+		}
 	})
 }
 

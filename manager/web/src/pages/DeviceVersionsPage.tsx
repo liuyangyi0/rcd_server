@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQueries, useQueryClient } from '@tanstack/react-query';
 import { CheckCircle2, Download, RefreshCw, Search, Settings2, XCircle } from 'lucide-react';
 import { useSearchParams } from 'react-router-dom';
 import { operationsApi, useDeviceVersionMutation, type AcquisitionSnapshot, type DeviceVersionMutationInput } from '../api/operations';
@@ -9,13 +9,13 @@ import { InlineNotice } from '../components/InlineNotice';
 import { Modal } from '../components/Modal';
 import { PageHeader } from '../components/PageHeader';
 import { EmptyState, ErrorState, LoadingState } from '../components/PageState';
-import { Pagination } from '../components/Pagination';
+import { Pagination, readPageSize } from '../components/Pagination';
 import { StatusBadge } from '../components/StatusBadge';
-import { ApiError, apiErrorMessage } from '../api/client';
+import { api, ApiError, apiErrorMessage } from '../api/client';
 import { formatDateTime } from '../lib/format';
 import { humanizeTechnicalMessage } from '../lib/labels';
 
-const PAGE_SIZE = 50;
+
 const SOURCE_CONCURRENCY = 3;
 const MAX_REVISION_ATTEMPTS = 3;
 
@@ -24,6 +24,7 @@ type RowOperation = { state: 'running' | 'success' | 'warning' | 'error'; messag
 export default function DeviceVersionsPage() {
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
+  const PAGE_SIZE = readPageSize(searchParams, 50);
   const [draftQuery, setDraftQuery] = useState(searchParams.get('q') ?? '');
   const sourceId = searchParams.get('source') ?? '';
   const portId = searchParams.get('port') ?? '';
@@ -34,9 +35,10 @@ export default function DeviceVersionsPage() {
   const filterKey = searchParams.toString();
   const params = useMemo<DeviceVersionParams>(() => ({
     page, pageSize: PAGE_SIZE, query: queryText, sourceId, portId, moduleType, status,
-  }), [moduleType, page, portId, queryText, sourceId, status]);
+  }), [PAGE_SIZE, moduleType, page, portId, queryText, sourceId, status]);
   const versionsQuery = useDeviceVersions(params);
   const sourcesQuery = useSources();
+  const topologies = useQueries({ queries: (sourcesQuery.data ?? []).filter((source) => !sourceId || source.id === sourceId).map((source) => ({ queryKey: ['version-port-options', source.id], queryFn: () => api.sourceTopology(source.id), staleTime: 30_000 })) });
   const mutation = useDeviceVersionMutation();
   const [selected, setSelected] = useState<Map<string, DeviceVersion>>(() => new Map());
   const [typeTargets, setTypeTargets] = useState<DeviceVersion[]>([]);
@@ -52,7 +54,7 @@ export default function DeviceVersionsPage() {
   const selectedOnPage = useMemo(() => [...selected.values()].filter((row) => pageKeys.has(versionKey(row))), [pageKeys, selected]);
   const selectableDomestic = useMemo(() => [...selected.values()].filter(canQueryVersion), [selected]);
   const allPageSelected = selectableRows.length > 0 && selectableRows.every((row) => selected.has(versionKey(row)));
-  const ports = useMemo(() => [...new Map(rows.map((row) => [row.portId, row.portName || row.portId])).entries()].sort((a, b) => a[1].localeCompare(b[1])), [rows]);
+  const ports = [...new Map([...topologies.flatMap((query) => (query.data?.ports ?? []).map((port) => [port.portId, port.portName || port.portId] as const)), ...rows.map((row) => [row.portId, row.portName || row.portId] as const)]).entries()].sort((a, b) => a[1].localeCompare(b[1]));
 
   useEffect(() => setDraftQuery(queryText), [filterKey, queryText]);
   useEffect(() => { setSelected(new Map()); }, [filterKey]);
@@ -196,8 +198,9 @@ export default function DeviceVersionsPage() {
             })}</tbody>
           </table>
         </div>
-        <Pagination page={versionsQuery.data?.page ?? page} pageSize={versionsQuery.data?.pageSize ?? PAGE_SIZE} total={versionsQuery.data?.total ?? 0} onPageChange={(nextPage) => updateParams({ page: nextPage })} />
+        <Pagination onPageSizeChange={(size) => updateParams({ size, page: 1 })} page={versionsQuery.data?.page ?? page} pageSize={versionsQuery.data?.pageSize ?? PAGE_SIZE} total={versionsQuery.data?.total ?? 0} onPageChange={(nextPage) => updateParams({ page: nextPage })} />
       </>}
+      {!versionsQuery.error && versionsQuery.data && !rows.length ? <Pagination onPageSizeChange={(size) => updateParams({ size, page: 1 })} page={page} pageSize={PAGE_SIZE} total={versionsQuery.data.total} onPageChange={(nextPage) => updateParams({ page: nextPage })} /> : null}
     </section>
 
     <Modal open={typeTargets.length > 0} title={typeTargets.length === 1 ? '设置站点模块类型' : `批量设置 ${typeTargets.length} 个站点`} description="类型保存到物理站点，不影响 OPC 分组或当前选源。" onClose={closeTypeDialog} footer={<><button className="button button-secondary" type="button" disabled={batchRunning} onClick={closeTypeDialog}>取消</button><button className="button button-primary" type="button" disabled={batchRunning || (nextType === 'domestic' && !typeConfirmed)} onClick={() => void execute(typeTargets, 'set_type', nextType).finally(closeTypeDialog)}>{batchRunning ? '正在保存…' : '确认保存'}</button></>}>

@@ -211,7 +211,8 @@ func (r *Runtime) validateCalculationContent(content string) (api.CalculationVal
 	if err != nil {
 		return api.CalculationValidation{}, err
 	}
-	_, err = calculation.Compile(config, calculationInputs(rawIndex))
+	err = validateStateTargets(config.StateInputs, catalogs, r.routes.Groups(), r.routes.Sources())
+	if err == nil { _, err = calculation.Compile(config, calculationInputs(rawIndex)) }
 	if err != nil {
 		var invalid *calculation.ValidationError
 		if errors.As(err, &invalid) {
@@ -265,6 +266,7 @@ func (r *Runtime) activateCalculationConfigLocked(ctx context.Context, config ca
 	if err != nil {
 		return calculation.Version{}, err
 	}
+	if err = validateStateTargets(config.StateInputs, catalogs, r.routes.Groups(), r.routes.Sources()); err != nil { return calculation.Version{}, err }
 	plan, err := calculation.Compile(config, calculationInputs(rawIndex))
 	if err != nil {
 		return calculation.Version{}, err
@@ -351,6 +353,8 @@ func (r *Runtime) activateCalculationConfigLocked(ctx context.Context, config ca
 	r.mu.Lock()
 	r.catalogs, r.index, r.conflictCount = catalogs, index, conflicts
 	r.calculationPlan, r.calculationVersion = plan, version
+	r.calculationStateSeen = nil
+	r.calculationStateEventPending = true
 	r.calculationPending = calculation.Version{}
 	r.calculationRunner = calculation.NewRunner(plan)
 	r.calculationResults = make(map[string]calculation.Result, plan.RuleCount())
@@ -603,6 +607,8 @@ func (r *Runtime) calculationWorker() {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			r.refreshCalculationStateInputs("")
+			r.flushCalculationStateEvent()
 			r.flushCalculationEvent()
 		case <-r.calculationWake:
 			timer := time.NewTimer(calculationDebounce)
@@ -687,7 +693,12 @@ func (r *Runtime) calculationInputsAtIndex(plan *calculation.Plan, index *catalo
 		defaults[group.ID] = group.DefaultSourceID
 	}
 	inputs := make(map[string]calculation.Input, len(names))
+	sources := r.routes.Sources()
 	for _, name := range names {
+		if state, ok := plan.StateInput(name); ok {
+			inputs[name] = stateViewInput(r.stateInputValue(state, groups, sources))
+			continue
+		}
 		point, exists := index.pointForNode(name)
 		definition, hasDefinition := plan.InputDefinition(name)
 		dataType := definition.DataType

@@ -4,17 +4,17 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { apiErrorMessage } from '../api/client';
 import { useLowerLogs, type LowerLogItem, type LowerLogLevel } from '../api/lowerLogs';
 import { useLoggingLevelMutation, useLoggingStatus, useOperationsCapabilities, type LoggingLevel } from '../api/operations';
-import { useSources } from '../api/queries';
+import { useSources, useSourceTopology } from '../api/queries';
 import type { Source } from '../api/types';
 import { InlineNotice } from '../components/InlineNotice';
 import { EmptyState, ErrorState, LoadingState } from '../components/PageState';
 import { PageHeader } from '../components/PageHeader';
-import { Pagination } from '../components/Pagination';
+import { Pagination, readPageSize } from '../components/Pagination';
 import { StatusBadge } from '../components/StatusBadge';
 import { formatDateTime, formatRelativeTime } from '../lib/format';
 import { humanizeTechnicalMessage } from '../lib/labels';
 
-const PAGE_SIZE = 100;
+
 const LOG_LEVELS: Array<{ value: LoggingLevel; label: string; description: string }> = [
   { value: 'error', label: 'ERROR', description: '只记录错误' },
   { value: 'warn', label: 'WARN', description: '错误和告警' },
@@ -25,10 +25,12 @@ const LOG_LEVELS: Array<{ value: LoggingLevel; label: string; description: strin
 
 export default function LowerLogsPage() {
   const [params, setParams] = useSearchParams();
+  const PAGE_SIZE = readPageSize(params, 100);
   const sources = useSources();
   const requestedSource = params.get('source') ?? '';
   const sourceId = requestedSource || sources.data?.[0]?.id || '';
-  const page = Math.max(1, Number(params.get('page') ?? 1) || 1);
+  const requestedPage = Number(params.get('page') ?? 1);
+  const page = Number.isSafeInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1;
   const level = (params.get('level') ?? '') as LowerLogLevel;
   const query = params.get('q') ?? '';
   const portId = params.get('port') ?? '';
@@ -37,11 +39,15 @@ export default function LowerLogsPage() {
   const customFrom = params.get('from') ?? '';
   const customTo = params.get('to') ?? '';
   const [draft, setDraft] = useState({ query, portId, deviceId });
-  const bounds = useMemo(() => logTimeBounds(range, customFrom, customTo), [range, customFrom, customTo]);
-  const logs = useLowerLogs({ sourceId, level, query, portId, deviceId, ...bounds, page, pageSize: PAGE_SIZE });
+  const [refreshRevision, setRefreshRevision] = useState(0);
+  const bounds = useMemo(() => logTimeBounds(range, customFrom, customTo), [range, customFrom, customTo, refreshRevision]);
+  const timeError = bounds.from && bounds.to && new Date(bounds.from) > new Date(bounds.to) ? '开始时间不能晚于结束时间；今天 08:00 之前请改选最近 1 小时。' : '';
+  const logs = useLowerLogs({ sourceId, level, query, portId, deviceId, ...bounds, page, pageSize: PAGE_SIZE }, !timeError);
   const groupedLogs = useMemo(() => groupRepeatedLogs(logs.data?.items ?? []), [logs.data?.items]);
   const selectedSource = useMemo(() => sources.data?.find((source) => source.id === sourceId), [sourceId, sources.data]);
-  const hasViewConstraints = Boolean(level || query || portId || deviceId || page > 1 || range !== '1h');
+  const topology = useSourceTopology(sourceId);
+  const ports = topology.data?.ports ?? [];
+  const devices = ports.find((port) => port.portId === draft.portId)?.devices ?? [];
 
   useEffect(() => {
     if (!requestedSource && sourceId) {
@@ -72,15 +78,21 @@ export default function LowerLogsPage() {
       ? <StatusBadge state="warning" compact label="已有历史日志" />
       : <StatusBadge state="unknown" compact label="尚未收到推送" />;
   const showLatest = () => {
+    setRefreshRevision((value) => value + 1);
     setDraft({ query: '', portId: '', deviceId: '' });
     update({ q: '', port: '', device: '', level: '', range: '1h', from: '', to: '', page: 1 });
+  };
+  const refreshLogs = () => {
+    if (range === 'all' || range === 'custom') { void logs.refetch(); return; }
+    setRefreshRevision((value) => value + 1);
+    update({ page: 1 });
   };
 
   return <div className="page lower-logs-page">
     <PageHeader title="下级集中日志" description="下级通过独立 HTTP 队列批量发送；管理端按来源滚动保存，串口采集不会等待网络。" actions={<>
-      <button className="button button-outline" type="button" disabled={!logs.data?.items.length} onClick={() => logs.data && exportCurrentPage(selectedSource?.name || sourceId, logs.data.items)}><Download size={16} />导出当前页</button>
-      <button className="button button-outline" type="button" disabled={!hasViewConstraints} onClick={showLatest}>显示最新日志</button>
-      <button className="button button-secondary" type="button" disabled={logs.isFetching || !sourceId} onClick={() => void logs.refetch()}><RefreshCw size={16} />刷新</button>
+      <button className="button button-outline" type="button" disabled={logs.isFetching || !!timeError || !logs.data?.items.length} onClick={() => logs.data && exportCurrentPage(selectedSource?.name || sourceId, logs.data.items)}><Download size={16} />导出当前页</button>
+      <button className="button button-outline" type="button" disabled={!sourceId || logs.isFetching} onClick={showLatest}>显示最新日志</button>
+      <button className="button button-secondary" type="button" disabled={logs.isFetching || !sourceId || !!timeError} onClick={refreshLogs}><RefreshCw size={16} />刷新</button>
     </>} />
 
     <InlineNotice><p>这里显示已推送到管理端的结构化日志。下级本机滚动日志仍完整保留；需要核对未推送区间时，可到“下级 OPC → 运维 → 日志”读取原始文件。</p></InlineNotice>
@@ -92,21 +104,24 @@ export default function LowerLogsPage() {
       <div><span>文件异常行</span><strong className={(logs.data?.invalidLines ?? 0) > 0 ? 'text-warning' : ''}>{logs.data?.invalidLines ?? 0}</strong><small>损坏行会跳过，不影响其他日志</small></div>
     </section>
 
-    <SourceLoggingControl source={selectedSource} />
+    <details className="secondary-settings"><summary>调整下级日志等级（与查看筛选无关）</summary><SourceLoggingControl key={sourceId} source={selectedSource} /></details>
 
     <form className="toolbar filter-toolbar lower-log-filters" onSubmit={(event) => { event.preventDefault(); update({ q: draft.query.trim(), port: draft.portId.trim(), device: draft.deviceId.trim(), page: 1 }); }}>
       <label className="field inline-field"><span>下级来源</span><select value={sourceId} disabled={sources.isLoading} onChange={(event) => { setDraft({ query: '', portId: '', deviceId: '' }); update({ source: event.target.value, q: '', port: '', device: '', level: '', page: 1 }); }}><option value="">请选择来源</option>{(sources.data ?? []).map((source) => <option key={source.id} value={source.id}>{source.name || source.id} · {source.id}</option>)}</select></label>
       <label className="field inline-field"><span>等级</span><select value={level} onChange={(event) => update({ level: event.target.value, page: 1 })}><option value="">全部</option>{['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'].map((value) => <option key={value}>{value}</option>)}</select></label>
-      <label className="field inline-field"><span>串口</span><input value={draft.portId} placeholder="/dev/ttyWCH0" onChange={(event) => setDraft((value) => ({ ...value, portId: event.target.value }))} /></label>
-      <label className="field inline-field"><span>站点</span><input value={draft.deviceId} placeholder="13" onChange={(event) => setDraft((value) => ({ ...value, deviceId: event.target.value }))} /></label>
+      <label className="field inline-field"><span>串口</span><select value={draft.portId} disabled={topology.isPending} onChange={(event) => { setDraft((value) => ({ ...value, portId: event.target.value, deviceId: '' })); update({ port: event.target.value, device: '', page: 1 }); }}><option value="">全部串口</option>{draft.portId && !ports.some((port) => port.portId === draft.portId) ? <option value={draft.portId}>{draft.portId}（历史筛选）</option> : null}{ports.map((port) => <option key={port.portId} value={port.portId}>{port.portName || port.portId}</option>)}</select></label>
+      <label className="field inline-field"><span>站点</span><select value={draft.deviceId} disabled={!draft.portId} onChange={(event) => { setDraft((value) => ({ ...value, deviceId: event.target.value })); update({ device: event.target.value, page: 1 }); }}><option value="">{draft.portId ? '全部站点' : '请先选择串口'}</option>{draft.deviceId && !devices.some((device) => device.deviceId === draft.deviceId) ? <option value={draft.deviceId}>{draft.deviceId}（历史筛选）</option> : null}{devices.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.deviceId} · {device.name}</option>)}</select></label>
       <label className="field inline-field"><span>时间范围</span><select value={range} onChange={(event) => update({ range: event.target.value, from: '', to: '', page: 1 })}><option value="1h">最近 1 小时</option><option value="24h">最近 24 小时</option><option value="today8">今天 08:00 起</option><option value="all">全部日志</option><option value="custom">自定义</option></select></label>
       {range === 'custom' ? <><label className="field inline-field"><span>开始</span><input type="datetime-local" value={logLocalInput(customFrom)} onChange={(event) => update({ from: logISO(event.target.value), page: 1 })} /></label><label className="field inline-field"><span>结束</span><input type="datetime-local" value={logLocalInput(customTo)} onChange={(event) => update({ to: logISO(event.target.value), page: 1 })} /></label></> : null}
       <label className="search-field"><Search size={17} /><input value={draft.query} placeholder="搜索消息、组件、串口或站点" onChange={(event) => setDraft((value) => ({ ...value, query: event.target.value }))} /><button type="submit">筛选</button></label>
       <span className="toolbar-order-note">最新在前</span>
     </form>
+    <div className="query-context" role="status">{timeError || `当前查询：${bounds.from ? formatDateTime(bounds.from) : '最早记录'} 至 ${bounds.to ? formatDateTime(bounds.to) : '现在'}。翻页时保持时间范围；点击刷新获取最新区间。`}</div>
+    {sources.error ? <ErrorState error={sources.error} onRetry={() => void sources.refetch()} /> : null}
+    {topology.error ? <ErrorState error={topology.error} title="串口与站点选项读取失败" onRetry={() => void topology.refetch()} /> : null}
 
     <section className="table-panel content-panel">
-      {!sourceId ? <EmptyState title="尚未配置下级来源" description="先在“下级 OPC”添加来源，再为对应下级启用 HTTP 日志推送。" />
+      {timeError ? <EmptyState title="请调整查询时间" description={timeError} /> : !sourceId ? <EmptyState title="尚未配置下级来源" description="先在“下级 OPC”添加来源，再为对应下级启用 HTTP 日志推送。" />
         : logs.isLoading && !logs.data ? <LoadingState label="正在读取管理端集中日志…" />
           : logs.error ? <ErrorState error={logs.error} title="无法读取集中日志" onRetry={() => void logs.refetch()} />
             : !logs.data?.items.length ? <EmptyState title="没有匹配的集中日志" description={logs.data?.pushState === 'never_received' ? '该来源尚未向管理端推送日志；原始文件仍可通过下级运维读取。' : '请调整等级、串口、站点或关键字筛选。'} />
@@ -117,7 +132,8 @@ export default function LowerLogsPage() {
                 <td data-label="串口 / 站点">{item.portId || '—'}<span className="sub-cell">站点 {item.deviceId || '—'}</span></td>
                 <td data-label="日志信息" className="message-cell lower-log-message"><span>{humanizeTechnicalMessage(item.message)}</span>{item.fields && Object.keys(item.fields).length ? <details><summary>结构化字段</summary><pre>{JSON.stringify(item.fields, null, 2)}</pre></details> : null}</td>
                 <td data-label="接收">{formatRelativeTime(item.receivedAt)}<span className="sub-cell">{formatDateTime(item.receivedAt)}</span></td>
-              </tr>)}</tbody></table></div><Pagination page={logs.data.page} pageSize={logs.data.pageSize} total={logs.data.total} onPageChange={(value) => update({ page: value })} /></>}
+              </tr>)}</tbody></table></div><Pagination onPageSizeChange={(size) => update({ size, page: 1 })} page={logs.data.page} pageSize={logs.data.pageSize} total={logs.data.total} onPageChange={(value) => update({ page: value })} /></>}
+      {!timeError && !logs.error && logs.data && !logs.data.items.length ? <Pagination onPageSizeChange={(size) => update({ size, page: 1 })} page={page} pageSize={PAGE_SIZE} total={logs.data.total} onPageChange={(value) => update({ page: value })} /> : null}
     </section>
   </div>;
 }

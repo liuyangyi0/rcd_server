@@ -82,6 +82,7 @@ function SourceSwitchForm({ mode, group, sources: allSources, sessions, initialS
       }
     >
       <div className="selection-section">
+        {mode === 'session' ? <p className="text-warning">本次手动切源会退出该 Session 本组的自动切源，改为手动固定。</p> : <p className="text-warning">默认源同时用于中央计算；已开启默认源自动策略时，后续故障仍可能触发自动切换。</p>}
         {mode === 'session' ? <>
           <span className="field-label">目标上级 Session</span>
           <div className="current-source-box">

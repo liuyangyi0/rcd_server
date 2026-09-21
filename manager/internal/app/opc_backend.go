@@ -52,11 +52,21 @@ func (b OPCBackend) GroupForNode(identifier string) (string, bool) {
 	return b.Runtime.GroupForNode(identifier)
 }
 func (b OPCBackend) PendingCount(groupID string) int { return b.Runtime.routes.PendingCount(groupID) }
+func (b OPCBackend) GroupRedundancy(group string) (domain.RedundancyView, error) {
+	return b.Runtime.Redundancy(context.Background(), group)
+}
+func (b OPCBackend) SetSessionAutomatic(session, group string, automatic bool, revision uint64) (domain.GroupRoute, error) {
+	return b.Runtime.SetSessionAutomatic(context.Background(), session, group, automatic, revision)
+}
 func (b OPCBackend) StationVersions(sourceID string) (domain.SourceStationVersions, bool) {
 	return b.Runtime.StationVersions(sourceID)
 }
 func (b OPCBackend) StationVersionSupport(sourceID string) (bool, bool) {
 	return b.Runtime.StationVersionSupport(sourceID)
+}
+
+func (b OPCBackend) StationCommunication(sourceID, portID, deviceID string) domain.StationCommunication {
+	return b.Runtime.StationCommunication(sourceID, portID, deviceID)
 }
 
 func (b OPCBackend) CalculationMetadata() opc.CalculationMetadata {
@@ -88,7 +98,11 @@ func (r *Runtime) openSession(sessionID string) error {
 	if len(r.routes.Sessions()) >= r.options.MaxSessions {
 		return fmt.Errorf("maximum %d upstream sessions reached", r.options.MaxSessions)
 	}
-	session, err := r.routes.OpenSession(sessionID)
+	automatic := make(map[string]bool)
+	for id, policy := range r.redundancyPolicies {
+		automatic[id] = policy.Enabled
+	}
+	session, err := r.routes.OpenSessionWithAutomatic(sessionID, automatic)
 	if err == nil {
 		r.broker.Publish(api.Event{Type: "session.changed", Data: session})
 	}

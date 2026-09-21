@@ -3,6 +3,7 @@ import type { CalculationProblem } from '../../api/types';
 
 export interface CalculationEditorHandle {
   getValue(): string;
+  insertText(value: string): void;
   focusProblem(problem: CalculationProblem): void;
 }
 
@@ -32,6 +33,13 @@ const CalculationEditor = forwardRef<CalculationEditorHandle, Props>(function Ca
 
   useImperativeHandle(ref, () => ({
     getValue: () => chunksRef.current.map((chunk) => chunk.content).join(''),
+    insertText(value) {
+      const target = editor.current;
+      if (!target || disabled) return;
+      const start = target.selectionStart, end = target.selectionEnd;
+      updateCurrent(target.value.slice(0, start) + value + target.value.slice(end));
+      requestAnimationFrame(() => { target.focus(); target.setSelectionRange(start + value.length, start + value.length); });
+    },
     focusProblem(problem) {
       const rule = problem.ruleIndex && problem.ruleIndex > 0 ? problem.ruleIndex : 1;
       const nextPage = Math.min(chunksRef.current.length - 1, Math.max(0, Math.floor((rule - 1) / RULES_PER_PAGE)));
@@ -39,7 +47,7 @@ const CalculationEditor = forwardRef<CalculationEditorHandle, Props>(function Ca
       setPage(nextPage);
       if (nextPage === page) focusPendingRule(editor.current, pendingRule);
     },
-  }), [page]);
+  }), [page, disabled, onDirty]);
 
   useEffect(() => {
     if (pendingRule.current === undefined) return;

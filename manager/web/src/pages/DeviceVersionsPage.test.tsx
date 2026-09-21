@@ -18,6 +18,7 @@ function setup(page = versionPage) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   vi.spyOn(api, 'deviceVersions').mockResolvedValue(page);
   vi.spyOn(api, 'sources').mockResolvedValue([source]);
+  vi.spyOn(api, 'sourceTopology').mockResolvedValue({ sourceId: source.id, groupId: 'g1', supported: true, catalogState: 'Ready', revision: 1, schemaVersion: 1, ports: [{ portId: '/dev/ttyWCH7', portName: '另一页的串口', sendNodeId: '', sendMethodId: '', pointCount: 1, devices: [] }], calculationCount: 0, crossDeviceCalculationCount: 0, unassignedPointCount: 0 });
   render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/device-versions']}><DeviceVersionsPage /></MemoryRouter></QueryClientProvider>);
   return userEvent.setup();
 }
@@ -28,6 +29,7 @@ describe('device version inventory', () => {
   it('shows raw versions, configured type, and summary independently from OPC routing', async () => {
     setup();
     await screen.findByRole('table');
+    expect(await screen.findByRole('option', { name: '另一页的串口' })).toBeInTheDocument();
     expect(screen.getByText('设备总数').parentElement).toHaveTextContent('2');
     const row = within(screen.getByRole('row', { name: /站点 12/ }));
     expect(row.getByText('V1.4')).toBeInTheDocument();

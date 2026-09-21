@@ -288,6 +288,9 @@ func (s *UpstreamServer) ReconcileCatalog(catalog domain.CatalogUnion, groups []
 		for _, name := range []string{"SelectedSourceId", "SelectionRevision", "Send"} {
 			s.groupNodeIDs[group.ID] = append(s.groupNodeIDs[group.ID], awu.NewNodeIDString(s.managementNS, "Groups/"+group.ID+"/"+name))
 		}
+		if _, ok := s.backend.(RedundancyBackend); ok {
+			s.groupNodeIDs[group.ID] = append(s.groupNodeIDs[group.ID], awu.NewNodeIDString(s.managementNS, "Groups/"+group.ID+"/AutomaticSelection"))
+		}
 	}
 	for _, group := range groups {
 		s.groupNodeIDs[group.ID] = append(s.groupNodeIDs[group.ID], s.memberTreeRouteIDs[group.ID]...)

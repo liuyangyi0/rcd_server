@@ -9,11 +9,14 @@ import (
 	"strings"
 	"syscall"
 
+	"rcd_manager/internal/api"
 	"rcd_manager/internal/app"
 	"rcd_manager/internal/buildinfo"
 	"rcd_manager/internal/config"
+	"rcd_manager/internal/platform/secrets"
 	"rcd_manager/internal/platform/service"
 	"rcd_manager/internal/processagent"
+	"rcd_manager/internal/store"
 )
 
 func main() {
@@ -35,6 +38,17 @@ func execute(args []string) error {
 			return nil
 		case "service":
 			return serviceCommand(args[1:])
+		case "web-reset-password":
+			cfg, err := config.Load(args[1:])
+			if err != nil {
+				return err
+			}
+			repo, err := store.Open(context.Background(), cfg.DatabasePath, secrets.NewMachineProtector())
+			if err != nil {
+				return err
+			}
+			defer repo.Close()
+			return api.ResetWebPassword(context.Background(), repo, os.Getenv("RCD_WEB_PASSWORD"))
 		case "agent":
 			return agentCommand(args[1:])
 		case "run":
@@ -107,6 +121,7 @@ Usage:
   rcd-manager service start|stop|uninstall
   rcd-manager agent run --instance-id ID --executable PATH --data-dir PATH [agent options]
   rcd-manager version
+  rcd-manager web-reset-password --data-dir PATH (stop manager first; use RCD_WEB_PASSWORD)
 
 Runtime options:
   --data-dir PATH

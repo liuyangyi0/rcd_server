@@ -528,6 +528,7 @@ func (s *UpstreamServer) addGroupManagementLocked(group domain.Group, members, p
 		{name: "PendingCommandCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar,
 			read: func(_ string) (any, awu.StatusCode) { return uint32(s.backend.PendingCount(group.ID)), awu.Good }},
 	}
+	definitions = append(definitions, s.redundancyVariables(group.ID)...)
 	for _, definition := range definitions {
 		if err := s.addManagementVariableLocked(objectID, "Groups/"+group.ID+"/"+definition.name, definition); err != nil {
 			return err
@@ -755,7 +756,9 @@ func (s *UpstreamServer) reconcileSourceStationVersionTreeLocked(source domain.S
 }
 
 func (s *UpstreamServer) addSourceStationDeviceVariablesLocked(sourceID, portID string, topologyDevice domain.TopologyDevice, parent awu.NodeID, path string) error {
-	for _, definition := range sourceStationDeviceVariables(s.backend, sourceID, portID, topologyDevice) {
+	definitions := sourceStationDeviceVariables(s.backend, sourceID, portID, topologyDevice)
+	definitions = append(definitions, stationCommunicationVariables(s.backend, sourceID, portID, topologyDevice.DeviceID)...)
+	for _, definition := range definitions {
 		if err := s.addManagementVariableLocked(parent, path+"/"+definition.name, definition); err != nil {
 			return err
 		}

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -74,6 +75,8 @@ type CalculationService interface {
 
 func (h *Handler) calculationRoutes() {
 	const base = "/api/v1/calculations"
+	h.mux.HandleFunc("GET "+base+"/state-inputs", h.calculationStateInputs)
+	h.mux.HandleFunc("GET "+base+"/state-input-candidates", h.calculationStateCandidates)
 	h.mux.HandleFunc("GET "+base+"/status", h.calculationStatus)
 	h.mux.HandleFunc("GET "+base+"/results", h.calculationResults)
 	h.mux.HandleFunc("GET "+base+"/results/export", h.exportCalculationResults)
@@ -331,9 +334,15 @@ func (h *Handler) exportCalculationResults(w http.ResponseWriter, r *http.Reques
 func decodeCalculationContent(w http.ResponseWriter, r *http.Request) (string, bool) {
 	var body struct {
 		Content string `json:"content"`
+		StateInputs *[]calculation.StateInput `json:"state_inputs,omitempty"`
 	}
 	if decodeCalculationJSON(w, r, &body) != nil {
 		return "", false
+	}
+	if body.StateInputs != nil {
+		content, err := calculation.ReplaceStateInputs(body.Content, *body.StateInputs)
+		if err != nil { status:=http.StatusUnprocessableEntity;if errors.Is(err,calculation.ErrConfigTooLarge) {status=http.StatusRequestEntityTooLarge};writeError(w, status, "invalid_configuration", err.Error(), nil); return "", false }
+		return content, true
 	}
 	return body.Content, true
 }

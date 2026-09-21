@@ -81,83 +81,87 @@ type Runtime struct {
 	cache   *sampleCache
 	options RuntimeOptions
 
-	configMu                    sync.RWMutex
-	sourceOperations            map[string]bool   // guarded by configMu; no hot-path I/O
-	sourceProcessOperations     map[string]string // durable maintenance fences, guarded by configMu
-	processExecuting            map[string]string // source -> executing request, guarded by configMu
-	lifecycleMu                 sync.Mutex
-	commandMu                   sync.Mutex
-	statusPersistMu             sync.Mutex
-	statusRetryMu               sync.Mutex
-	stationCacheMu              sync.Mutex
-	lowerLogMu                  sync.Mutex
-	mu                          sync.RWMutex
-	catalogs                    map[string]domain.SourceCatalog
-	index                       *catalogIndex
-	statuses                    map[string]opc.LowerStatus
-	lowers                      map[string]lowerHandle
-	generations                 map[string]uint64
-	dirtyCatalogs               map[string]domain.SourceCatalog
-	dirtyCommands               map[string]domain.PendingCommand
-	dirtyAudits                 map[string]domain.AuditEntry
-	dirtySourceEvents           []domain.SourceEvent
-	dirtyAlarmStatuses          map[string]opc.LowerStatus
-	stationVersions             map[string]domain.SourceStationVersions
-	stationVersionEpoch         map[string]uint64
-	stationRefreshPending       map[string]bool
-	stationRefreshDirty         map[string]bool
-	stationFeatureEpoch         map[string]uint64
-	stationFeatureSupported     map[string]bool
-	calculationPlan             *calculation.Plan
-	calculationVersion          calculation.Version
-	calculationPending          calculation.Version
-	calculationRunner           *calculation.Runner
-	calculationResults          map[string]calculation.Result
-	calculationRetired          map[string]calculation.Result
-	calculationRetiredPoints    map[string]indexedPoint
-	calculationDirty            map[string]struct{}
-	calculationFull             bool
-	calculationRouteRevision    uint64
-	calculationLastEvaluationAt time.Time
-	calculationLastDuration     time.Duration
-	calculationLastError        string
-	calculationEventAt          time.Time
-	calculationEventPending     bool
-	lowerLogs                   *lowerlogs.Store
-	quarantinedSources          map[string]string
-	pendingCommandMeta          map[string]pendingCommandMeta
-	ackSequences                map[string]uint64
-	ackEpochs                   map[string]uint64
-	commandHistory              map[string]commandHistoryEntry
-	catalogPersistError         string
-	commandPersistError         string
-	auditPersistError           string
-	statusPersistError          string
-	stationPersistError         string
-	lowerLogPersistError        string
-	upstreamReconcileError      string
-	upstreamReconcileDirty      bool
-	conflictCount               int
-	selectionCount              uint64
-	lastSelectionAt             time.Time
-	groupLastSelectedAt         map[string]time.Time
-	lastLowerDataAt             time.Time
-	lastSampleEventAt           time.Time
-	sampleEventPending          bool
-	startedAt                   time.Time
-	runContext                  context.Context
-	runCancel                   context.CancelFunc
-	shutdownDone                chan struct{}
-	refreshSession              func(sessionID, groupID string)
-	refreshQueue                chan sessionRefreshRequest
-	statusPersistWake           chan struct{}
-	stationRefreshQueue         chan string
-	calculationWake             chan struct{}
-	catalogValidator            CatalogPublisher
-	catalogReconciler           CatalogPublisher
-	refreshCalculations         func([]string)
-	sessionViews                func() map[string]api.SessionView
-	subscriptionCount           func() int
+	configMu                     sync.RWMutex
+	redundancyPolicies           map[string]domain.RedundancyPolicy // guarded by configMu
+	redundancyStates             map[string]*redundancyState        // guarded by configMu
+	sourceOperations             map[string]bool                    // guarded by configMu; no hot-path I/O
+	sourceProcessOperations      map[string]string                  // durable maintenance fences, guarded by configMu
+	processExecuting             map[string]string                  // source -> executing request, guarded by configMu
+	lifecycleMu                  sync.Mutex
+	commandMu                    sync.Mutex
+	statusPersistMu              sync.Mutex
+	statusRetryMu                sync.Mutex
+	stationCacheMu               sync.Mutex
+	lowerLogMu                   sync.Mutex
+	mu                           sync.RWMutex
+	catalogs                     map[string]domain.SourceCatalog
+	index                        *catalogIndex
+	statuses                     map[string]opc.LowerStatus
+	lowers                       map[string]lowerHandle
+	generations                  map[string]uint64
+	dirtyCatalogs                map[string]domain.SourceCatalog
+	dirtyCommands                map[string]domain.PendingCommand
+	dirtyAudits                  map[string]domain.AuditEntry
+	dirtySourceEvents            []domain.SourceEvent
+	dirtyAlarmStatuses           map[string]opc.LowerStatus
+	stationVersions              map[string]domain.SourceStationVersions
+	stationVersionEpoch          map[string]uint64
+	stationRefreshPending        map[string]bool
+	stationRefreshDirty          map[string]bool
+	stationFeatureEpoch          map[string]uint64
+	stationFeatureSupported      map[string]bool
+	calculationPlan              *calculation.Plan
+	calculationVersion           calculation.Version
+	calculationPending           calculation.Version
+	calculationRunner            *calculation.Runner
+	calculationResults           map[string]calculation.Result
+	calculationRetired           map[string]calculation.Result
+	calculationRetiredPoints     map[string]indexedPoint
+	calculationDirty             map[string]struct{}
+	calculationStateSeen         map[string]string
+	calculationStateEventPending bool
+	calculationFull              bool
+	calculationRouteRevision     uint64
+	calculationLastEvaluationAt  time.Time
+	calculationLastDuration      time.Duration
+	calculationLastError         string
+	calculationEventAt           time.Time
+	calculationEventPending      bool
+	lowerLogs                    *lowerlogs.Store
+	quarantinedSources           map[string]string
+	pendingCommandMeta           map[string]pendingCommandMeta
+	ackSequences                 map[string]uint64
+	ackEpochs                    map[string]uint64
+	commandHistory               map[string]commandHistoryEntry
+	catalogPersistError          string
+	commandPersistError          string
+	auditPersistError            string
+	statusPersistError           string
+	stationPersistError          string
+	lowerLogPersistError         string
+	upstreamReconcileError       string
+	upstreamReconcileDirty       bool
+	conflictCount                int
+	selectionCount               uint64
+	lastSelectionAt              time.Time
+	groupLastSelectedAt          map[string]time.Time
+	lastLowerDataAt              time.Time
+	lastSampleEventAt            time.Time
+	sampleEventPending           bool
+	startedAt                    time.Time
+	runContext                   context.Context
+	runCancel                    context.CancelFunc
+	shutdownDone                 chan struct{}
+	refreshSession               func(sessionID, groupID string)
+	refreshQueue                 chan sessionRefreshRequest
+	statusPersistWake            chan struct{}
+	stationRefreshQueue          chan string
+	calculationWake              chan struct{}
+	catalogValidator             CatalogPublisher
+	catalogReconciler            CatalogPublisher
+	refreshCalculations          func([]string)
+	sessionViews                 func() map[string]api.SessionView
+	subscriptionCount            func() int
 
 	running atomic.Bool
 	ready   atomic.Bool
@@ -275,6 +279,9 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 	if pendingErr == nil {
 		pendingConfig, parseErr := calculation.ParseConfig(pendingVersion.Content)
 		rawIndex, _, _, catalogErr := validateCatalogs(filterLowerCalculations(catalogs))
+		if parseErr == nil && catalogErr == nil {
+			parseErr = validateStateTargets(pendingConfig.StateInputs, catalogs, groups, sources)
+		}
 		if parseErr == nil && catalogErr == nil {
 			calculationPlan, parseErr = calculation.Compile(pendingConfig, calculationInputs(rawIndex))
 		}
@@ -434,6 +441,31 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 			Subscription: opc.SubscriptionInactive, Catalog: source.CatalogState, LastError: lastError, UpdatedAt: now,
 		}
 	}
+	policies, err := repo.LoadRedundancy(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load redundancy policies: %w", err)
+	}
+	runtime.redundancyPolicies = make(map[string]domain.RedundancyPolicy)
+	runtime.redundancyStates = make(map[string]*redundancyState)
+	for _, policy := range policies {
+		runtime.redundancyPolicies[policy.GroupID] = policy
+	}
+	for _, policy := range policies {
+		alarms, _, loadErr := repo.ListAlarms(ctx, store.AlarmFilter{State: string(domain.AlarmOpen), Query: policy.DifferenceKind(), Limit: 1000})
+		if loadErr != nil {
+			return nil, fmt.Errorf("restore difference alarms: %w", loadErr)
+		}
+		for _, alarm := range alarms {
+			if alarm.Kind == policy.DifferenceKind() && alarm.SourceID == "" {
+				s := runtime.redundancyStateLocked(policy.GroupID)
+				s.alarmKnown = true
+				s.alarmActive = true
+				s.alarmMessage = alarm.Message
+				s.view.DifferenceAlarmActive = true
+				s.view.ComparisonState = "Unknown"
+			}
+		}
+	}
 	return runtime, nil
 }
 
@@ -477,6 +509,8 @@ func (r *Runtime) Start(ctx context.Context) error {
 	go r.stationVersionRefreshWorker()
 	r.wg.Add(1)
 	go r.calculationWorker()
+	r.wg.Add(1)
+	go r.redundancyWorker()
 	if r.calculationPlan != nil {
 		r.requestCalculationFull()
 	}
@@ -1062,6 +1096,11 @@ func (r *Runtime) onCatalog(sourceID string, generation uint64, discovered domai
 	if !r.lowerCallbackCurrentLocked(sourceID, generation) {
 		r.mu.Unlock()
 		return
+	}
+	if domain.SourceTopologyFingerprint(previous.Topology) != domain.SourceTopologyFingerprint(merged.Topology) {
+		// A station at the same address in a new topology must not inherit the
+		// previous hardware's live health before a new status receipt arrives.
+		delete(r.stationVersionEpoch, sourceID)
 	}
 	r.catalogs = candidate
 	r.index = index

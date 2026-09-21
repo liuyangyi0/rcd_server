@@ -261,6 +261,9 @@ func (r *Runtime) DeleteGroup(ctx context.Context, id string, revision uint64) e
 	}); err != nil {
 		return err
 	}
+	delete(r.redundancyPolicies, id)
+	delete(r.redundancyStates, id)
+	r.broker.Publish(api.Event{Type: "alarm.changed", Data: map[string]string{"group_id": id}})
 	for _, source := range removedSources {
 		r.stopLower(source.ID)
 		r.cache.DeleteSource(source.ID)
@@ -311,6 +314,10 @@ func (r *Runtime) SetDefaultSource(ctx context.Context, groupID, sourceID string
 func (r *Runtime) setDefault(ctx context.Context, groupID, sourceID string, revision uint64, actor string) (domain.Group, error) {
 	r.configMu.Lock()
 	defer r.configMu.Unlock()
+	return r.setDefaultLocked(ctx, groupID, sourceID, revision, actor)
+}
+
+func (r *Runtime) setDefaultLocked(ctx context.Context, groupID, sourceID string, revision uint64, actor string) (domain.Group, error) {
 	if r.closing.Load() {
 		return domain.Group{}, domain.ErrShuttingDown
 	}

@@ -6,16 +6,17 @@ import { useGroups, usePointComparison, usePoints, useSessions, useSources, useS
 import type { ListParams, Point } from '../api/types';
 import { EmptyState, ErrorState, LoadingState } from '../components/PageState';
 import { PageHeader } from '../components/PageHeader';
-import { Pagination } from '../components/Pagination';
+import { Pagination, readPageSize } from '../components/Pagination';
 import { formatDateTime, displayValue, shortClientName, shortSessionId } from '../lib/format';
 import { statusCodeLabel } from '../lib/labels';
 import { isBadStatus } from '../lib/status';
 import { sourceHasGroup } from '../lib/sourceGroups';
 
-const PAGE_SIZE = 50;
+
 
 export default function PointsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const PAGE_SIZE = readPageSize(searchParams, 50);
   const [draftQuery, setDraftQuery] = useState(searchParams.get('q') ?? '');
   const groupId = searchParams.get('group') ?? '';
   const query = searchParams.get('q') ?? '';
@@ -126,7 +127,7 @@ export default function PointsPage() {
                 </tr>;
               })}</tbody></table>
             </div>
-            <Pagination page={activeData?.page ?? page} pageSize={PAGE_SIZE} total={activeData?.total ?? 0} onPageChange={(nextPage) => updateParams({ page: nextPage })} />
+            <Pagination onPageSizeChange={(size) => updateParams({ size, page: 1 })} page={activeData?.page ?? page} pageSize={PAGE_SIZE} total={activeData?.total ?? 0} onPageChange={(nextPage) => updateParams({ page: nextPage })} />
           </>
         ) : points.length === 0 ? (
           <EmptyState title={query || groupId || quality || catalogSourceId || portId || deviceId ? '没有匹配的点位' : '暂无点位目录'} description={query || groupId || quality || catalogSourceId || portId || deviceId ? '请调整搜索或筛选条件。' : '首次目录发现完成后，点位将显示在这里。'} />
@@ -152,7 +153,7 @@ export default function PointsPage() {
                 })}</tbody>
               </table>
             </div>
-            <Pagination page={pointsQuery.data?.page ?? page} pageSize={pointsQuery.data?.pageSize ?? PAGE_SIZE} total={pointsQuery.data?.total ?? 0} onPageChange={(nextPage) => updateParams({ page: nextPage })} />
+            <Pagination onPageSizeChange={(size) => updateParams({ size, page: 1 })} page={pointsQuery.data?.page ?? page} pageSize={pointsQuery.data?.pageSize ?? PAGE_SIZE} total={pointsQuery.data?.total ?? 0} onPageChange={(nextPage) => updateParams({ page: nextPage })} />
           </>
         )}
       </section>

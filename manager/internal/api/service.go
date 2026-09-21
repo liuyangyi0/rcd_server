@@ -215,10 +215,11 @@ type ExportSource struct {
 }
 
 type ConfigurationDocument struct {
-	SchemaVersion int             `json:"schema_version"`
-	ExportedAt    time.Time       `json:"exported_at,omitempty,omitzero"`
-	Groups        []GroupMutation `json:"groups"`
-	Sources       []ExportSource  `json:"sources"`
+	Redundancy    []domain.RedundancyPolicy `json:"redundancy,omitempty"`
+	SchemaVersion int                       `json:"schema_version"`
+	ExportedAt    time.Time                 `json:"exported_at,omitempty,omitzero"`
+	Groups        []GroupMutation           `json:"groups"`
+	Sources       []ExportSource            `json:"sources"`
 }
 
 type ConfigurationImportRequest struct {

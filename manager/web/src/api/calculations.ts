@@ -171,6 +171,8 @@ export function useCalculationMutation() {
       }
     },
     onSettled: async () => Promise.all([
+      client.invalidateQueries({ queryKey: ['calculations', 'state-draft'] }),
+      client.invalidateQueries({ queryKey: ['calculations', 'state-inputs'] }),
       client.invalidateQueries({ queryKey: calculationKeys.status }),
       client.invalidateQueries({ queryKey: calculationKeys.draft }),
       client.invalidateQueries({ queryKey: calculationKeys.allVersions }),

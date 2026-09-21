@@ -128,6 +128,7 @@ export async function request(path: string, init: RequestInit = {}): Promise<unk
   if (!response.ok) {
     const envelope = body && typeof body === 'object' ? (body as { error?: ApiFailure }) : {};
     const failure = envelope.error ?? (body && typeof body === 'object' ? (body as ApiFailure) : {});
+    if (failure.code === 'login_required' || failure.code === 'password_change_required') window.dispatchEvent(new Event('rcd-auth-expired'));
     if (!failure.detail && failure.details !== undefined) {
       failure.detail = typeof failure.details === 'string' ? failure.details : JSON.stringify(failure.details);
     }

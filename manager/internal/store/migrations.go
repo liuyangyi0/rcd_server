@@ -229,6 +229,21 @@ var migrations = []string{
 	`ALTER TABLE command_audit ADD COLUMN node_id TEXT NOT NULL DEFAULT '';
 	ALTER TABLE command_audit ADD COLUMN request TEXT NOT NULL DEFAULT '';
 	ALTER TABLE command_audit ADD COLUMN response TEXT NOT NULL DEFAULT '';`,
+	`CREATE TABLE web_admin (
+		id INTEGER PRIMARY KEY CHECK(id=1),
+		username TEXT NOT NULL,
+		password_hash TEXT NOT NULL,
+		must_change INTEGER NOT NULL CHECK(must_change IN (0,1))
+	);`,
+	`CREATE TABLE group_redundancy (
+		group_id TEXT PRIMARY KEY REFERENCES groups(id) ON DELETE CASCADE,
+		revision INTEGER NOT NULL CHECK(revision > 0),
+		policy_json TEXT NOT NULL
+	);
+	CREATE TRIGGER group_redundancy_resolve AFTER DELETE ON groups BEGIN
+		UPDATE alarms SET state='Resolved', resolved_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), revision=revision+1
+		WHERE source_id='' AND kind='group/' || OLD.id || '/data_difference' AND state='Open';
+	END;`,
 }
 
 func migrate(ctx context.Context, db *sql.DB) error {

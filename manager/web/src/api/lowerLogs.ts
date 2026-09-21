@@ -76,12 +76,12 @@ export async function listLowerLogs(params: LowerLogParams, signal?: AbortSignal
   };
 }
 
-export function useLowerLogs(params: LowerLogParams) {
+export function useLowerLogs(params: LowerLogParams, enabled = true) {
   return useQuery({
     queryKey: lowerLogKeys.source(params),
     queryFn: ({ signal }) => listLowerLogs(params, signal),
-    enabled: Boolean(params.sourceId),
-    placeholderData: (previous) => previous,
+    enabled: Boolean(params.sourceId) && enabled,
+    placeholderData: (previous, query) => query?.queryKey[1] === params.sourceId ? previous : undefined,
     refetchOnWindowFocus: false,
   });
 }

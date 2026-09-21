@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"rcd_manager/internal/domain"
@@ -10,7 +11,7 @@ import (
 // ImportEmptyConfiguration restores a validated, password-free configuration
 // into an empty database in one transaction. Existing installations must use
 // normal revisioned CRUD so an import cannot silently replace live routes.
-func (r *Repository) ImportEmptyConfiguration(ctx context.Context, groups []domain.Group, sources []domain.Source) ([]domain.Group, []domain.Source, error) {
+func (r *Repository) ImportEmptyConfiguration(ctx context.Context, groups []domain.Group, sources []domain.Source, policies ...domain.RedundancyPolicy) ([]domain.Group, []domain.Source, error) {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, nil, err
@@ -51,6 +52,19 @@ func (r *Repository) ImportEmptyConfiguration(ctx context.Context, groups []doma
 			sources[index].SecurityPolicy, sources[index].SecurityMode, sources[index].Username, boolInt(sources[index].Enabled),
 			domain.CatalogDiscovering, encodeTime(now), encodeTime(now), encodeBindings(sources[index].GroupBindings)); err != nil {
 			return nil, nil, fmt.Errorf("import source %s: %w", sources[index].ID, err)
+		}
+	}
+	for _, policy := range policies {
+		if err := policy.Validate(); err != nil {
+			return nil, nil, err
+		}
+		policy.Revision = 1
+		raw, err := json.Marshal(policy)
+		if err != nil {
+			return nil, nil, err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO group_redundancy(group_id,revision,policy_json) VALUES(?,1,?)`, policy.GroupID, string(raw)); err != nil {
+			return nil, nil, err
 		}
 	}
 	if err := tx.Commit(); err != nil {

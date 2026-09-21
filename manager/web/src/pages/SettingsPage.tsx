@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import { Activity, Download, PackageOpen, RefreshCw, Save, ShieldAlert, Upload } from 'lucide-react';
+import { Activity, Download, PackageOpen, RefreshCw, ShieldAlert, Upload } from 'lucide-react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { api, apiErrorMessage } from '../api/client';
 import type { ConfigurationDocument, ConfigurationImportResult } from '../api/types';
@@ -9,7 +9,6 @@ import { PageHeader } from '../components/PageHeader';
 import { InlineNotice } from '../components/InlineNotice';
 import { CopyTextButton } from '../components/CopyTextButton';
 import { formatDateTime, shortClientName, shortSessionId } from '../lib/format';
-import { getOperatorName, setOperatorName } from '../lib/operator';
 
 function formatBytes(value: number): string {
   if (value < 0) return '不可用';
@@ -26,8 +25,6 @@ export default function SettingsPage() {
   const sessions = useSessions();
   const system = useSystemInfo();
   const fileInput = useRef<HTMLInputElement>(null);
-  const [operator, setOperator] = useState(() => getOperatorName());
-  const [operatorSaved, setOperatorSaved] = useState(false);
   const [importDocument, setImportDocument] = useState<ConfigurationDocument>();
   const [importFileName, setImportFileName] = useState('');
   const [importMessage, setImportMessage] = useState('');
@@ -129,9 +126,7 @@ export default function SettingsPage() {
 
           <section className="settings-section">
             <h2>操作者标识</h2>
-            <p className="section-description">该名称会写入之后的管理审计，便于内网运维追溯；它不是登录或权限认证。</p>
-            <div className="settings-inline-form"><label className="field"><span>本机操作者名称</span><input value={operator} maxLength={64} placeholder="例如：张工 / 中控室-01" onChange={(event) => { setOperator(event.target.value); setOperatorSaved(false); }} /></label><button className="button button-primary" type="button" onClick={() => { setOperatorName(operator); setOperatorSaved(true); }}><Save size={16} />保存到本浏览器</button></div>
-            {operatorSaved ? <p className="text-good settings-feedback" role="status">已保存，下一次修改操作开始生效。</p> : null}
+            <p className="section-description">管理审计自动记录已登录账号与客户端 IP。修改密码或退出登录请使用页面右上角入口。</p>
           </section>
 
           <section className="settings-section">
@@ -153,7 +148,7 @@ export default function SettingsPage() {
 
           <section className="settings-section settings-wide">
             <h2>安全边界（保持当前配置）</h2>
-            <InlineNotice tone="warning"><p><strong>Web 无登录并允许从所有网卡访问。</strong> OPC 选源与旧命令接口允许匿名控制，只能部署在受信任的隔离内网。</p></InlineNotice>
+            <InlineNotice tone="warning"><p><strong>Web 管理接口需要登录。</strong> 当前 HTTP 不加密传输，OPC 选源与旧命令接口仍允许匿名控制，下级日志推送独立接入；仍须部署在受信任的隔离内网。</p></InlineNotice>
             <div className="security-callout"><ShieldAlert aria-hidden="true" size={30} /><div><strong>部署前检查</strong><p>通过 Windows 防火墙或 VLAN 仅允许上级 OPC、运维终端和指定管理网段访问 4840/{webPort} 端口。</p></div></div>
             <dl className="settings-list compact-settings-list"><div><dt>None/None</dt><dd>Anonymous</dd></div><div><dt>Basic256Sha256</dt><dd>SignAndEncrypt · Anonymous / Username</dd></div><div><dt>跨域写入</dt><dd>拒绝；仅允许同源浏览器请求</dd></div></dl>
           </section>

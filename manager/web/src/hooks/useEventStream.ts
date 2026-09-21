@@ -6,7 +6,7 @@ import type { EventEnvelope } from '../api/types';
 
 export type StreamState = 'connecting' | 'connected' | 'disconnected' | 'mock';
 
-const EVENT_NAMES = ['source.status', 'source.sample', 'source.event', 'source.operation', 'station_versions_changed', 'lower_logs_changed', 'calculation_config_changed', 'calculation_results_changed', 'group.changed', 'selection.changed', 'session.changed', 'command.changed', 'catalog.changed', 'alarm.changed', 'management.audit', 'configuration.changed', 'resync'];
+const EVENT_NAMES = ['source.status', 'source.sample', 'source.event', 'source.operation', 'station_versions_changed', 'lower_logs_changed', 'calculation_config_changed', 'calculation_results_changed', 'calculation_state_inputs_changed', 'group.changed', 'selection.changed', 'session.changed', 'command.changed', 'catalog.changed', 'alarm.changed', 'management.audit', 'configuration.changed', 'redundancy.changed', 'resync'];
 
 export function eventInvalidatesPoints(type: string): boolean {
   return type.includes('sample') || type.includes('catalog') || type.includes('selection') ||
@@ -45,6 +45,13 @@ export function useEventStream(): StreamState {
       }
 
       const type = envelope.type || event.type;
+      if (type === 'redundancy.changed' || type === 'selection.changed' || type === 'session.changed' || type === 'group.changed') {
+        void queryClient.invalidateQueries({ queryKey: ['redundancy'], refetchType: 'active' });
+      }
+      if (type === 'calculation_state_inputs_changed') {
+        void queryClient.invalidateQueries({ queryKey: ['calculations', 'state-inputs'], refetchType: 'active' });
+        return;
+      }
       if (type === 'resync') {
         void queryClient.invalidateQueries();
         return;

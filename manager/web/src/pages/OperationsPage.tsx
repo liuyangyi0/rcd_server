@@ -7,16 +7,17 @@ import { useAcknowledgeAlarm, useAlarms, useDeviceVersions, useManagementAudit, 
 import type { ManagementAudit, SourceEvent } from '../api/types';
 import { EmptyState, ErrorState, LoadingState } from '../components/PageState';
 import { PageHeader } from '../components/PageHeader';
-import { Pagination } from '../components/Pagination';
+import { Pagination, readPageSize } from '../components/Pagination';
 import { StatusBadge } from '../components/StatusBadge';
 import { formatDateTime } from '../lib/format';
 import { humanizeTechnicalMessage, kindLabel, operationLabel, stateLabel } from '../lib/labels';
 
-const PAGE_SIZE = 50;
+
 type Tab = 'alarms' | 'events' | 'audit';
 
 export default function OperationsPage() {
   const [params, setParams] = useSearchParams();
+  const PAGE_SIZE = readPageSize(params, 50);
   const tab = (['alarms', 'events', 'audit'].includes(params.get('tab') ?? '') ? params.get('tab') : 'alarms') as Tab;
   const page = Math.max(1, Number(params.get('page') ?? 1) || 1);
   const query = params.get('q') ?? '';
@@ -103,17 +104,17 @@ export default function OperationsPage() {
                 </tr>;
               })}
             </tbody></table></div>
-            <Pagination page={alarms.data?.page ?? page} pageSize={PAGE_SIZE} total={alarms.data?.total ?? 0} onPageChange={(value) => update({ page: value })} />
+            <Pagination onPageSizeChange={(size) => update({ size, page: 1 })} page={alarms.data?.page ?? page} pageSize={PAGE_SIZE} total={alarms.data?.total ?? 0} onPageChange={(value) => update({ page: value })} />
           </>
         ) : tab === 'events' ? (
           (events.data?.items.length ?? 0) === 0 ? <EmptyState title="暂无状态历史" /> : <>
             <div className="table-scroll"><table className="data-table responsive-table"><thead><tr><th>时间</th><th>来源</th><th>状态变化</th><th>信息</th></tr></thead><tbody>{groupedEvents.map((group) => <tr key={group.key}><td data-label="时间">{formatDateTime(group.occurredAt)}</td><td data-label="来源"><strong>{sourceNames.get(group.sourceId) ?? group.sourceId}</strong></td><td data-label="状态变化"><strong>{group.items.length > 1 ? '同一轮连接状态更新' : kindLabel(group.items[0].kind)}</strong><div className="event-transition-list">{group.items.map((event) => <span key={event.id}><b>{kindLabel(event.kind)}</b>{event.previous ? stateLabel(event.previous) : '—'} → {stateLabel(event.current)}</span>)}</div></td><td data-label="信息" className="message-cell">{group.items.map((event) => event.message).filter(Boolean).map((message) => humanizeTechnicalMessage(message)).join('；') || '—'}</td></tr>)}</tbody></table></div>
-            <Pagination page={events.data?.page ?? page} pageSize={PAGE_SIZE} total={events.data?.total ?? 0} onPageChange={(value) => update({ page: value })} />
+            <Pagination onPageSizeChange={(size) => update({ size, page: 1 })} page={events.data?.page ?? page} pageSize={PAGE_SIZE} total={events.data?.total ?? 0} onPageChange={(value) => update({ page: value })} />
           </>
         ) : (
           (audit.data?.items.length ?? 0) === 0 ? <EmptyState title="暂无管理审计" /> : <>
             <div className="table-scroll"><table className="data-table responsive-table management-audit-table"><thead><tr><th>时间</th><th>操作</th><th>操作者 / 目标</th><th>结果</th><th>摘要</th><th>技术明细</th></tr></thead><tbody>{groupedAudit.map((row) => { const entry = row.completed ?? row.requested ?? row.single; const outcome = auditOutcome(entry); return entry ? <tr key={row.key}><td data-label="时间">{formatDateTime(entry.occurredAt)}</td><td data-label="操作"><strong>{operationLabel(String(entry.details?.action ?? kindLabel(entry.kind)))}</strong><span className="sub-cell">{row.requested && row.completed ? '请求与完成已关联' : kindLabel(entry.kind)}</span></td><td data-label="操作者 / 目标">{entry.actor || '系统'}<span className="sub-cell">{entry.target}</span></td><td data-label="结果"><StatusBadge state={outcome === 'success' ? 'good' : outcome === 'pending' ? 'warning' : 'bad'} label={stateLabel(outcome)} compact /></td><td data-label="摘要" className="message-cell">{auditSummary(entry)}</td><td data-label="技术明细"><details className="audit-details"><summary>查看 JSON</summary><pre>{JSON.stringify({ requested: row.requested?.details, completed: row.completed?.details, single: row.single?.details }, null, 2)}</pre></details></td></tr> : null; })}</tbody></table></div>
-            <Pagination page={audit.data?.page ?? page} pageSize={PAGE_SIZE} total={audit.data?.total ?? 0} onPageChange={(value) => update({ page: value })} />
+            <Pagination onPageSizeChange={(size) => update({ size, page: 1 })} page={audit.data?.page ?? page} pageSize={PAGE_SIZE} total={audit.data?.total ?? 0} onPageChange={(value) => update({ page: value })} />
           </>
         )}
       </section>

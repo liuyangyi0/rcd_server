@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"rcd_manager/internal/api"
@@ -17,6 +18,7 @@ import (
 const unverifiedStationTopology = "unverified"
 
 func (r *Runtime) cacheStationVersionResult(request domain.OperationRequest, result json.RawMessage, source domain.Source, connectionEpoch uint64, fingerprint string) error {
+	defer r.refreshCalculationStateInputs(source.ID)
 	r.stationCacheMu.Lock()
 	defer r.stationCacheMu.Unlock()
 	verified := fingerprint != "" && fingerprint != unverifiedStationTopology
@@ -63,7 +65,9 @@ func (r *Runtime) cacheStationVersionResult(request domain.OperationRequest, res
 	}
 	r.mu.Unlock()
 	persistedSnapshot := false
-	if verified {
+	// Acquisition flags change independently of station/version revisions.
+	// Keep their updates in memory; a health refresh is not a SQLite data feed.
+	if verified && (!existed || !samePersistedStationVersionSnapshot(previous, snapshot)) {
 		persistContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		persistErr := r.repo.SaveSourceStationVersions(persistContext, snapshot)
 		cancel()
@@ -136,6 +140,22 @@ func sameStationVersionSnapshot(left, right domain.SourceStationVersions) bool {
 	return reflect.DeepEqual(left, right)
 }
 
+func samePersistedStationVersionSnapshot(left, right domain.SourceStationVersions) bool {
+	stripRuntime := func(snapshot domain.SourceStationVersions) domain.SourceStationVersions {
+		snapshot = snapshot.Clone()
+		for i := range snapshot.Ports {
+			port := &snapshot.Ports[i]
+			port.AppliedEnabled, port.Open, port.ControlPending, port.PendingCommands = false, false, false, 0
+			for j := range port.Devices {
+				device := &port.Devices[j]
+				device.AppliedReadEnabled, device.CommunicationOK, device.Stale = false, false, false
+			}
+		}
+		return snapshot
+	}
+	return sameStationVersionSnapshot(stripRuntime(left), stripRuntime(right))
+}
+
 func (r *Runtime) StationVersions(sourceID string) (domain.SourceStationVersions, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -201,9 +221,37 @@ func (r *Runtime) stationVersionRefreshWorker() {
 	r.mu.RLock()
 	ctx := r.runContext
 	r.mu.RUnlock()
-	// Revision subscriptions are primary. This slow poll only heals a dropped
-	// notification or an older-but-compatible lower implementation.
-	ticker := time.NewTicker(60 * time.Second)
+	// Runtime acquisition health does not increment StationVersionRevision.
+	// Poll status separately from the hot point path. A bounded pool prevents
+	// one unresponsive lower from blocking every other source's health.
+	var workers sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case sourceID := <-r.stationRefreshQueue:
+					refreshContext, cancel := context.WithTimeout(ctx, 3*time.Second)
+					_ = r.refreshSourceStationVersions(refreshContext, sourceID)
+					cancel()
+					// Yield the worker after every attempt, including a dirty
+					// refresh, so other sources cannot be starved indefinitely.
+					rerun := r.finishStationVersionRefresh(sourceID)
+					if rerun {
+						r.mu.Lock()
+						delete(r.stationRefreshPending, sourceID)
+						r.mu.Unlock()
+						r.queueStationVersionRefresh(sourceID)
+					}
+				}
+			}
+		}()
+	}
+	defer workers.Wait()
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -220,19 +268,6 @@ func (r *Runtime) stationVersionRefreshWorker() {
 			r.mu.RUnlock()
 			for _, sourceID := range sources {
 				r.queueStationVersionRefresh(sourceID)
-			}
-		case sourceID := <-r.stationRefreshQueue:
-			for {
-				refreshContext, cancel := context.WithTimeout(ctx, lowerOperationsTimeout)
-				// Connection state already carries transport failures. Refresh
-				// failures are deliberately non-fatal and retried on the next
-				// revision event, epoch transition, or slow fallback poll.
-				_ = r.refreshSourceStationVersions(refreshContext, sourceID)
-				cancel()
-				rerun := r.finishStationVersionRefresh(sourceID)
-				if !rerun {
-					break
-				}
 			}
 		}
 	}

@@ -16,8 +16,8 @@ import (
 var ErrConfigTooLarge = errors.New("calculation configuration exceeds a limit")
 
 const (
-	MaxConfigBytes     = 4 * 1024 * 1024
-	MaxRules           = 25_000
+	MaxConfigBytes = 4 * 1024 * 1024
+	MaxRules       = 25_000
 	// The deployed calc.toml contains generated minimum-selection expressions
 	// up to roughly 42 KiB / 6,800 tokens. Keep a bounded parser budget while
 	// accepting that existing configuration during a manager migration.
@@ -35,7 +35,8 @@ type Rule struct {
 }
 
 type rawConfig struct {
-	Rules []rawRule `toml:"rules"`
+	Rules       []rawRule    `toml:"rules"`
+	StateInputs []StateInput `toml:"state_inputs"`
 }
 
 type rawRule struct {
@@ -48,9 +49,10 @@ type rawRule struct {
 }
 
 type Config struct {
-	Content string `json:"content"`
-	Hash    string `json:"hash"`
-	Rules   []Rule `json:"rules"`
+	Content     string       `json:"content"`
+	Hash        string       `json:"hash"`
+	Rules       []Rule       `json:"rules"`
+	StateInputs []StateInput `json:"state_inputs"`
 }
 
 type Draft struct {
@@ -63,18 +65,18 @@ type Draft struct {
 }
 
 type Version struct {
-	ID          int64     `json:"id"`
-	Revision    uint64    `json:"revision"`
-	Hash        string    `json:"hash"`
-	Content     string    `json:"content,omitempty"`
-	RuleCount   int       `json:"rule_count"`
-	AddedCount  int       `json:"added_count"`
-	RemovedCount int      `json:"removed_count"`
-	ChangedCount int      `json:"changed_count"`
-	State       string    `json:"state"`
-	Actor       string    `json:"actor"`
-	CreatedAt   time.Time `json:"created_at"`
-	ActivatedAt time.Time `json:"activated_at,omitempty,omitzero"`
+	ID           int64     `json:"id"`
+	Revision     uint64    `json:"revision"`
+	Hash         string    `json:"hash"`
+	Content      string    `json:"content,omitempty"`
+	RuleCount    int       `json:"rule_count"`
+	AddedCount   int       `json:"added_count"`
+	RemovedCount int       `json:"removed_count"`
+	ChangedCount int       `json:"changed_count"`
+	State        string    `json:"state"`
+	Actor        string    `json:"actor"`
+	CreatedAt    time.Time `json:"created_at"`
+	ActivatedAt  time.Time `json:"activated_at,omitempty,omitzero"`
 }
 
 func ParseConfig(content string) (Config, error) {
@@ -129,7 +131,10 @@ func ParseConfig(content string) (Config, error) {
 			MaxLimit: maxLimit, MinLimit: minLimit, DefaultValue: defaultValue})
 	}
 	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(content)))
-	return Config{Content: content, Hash: hash, Rules: rules}, nil
+	if err := validateStateInputs(raw.StateInputs); err != nil {
+		return Config{}, err
+	}
+	return Config{Content: content, Hash: hash, Rules: rules, StateInputs: raw.StateInputs}, nil
 }
 
 func normalizeDataType(value string) (domain.DataType, bool) {

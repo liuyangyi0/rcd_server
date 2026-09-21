@@ -188,6 +188,9 @@ func TestReconcileCatalogRefreshesPhysicalGroupMemberTree(t *testing.T) {
 			prefix + "/Devices/7/ExplicitlyBound",
 			prefix + "/Devices/7/PresentInTopology",
 			prefix + "/Devices/7/Discovered",
+			prefix + "/Devices/7/CommunicationState",
+			prefix + "/Devices/7/CommunicationStateText",
+			prefix + "/Devices/7/CommunicationObservedAt",
 		}
 		for _, identifier := range identifiers {
 			_, exists := server.server.NamespaceManager().FindNode(awu.NewNodeIDString(server.managementNS, identifier))

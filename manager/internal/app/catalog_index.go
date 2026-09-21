@@ -44,6 +44,7 @@ func buildCatalogIndexWithCalculations(catalogs map[string]domain.SourceCatalog,
 	calculationConflicts := make(map[string][]string)
 	if plan != nil {
 		outputs := make(map[string]struct{}, plan.RuleCount()+len(retired))
+		for _, input := range plan.StateInputs() { outputs[input.Name] = struct{}{} }
 		for _, node := range plan.CatalogNodes() {
 			outputs[node.Key.Identifier] = struct{}{}
 		}

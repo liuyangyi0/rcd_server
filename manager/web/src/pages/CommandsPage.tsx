@@ -5,17 +5,18 @@ import { queryString } from '../api/client';
 import { useCommands, useGroups, useSources } from '../api/queries';
 import { EmptyState, ErrorState, LoadingState } from '../components/PageState';
 import { PageHeader } from '../components/PageHeader';
-import { Pagination } from '../components/Pagination';
+import { Pagination, readPageSize } from '../components/Pagination';
 import { CopyTextButton } from '../components/CopyTextButton';
 import { formatDateTime, shortSessionId } from '../lib/format';
 import { operationLabel, stateLabel, statusCodeLabel } from '../lib/labels';
 import { sourceHasGroup } from '../lib/sourceGroups';
 import { isGoodStatus } from '../lib/status';
 
-const PAGE_SIZE = 50;
+
 
 export default function CommandsPage() {
   const [params, setParams] = useSearchParams();
+  const PAGE_SIZE = readPageSize(params, 50);
   const page = Math.max(1, Number(params.get('page') ?? 1) || 1);
   const query = params.get('q') ?? '';
   const groupId = params.get('group') ?? '';
@@ -73,7 +74,7 @@ export default function CommandsPage() {
                 })}</tbody>
               </table>
             </div>
-            <Pagination page={commandsQuery.data?.page ?? page} pageSize={commandsQuery.data?.pageSize ?? PAGE_SIZE} total={commandsQuery.data?.total ?? 0} onPageChange={(value) => update({ page: value })} />
+            <Pagination onPageSizeChange={(size) => update({ size, page: 1 })} page={commandsQuery.data?.page ?? page} pageSize={commandsQuery.data?.pageSize ?? PAGE_SIZE} total={commandsQuery.data?.total ?? 0} onPageChange={(value) => update({ page: value })} />
           </>
         )}
       </section>

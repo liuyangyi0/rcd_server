@@ -71,12 +71,17 @@ func (r *Runtime) SystemInfo(ctx context.Context) (api.SystemInfo, error) {
 }
 
 func (r *Runtime) ExportConfiguration(_ context.Context) (api.ConfigurationDocument, error) {
+	r.configMu.RLock()
+	defer r.configMu.RUnlock()
 	groups := r.routes.Groups()
 	sources := r.routes.Sources()
 	document := api.ConfigurationDocument{SchemaVersion: 2, ExportedAt: time.Now().UTC(),
 		Groups: make([]api.GroupMutation, 0, len(groups)), Sources: make([]api.ExportSource, 0, len(sources))}
 	for _, group := range groups {
 		document.Groups = append(document.Groups, api.GroupMutation{ID: group.ID, Name: group.Name, DefaultSourceID: group.DefaultSourceID})
+		if policy, ok := r.redundancyPolicies[group.ID]; ok {
+			document.Redundancy = append(document.Redundancy, policy.Clone())
+		}
 	}
 	for _, source := range sources {
 		document.Sources = append(document.Sources, api.ExportSource{ID: source.ID, GroupID: source.GroupID, Name: source.Name,
@@ -92,6 +97,13 @@ func (r *Runtime) ImportConfiguration(ctx context.Context, request api.Configura
 	groups, sources, warnings, err := r.validateConfigurationDocument(document)
 	if err != nil {
 		return api.ConfigurationImportResult{}, err
+	}
+	policies, err := validateRedundancyImport(document.Redundancy, groups, sources)
+	if err != nil {
+		return api.ConfigurationImportResult{}, err
+	}
+	if len(policies) > 0 {
+		warnings = append(warnings, "自动切源策略已恢复参数但保持关闭；确认物理映射后请显式开启，差异检测按原配置恢复")
 	}
 	existingGroups, existingSources := r.routes.Groups(), r.routes.Sources()
 	result := api.ConfigurationImportResult{DryRun: request.DryRun, CreatedGroups: len(groups), CreatedSources: len(sources), Warnings: warnings}
@@ -117,12 +129,15 @@ func (r *Runtime) ImportConfiguration(ctx context.Context, request api.Configura
 	if len(r.routes.Groups()) > 0 || len(r.routes.Sources()) > 0 {
 		return api.ConfigurationImportResult{}, fmt.Errorf("configuration changed during import: %w", domain.ErrSourceInUse)
 	}
-	persistedGroups, persistedSources, err := r.repo.ImportEmptyConfiguration(ctx, groups, sources)
+	persistedGroups, persistedSources, err := r.repo.ImportEmptyConfiguration(ctx, groups, sources, policies...)
 	if err != nil {
 		return api.ConfigurationImportResult{}, err
 	}
 	if err := r.routes.ApplyConfiguration(persistedGroups, persistedSources); err != nil {
 		return api.ConfigurationImportResult{}, err
+	}
+	for _, policy := range policies {
+		r.redundancyPolicies[policy.GroupID] = policy.Clone()
 	}
 	catalogs := make(map[string]domain.SourceCatalog, len(persistedSources))
 	for _, source := range persistedSources {

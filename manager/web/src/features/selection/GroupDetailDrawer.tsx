@@ -66,7 +66,7 @@ export function GroupDetailDrawer({ group, sources, sessions, sessionId, onSessi
                     <div className="member-endpoint">{source.endpoint}</div>
                     <div className="member-endpoint">本组设备：{groupDeviceLabel(source, group.id)}</div>
                     <dl>
-                      <div><dt>本组目录</dt><dd className={unavailableReason ? 'text-warning' : 'text-good'}>{unavailableReason || '已发现，可选择'}{!unavailableReason && sourceState !== 'good' ? <span className="sub-cell">离线或异常来源仍可选择，不自动故障转移</span> : null}</dd></div>
+                      <div><dt>本组目录</dt><dd className={unavailableReason ? 'text-warning' : 'text-good'}>{unavailableReason || '已发现，可选择'}{!unavailableReason && sourceState !== 'good' ? <span className="sub-cell">离线或异常来源仍可手动选择，但不能作为健康自动候选</span> : null}</dd></div>
                       <div><dt>状态</dt><dd className={sourceState === 'bad' ? 'text-bad' : 'text-good'}>{sourceState === 'good' ? '正常' : source.lastError || source.connectionState}</dd></div>
                       <div><dt>连接 / 会话 / 订阅</dt><dd>{source.connectionState} / {source.sessionState} / {source.subscriptionState}<br /><span>{formatNumber(source.monitoredCount)} 个监控点</span></dd></div>
                       <div><dt>来源整体 Good / Bad</dt><dd>{source.qualityKnown ? <><span className="text-good">{formatNumber(source.goodPoints)}</span> / <span className={source.badPoints ? 'text-bad' : ''}>{formatNumber(source.badPoints)}</span></> : '实时质量未提供'}<span className="sub-cell">包括该来源所有组 · 最近数据 {formatRelativeTime(source.lastDataAt)}</span></dd></div>
@@ -82,7 +82,7 @@ export function GroupDetailDrawer({ group, sources, sessions, sessionId, onSessi
               <div><dt>最近更新</dt><dd>{formatRelativeTime(selectedSource?.lastDataAt)}</dd></div>
             </dl>
 
-            <InlineNotice tone="warning"><p>管理程序不会自动切换数据源。选中源异常时将继续发布 Bad 质量，由上层 OPC 或操作员决定何时切换。</p></InlineNotice>
+            <InlineNotice tone="warning"><p>自动切源默认关闭，可在组列表的“自动切源 / 差异告警”配置。手动切源会将当前 Session 本组设为手动固定；来源异常仍上报坏质量。</p></InlineNotice>
             <InlineNotice><p>执行中的命令固定在原始下级，直至完成或超时；新命令发往切换后的数据源。</p></InlineNotice>
             <InlineNotice><p>切换范围是当前 Session 的整逻辑组，不是整个下级，也不是单个变量。同一个下级提供的其他组保持原选源；跨设备计算不会按设备选源重新混算。</p></InlineNotice>
             {success ? <div className="drawer-success"><Info aria-hidden="true" size={16} />{success}</div> : null}

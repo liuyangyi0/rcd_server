@@ -148,9 +148,10 @@ func (c SourceCatalog) Clone() SourceCatalog {
 }
 
 type GroupRoute struct {
-	GroupID  string `json:"group_id"`
-	SourceID string `json:"source_id"`
-	Revision uint64 `json:"revision"`
+	Automatic bool   `json:"automatic"`
+	GroupID   string `json:"group_id"`
+	SourceID  string `json:"source_id"`
+	Revision  uint64 `json:"revision"`
 }
 
 type SessionRouteChange struct {
