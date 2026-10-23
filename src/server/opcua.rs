@@ -2,6 +2,9 @@
 //!
 //! 将串口采集到的设备数据发布为 OPC UA 变量节点，支持客户端写命令下发。
 
+mod tracked_commands;
+use tracked_commands::register_tracked_command_submit;
+
 /// OPC UA 默认监听地址。
 pub const OPCUA_BIND_HOST: &str = "0.0.0.0";
 /// OPC UA 默认监听端口。
@@ -441,7 +444,7 @@ pub async fn run_opcua_server(
         .application_name("Serial OPC UA Server")
         .application_uri("urn:SerialServer:rcd_server")
         .product_uri("urn:SerialServer")
-        .pki_dir("./pki")
+        .pki_dir(crate::runtime_paths::current()?.pki)
         .create_sample_keypair(true)
         .add_user_token("user1", ServerUserToken::user_pass("user1", "pwd"))
         .add_endpoint(
@@ -621,9 +624,10 @@ pub async fn run_opcua_server(
         &node_manager,
         &send_node_ids,
         &tx_by_com,
-        send_write_context,
-        next_ack_id,
+        send_write_context.clone(),
+        next_ack_id.clone(),
     );
+    register_tracked_command_submit(&operations, &tx_by_com, send_write_context, next_ack_id);
 
     let mut calc_runner = CalcRunner::new(calc_engine.clone());
     // 节点创建期间的状态已经进入最新值缓存。先丢弃这段时间排队的广播，再读取快照，
@@ -712,6 +716,8 @@ pub async fn run_opcua_server(
     let subs_ack = subscriptions.clone();
     let pending_ack = pending_commands.clone();
     let cancel_ack = cancel.clone();
+    let command_tracker = operations.command_tracker();
+    let nm_command_operations = operations_manager.clone();
 
     let mut task_ack = tokio::spawn(async move {
         loop {
@@ -730,8 +736,32 @@ pub async fn run_opcua_server(
                 &send_node_ids,
             );
             for update in collect_expired_pending_commands(&pending_ack, Instant::now()) {
-                write_send_status(&nm_ack, &subs_ack, &send_node_ids, &update);
+                command_tracker.update(&update.com, update.ack_id, |v| {
+                    if !v.terminal() {
+                        v.phase = "Expired".into();
+                        v.error = "command deadline expired".into();
+                    }
+                });
+                process_command_ack_update(
+                    update,
+                    &pending_ack,
+                    &nm_ack,
+                    &subs_ack,
+                    &send_node_ids,
+                );
             }
+            let command_revision_id = NodeId::new(operations_ns, "Operations/CommandRevision");
+            let _ = nm_command_operations.set_values(
+                &subs_ack,
+                std::iter::once((
+                    &command_revision_id,
+                    None,
+                    pushed_data_value(
+                        Variant::String(command_tracker.revision().into()),
+                        StatusCode::Good,
+                    ),
+                )),
+            );
         }
     });
 
@@ -1495,9 +1525,10 @@ fn register_send_methods(
 
                 match forward_hex_command(hex_str, &com, &tx, false, &operations) {
                     Ok(msg) => Ok(vec![Variant::String(UAString::from(msg))]),
+                    Err(error) if error.code == "busy" => Err(StatusCode::BadWaitingForResponse),
                     Err(msg) => {
                         warn!("Method 调用失败: {}", msg);
-                        Ok(vec![Variant::String(UAString::from(msg))])
+                        Ok(vec![Variant::String(UAString::from(msg.message))])
                     }
                 }
             });
@@ -1563,6 +1594,37 @@ fn handle_send_node_write(
     context: &SendNodeWriteContext,
     ack_id: u64,
 ) -> StatusCode {
+    handle_send_node_write_tracked(data_value, com, tx, context, ack_id, false)
+}
+
+fn handle_send_node_write_tracked(
+    data_value: DataValue,
+    com: &str,
+    tx: &mpsc::Sender<Command>,
+    context: &SendNodeWriteContext,
+    ack_id: u64,
+    already_tracked: bool,
+) -> StatusCode {
+    handle_send_node_write_tracked_deadline(
+        data_value,
+        com,
+        tx,
+        context,
+        ack_id,
+        already_tracked,
+        None,
+    )
+}
+
+fn handle_send_node_write_tracked_deadline(
+    data_value: DataValue,
+    com: &str,
+    tx: &mpsc::Sender<Command>,
+    context: &SendNodeWriteContext,
+    ack_id: u64,
+    already_tracked: bool,
+    not_after: Option<Instant>,
+) -> StatusCode {
     let Some(value) = data_value.value else {
         log_opc_write_warn(format!(
             "[OPC 写诊断] 拒绝写入: 串口={}, 原因=未携带 Value",
@@ -1608,7 +1670,18 @@ fn handle_send_node_write(
         warn!("命令 pending 状态锁中毒，恢复: {}", e);
         e.into_inner()
     });
-    if pending.contains_key(com) {
+    // A tracked terminal result may be visible before the 50 ms ACK-node
+    // drainer runs. Do not reject a completed transaction merely because its
+    // old notification is still queued. The physical permit below remains the
+    // authority: if the worker is still executing it will reject admission.
+    let unfinished = pending.get(com).is_some_and(|previous| {
+        !context.operations.as_ref().is_some_and(|operations| {
+            operations
+                .command_tracker()
+                .is_terminal_ack(com, previous.ack_id)
+        })
+    });
+    if unfinished {
         log_opc_write_warn(format!(
             "[OPC 写诊断] 拒绝写入: 串口={}, 原因=上一条命令仍在等待设备回复",
             com
@@ -1616,7 +1689,10 @@ fn handle_send_node_write(
         return StatusCode::BadWaitingForResponse;
     }
 
-    let deadline = Instant::now() + context.command_pending_timeout;
+    let deadline = not_after.unwrap_or_else(|| Instant::now() + context.command_pending_timeout);
+    if Instant::now() >= deadline {
+        return StatusCode::BadTimeout;
+    }
     cmd.expires_at = Some(deadline);
     if let Some(operations) = &context.operations {
         cmd.permit = match operations.admit_command(com) {
@@ -1631,15 +1707,46 @@ fn handle_send_node_write(
             }
         };
     }
+    // Acquiring the physical/maintenance permit may itself wait behind a
+    // concurrent operation. Keep the original absolute receipt deadline.
+    if Instant::now() >= deadline {
+        return StatusCode::BadTimeout;
+    }
+    // Reserve before the bounded journal wait, then release the shared lock.
+    pending.insert(com.to_string(), PendingCommand { ack_id, deadline });
+    drop(pending);
+    let tracker = context.operations.as_ref().map(Operations::command_tracker);
+    if let Some(tracker) = &tracker {
+        if !already_tracked {
+            let boot = tracker.identity()["boot_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let _ = tracker.begin("legacy", &format!("{boot}-{ack_id}"), com, ack_id, hex_str);
+        }
+        // Mark acceptance before handing ownership to the worker: it may
+        // finish before tx.send returns. Never overwrite a terminal phase.
+        tracker.update(com, Some(ack_id), |v| v.accepted = true);
+    }
     if let Err(e) = tx.send(cmd) {
+        context
+            .pending_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(com);
+        if let Some(tracker) = &tracker {
+            tracker.update(com, Some(ack_id), |v| {
+                v.accepted = false;
+                v.phase = "Failed".into();
+                v.error = "command channel unavailable".into();
+            });
+        }
         log_opc_write_warn(format!(
             "[OPC 写诊断] 拒绝写入: 串口={}, 原因=命令通道不可用, 错误={:?}",
             com, e
         ));
         return StatusCode::BadResourceUnavailable;
     }
-    pending.insert(com.to_string(), PendingCommand { ack_id, deadline });
-    drop(pending);
 
     log_opc_write_info(format!(
         "收到 OPC 客户端写值并已入队: 串口={} ack_id={} 数据长度={} 数据预览={}{}",
@@ -1768,13 +1875,13 @@ fn forward_hex_command(
     tx: &mpsc::Sender<Command>,
     with_ack: bool,
     operations: &Operations,
-) -> Result<String, String> {
-    let mut cmd = build_hex_command(hex_str, com, with_ack, None)?;
-    cmd.permit = Some(
-        operations
-            .admit_command(com)
-            .map_err(|error| error.to_string())?,
-    );
+) -> Result<String, crate::operations::OperationError> {
+    let mut cmd = build_hex_command(hex_str, com, with_ack, None)
+        .map_err(|error| crate::operations::OperationError::new("invalid_request", error))?;
+    cmd.permit = Some(operations.admit_command(com).map_err(|error| {
+        // Preserve legacy non-busy Result text while keeping busy typed for UA.
+        crate::operations::OperationError::new(&error.code, error.to_string())
+    })?);
     let device_id = match &cmd.command {
         CommandType::SendData(data) | CommandType::SendDataWithAck(data) => data.device_id,
         CommandType::PortStatus(_)
@@ -1783,8 +1890,26 @@ fn forward_hex_command(
         | CommandType::StationModuleTypeSetting(_)
         | CommandType::QueryStationVersion(_) => 0,
     };
-    tx.send(cmd)
-        .map_err(|e| format!("转发命令到串口失败: {:?}", e))?;
+    let tracker = operations.command_tracker();
+    let ack = tracker.legacy_ack_id();
+    let boot = tracker.identity()["boot_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let _ = tracker.begin("legacy", &format!("method-{boot}-{ack}"), com, ack, hex_str);
+    cmd.ack_id = Some(ack);
+    tracker.update(com, Some(ack), |v| v.accepted = true);
+    if let Err(error) = tx.send(cmd) {
+        tracker.update(com, Some(ack), |v| {
+            v.accepted = false;
+            v.phase = "Failed".into();
+            v.error = "command channel unavailable".into();
+        });
+        return Err(crate::operations::OperationError::new(
+            "operation_failed",
+            format!("转发命令到串口失败: {error:?}"),
+        ));
+    }
     Ok(format!("已发送到 {} 设备 {}", com, device_id))
 }
 
@@ -1827,13 +1952,13 @@ fn process_command_ack_update(
     subscriptions: &Arc<SubscriptionCache>,
     send_node_ids: &[(String, NodeId)],
 ) {
-    let should_write = {
-        let mut pending = pending_commands.lock().unwrap_or_else(|e| {
-            warn!("命令 pending 状态锁中毒，恢复: {}", e);
-            e.into_inner()
-        });
-        apply_ack_pending_state(&mut pending, &update)
-    };
+    // Keep ACK identity validation and node update atomic with admission. An
+    // old ACK must never overwrite a newer command after its ID was checked.
+    let mut pending = pending_commands.lock().unwrap_or_else(|e| {
+        warn!("命令 pending 状态锁中毒，恢复: {}", e);
+        e.into_inner()
+    });
+    let should_write = apply_ack_pending_state(&mut pending, &update);
 
     if should_write {
         write_send_status(node_manager, subscriptions, send_node_ids, &update);
@@ -1864,7 +1989,7 @@ fn collect_expired_pending_commands(
     pending_commands: &Arc<Mutex<HashMap<String, PendingCommand>>>,
     now: Instant,
 ) -> Vec<CommandAckUpdate> {
-    let mut pending = pending_commands.lock().unwrap_or_else(|e| {
+    let pending = pending_commands.lock().unwrap_or_else(|e| {
         warn!("命令 pending 状态锁中毒，恢复: {}", e);
         e.into_inner()
     });
@@ -1874,10 +1999,9 @@ fn collect_expired_pending_commands(
         .map(|(com, command)| (com.clone(), command.ack_id))
         .collect();
 
-    for (com, _) in &expired {
-        pending.remove(com);
-    }
-
+    // Capture candidates only. Completion must recheck the ACK identity and
+    // remove the reservation atomically with its node update. A tracked terminal
+    // may allow the next command to enter between collection and processing.
     expired
         .into_iter()
         .map(|(com, ack_id)| CommandAckUpdate {
@@ -2886,7 +3010,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_pending_commands_emit_failed_and_clear() {
+    fn expired_pending_commands_clear_only_when_identity_is_still_current() {
         let pending = Arc::new(Mutex::new(HashMap::<String, PendingCommand>::new()));
         let now = Instant::now();
         pending.lock().unwrap().insert(
@@ -2915,9 +3039,23 @@ mod tests {
                 status: CommandAckStatus::Failed,
             }]
         );
-        let guard = pending.lock().unwrap();
+        let mut guard = pending.lock().unwrap();
+        assert_eq!(guard.get("COM1").unwrap().ack_id, 11);
+        assert!(apply_ack_pending_state(&mut guard, &updates[0]));
         assert!(!guard.contains_key("COM1"));
         assert_eq!(guard.get("COM2").unwrap().ack_id, 12);
+
+        // Admission of a new command after expiry collection must fence out
+        // the old timeout just as it fences out a delayed serial ACK.
+        guard.insert(
+            "COM1".into(),
+            PendingCommand {
+                ack_id: 13,
+                deadline: now + Duration::from_secs(1),
+            },
+        );
+        assert!(!apply_ack_pending_state(&mut guard, &updates[0]));
+        assert_eq!(guard.get("COM1").unwrap().ack_id, 13);
     }
 
     #[test]

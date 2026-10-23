@@ -1,0 +1,102 @@
+---
+# This playbook is admitted only through a persisted, nonce-bound host setup.
+# No browser variable may select an executable, destination or install script.
+- name: RCD explicit host key discovery on controller (no SSH authentication)
+  hosts: rcd_nodes
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Require the fixed native target and phase
+      ansible.builtin.assert:
+        that:
+          - rcd_host_setup is defined
+          - ansible_play_hosts_all | length == 1
+          - inventory_hostname == rcd_host_setup.host_alias
+          - rcd_host_setup.phase in ['keyscan', 'probe', 'install', 'reconcile']
+      delegate_to: localhost
+
+    - name: Discover public SSH keys without sending credentials
+      when: rcd_host_setup.phase == 'keyscan'
+      delegate_to: localhost
+      become: false
+      block:
+        - name: Allocate private controller scratch
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: rcd-host-keyscan-
+          register: rcd_keyscan_scratch
+        - name: Write authoritative public scan request
+          ansible.builtin.copy:
+            dest: "{{ rcd_keyscan_scratch.path }}/request.json"
+            mode: '0600'
+            content: "{{ rcd_host_setup.request | to_json }}"
+        - name: Run only the fixed bounded host key scanner
+          ansible.builtin.command:
+            argv: ['/usr/bin/python3', '{{ playbook_dir }}/../release/host_setup.py', 'keyscan', '--request', '{{ rcd_keyscan_scratch.path }}/request.json', '--report', '{{ rcd_host_setup.report_path }}']
+            expand_argument_vars: false
+          changed_when: false
+      always:
+        - name: Remove only this keyscan scratch
+          ansible.builtin.file:
+            path: "{{ rcd_keyscan_scratch.path }}"
+            state: absent
+          when: rcd_keyscan_scratch.path is defined
+
+    - name: Authenticated probe or explicit first install after verified SSH keys
+      when: rcd_host_setup.phase in ['probe', 'install', 'reconcile']
+      become: "{{ rcd_host_setup.become }}"
+      block:
+        - name: Allocate private target scratch
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: rcd-host-setup-
+          register: rcd_setup_scratch
+        - name: Transfer only reviewed fixed tools
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/../release/{{ item }}"
+            dest: "{{ rcd_setup_scratch.path }}/{{ item }}"
+            mode: '0600'
+          loop: [host_setup.py, application_profile.py, deployment.py, release_probe.py]
+        - name: Transfer authoritative immutable request
+          ansible.builtin.copy:
+            dest: "{{ rcd_setup_scratch.path }}/request.json"
+            mode: '0600'
+            content: "{{ rcd_host_setup.request | to_json }}"
+        - name: Transfer selected verified single-component package (not an installer)
+          ansible.builtin.copy:
+            src: "{{ rcd_host_setup.package_path }}"
+            dest: "{{ rcd_setup_scratch.path }}/package.rcd.tar.gz"
+            mode: '0600'
+          when: rcd_host_setup.phase == 'install'
+        - name: Execute fixed phase without a shell, auto-start or serial access
+          ansible.builtin.command:
+            argv: >-
+              {{ ['/usr/bin/python3', rcd_setup_scratch.path ~ '/host_setup.py', rcd_host_setup.phase,
+                  '--request', rcd_setup_scratch.path ~ '/request.json',
+                  '--report', rcd_setup_scratch.path ~ '/report.json']
+                  + (['--package', rcd_setup_scratch.path ~ '/package.rcd.tar.gz'] if rcd_host_setup.phase == 'install' else []) }}
+            expand_argument_vars: false
+          changed_when: rcd_host_setup.phase == 'install'
+      always:
+        - name: Read the original bounded structured receipt even when phase failed
+          ansible.builtin.slurp:
+            src: "{{ rcd_setup_scratch.path }}/report.json"
+          register: rcd_setup_report
+          when: rcd_setup_scratch.path is defined
+          failed_when: false
+          no_log: true
+        - name: Save unchanged task-bound receipt on the controller
+          ansible.builtin.copy:
+            dest: "{{ rcd_host_setup.report_path }}"
+            mode: '0600'
+            content: "{{ rcd_setup_report.content | b64decode }}"
+          delegate_to: localhost
+          become: false
+          when: rcd_setup_report.content is defined
+          no_log: true
+        - name: Remove only this task scratch, never transaction evidence or business files
+          ansible.builtin.file:
+            path: "{{ rcd_setup_scratch.path }}"
+            state: absent
+          when: rcd_setup_scratch.path is defined

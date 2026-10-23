@@ -4,31 +4,33 @@ import (
 	"context"
 	"time"
 
+	"rcd_manager/internal/buildinfo"
 	"rcd_manager/internal/domain"
 )
 
 type Overview struct {
-	ManagerState         string    `json:"manager_state"`
-	OPCEndpoint          string    `json:"opc_endpoint"`
-	GroupCount           int       `json:"group_count"`
-	SourceCount          int       `json:"source_count"`
-	ConnectedSources     int       `json:"connected_sources"`
-	SessionCount         int       `json:"session_count"`
-	SubscriptionCount    int       `json:"subscription_count"`
-	PointCount           int       `json:"point_count"`
-	GoodPoints           int       `json:"good_points"`
-	BadPoints            int       `json:"bad_points"`
-	PendingCommands      int       `json:"pending_commands"`
-	CatalogConflicts     int       `json:"catalog_conflicts"`
-	OpenAlarms           int       `json:"open_alarms"`
-	UnacknowledgedAlarms int       `json:"unacknowledged_alarms"`
-	RecentSelectionAt    time.Time `json:"recent_selection_at,omitempty,omitzero"`
-	RecentSelectionCount uint64    `json:"recent_selection_count"`
-	Version              string    `json:"version,omitempty"`
-	GitSHA               string    `json:"git_sha,omitempty"`
-	SystemTime           time.Time `json:"system_time"`
-	StartedAt            time.Time `json:"started_at"`
-	LastLowerDataAt      time.Time `json:"last_lower_data_at,omitempty,omitzero"`
+	BuildInfo            buildinfo.Info `json:"build_info"`
+	ManagerState         string         `json:"manager_state"`
+	OPCEndpoint          string         `json:"opc_endpoint"`
+	GroupCount           int            `json:"group_count"`
+	SourceCount          int            `json:"source_count"`
+	ConnectedSources     int            `json:"connected_sources"`
+	SessionCount         int            `json:"session_count"`
+	SubscriptionCount    int            `json:"subscription_count"`
+	PointCount           int            `json:"point_count"`
+	GoodPoints           int            `json:"good_points"`
+	BadPoints            int            `json:"bad_points"`
+	PendingCommands      int            `json:"pending_commands"`
+	CatalogConflicts     int            `json:"catalog_conflicts"`
+	OpenAlarms           int            `json:"open_alarms"`
+	UnacknowledgedAlarms int            `json:"unacknowledged_alarms"`
+	RecentSelectionAt    time.Time      `json:"recent_selection_at,omitempty,omitzero"`
+	RecentSelectionCount uint64         `json:"recent_selection_count"`
+	Version              string         `json:"version,omitempty"`
+	GitSHA               string         `json:"git_sha,omitempty"`
+	SystemTime           time.Time      `json:"system_time"`
+	StartedAt            time.Time      `json:"started_at"`
+	LastLowerDataAt      time.Time      `json:"last_lower_data_at,omitempty,omitzero"`
 }
 
 type GroupView struct {

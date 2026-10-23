@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -30,9 +32,7 @@ func execute(args []string) error {
 	if len(args) > 0 {
 		switch args[0] {
 		case "version", "--version", "-version":
-			info := buildinfo.Current()
-			fmt.Printf("RCD Manager %s (%s, %s)\n", info.Version, info.Commit, info.BuiltAt)
-			return nil
+			return writeVersion(os.Stdout, "manager", args[1:])
 		case "help", "--help", "-h":
 			printUsage()
 			return nil
@@ -73,6 +73,9 @@ func execute(args []string) error {
 }
 
 func agentCommand(args []string) error {
+	if len(args) > 0 && (args[0] == "version" || args[0] == "--version") {
+		return writeVersion(os.Stdout, "agent", args[1:])
+	}
 	if len(args) > 0 && args[0] == "run" {
 		args = args[1:]
 	}
@@ -83,6 +86,22 @@ func agentCommand(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return processagent.Run(ctx, cfg)
+}
+
+func writeVersion(w io.Writer, component string, args []string) error {
+	info := buildinfo.ForComponent(component)
+	if len(args) == 1 && args[0] == "--json" {
+		return json.NewEncoder(w).Encode(info)
+	}
+	if len(args) != 0 {
+		return errors.New("usage: version [--json]")
+	}
+	label := "Manager"
+	if component == "agent" {
+		label = "Agent"
+	}
+	_, err := fmt.Fprintf(w, "RCD %s %s (%s, %s)\n", label, info.Version, info.Commit, info.BuiltAt)
+	return err
 }
 
 func serviceCommand(args []string) error {
@@ -120,7 +139,8 @@ Usage:
   rcd-manager service install [options]
   rcd-manager service start|stop|uninstall
   rcd-manager agent run --instance-id ID --executable PATH --data-dir PATH [agent options]
-  rcd-manager version
+  rcd-manager version [--json]
+  rcd-manager agent version [--json]
   rcd-manager web-reset-password --data-dir PATH (stop manager first; use RCD_WEB_PASSWORD)
 
 Runtime options:

@@ -19,19 +19,30 @@ import (
 var _ api.ProcessControlService = (*Runtime)(nil)
 
 func (r *Runtime) checkProcessMaintenanceLocked(sourceID string) error {
-	if r.sourceProcessOperations[sourceID] != "" || r.processExecuting[sourceID] != "" {
-		return &domain.OperationError{Code: "busy", Message: "该下级有待确认的进程操作，命令及运维修改暂不可用；请核对原请求"}
+	if r.release.Active {
+		return &domain.OperationError{Code: "busy", Message: "管理端正在软件维护，停止接收新控制命令"}
 	}
-	return nil
+	return r.maintenance.check(sourceID, true)
 }
 
 func (r *Runtime) SourceProcessBinding(ctx context.Context, id string) (domain.ProcessBinding, error) {
 	r.configMu.RLock()
 	defer r.configMu.RUnlock()
-	return r.repo.GetProcessBinding(ctx, id)
+	binding, err := r.repo.GetProcessBinding(ctx, id)
+	if err == nil {
+		if row, _, e := r.repo.FleetBinding(ctx, id); e == nil {
+			binding.RegistryDeviceID = row.DeviceID
+		}
+	}
+	return binding, err
 }
 
 func (r *Runtime) SaveSourceProcessBinding(ctx context.Context, binding domain.ProcessBinding, revision uint64) (domain.ProcessBinding, error) {
+	if _, _, err := r.repo.FleetBinding(ctx, binding.SourceID); err == nil {
+		return domain.ProcessBinding{}, &domain.OperationError{Code: "conflict", Message: "守护绑定由发布平台统一台账管理，请在平台修改"}
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return domain.ProcessBinding{}, err
+	}
 	binding.AgentURL = domain.NormalizeProcessAgentURL(binding.AgentURL)
 	if err := binding.Validate(); err != nil {
 		return domain.ProcessBinding{}, err
@@ -70,7 +81,7 @@ func (r *Runtime) processBindingSnapshot(ctx context.Context, sourceID string) (
 		return binding, nil, processUnsupported()
 	}
 	var pending *domain.ProcessOperation
-	if requestID := r.sourceProcessOperations[sourceID]; requestID != "" {
+	if requestID := r.maintenance.pending(sourceID); requestID != "" {
 		record, err := r.repo.GetProcessOperation(ctx, sourceID, requestID)
 		if err != nil {
 			return binding, nil, err
@@ -82,28 +93,34 @@ func (r *Runtime) processBindingSnapshot(ctx context.Context, sourceID string) (
 	return binding, pending, nil
 }
 
-func (r *Runtime) SourceProcessStatus(ctx context.Context, id string) (api.ProcessStatusView, error) {
+func (r *Runtime) SourceProcessStatus(ctx context.Context, id string) (domain.ProcessStatusView, error) {
 	binding, pending, err := r.processBindingSnapshot(ctx, id)
 	if err != nil {
-		return api.ProcessStatusView{}, err
+		return domain.ProcessStatusView{}, err
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, processRequestTimeout)
 	defer cancel()
 	snapshot, err := r.options.ProcessAgentClient.Status(requestCtx, binding)
 	if err == nil {
 		err = snapshot.Validate(binding.InstanceID)
+		if _, _, e := r.repo.FleetBinding(ctx, id); err == nil && e != nil && !errors.Is(e, domain.ErrNotFound) {
+			err = e
+		}
+		if row, _, e := r.repo.FleetBinding(ctx, id); err == nil && e == nil && row.Machine != nil && snapshot.GatewayInstanceID != row.Machine.GatewayInstanceID {
+			err = processInvalidResponse("Agent 下级身份与统一台账不符")
+		}
 	}
-	return api.ProcessStatusView{ProcessSnapshot: snapshot, SourceID: id, SourceRevision: binding.SourceRevision,
+	return domain.ProcessStatusView{ProcessSnapshot: snapshot, SourceID: id, SourceRevision: binding.SourceRevision,
 		BindingRevision: binding.Revision, PendingOperation: pending}, err
 }
 
-func (r *Runtime) SourceProcessLog(ctx context.Context, id string, limit int) (api.ProcessLogView, error) {
+func (r *Runtime) SourceProcessLog(ctx context.Context, id string, limit int) (domain.ProcessLogView, error) {
 	if limit < 4 || limit > domain.MaxProcessLogBytes {
-		return api.ProcessLogView{}, &domain.FieldError{Field: "limit", Message: "must be between 4 and 65536"}
+		return domain.ProcessLogView{}, &domain.FieldError{Field: "limit", Message: "must be between 4 and 65536"}
 	}
 	binding, _, err := r.processBindingSnapshot(ctx, id)
 	if err != nil {
-		return api.ProcessLogView{}, err
+		return domain.ProcessLogView{}, err
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, processRequestTimeout)
 	defer cancel()
@@ -111,10 +128,10 @@ func (r *Runtime) SourceProcessLog(ctx context.Context, id string, limit int) (a
 	if err == nil && (result.InstanceID != binding.InstanceID || result.SizeBytes < 0 || len(result.Text) > limit) {
 		err = processInvalidResponse("进程日志身份或长度无效")
 	}
-	return api.ProcessLogView{ProcessLog: result, SourceID: id, SourceRevision: binding.SourceRevision, BindingRevision: binding.Revision}, err
+	return domain.ProcessLogView{ProcessLog: result, SourceID: id, SourceRevision: binding.SourceRevision, BindingRevision: binding.Revision}, err
 }
 
-func (r *Runtime) ListSourceProcessOperations(ctx context.Context, id string, limit, offset int) (api.ProcessOperationPage, error) {
+func (r *Runtime) ListSourceProcessOperations(ctx context.Context, id string, limit, offset int) (domain.ProcessOperationPage, error) {
 	if limit < 1 || limit > 100 {
 		limit = 50
 	}
@@ -125,17 +142,17 @@ func (r *Runtime) ListSourceProcessOperations(ctx context.Context, id string, li
 	defer r.configMu.RUnlock()
 	source, err := r.source(id)
 	if err != nil {
-		return api.ProcessOperationPage{}, err
+		return domain.ProcessOperationPage{}, err
 	}
 	records, total, err := r.repo.ListProcessOperations(ctx, id, limit, offset)
-	page := api.ProcessOperationPage{SourceID: id, SourceRevision: source.Revision, Items: make([]domain.ProcessOperation, 0, len(records)), Total: total, Limit: limit, Offset: offset}
+	page := domain.ProcessOperationPage{SourceID: id, SourceRevision: source.Revision, Items: make([]domain.ProcessOperation, 0, len(records)), Total: total, Limit: limit, Offset: offset}
 	for _, record := range records {
 		page.Items = append(page.Items, record.Operation)
 	}
 	return page, err
 }
 
-func validateProcessInput(input api.ProcessActionInput, revision string) error {
+func validateProcessInput(input domain.ProcessActionInput, revision string) error {
 	if input.SourceRevision == 0 || input.BindingRevision == 0 {
 		return &domain.FieldError{Field: "revision", Message: "source_revision and binding_revision are required"}
 	}
@@ -162,18 +179,18 @@ func validateProcessInput(input api.ProcessActionInput, revision string) error {
 	return nil
 }
 
-func (r *Runtime) ExecuteSourceProcess(ctx context.Context, id, revision string, input api.ProcessActionInput) (domain.ProcessOperation, error) {
+func (r *Runtime) ExecuteSourceProcess(ctx context.Context, id, revision string, input domain.ProcessActionInput) (domain.ProcessOperation, error) {
 	return r.admitSourceProcess(ctx, id, revision, input, false)
 }
 
 // Resolve can establish a manager-side tombstone before a delayed original
 // HTTP Action arrives. It shares admission and the exact durable fingerprint;
 // its agent call never executes a process action.
-func (r *Runtime) ResolveSourceProcess(ctx context.Context, id, revision string, input api.ProcessActionInput) (domain.ProcessOperation, error) {
+func (r *Runtime) ResolveSourceProcess(ctx context.Context, id, revision string, input domain.ProcessActionInput) (domain.ProcessOperation, error) {
 	return r.admitSourceProcess(ctx, id, revision, input, true)
 }
 
-func (r *Runtime) admitSourceProcess(ctx context.Context, id, revision string, input api.ProcessActionInput, resolveOnly bool) (domain.ProcessOperation, error) {
+func (r *Runtime) admitSourceProcess(ctx context.Context, id, revision string, input domain.ProcessActionInput, resolveOnly bool) (domain.ProcessOperation, error) {
 	if err := validateProcessInput(input, revision); err != nil {
 		return domain.ProcessOperation{}, err
 	}
@@ -188,7 +205,8 @@ func (r *Runtime) admitSourceProcess(ctx context.Context, id, revision string, i
 	}
 	existing, err := r.repo.GetProcessOperation(ctx, id, input.RequestID)
 	if err == nil {
-		request := domain.ProcessActionRequest{RequestID: input.RequestID, InstanceID: existing.Binding.InstanceID, Action: input.Action, ExpectedRevision: revision}
+		request := existing.Request
+		request.RequestID, request.InstanceID, request.Action, request.ExpectedRevision = input.RequestID, existing.Binding.InstanceID, input.Action, revision
 		if !existing.SameRequest(input.SourceRevision, input.BindingRevision, request, input.ExpectedConfigRevisions) {
 			r.configMu.Unlock()
 			return domain.ProcessOperation{}, &domain.OperationError{Code: "conflict", Message: "request_id 已用于不同的目标版本或操作，不得改写原请求"}
@@ -223,6 +241,68 @@ func (r *Runtime) admitSourceProcess(ctx context.Context, id, revision string, i
 		return domain.ProcessOperation{}, err
 	}
 	request := domain.ProcessActionRequest{RequestID: input.RequestID, InstanceID: binding.InstanceID, Action: input.Action, ExpectedRevision: revision}
+	if prepare, ok := r.options.ProcessAgentClient.(interface {
+		Prepare(context.Context, domain.ProcessBinding, domain.ProcessActionRequest) (domain.ProcessActionRequest, error)
+	}); ok && !resolveOnly {
+		if len(input.ExpectedConfigRevisions) > 0 {
+			guard, e := json.Marshal(input.ExpectedConfigRevisions)
+			if e != nil {
+				r.configMu.Unlock()
+				return domain.ProcessOperation{}, e
+			}
+			request.ConfigurationGuard = string(guard)
+		}
+		request.ManagerInstanceID, request.Actor = r.release.InstanceID, requestActor(ctx)
+		r.configMu.Unlock()
+		probeCtx, probeCancel := context.WithTimeout(ctx, processRequestTimeout)
+		request, err = prepare.Prepare(probeCtx, binding, request)
+		probeCancel()
+		r.configMu.Lock()
+		if r.closing.Load() {
+			err = domain.ErrShuttingDown
+		}
+		if err == nil {
+			row, _, e := r.repo.FleetBinding(ctx, id)
+			if e == nil && row.Machine != nil && request.GatewayInstanceID != row.Machine.GatewayInstanceID {
+				err = processInvalidResponse("下级身份与固定台账不符，未派发")
+			} else if e != nil && !errors.Is(e, domain.ErrNotFound) {
+				err = e
+			}
+		}
+		if err == nil {
+			latest, e := r.repo.GetProcessBinding(ctx, id)
+			if e != nil {
+				err = e
+			} else if latest.SourceRevision != binding.SourceRevision || latest.Revision != binding.Revision {
+				err = domain.ErrRevisionConflict
+			}
+		}
+		if err == nil {
+			err = r.checkSourceOperationLocked(id)
+		}
+		if err == nil && r.routes.SourcePendingCount(id) != 0 {
+			err = domain.ErrCommandPending
+		}
+		if err != nil {
+			r.configMu.Unlock()
+			return domain.ProcessOperation{}, err
+		}
+		if existing, e := r.repo.GetProcessOperation(ctx, id, input.RequestID); e == nil {
+			r.configMu.Unlock()
+			// A resolve-first tombstone can win while Prepare is probing the
+			// Agent. Compare the original caller input, not freshly discovered
+			// lifecycle identity, and never dispatch over that durable result.
+			original := existing.Request
+			original.RequestID, original.InstanceID, original.Action, original.ExpectedRevision = request.RequestID, request.InstanceID, request.Action, request.ExpectedRevision
+			if !existing.SameRequest(input.SourceRevision, input.BindingRevision, original, input.ExpectedConfigRevisions) {
+				return domain.ProcessOperation{}, domain.ErrRevisionConflict
+			}
+			return existing.Operation, nil
+		} else if !errors.Is(e, domain.ErrNotFound) {
+			r.configMu.Unlock()
+			return domain.ProcessOperation{}, e
+		}
+	}
 	info, now := api.RequestInfoFromContext(ctx), time.Now().UTC()
 	configs := make(map[string]string, len(input.ExpectedConfigRevisions))
 	for name, hash := range input.ExpectedConfigRevisions {
@@ -232,25 +312,39 @@ func (r *Runtime) admitSourceProcess(ctx context.Context, id, revision string, i
 		Actor: requestActor(ctx), RemoteAddress: info.RemoteAddress, UserAgent: info.UserAgent,
 		Operation: domain.ProcessOperation{SourceID: id, SourceRevision: binding.SourceRevision, BindingRevision: binding.Revision,
 			RequestID: request.RequestID, InstanceID: request.InstanceID, Action: request.Action, State: "accepted", CreatedAt: now, UpdatedAt: now}}
-	if r.sourceProcessOperations == nil {
-		r.sourceProcessOperations = make(map[string]string)
+	if resolveOnly {
+		// No manager record means this manager never dispatched the request:
+		// dispatch is always preceded by a durable intent. Seal the original
+		// input locally while holding the admission lock. Do not guess a new
+		// Agent identity or call the legacy remote resolve endpoint. A late
+		// Action (including one currently in Prepare) reads this tombstone.
+		record.Operation.State, record.Operation.ErrorCode = "failed", "unconfirmed_cancelled"
+		record.Operation.Error = "未找到管理端作业登记，已封存该编号；未向下级派发进程操作"
+		err = r.repo.CreateProcessOperation(ctx, record)
+		r.configMu.Unlock()
+		if err != nil {
+			return domain.ProcessOperation{}, err
+		}
+		r.auditProcess(record, "source.process.terminal")
+		r.broker.Publish(api.Event{Type: "source.process", SourceID: id, Data: record.Operation})
+		return record.Operation, nil
 	}
-	if r.processExecuting == nil {
-		r.processExecuting = make(map[string]string)
+	if err = r.maintenance.beginProcess(id, request.RequestID); err != nil {
+		r.configMu.Unlock()
+		return domain.ProcessOperation{}, err
 	}
-	r.sourceProcessOperations[id], r.processExecuting[id] = request.RequestID, request.RequestID
 	// The durable intent is written before any request can leave this manager.
 	// Network I/O begins only after configMu is released.
 	err = r.repo.CreateProcessOperation(ctx, record)
 	if err != nil {
-		delete(r.sourceProcessOperations, id)
-		delete(r.processExecuting, id)
+		r.maintenance.releaseFence(id, request.RequestID)
+		r.maintenance.endExecution(id, request.RequestID)
 		r.configMu.Unlock()
 		return domain.ProcessOperation{}, err
 	}
 	var lowerTarget lowerOperationsTarget
 	var preflightErr error
-	if !resolveOnly && len(configs) > 0 {
+	if len(configs) > 0 {
 		lowerTarget, preflightErr = r.lowerOperationsTargetLocked(id)
 	}
 	if r.running.Load() {
@@ -267,7 +361,7 @@ func (r *Runtime) admitSourceProcess(ctx context.Context, id, revision string, i
 	// subsequent work uses GET/Resolve, never a new Action.
 	operationCtx, cancel := r.processOperationContext(ctx)
 	defer cancel()
-	if preflightErr == nil && !resolveOnly && len(configs) > 0 {
+	if preflightErr == nil && len(configs) > 0 {
 		preflightErr = r.checkProcessConfiguration(operationCtx, lowerTarget, configs)
 	}
 	if preflightErr != nil {
@@ -289,18 +383,13 @@ func (r *Runtime) admitSourceProcess(ctx context.Context, id, revision string, i
 	var operation domain.ProcessOperation
 	dispatchCtx, dispatchCancel := context.WithTimeout(operationCtx, processRequestTimeout)
 	defer dispatchCancel()
-	if resolveOnly {
-		operation, err = r.options.ProcessAgentClient.Resolve(dispatchCtx, binding, request)
-	} else {
-		operation, err = r.options.ProcessAgentClient.Action(dispatchCtx, binding, request)
-	}
+	operation, err = r.options.ProcessAgentClient.Action(dispatchCtx, binding, request)
 	if err == nil {
 		err = operation.Validate(request)
 	}
 	if err != nil {
 		// Only explicit business rejection of an Action is proof no job began.
-		// Resolve failures can never release the original unknown intent.
-		if !resolveOnly && processDefinitiveRejection(err) {
+		if processDefinitiveRejection(err) {
 			record = failProcessRecord(record, err, "rejected")
 		} else {
 			record = unknownProcessRecord(record, err)
@@ -429,11 +518,7 @@ func (r *Runtime) persistProcessRecord(record store.ProcessControlRecord) (store
 		return record, fmt.Errorf("persist process operation: %w", err)
 	}
 	if saved.Operation.Terminal() {
-		r.configMu.Lock()
-		if r.sourceProcessOperations[saved.Binding.SourceID] == saved.Request.RequestID {
-			delete(r.sourceProcessOperations, saved.Binding.SourceID)
-		}
-		r.configMu.Unlock()
+		r.maintenance.releaseFence(saved.Binding.SourceID, saved.Request.RequestID)
 	}
 	if changed {
 		if saved.Operation.Terminal() {
@@ -460,11 +545,7 @@ func (r *Runtime) auditProcess(record store.ProcessControlRecord, kind string) {
 }
 
 func (r *Runtime) endProcessExecution(id, requestID string) {
-	r.configMu.Lock()
-	if r.processExecuting[id] == requestID {
-		delete(r.processExecuting, id)
-	}
-	r.configMu.Unlock()
+	r.maintenance.endExecution(id, requestID)
 }
 
 func (r *Runtime) SourceProcessOperation(ctx context.Context, id, requestID string) (domain.ProcessOperation, error) {
@@ -481,11 +562,10 @@ func (r *Runtime) SourceProcessOperation(ctx context.Context, id, requestID stri
 		r.configMu.Unlock()
 		return domain.ProcessOperation{}, err
 	}
-	if record.Operation.Terminal() || r.processExecuting[id] != "" || r.closing.Load() {
+	if record.Operation.Terminal() || r.closing.Load() || !r.maintenance.tryReconcile(id, requestID) {
 		r.configMu.Unlock()
 		return record.Operation, nil
 	}
-	r.processExecuting[id] = requestID
 	if r.running.Load() {
 		r.wg.Add(1)
 		defer r.wg.Done()
@@ -505,9 +585,12 @@ func (r *Runtime) reconcileProcess(ctx context.Context, record store.ProcessCont
 	defer cancel()
 	operation, err := r.options.ProcessAgentClient.Operation(queryCtx, record.Binding, record.Request)
 	var operationErr *domain.OperationError
-	if errors.As(err, &operationErr) && operationErr.Code == "not_found" {
+	if (errors.As(err, &operationErr) && operationErr.Code == "not_found") || (err == nil && record.Request.Lifecycle && operation.State == "unknown") {
 		// A plain 404 is not proof a delayed original Action cannot still
 		// arrive. Resolve atomically tombstones it or returns the accepted job.
+		// An existing unknown lifecycle job also needs Resolve: GET only reads
+		// its journal, while Resolve can confirm a late exit/release without
+		// repeating any enter, signal, start, or leave operation.
 		operation, err = r.options.ProcessAgentClient.Resolve(queryCtx, record.Binding, record.Request)
 	}
 	if err == nil {
@@ -533,7 +616,9 @@ func (r *Runtime) restoreProcessOperations(ctx context.Context) error {
 		if _, err := r.source(record.Binding.SourceID); err != nil {
 			return fmt.Errorf("pending process source %s is missing: %w", record.Binding.SourceID, err)
 		}
-		r.sourceProcessOperations[record.Binding.SourceID] = record.Request.RequestID
+		if err := r.maintenance.restoreFence(record.Binding.SourceID, record.Request.RequestID); err != nil {
+			return fmt.Errorf("restore process fence for %s: %w", record.Binding.SourceID, err)
+		}
 		if !record.Dispatched {
 			record = failProcessRecord(record, nil, "interrupted_before_dispatch")
 			if _, err := r.persistProcessRecord(record); err != nil {
@@ -552,12 +637,7 @@ func (r *Runtime) processControlWorker() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
-		r.configMu.RLock()
-		pending := make(map[string]string, len(r.sourceProcessOperations))
-		for id, requestID := range r.sourceProcessOperations {
-			pending[id] = requestID
-		}
-		r.configMu.RUnlock()
+		pending := r.maintenance.pendingSnapshot()
 		// A down agent must not serialize confirmation of every other source.
 		// The parent worker is joined at shutdown; each bounded batch joins all
 		// its workers, and per-source gates prevent overlapping API polls.

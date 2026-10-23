@@ -145,6 +145,9 @@ func NewUpstreamServer(cfg UpstreamConfig, backend UpstreamBackend) (*UpstreamSe
 		DiscoveryURLs:   []string{cfg.EndpointURL},
 	}
 	serverCapabilities := awu.NewServerCapabilities()
+	// Atomic synchronization snapshots carry a complete typed field map.
+	// Business handlers still enforce their own (usually smaller) bounds.
+	serverCapabilities.MaxStringLength = 64 * 1024
 	serverCapabilities.MaxArrayLength = managementMaxArrayLength
 	serverCapabilities.MinSupportedSampleRate = upstreamMinimumSamplingIntervalMS
 	adapter := &UpstreamServer{
@@ -426,6 +429,23 @@ func (s *UpstreamServer) ForceSessionRefresh(sessionID, groupID string) int {
 	return forceSessionRefreshBatches(nodes, func(batch []awu.NodeID) int {
 		return s.server.ForceResampleSessionNodes(id, batch)
 	})
+}
+
+func (s *UpstreamServer) NotifyCommandResult(sessionID string, key domain.NodeKey, sample domain.Sample) {
+	id := awu.ParseNodeID(sessionID)
+	if id == nil {
+		return
+	}
+	var ns uint16
+	switch key.NamespaceURI {
+	case "urn:SerialServer":
+		ns = 2
+	case "urn:RcdManager:management":
+		ns = s.managementNS
+	default:
+		return
+	}
+	s.server.QueueSessionNodeValue(id, awu.NewNodeIDString(ns, key.Identifier), sampleToDataValue(sample, domain.DataTypeString, awu.ValueRankScalar, time.Now()))
 }
 
 // ForceCalculationRefresh publishes central calculation changes to every

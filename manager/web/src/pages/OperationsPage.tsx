@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Check, RefreshCw, Search, Volume2, VolumeX } from 'lucide-react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { apiErrorMessage } from '../api/client';
@@ -22,16 +22,24 @@ export default function OperationsPage() {
   const page = Math.max(1, Number(params.get('page') ?? 1) || 1);
   const query = params.get('q') ?? '';
   const sourceId = params.get('source') ?? '';
-  const state = params.get('state') ?? (tab === 'alarms' ? 'Open' : '');
+  const selectedState = params.get('state') ?? (tab === 'alarms' ? 'Open' : 'all');
+  const state = selectedState === 'all' ? '' : selectedState;
   const range = params.get('range') ?? '24h';
   const customFrom = params.get('from') ?? '';
   const customTo = params.get('to') ?? '';
   const [draft, setDraft] = useState(query);
+  const [relativeNow, setRelativeNow] = useState(() => Date.now());
+  useEffect(() => setDraft(query), [query]);
+  useEffect(() => {
+    if (range === 'all' || range === 'custom') return;
+    const timer = window.setInterval(() => setRelativeNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, [range]);
   const sources = useSources();
   const overview = useOverview();
   const calculation = useCalculationStatus();
   const versions = useDeviceVersions({ page: 1, pageSize: 1 });
-  const bounds = useMemo(() => timeBounds(range, customFrom, customTo), [range, customFrom, customTo]);
+  const bounds = useMemo(() => timeBounds(range, customFrom, customTo, relativeNow), [range, customFrom, customTo, relativeNow]);
   const listParams = { page, pageSize: PAGE_SIZE, query, sourceId, status: state, ...bounds };
   const alarms = useAlarms(listParams, tab === 'alarms');
   const events = useSourceEvents(listParams, tab === 'events');
@@ -41,6 +49,14 @@ export default function OperationsPage() {
   const mutationError = acknowledge.error ?? silence.error;
 
   const activeQuery = tab === 'alarms' ? alarms : tab === 'events' ? events : audit;
+  const refresh = () => {
+    // Relative windows remain live: never pin an upper bound that filters out
+    // events arriving after this page opened. Moving the lower bound changes
+    // the query key; do not also refetch the obsolete key.
+    const now = Date.now();
+    if (range !== 'all' && range !== 'custom' && now !== relativeNow) setRelativeNow(now);
+    else void activeQuery.refetch();
+  };
   const sourceNames = useMemo(() => new Map((sources.data ?? []).map((source) => [source.id, source.name || source.id])), [sources.data]);
   const groupedEvents = useMemo(() => groupSourceEvents(events.data?.items ?? []), [events.data?.items]);
   const groupedAudit = useMemo(() => groupAuditLifecycle(audit.data?.items ?? []), [audit.data?.items]);
@@ -57,7 +73,7 @@ export default function OperationsPage() {
   return (
     <div className="page">
       <PageHeader title="告警与审计" description="查看下级状态历史、确认告警并追溯所有管理操作。" actions={
-        <button className="button button-secondary" type="button" onClick={() => void activeQuery.refetch()}><RefreshCw size={16} />刷新</button>
+        <button className="button button-secondary" type="button" onClick={refresh}><RefreshCw size={16} />刷新</button>
       } />
 
       <div className="tab-list" role="tablist" aria-label="运维记录">
@@ -70,8 +86,8 @@ export default function OperationsPage() {
       <form className="toolbar filter-toolbar" onSubmit={(event) => { event.preventDefault(); update({ q: draft.trim(), page: 1 }); }}>
         <label className="search-field"><Search size={17} /><input value={draft} placeholder="搜索来源、类型、目标或信息" onChange={(event) => setDraft(event.target.value)} /><button type="submit">搜索</button></label>
         {tab !== 'audit' ? <label className="field inline-field"><span>来源</span><select value={sourceId} onChange={(event) => update({ source: event.target.value, page: 1 })}><option value="">全部来源</option>{(sources.data ?? []).map((source) => <option key={source.id} value={source.id}>{source.name || source.id}</option>)}</select></label> : null}
-        {tab === 'alarms' ? <label className="field inline-field"><span>状态</span><select value={state} onChange={(event) => update({ state: event.target.value, page: 1 })}><option value="">全部</option><option value="Open">未恢复</option><option value="Resolved">已恢复</option></select></label> : null}
-        <label className="field inline-field"><span>时间范围</span><select value={range} onChange={(event) => update({ range: event.target.value, from: '', to: '', page: 1 })}><option value="1h">最近 1 小时</option><option value="24h">最近 24 小时</option><option value="today8">今天 08:00 起</option><option value="all">全部记录</option><option value="custom">自定义</option></select></label>
+        {tab === 'alarms' ? <label className="field inline-field"><span>状态</span><select aria-label="告警状态" value={state || 'all'} onChange={(event) => update({ state: event.target.value, page: 1 })}><option value="all">全部</option><option value="Open">未恢复</option><option value="Resolved">已恢复</option></select></label> : null}
+        <label className="field inline-field"><span>时间范围</span><select aria-label="时间范围" value={range} onChange={(event) => { setRelativeNow(Date.now()); update({ range: event.target.value, from: '', to: '', page: 1 }); }}><option value="1h">最近 1 小时</option><option value="24h">最近 24 小时</option><option value="today8">今天 08:00 起</option><option value="all">全部记录</option><option value="custom">自定义</option></select></label>
         {range === 'custom' ? <><label className="field inline-field"><span>开始</span><input type="datetime-local" value={toLocalInput(customFrom)} onChange={(event) => update({ from: toISO(event.target.value), page: 1 })} /></label><label className="field inline-field"><span>结束</span><input type="datetime-local" value={toLocalInput(customTo)} onChange={(event) => update({ to: toISO(event.target.value), page: 1 })} /></label></> : null}
       </form>
       {mutationError ? <div className="top-error">{apiErrorMessage(mutationError)}</div> : null}
@@ -104,35 +120,33 @@ export default function OperationsPage() {
                 </tr>;
               })}
             </tbody></table></div>
-            <Pagination onPageSizeChange={(size) => update({ size, page: 1 })} page={alarms.data?.page ?? page} pageSize={PAGE_SIZE} total={alarms.data?.total ?? 0} onPageChange={(value) => update({ page: value })} />
           </>
         ) : tab === 'events' ? (
           (events.data?.items.length ?? 0) === 0 ? <EmptyState title="暂无状态历史" /> : <>
             <div className="table-scroll"><table className="data-table responsive-table"><thead><tr><th>时间</th><th>来源</th><th>状态变化</th><th>信息</th></tr></thead><tbody>{groupedEvents.map((group) => <tr key={group.key}><td data-label="时间">{formatDateTime(group.occurredAt)}</td><td data-label="来源"><strong>{sourceNames.get(group.sourceId) ?? group.sourceId}</strong></td><td data-label="状态变化"><strong>{group.items.length > 1 ? '同一轮连接状态更新' : kindLabel(group.items[0].kind)}</strong><div className="event-transition-list">{group.items.map((event) => <span key={event.id}><b>{kindLabel(event.kind)}</b>{event.previous ? stateLabel(event.previous) : '—'} → {stateLabel(event.current)}</span>)}</div></td><td data-label="信息" className="message-cell">{group.items.map((event) => event.message).filter(Boolean).map((message) => humanizeTechnicalMessage(message)).join('；') || '—'}</td></tr>)}</tbody></table></div>
-            <Pagination onPageSizeChange={(size) => update({ size, page: 1 })} page={events.data?.page ?? page} pageSize={PAGE_SIZE} total={events.data?.total ?? 0} onPageChange={(value) => update({ page: value })} />
           </>
         ) : (
           (audit.data?.items.length ?? 0) === 0 ? <EmptyState title="暂无管理审计" /> : <>
             <div className="table-scroll"><table className="data-table responsive-table management-audit-table"><thead><tr><th>时间</th><th>操作</th><th>操作者 / 目标</th><th>结果</th><th>摘要</th><th>技术明细</th></tr></thead><tbody>{groupedAudit.map((row) => { const entry = row.completed ?? row.requested ?? row.single; const outcome = auditOutcome(entry); return entry ? <tr key={row.key}><td data-label="时间">{formatDateTime(entry.occurredAt)}</td><td data-label="操作"><strong>{operationLabel(String(entry.details?.action ?? kindLabel(entry.kind)))}</strong><span className="sub-cell">{row.requested && row.completed ? '请求与完成已关联' : kindLabel(entry.kind)}</span></td><td data-label="操作者 / 目标">{entry.actor || '系统'}<span className="sub-cell">{entry.target}</span></td><td data-label="结果"><StatusBadge state={outcome === 'success' ? 'good' : outcome === 'pending' ? 'warning' : 'bad'} label={stateLabel(outcome)} compact /></td><td data-label="摘要" className="message-cell">{auditSummary(entry)}</td><td data-label="技术明细"><details className="audit-details"><summary>查看 JSON</summary><pre>{JSON.stringify({ requested: row.requested?.details, completed: row.completed?.details, single: row.single?.details }, null, 2)}</pre></details></td></tr> : null; })}</tbody></table></div>
-            <Pagination onPageSizeChange={(size) => update({ size, page: 1 })} page={audit.data?.page ?? page} pageSize={PAGE_SIZE} total={audit.data?.total ?? 0} onPageChange={(value) => update({ page: value })} />
           </>
         )}
+        {!activeQuery.isError && activeQuery.data ? <Pagination onPageSizeChange={(size) => update({ size, page: 1 })} page={activeQuery.data.page ?? page} pageSize={PAGE_SIZE} total={activeQuery.data.total} onPageChange={(value) => update({ page: value })} /> : null}
       </section>
     </div>
   );
 }
 
-function timeBounds(range: string, customFrom: string, customTo: string): { from?: string; to?: string } {
-  const now = new Date();
+function timeBounds(range: string, customFrom: string, customTo: string, nowMs: number): { from?: string; to?: string } {
+  const now = new Date(nowMs);
   if (range === 'all') return {};
   if (range === 'custom') return { from: customFrom || undefined, to: customTo || undefined };
   if (range === 'today8') {
     const from = new Date(now);
     from.setHours(8, 0, 0, 0);
-    return { from: from.toISOString(), to: now.toISOString() };
+    return { from: from.toISOString() };
   }
   const hours = range === '1h' ? 1 : 24;
-  return { from: new Date(now.getTime() - hours * 60 * 60 * 1000).toISOString(), to: now.toISOString() };
+  return { from: new Date(now.getTime() - hours * 60 * 60 * 1000).toISOString() };
 }
 
 function toLocalInput(value: string): string {

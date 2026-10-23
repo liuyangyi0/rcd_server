@@ -1,0 +1,39 @@
+---
+- name: Inspect explicitly selected RCD runtime images without changing services
+  hosts: rcd_nodes
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Require an explicit host selection and registered service targets
+      ansible.builtin.assert:
+        that:
+          - ansible_limit is defined
+          - ansible_limit | default('') | length > 0
+          - rcd_services is defined
+          - rcd_services | length > 0
+        fail_msg: Use --limit with explicit inventory host names and declare rcd_services.
+
+    - name: Inspect fixed software entries and actual process images
+      ansible.builtin.script:
+        cmd: >-
+          ../release/inspect_runtime.py
+          --component {{ item.component | quote }}
+          --instance {{ item.instance | quote }}
+          --scope {{ item.scope | quote }}
+          --unit {{ item.unit | quote }}
+        executable: /usr/bin/python3
+      loop: "{{ rcd_services }}"
+      loop_control:
+        label: "{{ item.component }}/{{ item.instance }}"
+      register: rcd_runtime
+      changed_when: false
+      # Execute read-only probes even with --check; there are no mutations.
+      check_mode: false
+
+    - name: Show separate running and on-disk identities
+      ansible.builtin.debug:
+        msg: "{{ item.stdout | trim | from_json }}"
+      loop: "{{ rcd_runtime.results }}"
+      loop_control:
+        label: "{{ item.item.component }}/{{ item.item.instance }}"

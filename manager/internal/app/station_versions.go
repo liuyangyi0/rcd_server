@@ -19,8 +19,8 @@ const unverifiedStationTopology = "unverified"
 
 func (r *Runtime) cacheStationVersionResult(request domain.OperationRequest, result json.RawMessage, source domain.Source, connectionEpoch uint64, fingerprint string) error {
 	defer r.refreshCalculationStateInputs(source.ID)
-	r.stationCacheMu.Lock()
-	defer r.stationCacheMu.Unlock()
+	r.stationSync.writerMu.Lock()
+	defer r.stationSync.writerMu.Unlock()
 	verified := fingerprint != "" && fingerprint != unverifiedStationTopology
 	if fingerprint == "" {
 		fingerprint = unverifiedStationTopology
@@ -42,10 +42,8 @@ func (r *Runtime) cacheStationVersionResult(request domain.OperationRequest, res
 		r.mu.Unlock()
 		return nil
 	}
-	previous, existed := r.stationVersions[source.ID]
-	previous = previous.Clone()
-	previousEpoch := r.stationVersionEpoch[source.ID]
-	if existed && previous.TopologyFingerprint == snapshot.TopologyFingerprint && previousEpoch == connectionEpoch {
+	previous, previousEpoch, previousLive, existed := r.stations.read(source.ID)
+	if existed && previousLive && previous.TopologyFingerprint == snapshot.TopologyFingerprint && previousEpoch == connectionEpoch {
 		previousRevision, previousOK := domain.ParseStationRevision(previous.StationRevision)
 		incomingRevision, incomingOK := domain.ParseStationRevision(snapshot.StationRevision)
 		if previousOK && incomingOK && incomingRevision < previousRevision {
@@ -53,13 +51,9 @@ func (r *Runtime) cacheStationVersionResult(request domain.OperationRequest, res
 			return nil
 		}
 	}
-	if existed && sameStationVersionSnapshot(previous, snapshot) {
-		previous.Cached = false
-		previous.ObservedAt = snapshot.ObservedAt
-		r.stationVersions[source.ID] = previous
-		r.stationVersionEpoch[source.ID] = connectionEpoch
-		r.stationFeatureEpoch[source.ID] = connectionEpoch
-		r.stationFeatureSupported[source.ID] = true
+	if existed && sameStationVersionSnapshot(previous, snapshot) && !r.stationSync.needsPersistence(source.ID) {
+		r.stations.touch(source.ID, snapshot.ObservedAt, connectionEpoch)
+		r.stationSync.setSupport(source.ID, connectionEpoch, true)
 		r.mu.Unlock()
 		return nil
 	}
@@ -67,17 +61,11 @@ func (r *Runtime) cacheStationVersionResult(request domain.OperationRequest, res
 	persistedSnapshot := false
 	// Acquisition flags change independently of station/version revisions.
 	// Keep their updates in memory; a health refresh is not a SQLite data feed.
-	if verified && (!existed || !samePersistedStationVersionSnapshot(previous, snapshot)) {
+	if verified && (r.stationSync.needsPersistence(source.ID) || !existed || !samePersistedStationVersionSnapshot(previous, snapshot)) {
 		persistContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		persistErr := r.repo.SaveSourceStationVersions(persistContext, snapshot)
 		cancel()
-		r.mu.Lock()
-		if persistErr != nil {
-			r.stationPersistError = persistErr.Error()
-		} else {
-			r.stationPersistError = ""
-		}
-		r.mu.Unlock()
+		r.stationSync.persistenceResult(source.ID, persistErr)
 		if persistErr != nil {
 			// The live immutable snapshot remains useful, but health reports that
 			// it cannot yet survive a manager restart.
@@ -104,10 +92,8 @@ func (r *Runtime) cacheStationVersionResult(request domain.OperationRequest, res
 		r.queueStationVersionRefresh(source.ID)
 		return err
 	}
-	r.stationVersions[source.ID] = snapshot.Clone()
-	r.stationVersionEpoch[source.ID] = connectionEpoch
-	r.stationFeatureEpoch[source.ID] = connectionEpoch
-	r.stationFeatureSupported[source.ID] = true
+	r.stations.replace(source.ID, snapshot, connectionEpoch, true)
+	r.stationSync.setSupport(source.ID, connectionEpoch, true)
 	r.mu.Unlock()
 	r.broker.Publish(api.Event{Type: "station_versions_changed", SourceID: source.ID,
 		Data: map[string]any{"source_id": source.ID, "station_revision": snapshot.StationRevision}})
@@ -124,13 +110,7 @@ func (r *Runtime) restoreStationVersionPersistence(sourceID string, previous dom
 	} else {
 		err = r.repo.ClearSourceStationVersions(ctx, sourceID)
 	}
-	r.mu.Lock()
-	if err != nil {
-		r.stationPersistError = err.Error()
-	} else {
-		r.stationPersistError = ""
-	}
-	r.mu.Unlock()
+	r.stationSync.persistenceResult(sourceID, err)
 	return err
 }
 
@@ -157,63 +137,40 @@ func samePersistedStationVersionSnapshot(left, right domain.SourceStationVersion
 }
 
 func (r *Runtime) StationVersions(sourceID string) (domain.SourceStationVersions, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	snapshot, ok := r.stationVersions[sourceID]
-	return snapshot.Clone(), ok
+	return r.stations.snapshot(sourceID)
 }
 
 func (r *Runtime) StationVersionSupport(sourceID string) (known, supported bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	epoch, known := r.stationFeatureEpoch[sourceID]
 	status, hasStatus := r.statuses[sourceID]
-	if !known || !hasStatus || epoch != status.Epoch {
+	if !hasStatus {
 		return false, false
 	}
-	return true, r.stationFeatureSupported[sourceID]
+	return r.stationSync.support(sourceID, status.Epoch)
 }
 
 func (r *Runtime) queueStationVersionRefresh(sourceID string) {
-	r.mu.Lock()
+	r.mu.RLock()
 	ctx := r.runContext
-	if ctx == nil || !r.running.Load() {
-		r.mu.Unlock()
+	_, exists := r.statuses[sourceID]
+	if ctx == nil || !r.running.Load() || !exists {
+		r.mu.RUnlock()
 		return
 	}
-	if r.stationRefreshPending[sourceID] {
-		r.stationRefreshDirty[sourceID] = true
-		r.mu.Unlock()
+	ticket, enqueue := r.stationSync.request(sourceID)
+	r.mu.RUnlock()
+	if !enqueue {
 		return
 	}
-	r.stationRefreshPending[sourceID] = true
-	r.mu.Unlock()
 	select {
-	case r.stationRefreshQueue <- sourceID:
+	case r.stationSync.queue() <- ticket:
 	case <-ctx.Done():
-		r.mu.Lock()
-		delete(r.stationRefreshPending, sourceID)
-		r.mu.Unlock()
+		r.stationSync.finish(ticket)
 	default:
-		r.mu.Lock()
-		delete(r.stationRefreshPending, sourceID)
-		delete(r.stationRefreshDirty, sourceID)
-		r.mu.Unlock()
+		// The periodic sweep will retry; release only this exact reservation.
+		r.stationSync.finish(ticket)
 	}
-}
-
-// finishStationVersionRefresh preserves an invalidation that arrived while a
-// status Call was in flight. The caller immediately performs one more refresh
-// before releasing the source's pending marker.
-func (r *Runtime) finishStationVersionRefresh(sourceID string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.stationRefreshDirty[sourceID] {
-		delete(r.stationRefreshDirty, sourceID)
-		return true
-	}
-	delete(r.stationRefreshPending, sourceID)
-	return false
 }
 
 func (r *Runtime) stationVersionRefreshWorker() {
@@ -233,18 +190,17 @@ func (r *Runtime) stationVersionRefreshWorker() {
 				select {
 				case <-ctx.Done():
 					return
-				case sourceID := <-r.stationRefreshQueue:
+				case ticket := <-r.stationSync.queue():
+					if !r.stationSync.current(ticket) {
+						continue
+					}
 					refreshContext, cancel := context.WithTimeout(ctx, 3*time.Second)
-					_ = r.refreshSourceStationVersions(refreshContext, sourceID)
+					_ = r.refreshSourceStationVersions(refreshContext, ticket.sourceID)
 					cancel()
 					// Yield the worker after every attempt, including a dirty
 					// refresh, so other sources cannot be starved indefinitely.
-					rerun := r.finishStationVersionRefresh(sourceID)
-					if rerun {
-						r.mu.Lock()
-						delete(r.stationRefreshPending, sourceID)
-						r.mu.Unlock()
-						r.queueStationVersionRefresh(sourceID)
+					if r.stationSync.finish(ticket) {
+						r.queueStationVersionRefresh(ticket.sourceID)
 					}
 				}
 			}
@@ -275,19 +231,30 @@ func (r *Runtime) stationVersionRefreshWorker() {
 
 func (r *Runtime) refreshSourceStationVersions(ctx context.Context, sourceID string) error {
 	r.mu.RLock()
-	status := r.statuses[sourceID]
-	featureEpoch, known := r.stationFeatureEpoch[sourceID]
-	supported := r.stationFeatureSupported[sourceID]
+	status, exists := r.statuses[sourceID]
+	handle, attached := r.connections.handle(sourceID)
+	fingerprint := domain.SourceTopologyFingerprint(r.catalogs[sourceID].Topology)
+	known, supported := r.stationSync.support(sourceID, status.Epoch)
 	r.mu.RUnlock()
-	if !known || featureEpoch != status.Epoch {
+	if !exists || !attached || status.Connection != opc.ConnectionConnected || status.Session != opc.SessionActive {
+		return nil
+	}
+	if !known {
 		capabilities, err := r.SourceOperationsCapabilities(ctx, sourceID)
 		if err != nil {
 			return err
 		}
 		supported = capabilities.Supported && capabilities.HasFeature("station_versions")
 		r.mu.Lock()
-		r.stationFeatureEpoch[sourceID] = status.Epoch
-		r.stationFeatureSupported[sourceID] = supported
+		current, exists := r.statuses[sourceID]
+		if !exists || current.Epoch != status.Epoch ||
+			current.Connection != opc.ConnectionConnected || current.Session != opc.SessionActive ||
+			!r.connections.current(sourceID, handle.generation) ||
+			domain.SourceTopologyFingerprint(r.catalogs[sourceID].Topology) != fingerprint {
+			r.mu.Unlock()
+			return nil
+		}
+		r.stationSync.setSupport(sourceID, status.Epoch, supported)
 		r.mu.Unlock()
 		if !supported {
 			r.broker.Publish(api.Event{Type: "station_versions_changed", SourceID: sourceID,
@@ -386,29 +353,22 @@ func (r *Runtime) ListDeviceVersions(_ context.Context, request api.DeviceVersio
 	sources := r.routes.Sources()
 	sort.Slice(sources, func(i, j int) bool { return sources[i].ID < sources[j].ID })
 	r.mu.RLock()
-	snapshots := make(map[string]domain.SourceStationVersions, len(r.stationVersions))
+	stationView := r.stations.view()
 	statuses := make(map[string]opc.LowerStatus, len(r.statuses))
-	featureSupport := make(map[string]bool, len(r.stationFeatureSupported))
-	featureKnown := make(map[string]bool, len(r.stationFeatureEpoch))
+	featureSupport := make(map[string]bool, len(r.statuses))
+	featureKnown := make(map[string]bool, len(r.statuses))
 	topologies := make(map[string]*domain.SourceTopology, len(r.catalogs))
-	for id, snapshot := range r.stationVersions {
-		snapshots[id] = snapshot.Clone()
-	}
 	for id, status := range r.statuses {
 		statuses[id] = status
 	}
-	for id, supported := range r.stationFeatureSupported {
-		featureSupport[id] = supported
-	}
-	for id, epoch := range r.stationFeatureEpoch {
-		if status, ok := statuses[id]; ok && status.Epoch == epoch {
-			featureKnown[id] = true
-		}
+	for id, status := range statuses {
+		featureKnown[id], featureSupport[id] = r.stationSync.support(id, status.Epoch)
 	}
 	for id, catalog := range r.catalogs {
 		topologies[id] = catalog.Topology.Clone()
 	}
 	r.mu.RUnlock()
+	snapshots := stationView.cloneAll()
 	items := make([]api.DeviceVersionItem, 0)
 	for _, source := range sources {
 		if request.SourceID != "" && source.ID != request.SourceID {
@@ -637,11 +597,7 @@ func stationOperationAuditResult(result json.RawMessage, request domain.Operatio
 func (r *Runtime) invalidateStationVersionsForTopology(sourceID string, topology *domain.SourceTopology) {
 	fingerprint := domain.SourceTopologyFingerprint(topology)
 	r.mu.Lock()
-	current, exists := r.stationVersions[sourceID]
-	if exists && current.TopologyFingerprint != fingerprint {
-		delete(r.stationVersions, sourceID)
-		delete(r.stationVersionEpoch, sourceID)
-	}
+	r.stations.removeOtherTopology(sourceID, fingerprint)
 	r.mu.Unlock()
 }
 

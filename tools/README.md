@@ -9,6 +9,8 @@
 | [fuzz-device/](fuzz-device/) | 设备模拟工具及 Windows/Kylin 打包入口 | 仅供隔离回归，不能代替真实设备验收 |
 | [nesting-check/](nesting-check/) | 现有独立 Rust 辅助工具 | 保持自身 Cargo 根目录 |
 | [maintenance/](maintenance/README.md) | 目录检查、迁移清单及可恢复整理工具 | 整理脚本默认预览；历史清单不可重复执行 |
+| [release/](release/README.md) | 显式目标发布、配置保留回滚、目录迁移及实际运行版本检查 | live 操作须有当次授权与维护窗口；不默认升级 58 |
+| [ansible/](ansible/README.md) | 复用 release 的巡检、分发、串行部署、验收及显式恢复 | 发布/回滚须当次授权；不接管用户配置，不自动重试未知结果 |
 
 管理端专用工具仍在 [manager/tools](../manager/tools/README.md)，不复制第二套。
 

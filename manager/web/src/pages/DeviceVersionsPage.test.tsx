@@ -26,6 +26,66 @@ function setup(page = versionPage) {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('device version inventory', () => {
+  it('does not rebase and repeat a confirmed station write after a revision conflict', async () => {
+    const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+    const snapshot = { source_id: 'lower-a', source_revision: 7, schema_version: 1, revision: '1', station_revision: '2', status: 'Applied', ports: [{ port_id: '/dev/ttyWCH0', devices: [{ device_id: '14', configured_module_type: 'legacy_russian' }] }] };
+    let writes = 0;
+    const fetchMock = vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+      if (init?.method === 'PUT' && ++writes === 1) return Promise.resolve(json({ error: { code: 'revision_conflict', message: 'station revision changed' } }, 409));
+      return Promise.resolve(json(snapshot));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const user = setup();
+    const row = within(await screen.findByRole('row', { name: /站点 14/ }));
+    await user.click(row.getByRole('button', { name: '设置类型' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: '模块类型' }), 'domestic');
+    await user.click(screen.getByText('我确认这些站点为国产模块，并允许下级发送一次版本请求'));
+    await user.click(screen.getByRole('button', { name: '确认保存' }));
+    await screen.findByText(/操作冲突，请刷新并重新核对目标；未自动重试/);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(writes).toBe(1);
+  });
+
+  it('uses only the previous confirmed batch result revision for the next station', async () => {
+    let revision = 1;
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify({ source_id: 'lower-a', source_revision: 7, schema_version: 1, revision: '1', station_revision: String(++revision), status: 'Applied', ports: [{ port_id: '/dev/ttyWCH0', devices: rows.map((row) => ({ device_id: row.deviceId, configured_module_type: 'legacy_russian' })) }] }), { status: 200, headers: { 'Content-Type': 'application/json' } })));
+    vi.stubGlobal('fetch', fetchMock);
+    const user = setup();
+    await screen.findByRole('row', { name: /站点 14/ });
+    await user.click(screen.getByRole('checkbox', { name: '选择当前页全部站点' }));
+    await user.click(screen.getByRole('button', { name: '批量设置类型' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: '模块类型' }), 'legacy_russian');
+    await user.click(screen.getByRole('button', { name: '确认保存' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(fetchMock.mock.calls.map(([, init]) => JSON.parse(String((init as RequestInit).body)))).toMatchObject([
+      { device_id: '12', station_revision: '1', module_type: 'legacy_russian' },
+      { device_id: '14', station_revision: '2', module_type: 'legacy_russian' },
+    ]);
+  });
+
+  it('does not claim version success when the response omits the target station', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ source_id: 'lower-a', source_revision: 7, schema_version: 1, revision: '1', station_revision: '2', status: 'Applied', ports: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const user = setup();
+    const row = within(await screen.findByRole('row', { name: /站点 12/ }));
+    await user.click(row.getByRole('button', { name: '查询版本' }));
+    await user.click(screen.getByRole('checkbox', { name: '我确认对所选国产站点发送版本查询' }));
+    await user.click(screen.getByRole('button', { name: '开始查询' }));
+    expect(await screen.findByText(/下级响应缺少目标站点，结果待确认/)).toBeInTheDocument();
+    expect(screen.queryByText('版本查询完成')).not.toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('does not leave writable rows from a previous filter visible while the next inventory loads', async () => {
+    const user = setup();
+    await screen.findByRole('row', { name: /站点 12/ });
+    vi.mocked(api.deviceVersions).mockReturnValue(new Promise<DeviceVersionPage>(() => undefined));
+    await user.selectOptions(screen.getByRole('combobox', { name: /^状态/ }), 'failed');
+    await screen.findByText('正在读取全部下级设备版本…');
+    expect(screen.queryByRole('row', { name: /站点 12/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '设置类型' })).not.toBeInTheDocument();
+  });
+
   it('shows raw versions, configured type, and summary independently from OPC routing', async () => {
     setup();
     await screen.findByRole('table');

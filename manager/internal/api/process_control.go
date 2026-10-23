@@ -9,37 +9,10 @@ import (
 	"rcd_manager/internal/domain"
 )
 
-type ProcessActionInput struct {
-	Action                  string            `json:"action"`
-	RequestID               string            `json:"request_id"`
-	SourceRevision          uint64            `json:"source_revision"`
-	BindingRevision         uint64            `json:"binding_revision"`
-	ExpectedConfigRevisions map[string]string `json:"expected_config_revisions,omitempty"`
-}
-
-type ProcessStatusView struct {
-	domain.ProcessSnapshot
-	SourceID         string                   `json:"source_id"`
-	SourceRevision   uint64                   `json:"source_revision"`
-	BindingRevision  uint64                   `json:"binding_revision"`
-	PendingOperation *domain.ProcessOperation `json:"pending_operation,omitempty"`
-}
-
-type ProcessLogView struct {
-	domain.ProcessLog
-	SourceID        string `json:"source_id"`
-	SourceRevision  uint64 `json:"source_revision"`
-	BindingRevision uint64 `json:"binding_revision"`
-}
-
-type ProcessOperationPage struct {
-	SourceID       string                    `json:"source_id"`
-	SourceRevision uint64                    `json:"source_revision"`
-	Items          []domain.ProcessOperation `json:"items"`
-	Total          int                       `json:"total"`
-	Limit          int                       `json:"limit"`
-	Offset         int                       `json:"offset"`
-}
+type ProcessActionInput = domain.ProcessActionInput
+type ProcessStatusView = domain.ProcessStatusView
+type ProcessLogView = domain.ProcessLogView
+type ProcessOperationPage = domain.ProcessOperationPage
 
 // Independent process control remains available while lower OPC is offline.
 // Kept optional to preserve the base Service implementations and test doubles.

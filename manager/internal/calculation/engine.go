@@ -142,7 +142,14 @@ func Compile(config Config, inputs map[string]InputDefinition) (*Plan, error) {
 			outputs[rule.Output] = index
 		}
 		if _, collision := inputs[rule.Output]; collision {
-			problems = append(problems, Problem{RuleIndex: index + 1, Rule: rule.Output, Field: "kks_calc", Message: fmt.Sprintf("calculation output %s conflicts with a lower point or command", rule.Output)})
+			kind := "a lower point or command"
+			for _, input := range config.StateInputs {
+				if input.Name == rule.Output {
+					kind = "a state input OPC output"
+					break
+				}
+			}
+			problems = append(problems, Problem{RuleIndex: index + 1, Rule: rule.Output, Field: "kks_calc", Message: fmt.Sprintf("calculation output %s conflicts with %s", rule.Output, kind)})
 		}
 		ast, variables, err := parseExpression(rule.Expression)
 		if err != nil {
@@ -281,6 +288,9 @@ func (p *Plan) OutputDataType(name string) (domain.DataType, bool) {
 	if p == nil {
 		return "", false
 	}
+	if _, exists := p.stateInputs[name]; exists {
+		return domain.DataTypeUInt32, true
+	}
 	index, ok := p.byName[name]
 	if !ok {
 		return "", false
@@ -291,9 +301,12 @@ func (p *Plan) OutputNames() []string {
 	if p == nil {
 		return nil
 	}
-	result := make([]string, 0, len(p.rules))
+	result := make([]string, 0, len(p.rules)+len(p.config.StateInputs))
 	for _, rule := range p.rules {
 		result = append(result, rule.Output)
+	}
+	for _, input := range p.config.StateInputs {
+		result = append(result, input.Name)
 	}
 	return result
 }
@@ -311,9 +324,12 @@ func (p *Plan) CatalogNodes() []domain.CatalogNode {
 	if p == nil {
 		return nil
 	}
-	nodes := make([]domain.CatalogNode, 0, len(p.rules))
+	nodes := make([]domain.CatalogNode, 0, len(p.rules)+len(p.config.StateInputs))
 	for _, rule := range p.rules {
 		nodes = append(nodes, domain.CatalogNode{Kind: "manager_calculation", Key: domain.NodeKey{NamespaceURI: "urn:SerialServer", Identifier: rule.Output}, BrowseName: rule.Output, ParentPath: "Objects/Devices", Class: domain.NodeClassVariable, DataType: rule.DataType, ValueRank: -1})
+	}
+	for _, input := range p.config.StateInputs {
+		nodes = append(nodes, domain.CatalogNode{Kind: "manager_calculation", Key: domain.NodeKey{NamespaceURI: "urn:SerialServer", Identifier: input.Name}, BrowseName: input.Name, ParentPath: "Objects/Devices", Class: domain.NodeClassVariable, DataType: domain.DataTypeUInt32, ValueRank: -1})
 	}
 	return nodes
 }

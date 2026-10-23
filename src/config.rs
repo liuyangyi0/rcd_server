@@ -11,6 +11,8 @@ use crate::logging::LoggingConfig;
 
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1;
 pub const DEFAULT_COMMAND_RETRY_COUNT: u32 = 3;
+pub const DEFAULT_COMMAND_INTERVAL_MS: u64 = 0;
+pub const MAX_COMMAND_INTERVAL_MS: u64 = 60_000;
 pub const DEFAULT_QUERY_RETRY_COUNT: u32 = 0;
 pub const DEFAULT_PARITY_SWITCH_DELAY_MS: u64 = 1;
 pub const DEFAULT_TRANSMIT_SETTLE_GUARD_MS: u64 = 1;
@@ -174,6 +176,13 @@ pub struct Settings {
     /// 命令未收到 ACK 时的最大连续下发次数。
     #[serde(default = "default_command_retry_count")]
     pub command_retry_count: u32,
+    /// 同一物理串口的上一条控制事务结束至下一条首次发送的最小间隔。
+    /// 不限制普通轮询或同一控制事务内的 ACK 重试；0 保持旧行为。
+    #[serde(
+        default = "default_command_interval_ms",
+        deserialize_with = "deserialize_command_interval_ms"
+    )]
+    pub command_interval_ms: u64,
     /// 自动轮询查询失败后的补发次数。快速模式使用 0，避免一次故障等待两个读取超时。
     #[serde(default = "default_query_retry_count")]
     pub query_retry_count: u32,
@@ -208,6 +217,23 @@ fn default_command_retry_count() -> u32 {
     DEFAULT_COMMAND_RETRY_COUNT
 }
 
+fn default_command_interval_ms() -> u64 {
+    DEFAULT_COMMAND_INTERVAL_MS
+}
+
+fn deserialize_command_interval_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value > MAX_COMMAND_INTERVAL_MS {
+        return Err(serde::de::Error::custom(
+            "command_interval_ms 必须为 0–60000 毫秒的整数",
+        ));
+    }
+    Ok(value)
+}
+
 fn default_query_retry_count() -> u32 {
     DEFAULT_QUERY_RETRY_COUNT
 }
@@ -224,13 +250,9 @@ fn default_transmit_settle_guard_ms() -> u64 {
 //  路径与加载
 // ============================================================
 
-/// 获取可执行文件同级的 `config` 目录路径。
+/// 获取启动时选定的配置目录；无显式设置时仍为 EXE 同级 `config`。
 pub fn config_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    let exe_dir = std::env::current_exe()?
-        .parent()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "无法获取可执行文件目录"))?
-        .to_path_buf();
-    Ok(exe_dir.join("config"))
+    Ok(crate::runtime_paths::current()?.config)
 }
 
 /// 从可执行文件同级的 `config/config.toml` 读取并反序列化配置。
@@ -283,6 +305,10 @@ timeout = 300
         );
         assert_eq!(config.settings.query_retry_count, DEFAULT_QUERY_RETRY_COUNT);
         assert_eq!(
+            config.settings.command_interval_ms,
+            DEFAULT_COMMAND_INTERVAL_MS
+        );
+        assert_eq!(
             config.settings.parity_switch_delay_ms,
             DEFAULT_PARITY_SWITCH_DELAY_MS
         );
@@ -302,6 +328,7 @@ timeout = 300
 timeout = 300
 poll_interval_ms = 50
 command_retry_count = 5
+command_interval_ms = 500
 query_retry_count = 1
 parity_switch_delay_ms = 2
 transmit_settle_guard_ms = 3
@@ -318,6 +345,7 @@ serial_frame_logs = true
         assert_eq!(config.settings.timeout, 300);
         assert_eq!(config.settings.poll_interval_ms, 50);
         assert_eq!(config.settings.command_retry_count, 5);
+        assert_eq!(config.settings.command_interval_ms, 500);
         assert_eq!(config.settings.query_retry_count, 1);
         assert_eq!(config.settings.parity_switch_delay_ms, 2);
         assert_eq!(config.settings.transmit_settle_guard_ms, 3);
@@ -346,6 +374,24 @@ mode = "manager"
         ))
         .unwrap();
         assert_eq!(manager.calculation.mode, CalculationMode::Manager);
+    }
+
+    #[test]
+    fn command_interval_accepts_bounds_and_rejects_invalid_config_at_startup() {
+        for value in ["0", "60000"] {
+            let text =
+                format!("{BASE_CONFIG}\n[settings]\ntimeout=50\ncommand_interval_ms={value}\n");
+            let config: Config = toml::from_str(&text).unwrap();
+            assert_eq!(
+                config.settings.command_interval_ms,
+                value.parse::<u64>().unwrap()
+            );
+        }
+        for value in ["-1", "60001", "1.5", "\"500\"", "true"] {
+            let text =
+                format!("{BASE_CONFIG}\n[settings]\ntimeout=50\ncommand_interval_ms={value}\n");
+            assert!(toml::from_str::<Config>(&text).is_err(), "accepted {value}");
+        }
     }
 
     #[test]

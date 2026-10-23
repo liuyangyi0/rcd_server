@@ -44,6 +44,28 @@ data_type="UInt32"
 expression="IF(DEFAULT == 1, 0, 1)"
 `
 
+func TestStateTargetDiagnosticsDistinguishIdentityAndTopology(t *testing.T) {
+	r := stateRuntime(t)
+	for _, test := range []struct{ source, port, device, want string }{
+		{"missing", "COM1", "11", "来源ID不存在: missing"},
+		{"source-a", "missing", "11", "串口不存在"},
+		{"source-a", "COM1", "99", "站点不存在"},
+	} {
+		input := calculation.StateInput{Name: "CHECK", Mode: "fixed", Targets: []calculation.StateTarget{{SourceID: test.source, PortID: test.port, DeviceID: test.device}}}
+		err := validateStateTargets([]calculation.StateInput{input}, r.catalogs, r.routes.Groups(), r.routes.Sources())
+		if err == nil || !strings.Contains(err.Error(), test.want) {
+			t.Fatalf("want %s got %v", test.want, err)
+		}
+		view := r.stateInputValue(input, r.routes.Groups(), r.routes.Sources())
+		if view.StatusCode != domain.StatusBadConfigurationError || !strings.Contains(view.Error, test.want) {
+			t.Fatal(view)
+		}
+	}
+	if message := stateTargetProblem(calculation.StateTarget{SourceID: "source-a", PortID: "COM1", DeviceID: "11"}, nil); !strings.Contains(message, "尚无有效拓扑") {
+		t.Fatal(message)
+	}
+}
+
 func stateRuntime(t *testing.T) *Runtime {
 	r := seededRuntime(t)
 	for i, id := range []string{"source-a", "source-b"} {
@@ -56,8 +78,7 @@ func stateRuntime(t *testing.T) *Runtime {
 		c := r.catalogs[id]
 		c.Topology = &domain.SourceTopology{SchemaVersion: 1, Ports: []domain.TopologyPort{{PortID: port, Devices: []domain.TopologyDevice{{DeviceID: device}}}}}
 		r.catalogs[id] = c
-		r.stationVersions[id] = domain.SourceStationVersions{TopologyFingerprint: domain.SourceTopologyFingerprint(c.Topology), ObservedAt: time.Now().UTC(), Ports: []domain.StationVersionPort{{PortID: port, Enabled: true, AppliedEnabled: true, Open: true, Devices: []domain.StationVersion{{DeviceID: device, ReadEnabled: true, AppliedReadEnabled: true, CommunicationOK: i == 0}}}}}
-		r.stationVersionEpoch[id] = 1
+		r.stations.replace(id, domain.SourceStationVersions{TopologyFingerprint: domain.SourceTopologyFingerprint(c.Topology), ObservedAt: time.Now().UTC(), Ports: []domain.StationVersionPort{{PortID: port, Enabled: true, AppliedEnabled: true, Open: true, Devices: []domain.StationVersion{{DeviceID: device, ReadEnabled: true, AppliedReadEnabled: true, CommunicationOK: i == 0}}}}}, 1, true)
 		r.mu.Unlock()
 	}
 	return r
@@ -70,7 +91,7 @@ func TestCalculationStateRoutingAndOffline(t *testing.T) {
 	check := func(name string, want uint32) {
 		t.Helper()
 		r.mu.RLock()
-		got := r.calculationResults[name]
+		got, _ := r.calculations.result(name)
 		r.mu.RUnlock()
 		if got.Value != want || got.StatusCode != domain.StatusGood {
 			t.Fatalf("%s: %#v want %d", name, got, want)
@@ -112,14 +133,14 @@ func TestCalculationStateExpiryValidationAndPaging(t *testing.T) {
 	r.refreshCalculationStateInputs("")
 	r.runCalculationBatch()
 	r.mu.Lock()
-	s := r.stationVersions["source-a"]
+	s, _ := r.stations.snapshot("source-a")
 	s.ObservedAt = time.Now().Add(-time.Minute)
-	r.stationVersions["source-a"] = s
+	r.stations.replace("source-a", s, 1, true)
 	r.mu.Unlock()
 	r.refreshCalculationStateInputs("source-a")
 	r.runCalculationBatch()
 	r.mu.RLock()
-	got := r.calculationResults["FIXED_VALUE"]
+	got, _ := r.calculations.result("FIXED_VALUE")
 	r.mu.RUnlock()
 	if got.Value != uint32(0) || got.StatusCode != domain.StatusGood {
 		t.Fatal(got)
@@ -145,7 +166,7 @@ func TestCalculationStateExpiryValidationAndPaging(t *testing.T) {
 	r.requestCalculationFull()
 	r.runCalculationBatch()
 	r.mu.RLock()
-	got = r.calculationResults["FIXED_VALUE"]
+	got, _ = r.calculations.result("FIXED_VALUE")
 	r.mu.RUnlock()
 	if got.StatusCode != domain.StatusBadConfigurationError {
 		t.Fatal(got)
@@ -170,33 +191,57 @@ func TestStateInputHeartbeatDoesNotDirtyCalculations(t *testing.T) {
 	r.runCalculationBatch()
 	r.flushCalculationStateEvent()
 	r.mu.Lock()
-	snapshot := r.stationVersions["source-a"]
+	snapshot, _ := r.stations.snapshot("source-a")
 	snapshot.ObservedAt = time.Now().UTC()
-	r.stationVersions["source-a"] = snapshot
+	r.stations.replace("source-a", snapshot, 1, true)
 	r.mu.Unlock()
 	r.refreshCalculationStateInputs("source-a")
 	r.mu.RLock()
-	dirty, pending := len(r.calculationDirty), r.calculationStateEventPending
+	dirty, pending := r.calculations.pendingWork()
 	r.mu.RUnlock()
 	if dirty != 0 || pending {
 		t.Fatalf("heartbeat caused recompute/event: dirty=%d pending=%v", dirty, pending)
 	}
 	r.mu.Lock()
 	snapshot.Ports[0].Devices[0].CommunicationOK = false
-	r.stationVersions["source-a"] = snapshot
+	r.stations.replace("source-a", snapshot, 1, true)
 	r.mu.Unlock()
 	r.refreshCalculationStateInputs("source-a")
 	r.mu.RLock()
-	dirty, pending = len(r.calculationDirty), r.calculationStateEventPending
+	dirty, pending = r.calculations.pendingWork()
 	r.mu.RUnlock()
 	if dirty != 2 || !pending {
 		t.Fatalf("state transition missing: dirty=%d pending=%v", dirty, pending)
 	}
 	r.runCalculationBatch()
 	r.mu.RLock()
-	result := r.calculationResults["ALARM"]
+	result, _ := r.calculations.result("ALARM")
 	r.mu.RUnlock()
 	if result.Value != uint32(1) || result.StatusCode != domain.StatusGood {
 		t.Fatal(result)
 	}
+}
+
+func TestCalculationDigitLeadingFixedStateInput(t *testing.T) {
+	const name = "9CYE91GH201_COM1"
+	r := stateRuntime(t)
+	content := strings.Replace(stateConfig, `name="FIXED"`, `name="`+name+`"`, 1)
+	content = strings.Replace(content, `expression="FIXED"`, `expression="`+name+`"`, 1)
+	activateTestCalculation(t, r, content)
+	r.runCalculationBatch()
+	check := func(want uint32) {
+		t.Helper()
+		got := r.ReadSample("digit-leading-test", testKey("FIXED_VALUE"))
+		if got.Value != want || got.StatusCode != domain.StatusGood {
+			t.Fatalf("fixed state input result=%#v want=%d/Good", got, want)
+		}
+	}
+	check(1)
+	page, err := r.ListCalculationStateInputs(context.Background(), api.PageRequest{Limit: 10, Query: name}, "active", "fixed", "source-a")
+	if err != nil || page.Total != 1 || len(page.Items) != 1 || page.Items[0].Name != name {
+		t.Fatalf("active binding missing: %#v err=%v", page, err)
+	}
+	r.OnLowerStatus(opc.LowerStatus{SourceID: "source-a", Connection: opc.ConnectionDisconnected, Session: opc.SessionInactive, Epoch: 1, Catalog: domain.CatalogReady})
+	r.runCalculationBatch()
+	check(5)
 }

@@ -14,6 +14,7 @@ const CommandsPage = lazy(() => import('./pages/CommandsPage'));
 const LowerLogsPage = lazy(() => import('./pages/LowerLogsPage'));
 const OperationsPage = lazy(() => import('./pages/OperationsPage'));
 const SettingsPage = lazy(() => import('./pages/SettingsPage'));
+const HelpPage = lazy(() => import('./pages/HelpPage'));
 
 export default function App() {
   return (
@@ -29,6 +30,7 @@ export default function App() {
         <Route path="lower-logs" element={<Suspense fallback={<LoadingState />}><LowerLogsPage /></Suspense>} />
         <Route path="operations" element={<Suspense fallback={<LoadingState />}><OperationsPage /></Suspense>} />
         <Route path="settings" element={<Suspense fallback={<LoadingState />}><SettingsPage /></Suspense>} />
+        <Route path="help" element={<Suspense fallback={<LoadingState />}><HelpPage /></Suspense>} />
         <Route path="*" element={<Navigate replace to="/" />} />
       </Route>
     </Routes></AuthGate>

@@ -289,3 +289,27 @@ func (srv *Server) ForceResampleSessionNodes(sessionID ua.NodeID, nodeIDs []ua.N
 	}
 	return count
 }
+
+// QueueSessionNodeValue never rereads mutable backing state and never delivers
+// one Session's command result to another Session.
+func (srv *Server) QueueSessionNodeValue(sessionID, nodeID ua.NodeID, value ua.DataValue) int {
+	session, ok := srv.sessionManager.GetBySessionID(sessionID)
+	if !ok {
+		return 0
+	}
+	count := 0
+	for _, sub := range srv.subscriptionManager.GetBySession(session) {
+		for _, item := range sub.Items() {
+			dc, ok := item.(*DataChangeMonitoredItem)
+			if !ok {
+				continue
+			}
+			monitored := dc.ItemToMonitor()
+			if monitored.NodeID == nodeID && monitored.AttributeID == ua.AttributeIDValue && monitored.IndexRange == "" {
+				dc.QueueValue(value)
+				count++
+			}
+		}
+	}
+	return count
+}

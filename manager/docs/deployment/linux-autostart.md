@@ -1,5 +1,7 @@
 # Linux 固定路径与开机自启
 
+> 本文保留早期用户级安装方式及模板说明。2026-09-28 现场已迁入 `/opt/rcd`、`/var/lib/rcd` 和 `/var/log/rcd`，manager/agent 入口分开；不要照本文旧入口覆盖现有服务。当前布局与原服务 drop-in 见 [软件版本与标准路径](version-and-paths.md)。
+
 管理端和下级进程守护均使用同一个固定入口：`~/.local/bin/RcdManager`。管理端由
 `rcd-manager.service` 运行；每个下级由 `rcd-process-agent@<instance>.service`
 运行。agent 再启动固定工作目录中的 `rcd_server`，因此网页停止下级后仍能通过

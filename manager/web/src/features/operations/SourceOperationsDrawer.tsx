@@ -3,7 +3,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { Activity, Cpu, FileText, ScrollText } from 'lucide-react';
 import { ApiError } from '../../api/client';
 import { operationKeys, useOperationsCapabilities, type OperationFeature } from '../../api/operations';
-import { processOperationTerminal, useProcessBinding, useProcessStatus, type ConfigRestartIntent } from '../../api/process';
+import { processMaintenanceActive, processOperationTerminal, useProcessBinding, useProcessStatus, type ConfigRestartIntent } from '../../api/process';
 import type { Source } from '../../api/types';
 import { Drawer } from '../../components/Drawer';
 import { InlineNotice } from '../../components/InlineNotice';
@@ -14,6 +14,7 @@ import { stateLabel } from '../../lib/labels';
 import { AcquisitionTab } from './AcquisitionTab';
 import { ConfigurationTab } from './ConfigurationTab';
 import { LogsTab } from './LogsTab';
+import { discardConfigurationDrafts, rememberedConfigurationFile } from './configurationDrafts';
 
 const ProcessTab = lazy(() => import('./ProcessTab').then((module) => ({ default: module.ProcessTab })));
 type OperationTab = OperationFeature | 'process';
@@ -33,7 +34,7 @@ function OperationsPanel({ source, sourceDeleted = false, onClose }: Props) {
   // background polling. ProcessTab alone polls a visible pending request.
   const processBinding = useProcessBinding(target);
   const processStatus = useProcessStatus(target, processBinding.data);
-  const [selectedTab, setSelectedTab] = useState<OperationTab>('acquisition');
+  const [selectedTab, setSelectedTab] = useState<OperationTab>(() => rememberedConfigurationFile(client, target) ? 'configuration' : 'acquisition');
   const [restartIntent, setRestartIntent] = useState<ConfigRestartIntent>();
   const [unresolvedProcess, setUnresolvedProcess] = useState(false);
   const [dirty, setDirty] = useState(false);
@@ -42,12 +43,13 @@ function OperationsPanel({ source, sourceDeleted = false, onClose }: Props) {
   const [discarding, setDiscarding] = useState(false);
   const supported = capabilities.data?.supported && capabilities.data.schema_version === 1;
   const features = capabilities.data?.features ?? [];
-  const tab = dirty || busy || selectedTab === 'process' ? selectedTab : features.includes(selectedTab) ? selectedTab : features[0] ?? 'acquisition';
+  const tab = dirty || busy || selectedTab === 'process' ? selectedTab : features.includes(selectedTab) ? selectedTab : tabs.find((item) => item.id !== 'process' && features.includes(item.id))?.id ?? 'acquisition';
   const sourceChanged = target.revision !== source.revision || target.endpoint !== source.endpoint;
   const connected = !sourceDeleted && source.enabled && source.connectionState.trim().toLowerCase() === 'connected';
   const capabilityConflict = capabilities.error instanceof ApiError && capabilities.error.code === 'source_revision_conflict';
   const processPending = unresolvedProcess || Boolean(processStatus.data?.pending_request_id || (processStatus.data?.pending_operation && !processOperationTerminal(processStatus.data.pending_operation)));
-  const writable = connected && !sourceChanged && Boolean(supported) && !capabilityConflict && !processPending;
+  const maintenanceActive = processMaintenanceActive(processStatus.data);
+  const writable = connected && !sourceChanged && Boolean(supported) && !capabilityConflict && !processPending && !maintenanceActive;
   const reportDirty = useCallback((value: boolean) => { if (value && tab) setSelectedTab(tab); setDirty(value); }, [tab]);
   const reportBusy = useCallback((value: boolean) => { if (value && tab) setSelectedTab(tab); setBusy(value); }, [tab]);
   const requestClose = useCallback(() => {
@@ -55,6 +57,7 @@ function OperationsPanel({ source, sourceDeleted = false, onClose }: Props) {
     if (dirty) setDiscarding(true);
     else onClose();
   }, [busy, childDialog, discarding, dirty, onClose]);
+  const discardAndClose = () => { discardConfigurationDrafts(client, target); onClose(); };
 
   useEffect(() => () => { void client.cancelQueries({ queryKey: operationKeys.source(target) }); }, [client, target.id, target.revision]);
   useEffect(() => {
@@ -72,6 +75,7 @@ function OperationsPanel({ source, sourceDeleted = false, onClose }: Props) {
       {sourceChanged ? <InlineNotice tone="warning">来源配置已变为版本 {source.revision}。当前抽屉保留旧目标和草稿，已锁定所有写操作；请先下载草稿，再关闭并重新打开运维。</InlineNotice> : null}
       {!connected && !sourceDeleted ? <InlineNotice tone="warning">下级 OPC 当前未连接，不能确认最新采集状态。已有内容仅供核对或下载；“进程”页仍可通过独立守护代理查询、启动下级，不会自动重试写操作。</InlineNotice> : null}
       {processPending && tab !== 'process' ? <InlineNotice tone="warning">存在尚未核对完成的进程作业，采集控制和配置保存暂时锁定；读取、草稿与日志仍可使用。请到“进程”页按原请求编号核对结果。</InlineNotice> : null}
+      {maintenanceActive && tab !== 'process' ? <InlineNotice tone="warning">发布维护尚未结束，采集控制和配置保存暂时锁定；草稿、读取与日志仍可使用。请到“进程”页查看维护阶段。</InlineNotice> : null}
       {busy ? <p className="operations-muted" role="status">正在核对请求结果，请稍候再关闭或切换标签。</p> : null}
       <div className="tab-list operations-tabs" role="tablist" aria-label="下级运维功能">{tabs.map(({ id, label, icon: Icon }) => {
         const available = id === 'process' || features.includes(id);
@@ -82,11 +86,11 @@ function OperationsPanel({ source, sourceDeleted = false, onClose }: Props) {
           {capabilities.error ? <ErrorState error={capabilities.error} title="无法读取下级运维能力" onRetry={() => void capabilities.refetch()} /> : null}
           {!supported && (dirty || busy) ? <InlineNotice tone="warning">下级运维能力已变化。当前草稿保留，写入已锁定；请先下载草稿再关闭面板。</InlineNotice> : null}
           {!capabilities.data && capabilities.isPending ? <LoadingState label="正在检查下级运维能力…" /> : capabilities.data && !supported && !dirty && !busy ? <EmptyState title={capabilities.data.supported ? '下级运维协议版本暂不兼容' : '此下级未提供运维能力'} description={capabilities.data.reason || '旧版下级仍可正常提供 OPC 数据；独立进程守护功能可在“进程”页配置，不依赖此能力。'} /> : supported || dirty || busy ? <>
-            {tab === 'acquisition' ? <AcquisitionTab target={target} writable={writable} stationVersions={features.includes('station_versions')} onBusyChange={reportBusy} onDialogChange={setChildDialog} /> : tab === 'configuration' ? <ConfigurationTab target={target} writable={writable} maxBytes={capabilities.data?.max_config_bytes ?? 2_097_152} onDirtyChange={reportDirty} onBusyChange={reportBusy} onRestartRequested={(intent) => { setRestartIntent(intent); setSelectedTab('process'); }} /> : tab === 'logs' ? <LogsTab target={target} maxBytes={capabilities.data?.max_log_bytes ?? 65_536} /> : <EmptyState title="下级未声明可用的运维功能" />}
+            {tab === 'acquisition' ? <AcquisitionTab target={target} writable={writable} stationVersions={features.includes('station_versions')} onBusyChange={reportBusy} onDialogChange={setChildDialog} /> : tab === 'configuration' ? <ConfigurationTab target={target} writable={writable} forms={features.includes('configuration_forms')} acquisition={features.includes('acquisition')} maxBytes={capabilities.data?.max_config_bytes ?? 2_097_152} onDirtyChange={reportDirty} onBusyChange={reportBusy} onRestartRequested={(intent) => { setRestartIntent(intent); setSelectedTab('process'); }} /> : tab === 'logs' ? <LogsTab target={target} maxBytes={capabilities.data?.max_log_bytes ?? 65_536} /> : <EmptyState title="下级未声明可用的运维功能" />}
           </> : null}
         </>}
       </div>
     </Drawer>
-    <Modal open={discarding} title="放弃未保存的配置草稿？" description="关闭后草稿不会写入下级，也不会为其他来源保留。可取消并先下载草稿。" onClose={() => setDiscarding(false)} footer={<><button className="button button-secondary" type="button" onClick={() => setDiscarding(false)}>保留草稿，继续编辑</button><button className="button button-danger" type="button" onClick={onClose}>放弃草稿并关闭</button></>}><p>此操作只丢弃浏览器内的编辑内容，不会修改下级配置文件。</p></Modal>
+    <Modal open={discarding} title="放弃未保存的配置草稿？" description="明确放弃会清除本来源的内存草稿，不会写入下级。可取消并先下载草稿；普通页面跳转则保留当前登录期间的副本。" onClose={() => setDiscarding(false)} footer={<><button className="button button-secondary" type="button" onClick={() => setDiscarding(false)}>保留草稿，继续编辑</button><button className="button button-danger" type="button" onClick={discardAndClose}>放弃草稿并关闭</button></>}><p>此操作只丢弃浏览器内的编辑内容，不会修改下级配置文件。</p></Modal>
   </>;
 }

@@ -8,6 +8,7 @@ import { EmptyState, ErrorState, LoadingState } from '../../components/PageState
 import { Pagination } from '../../components/Pagination';
 import { copyText } from '../../lib/clipboard';
 import { formatDateTime } from '../../lib/format';
+import { isValidStateInputName } from './stateInputNames';
 
 export type StateTarget = { source_id: string; port_id: string; device_id: string };
 export type StateBinding = { name: string; mode: 'fixed' | 'group_default'; group_id?: string; targets: StateTarget[] };
@@ -65,12 +66,19 @@ export default function StateInputsTab() {
   };
   const open = (binding?: StateBinding) => {
     if (!draftBundle.data) return;
-    setBase(draftBundle.data); setOriginalName(binding?.name ?? ''); setNormalized(false); setError('');
-    setEdit(binding ? bindingOnly(binding) : { name: '', mode: 'group_default', group_id: groups.data?.[0]?.id ?? '', targets: [] });
+    const bundle = draftBundle.data;
+    // A displayed row can still belong to the previous page response. Content
+    // and the CAS revision must always come from the same complete snapshot.
+    const current = binding ? bundle.inputs.find((input) => input.name === binding.name) : undefined;
+    if (binding && !current) { setError('该状态输入已从草稿移除，请刷新列表后再编辑。'); return; }
+    setBase(bundle); setOriginalName(current?.name ?? ''); setNormalized(false); setError('');
+    setMessage(binding && values.data?.revision !== bundle.revision ? `列表与草稿版本不同，已载入草稿 r${bundle.revision} 中的最新映射，请核对后保存。` : '');
+    setEdit(current ? bindingOnly(current) : { name: '', mode: 'group_default', group_id: groups.data?.[0]?.id ?? '', targets: [] });
   };
   const save = async (remove = false) => {
     if (remove && !window.confirm(`从草稿删除 ${originalName}？引用它的公式也需要修改。当前活动版本不受影响。`)) return;
     if (!base || !edit || !normalized) return;
+    if (!remove && !isValidStateInputName(edit.name)) throw new Error('变量名最长128字符，只能使用英文字母、数字和下划线，不能是纯数字或IF/true/false');
     if (!remove && base.inputs.some((input) => input.name === edit.name && input.name !== originalName)) throw new Error('变量名已存在');
     const inputs = base.inputs.filter((input) => input.name !== originalName);
     if (!remove) inputs.push(bindingOnly(edit));
@@ -99,7 +107,7 @@ export default function StateInputsTab() {
     setMessage(missing.length ? `以下来源未找到同名串口和站点，请手动选择：${missing.join('、')}` : '已匹配同名串口和站点，请核对后保存。');
   };
   return <section className="calculation-tab-panel state-inputs-panel">
-    <div className="workflow-note"><strong>① 选择站点并命名 → ② 保存草稿 → ③ 在规则配置中校验、激活</strong><span>当前生效与草稿分开显示；保存草稿不会修改正在运行的公式。</span></div>
+    <div className="workflow-note"><strong>① 选择站点并命名 → ② 保存草稿 → ③ 在规则配置中校验、激活</strong><span>激活后直接生成同名只读 UInt32 OPC 节点（ns=2），无需转发公式。保存草稿不会立即生效。</span></div>
     <details className="secondary-settings"><summary>状态 0～5 是什么意思？</summary><div className="state-legend">{['未知 / 过期', '通信正常', '通信异常', '串口未打开', '已停用', '下级离线'].map((label, value) => <span key={value}><b>{value}</b>{label}</span>)}</div><p>状态质量 Good 表示判断有效，不表示设备正常。离线保留数值 5，不清零。</p></details>
     <form className="toolbar filter-toolbar state-input-filters" onSubmit={(event) => { event.preventDefault(); setQuery(search.trim()); setPage(0); }}>
       <label className="field inline-field">查看<select aria-label="配置视图" value={view} onChange={(e) => { setView(e.target.value as typeof view); setPage(0); }}><option value="active">当前生效</option><option value="draft">已保存草稿（未生效）</option></select></label>
@@ -120,14 +128,15 @@ export default function StateInputsTab() {
     {edit ? <section className="content-panel state-input-editor" aria-label="状态输入配置">
       <h3>{originalName ? '编辑状态输入' : '新增状态输入'}</h3>
       <fieldset className="unstyled-fieldset" disabled={busy}>
-      <div className="toolbar"><label className="field">变量名<input aria-label="变量名" value={edit.name} maxLength={128} onChange={(e) => setEdit({ ...edit, name: e.target.value })} placeholder="RCD46_WCH0_11_STATE" /></label>
+      <div className="toolbar"><label className="field">变量名<input aria-label="变量名" aria-describedby="state-input-name-hint" value={edit.name} maxLength={128} onChange={(e) => setEdit({ ...edit, name: e.target.value })} placeholder="9CYE91GH201_COM1" /></label>
       <label className="field">取源模式<select aria-label="取源模式" value={edit.mode} onChange={(e) => setEdit({ name: edit.name, mode: e.target.value as StateBinding['mode'], group_id: e.target.value === 'group_default' ? groups.data?.[0]?.id : undefined, targets: [] })}><option value="group_default">跟随组默认来源</option><option value="fixed">固定来源</option></select></label>
       {edit.mode === 'group_default' ? <label className="field">逻辑组<select aria-label="逻辑组" value={edit.group_id ?? ''} onChange={(e) => setEdit({ ...edit, group_id: e.target.value, targets: [] })}><option value="">请选择</option>{groups.data?.map((g) => <option key={g.id} value={g.id}>{g.name} ({g.id})</option>)}</select></label> : <label className="field">下级来源<select aria-label="下级来源" value={edit.targets[0]?.source_id ?? ''} onChange={(e) => setEdit({ ...edit, targets: [{ source_id: e.target.value, port_id: '', device_id: '' }] })}><option value="">请选择</option>{sourceItems.map((s) => <option key={s.id} value={s.id}>{s.name} ({s.id})</option>)}</select></label>}</div>
+      <p id="state-input-name-hint">允许数字开头，如9CYE91GH201_COM1；最长128字符，只能使用英文字母、数字和下划线，不能是纯数字或IF/true/false，不能与现有点或计算输出重名。</p>
       {selectedSources.map((source) => <TargetPicker key={source.id} source={source.id} label={`${source.name} (${source.id})`} group={edit.mode === 'group_default' ? edit.group_id : undefined} value={edit.targets.find((t) => t.source_id === source.id)} onChange={(target) => setEdit((current) => current ? { ...current, targets: [...current.targets.filter((t) => t.source_id !== target.source_id), target] } : current)} />)}
       {edit.mode === 'group_default' ? <p>每个候选来源都需要选择对应站点。允许各来源使用不同的串口或站号；缺少映射时不能激活。<button className="button button-secondary" disabled={busy} onClick={() => void act(autofill)}>按已选站点匹配其他来源</button></p> : null}
-      <p>公式示例：<code>IF({edit.name || '状态变量名'} == 1, 0, 1)</code>（正常 0，其他状态报警 1）。</p>
+      <p>OPC 输出：<code>ns=2;s={edit.name || '状态变量名'}</code>（UInt32，只读，激活后生效）。也可在其他公式中引用：<code>IF({edit.name || '状态变量名'} == 1, 0, 1)</code>。</p>
       <label><input type="checkbox" checked={normalized} onChange={(e) => setNormalized(e.target.checked)} />我确认保存时规范化草稿 TOML 排版并移除注释，保留现有规则字段值。</label>
-      <div className="toolbar"><button className="button button-primary" disabled={busy || !normalized || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(edit.name) || !selectedSources.length || selectedSources.some((source) => !edit.targets.some((target) => target.source_id === source.id && target.port_id && target.device_id))} onClick={() => void act(() => save())}>保存草稿</button>{originalName ? <button className="button button-outline" disabled={busy || !normalized} onClick={() => void act(() => save(true))}>从草稿删除</button> : null}<button className="button button-secondary" disabled={busy} onClick={() => setEdit(null)}>取消</button></div></fieldset>
+      <div className="toolbar"><button className="button button-primary" disabled={busy || !normalized || !isValidStateInputName(edit.name) || !selectedSources.length || selectedSources.some((source) => !edit.targets.some((target) => target.source_id === source.id && target.port_id && target.device_id))} onClick={() => void act(() => save())}>保存草稿</button>{originalName ? <button className="button button-outline" disabled={busy || !normalized} onClick={() => void act(() => save(true))}>从草稿删除</button> : null}<button className="button button-secondary" disabled={busy} onClick={() => setEdit(null)}>取消</button></div></fieldset>
     </section> : null}
     {values.isPending ? <LoadingState /> : values.error ? <ErrorState error={values.error} onRetry={() => void values.refetch()} /> : <section className="table-panel content-panel"><div className="table-scroll"><table className="data-table responsive-table state-input-table"><thead><tr><th>变量名</th><th>取源模式</th><th>当前实际站点</th><th>状态值</th><th>质量 / 错误</th><th>观测时间</th><th>操作</th></tr></thead><tbody>{values.data?.items.map((item) => <tr className="virtual-row" key={item.name}><td><code>{item.name}</code></td><td>{item.mode === 'fixed' ? '固定来源' : `跟随默认来源 · ${item.group_id}`}</td><td>{item.resolved_target ? <><strong>{sourceItems.find((source) => source.id === item.resolved_target?.source_id)?.name || item.resolved_target.source_id}</strong><span className="sub-cell">{item.resolved_target.port_id} / 站点 {item.resolved_target.device_id}</span><small>{item.resolved_target.source_id}</small></> : '无有效目标'}</td><td>{item.value} · {item.state_text}</td><td className={item.status_code ? 'text-bad' : ''}>{item.status_code ? 'BadConfigurationError' : 'Good'}{item.error ? <span className="sub-cell">{item.error}</span> : null}</td><td>{formatDateTime(item.observed_at)}</td><td><div className="table-actions"><button className="button button-small" onClick={() => void act(async () => { await copyStateName(item.name); setMessage('变量名已复制'); })}>复制变量名</button><Link className="button button-small" to={`?tab=config&insert=${encodeURIComponent(item.name)}`}>插入公式</Link>{view === 'draft' ? <button className="button button-small" disabled={busy || !draftBundle.data || !!edit} onClick={() => open(item)}>编辑</button> : null}</div></td></tr>)}</tbody></table></div>{!values.data?.items.length ? <EmptyState title={query || filterMode || filterSource || filterStatus ? '没有匹配的状态输入' : view === 'active' ? '尚未激活状态输入' : '草稿中尚无状态输入'} description={query || filterMode || filterSource || filterStatus ? '请清空筛选或调整条件。' : '新增站点映射并保存草稿后，前往规则配置校验、激活。'} /> : null}<Pagination page={page + 1} pageSize={50} total={values.data?.total ?? 0} onPageChange={(next) => setPage(next - 1)} /></section>}
   </section>;

@@ -40,14 +40,10 @@ func stationStatusResult(t *testing.T, revision uint64, open bool) json.RawMessa
 func TestStationVersionCacheRejectsOutOfOrderWithinEpochAndAcceptsResetAfterReconnect(t *testing.T) {
 	const sourceID = "source-a"
 	runtime := &Runtime{
-		broker:                  api.NewBroker(),
-		catalogs:                map[string]domain.SourceCatalog{sourceID: {SourceID: sourceID}},
-		statuses:                map[string]opc.LowerStatus{sourceID: {SourceID: sourceID, Epoch: 9}},
-		stationVersions:         make(map[string]domain.SourceStationVersions),
-		stationVersionEpoch:     make(map[string]uint64),
-		stationRefreshDirty:     make(map[string]bool),
-		stationFeatureEpoch:     make(map[string]uint64),
-		stationFeatureSupported: make(map[string]bool),
+		calculations: newTestCalculationService(),
+		broker:       api.NewBroker(),
+		catalogs:     map[string]domain.SourceCatalog{sourceID: {SourceID: sourceID}},
+		statuses:     map[string]opc.LowerStatus{sourceID: {SourceID: sourceID, Epoch: 9}},
 	}
 	source := domain.Source{ID: sourceID}
 
@@ -89,8 +85,9 @@ func TestStationVersionCacheRejectsOutOfOrderWithinEpochAndAcceptsResetAfterReco
 		t.Fatal(err)
 	}
 	snapshot, _ = runtime.StationVersions(sourceID)
-	if snapshot.StationRevision != "1" || runtime.stationVersionEpoch[sourceID] != 10 {
-		t.Fatalf("new-epoch snapshot = %#v epoch=%d", snapshot, runtime.stationVersionEpoch[sourceID])
+	_, epoch, live, _ := runtime.stations.read(sourceID)
+	if snapshot.StationRevision != "1" || epoch != 10 || !live {
+		t.Fatalf("new-epoch snapshot = %#v epoch=%d live=%v", snapshot, epoch, live)
 	}
 
 	// A successful old-Session Call arriving after reconnect is discarded.
@@ -108,19 +105,25 @@ func TestStationVersionRefreshKeepsInvalidationArrivingInFlight(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runtime := &Runtime{
-		runContext: ctx, stationRefreshQueue: make(chan string, 1),
-		stationRefreshPending: make(map[string]bool), stationRefreshDirty: make(map[string]bool),
+		runContext: ctx,
+		statuses:   map[string]opc.LowerStatus{"source-a": {SourceID: "source-a"}},
 	}
 	runtime.running.Store(true)
 	runtime.queueStationVersionRefresh("source-a")
-	if sourceID := <-runtime.stationRefreshQueue; sourceID != "source-a" {
-		t.Fatalf("queued source = %q", sourceID)
+	ticket := <-runtime.stationSync.queue()
+	if ticket.sourceID != "source-a" {
+		t.Fatalf("queued ticket = %+v", ticket)
 	}
 	runtime.queueStationVersionRefresh("source-a")
-	if !runtime.finishStationVersionRefresh("source-a") || !runtime.stationRefreshPending["source-a"] {
+	if !runtime.stationSync.finish(ticket) {
 		t.Fatal("in-flight invalidation was not retained for a second refresh")
 	}
-	if runtime.finishStationVersionRefresh("source-a") || runtime.stationRefreshPending["source-a"] {
+	runtime.queueStationVersionRefresh("source-a")
+	next := <-runtime.stationSync.queue()
+	if next == ticket || runtime.stationSync.finish(ticket) || !runtime.stationSync.current(next) {
+		t.Fatal("old completion consumed the replacement refresh")
+	}
+	if runtime.stationSync.finish(next) || runtime.stationSync.current(next) {
 		t.Fatal("pending marker was not released after the clean refresh")
 	}
 }
@@ -160,7 +163,7 @@ func TestLateStationVersionPersistenceRestoresPreviousOrClears(t *testing.T) {
 	if err := repository.SaveSourceStationVersions(ctx, late); err != nil {
 		t.Fatal(err)
 	}
-	runtime := &Runtime{repo: repository}
+	runtime := &Runtime{repo: repository, calculations: newTestCalculationService()}
 	if err := runtime.restoreStationVersionPersistence("source-a", previous, true); err != nil {
 		t.Fatal(err)
 	}

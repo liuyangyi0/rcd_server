@@ -93,10 +93,15 @@ Groups/<group_id>/Members
 点表和全部成员的 seqlock：整套读取前后必须是同一个非零偶数。客户端可先用它从
 KKS 精确反查逻辑组，再通过成员的 `ProvidedPointNodeIds` / `MissingPointNodeIds` 判断该来源是否
 提供兼容的此点。`CoverageKnown=false` 时清单尚未完成；冲突来源的清单只相对当前可发布组并集，
-用于诊断而不能表示该来源全部原始目录。客户端 Browse 成员树确认 source、实际串口和子站关系，再将目标 `source_id` 作为 String
-写入同组的 `SelectedSourceId`。写入与业务点 Read/Subscribe 必须使用同一个 OPC Session；
+用于诊断而不能表示该来源全部原始目录。`MemberSourceIds` 是已配置成员列表，包含离线、停用和不可选来源，不是健康列表；须另查成员的 `Selectable`、`ConnectionState`、`CatalogState` 和 `CompleteCoverage`。允许选择有效缓存的离线成员，`Selectable=true` 不保证在线或点值为Good。
+
+客户端 Browse 成员树确认 source、实际串口和子站关系。推荐在同一OPC Session内读取 `SelectionRevision`，调用组对象下的 `SelectSource(SourceId String, ExpectedRevision UInt64) -> (SelectedSourceId String, SelectionRevision UInt64)`。例如ObjectId为`ns=3;s=Groups/device-a`，MethodId为`ns=3;s=Groups/device-a/SelectSource`。只有客户端提供的期望版本匹配才提交；版本冲突返回`BadInvalidState`且不修改选择。成功输出来自本次已提交路由，不通过另一次读取得到；返回后仍可能有后续合法操作。
+
+旧客户端仍可将目标 `source_id` 作为String写入同组 `SelectedSourceId`，NodeId、类型和语义保持；它没有客户端期望版本参数，先读Revision再普通Write也不能防止陈旧意图覆盖。新Method与Web/旧Write共用路由事务、命令锁、审计和订阅刷新；不允许另设旁路。以上操作与业务点 Read/Subscribe 必须使用同一个 OPC Session；
 切换的是该 Session 的整个逻辑设备组，不是整台下级，也不是一个 KKS。成员树没有写接口，
 串口/子站映射只能通过经过 revision 校验的 Web/REST 配置修改。
+
+新增Method已于2026-10-21随`0.6.12-state-names.20261021.1`部署到30、58、46，其他旧服务须先确认能力。参数数量缺少/多余为`BadArgumentsMissing`/`BadTooManyArguments`，类型不符为`BadTypeMismatch`，目标不可选为`BadConfigurationError`，组有在途事务为`BadWaitingForResponse`。失败不返回成功输出，不用最新revision自动重试旧选择。手动Method与旧Write都会将本Session本组改为手动固定；`SelectionRevision`不是通信程序`TransmitStatus.revision`。切源不撤回旧下级已接受的快照，也不建立独占发送权。
 
 `Configured` 表示设备已有效归入该组（包括继承来源默认组），`ExplicitlyBound` 只表示存在人工
 绑定；`PresentInTopology` 表示设备存在于最后一份已验证的拓扑快照，来源是否在线另看
@@ -147,10 +152,26 @@ KKS 精确反查逻辑组，再通过成员的 `ProvidedPointNodeIds` / `Missing
 实际串口和下级命令 NodeId。不可重写原始协议字节；目标地址必须与选中设备匹配。
 无法唯一确定设备、端口、选源或成员关系时返回 `BadConfigurationError`，不派发命令。
 无新拓扑/无设备 bindings 的旧配置仍按原单组规则处理。
-pending 保持 `source_id + physical port`，同一物理串口跨设备仍互斥；选源锁针对本次命中的逻辑组。
+pending 保持 `source_id + physical port`，同一物理串口跨设备仍只能执行一条；选源锁针对本次命中的逻辑组。
+连续写 `_Send` 或组 `Send` 时，管理端为每条命令保存独立载荷并按该端口的接受顺序发送，
+队列最多 64 条（包含正在执行的一条）。队满明确返回 `BadWaitingForResponse`；不会覆盖旧命令。
+接受成功不等于设备成功。排队命令也锁定所在组选源，并计入维护排空数量。
+总期限包含排队时间，沿用管理端命令 pending 超时（默认 30 秒）。下级明确返回失败后继续下一条；
+如果管理端失联、等待超时或不能确认上一条执行结果，则终止剩余队列并记录原因，不自动重发。
+管理端重启也不会重放这些命令。同步 `SendCommand` 方法保持忙时拒绝，不参与排队。
+
+`_Send` 的空值、IDLE、0/1/2/3 是被动复位/状态写，不是硬件控制命令。它不进硬件 FIFO、没有发送次数审计，但仍受管理端/来源维护及同端口互斥保护；复位 RPC 正在执行时新的同端口命令明确返回 `BadWaitingForResponse`，不会假装入队成功。复位结束才释放占用。这项保护随 2026-10-23 审查修复，当前为隔离验证版，见[复查记录](../validation/command-chain-adversarial-review-20261023.md)，不能据本文假定旧现场版本已具备。
+
+关联协议的 `Expired` 可能由下级独立看门狗提前报告，不能证明串口 worker 已退出交换或释放占用。因此管理端保留超时结果并取消该端口未派发的队列，不因稍后收到该条的成功证据自动恢复队列。明确的完成 ACK/失败则在下级释放物理占用后发布，才允许接续下一条；同一条命令 ACK 超时重试耗尽与执行结果未知是不同情况。补查只补审计，不重投、不追溯更改已经返回给客户端的结论。
+
+新版采集下级可设置 `settings.command_interval_ms`，在同一串口上一控制事务完成后延迟下一条首次发送；默认 0，保存配置后重启下级生效，配置步骤见[下级配置说明](lower-operations.md#控制命令最小发送间隔)。等待期间不阻塞普通采集，不改变同条命令重试。不同管理端没有共享 FIFO，但连接同一下级时都受该下级的物理串口间隔约束。间隔等待不会更新管理端的总期限，关联请求仅传递当时剩余的执行预算；到期不补发。
+
+Web 命令记录显示“排队待发送”，每条命令仍保存独立审计。OPC 可读取
+`Groups/<group>/QueuedCommandCount`、`ExecutingCommandCount`、`CommandQueueCapacityPerPort`；
+原 `PendingCommandCount` 是排队与执行的合计。`_Send` 结果仍代表该 Session 最近接受的一条，
+不要求订阅者收到所有中间状态；要核对每条命令请看审计。不同管理端之间没有共享 FIFO。
 `_Send` 写入保持 pending 至设备 ACK 或超时；ACK 绑定已固定的 source/port/epoch，
-Session 关闭不重定向正在执行的命令。上级 `SendCommand` 保留原方法签名，但管理器将其转换为
-所选下级 `_Send` 写入并同步等待设备 ACK：只有 ACK `1` 返回 `Good` 和 Result `"1"`，ACK `3`
+Session 关闭不重定向正在执行的命令。上级`SendCommand`保留原方法签名，共用命令派发与ACK等待；下级支持`command_tracking`时使用关联`submit_command`，明确不支持时才兼容`_Send`写入。新接口超时或结果不明不退回旧接口重发。只有ACK `1`返回`Good`和Result `"1"`，仅表示协议确认；ACK `3`
 返回坏状态，串口停用/不可服务保留下级状态，等待超时返回 `BadTimeout`。其 pending 锁同样保持到
 设备终态，不再把下级 OPC 入队成功当作设备执行成功。
 旧共享 `_Send` 读取优先显示该 Session 最近一次该节点命令的结果，按 command ID

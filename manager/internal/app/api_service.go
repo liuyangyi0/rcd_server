@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"rcd_manager/internal/api"
+	"rcd_manager/internal/buildinfo"
 	"rcd_manager/internal/domain"
 	"rcd_manager/internal/opc"
 	"rcd_manager/internal/store"
@@ -30,6 +32,7 @@ func (r *Runtime) Overview(ctx context.Context) (api.Overview, error) {
 	subscriptionCount := r.subscriptionCount
 	r.mu.RUnlock()
 	result := api.Overview{
+		BuildInfo:    buildinfo.Current(),
 		ManagerState: "Running", OPCEndpoint: r.options.OPCEndpoint,
 		GroupCount: len(groups), SourceCount: len(sources), SessionCount: len(sessions),
 		Version: r.options.Version, GitSHA: r.options.GitSHA, SystemTime: time.Now().UTC(),
@@ -240,7 +243,7 @@ func (r *Runtime) DeleteGroup(ctx context.Context, id string, revision uint64) e
 	for _, source := range removedSources {
 		delete(candidateCatalogs, source.ID)
 	}
-	candidateIndex, states, candidateConflictCount, err := buildCatalogIndexWithCalculations(candidateCatalogs, r.calculationPlan, r.calculationRetiredPoints, candidate)
+	candidateIndex, states, candidateConflictCount, err := r.buildCatalogWithCalculations(candidateCatalogs, candidate)
 	if err != nil {
 		return err
 	}
@@ -256,13 +259,14 @@ func (r *Runtime) DeleteGroup(ctx context.Context, id string, revision uint64) e
 	if err := r.validateUpstream(candidateIndex, candidate, candidateSources); err != nil {
 		return err
 	}
+	r.stationSync.writerMu.Lock()
+	defer r.stationSync.writerMu.Unlock()
 	if err := r.routes.CommitConfiguration(candidate, candidateSources, func() error {
 		return r.repo.DeleteGroupCascade(ctx, id, revision)
 	}); err != nil {
 		return err
 	}
-	delete(r.redundancyPolicies, id)
-	delete(r.redundancyStates, id)
+	r.redundancy.remove(id)
 	r.broker.Publish(api.Event{Type: "alarm.changed", Data: map[string]string{"group_id": id}})
 	for _, source := range removedSources {
 		r.stopLower(source.ID)
@@ -271,7 +275,7 @@ func (r *Runtime) DeleteGroup(ctx context.Context, id string, revision uint64) e
 	r.mu.Lock()
 	for sourceID, catalog := range candidateCatalogs {
 		if r.catalogs[sourceID].State != catalog.State {
-			r.dirtyCatalogs[sourceID] = catalog
+			r.catalogPersistence.queue(catalog)
 		}
 	}
 	r.catalogs = candidateCatalogs
@@ -279,7 +283,9 @@ func (r *Runtime) DeleteGroup(ctx context.Context, id string, revision uint64) e
 	r.conflictCount = candidateConflictCount
 	for _, source := range removedSources {
 		delete(r.statuses, source.ID)
-		delete(r.dirtyCatalogs, source.ID)
+		r.stations.remove(source.ID)
+		r.stationSync.remove(source.ID)
+		r.catalogPersistence.discard(source.ID)
 		delete(r.quarantinedSources, source.ID)
 		for key := range r.ackSequences {
 			if strings.HasPrefix(key, source.ID+"\x00") {
@@ -287,9 +293,6 @@ func (r *Runtime) DeleteGroup(ctx context.Context, id string, revision uint64) e
 				delete(r.ackEpochs, key)
 			}
 		}
-	}
-	if len(r.dirtyCatalogs) == 0 {
-		r.catalogPersistError = ""
 	}
 	r.mu.Unlock()
 	for _, source := range removedSources {
@@ -468,7 +471,7 @@ func (r *Runtime) CreateSource(ctx context.Context, mutation api.SourceMutation)
 	candidateCatalogs := cloneCatalogMap(r.catalogs)
 	r.mu.RUnlock()
 	candidateCatalogs[source.ID] = domain.SourceCatalog{SourceID: source.ID, GroupID: source.GroupID, State: domain.CatalogDiscovering}
-	candidateIndex, states, candidateConflictCount, err := buildCatalogIndexWithCalculations(candidateCatalogs, r.calculationPlan, r.calculationRetiredPoints, oldGroups)
+	candidateIndex, states, candidateConflictCount, err := r.buildCatalogWithCalculations(candidateCatalogs, oldGroups)
 	if err != nil {
 		return api.SourceView{}, err
 	}
@@ -519,6 +522,9 @@ func (r *Runtime) CreateSource(ctx context.Context, mutation api.SourceMutation)
 }
 
 func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, mutation api.SourceMutation) (api.SourceView, error) {
+	if row,_,err:=r.repo.FleetBinding(ctx,id);err==nil&&row.Machine!=nil{
+		if mutation.Endpoint!=row.Machine.OPCEndpoint||mutation.Name!=row.Machine.Name{return api.SourceView{},&domain.OperationError{Code:"conflict",Message:"来源名称与地址由发布平台统一台账管理；业务配置仍可在此修改"}}
+	}else if err!=nil&&!errors.Is(err,domain.ErrNotFound){return api.SourceView{},err}
 	if mutation.ID == "" {
 		mutation.ID = id
 	}
@@ -615,7 +621,7 @@ func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, 
 		candidateCatalogs[id] = previous
 		var states map[string]domain.CatalogState
 		var validateErr error
-		candidateIndex, states, candidateConflictCount, validateErr = buildCatalogIndexWithCalculations(candidateCatalogs, r.calculationPlan, r.calculationRetiredPoints, oldGroups)
+		candidateIndex, states, candidateConflictCount, validateErr = r.buildCatalogWithCalculations(candidateCatalogs, oldGroups)
 		if validateErr != nil {
 			return api.SourceView{}, validateErr
 		}
@@ -668,24 +674,20 @@ func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, 
 		r.catalogs = candidateCatalogs
 		r.index = candidateIndex
 		r.conflictCount = candidateConflictCount
-		delete(r.dirtyCatalogs, id)
+		r.catalogPersistence.discard(id)
 		if (bindingsChanged && !resetCatalog) || candidateCatalogs[id].QuarantineReason != "" {
-			r.dirtyCatalogs[id] = candidateCatalogs[id]
-		}
-		if len(r.dirtyCatalogs) == 0 {
-			r.catalogPersistError = ""
+			r.catalogPersistence.queue(candidateCatalogs[id])
 		}
 		r.mu.Unlock()
 		if resetCatalog {
-			if clearErr := r.repo.ClearSourceStationVersions(ctx, id); clearErr != nil {
-				r.mu.Lock()
-				r.stationPersistError = clearErr.Error()
-				r.mu.Unlock()
-			}
+			r.stationSync.writerMu.Lock()
+			clearErr := r.repo.ClearSourceStationVersions(ctx, id)
 			r.mu.Lock()
-			delete(r.stationVersions, id)
-			delete(r.stationVersionEpoch, id)
+			r.stations.remove(id)
+			r.stationSync.remove(id)
+			r.stationSync.persistenceResult(id, clearErr)
 			r.mu.Unlock()
+			r.stationSync.writerMu.Unlock()
 		}
 	}
 	if restartRequired && updated.Enabled && r.running.Load() {
@@ -729,7 +731,7 @@ func (r *Runtime) DeleteSource(ctx context.Context, id string, revision uint64) 
 	candidateCatalogs := cloneCatalogMap(r.catalogs)
 	r.mu.RUnlock()
 	delete(candidateCatalogs, id)
-	candidateIndex, states, candidateConflictCount, err := buildCatalogIndexWithCalculations(candidateCatalogs, r.calculationPlan, r.calculationRetiredPoints, oldGroups)
+	candidateIndex, states, candidateConflictCount, err := r.buildCatalogWithCalculations(candidateCatalogs, oldGroups)
 	if err != nil {
 		return err
 	}
@@ -745,6 +747,8 @@ func (r *Runtime) DeleteSource(ctx context.Context, id string, revision uint64) 
 	if err := r.validateUpstream(candidateIndex, oldGroups, candidate); err != nil {
 		return err
 	}
+	r.stationSync.writerMu.Lock()
+	defer r.stationSync.writerMu.Unlock()
 	if err := r.routes.CommitConfiguration(oldGroups, candidate, func() error {
 		return r.repo.DeleteSource(ctx, id, revision)
 	}); err != nil {
@@ -755,29 +759,22 @@ func (r *Runtime) DeleteSource(ctx context.Context, id string, revision uint64) 
 	r.mu.Lock()
 	for sourceID, catalog := range candidateCatalogs {
 		if r.catalogs[sourceID].State != catalog.State {
-			r.dirtyCatalogs[sourceID] = catalog
+			r.catalogPersistence.queue(catalog)
 		}
 	}
 	r.catalogs = candidateCatalogs
 	r.index = candidateIndex
 	r.conflictCount = candidateConflictCount
 	delete(r.statuses, id)
-	delete(r.stationVersions, id)
-	delete(r.stationVersionEpoch, id)
-	delete(r.stationRefreshPending, id)
-	delete(r.stationRefreshDirty, id)
-	delete(r.stationFeatureEpoch, id)
-	delete(r.stationFeatureSupported, id)
-	delete(r.dirtyCatalogs, id)
+	r.stations.remove(id)
+	r.stationSync.remove(id)
+	r.catalogPersistence.discard(id)
 	delete(r.quarantinedSources, id)
 	for key := range r.ackSequences {
 		if strings.HasPrefix(key, id+"\x00") {
 			delete(r.ackSequences, key)
 			delete(r.ackEpochs, key)
 		}
-	}
-	if len(r.dirtyCatalogs) == 0 {
-		r.catalogPersistError = ""
 	}
 	r.mu.Unlock()
 	deleted := opc.LowerStatus{SourceID: id}
@@ -929,6 +926,9 @@ func (r *Runtime) ListCommands(ctx context.Context, request api.PageRequest) (ap
 		GroupID: request.GroupID, SourceID: request.SourceID, Status: request.Status,
 		Query: request.Query, From: request.From, To: request.To, Limit: limit, Offset: offset,
 	})
+	if err == nil {
+		err = r.repo.AttachCommandSummaries(ctx, items)
+	}
 	return api.CommandPage{Items: items, Total: total, Limit: limit, Offset: offset}, err
 }
 
@@ -943,13 +943,16 @@ func (r *Runtime) Health(ctx context.Context) api.HealthStatus {
 		checks["database"] = err.Error()
 	}
 	r.mu.RLock()
-	catalogError := r.catalogPersistError
-	commandError := r.commandPersistError
-	auditError := r.auditPersistError
-	statusError := r.statusPersistError
-	stationError := r.stationPersistError
-	lowerLogError := r.lowerLogPersistError
-	upstreamError := r.upstreamReconcileError
+	_, catalogError := r.catalogPersistence.status()
+	commandError := r.tracking.audit.health()
+	_, auditError := r.managementAudit.state()
+	_, _, statusError := r.statusHistory.state()
+	stationError := r.stationSync.persistenceError()
+	lowerLogError := ""
+	if r.lowerLogs != nil {
+		lowerLogError = r.lowerLogs.HealthError()
+	}
+	upstreamError := r.upstreamCatalogErrorLocked()
 	r.mu.RUnlock()
 	if catalogError == "" {
 		checks["catalog_persistence"] = "ok"
@@ -964,7 +967,7 @@ func (r *Runtime) Health(ctx context.Context) api.HealthStatus {
 	if commandError == "" {
 		checks["command_persistence"] = "ok"
 	} else {
-		checks["command_persistence"] = commandError
+		checks["command_persistence"] = "warning: " + commandError
 	}
 	if auditError == "" {
 		checks["management_audit_persistence"] = "ok"
@@ -986,7 +989,15 @@ func (r *Runtime) Health(ctx context.Context) api.HealthStatus {
 	} else {
 		checks["central_lower_log_persistence"] = lowerLogError
 	}
-	ok := err == nil && catalogError == "" && commandError == "" && auditError == "" && statusError == "" && stationError == "" && lowerLogError == "" && upstreamError == ""
+	ok := err == nil && catalogError == "" && auditError == "" && statusError == "" && stationError == "" && lowerLogError == "" && upstreamError == ""
+	// Audit degradation is visible but intentionally not a readiness failure.
+	if r.tracking != nil {
+		r.tracking.mu.Lock()
+		for source, message := range r.tracking.errors {
+			checks["command_tracking/"+source] = "warning: " + message
+		}
+		r.tracking.mu.Unlock()
+	}
 	return api.HealthStatus{OK: ok, Status: ternary(ok, "ok", "unhealthy"), Checks: checks, Time: time.Now().UTC()}
 }
 
@@ -1002,9 +1013,13 @@ func (r *Runtime) Ready(ctx context.Context) api.HealthStatus {
 }
 
 func (r *Runtime) audit(ctx context.Context, kind, target string, revision uint64, details map[string]any) {
-	if details == nil {
-		details = make(map[string]any)
+	// Enrich a private top-level map; callers may reuse their details after this
+	// call. The audit component freezes nested values before accepting the save.
+	ownedDetails := make(map[string]any, len(details)+2)
+	for key, value := range details {
+		ownedDetails[key] = value
 	}
+	details = ownedDetails
 	info := api.RequestInfoFromContext(ctx)
 	if info.RemoteAddress != "" {
 		details["remote_address"] = info.RemoteAddress
@@ -1019,21 +1034,12 @@ func (r *Runtime) audit(ctx context.Context, kind, target string, revision uint6
 	entry := domain.AuditEntry{Kind: kind, Actor: actor, Target: target, Revision: revision,
 		Details: details, OccurredAt: time.Now().UTC()}
 	persistContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	_, err := r.repo.AppendAudit(persistContext, entry)
+	saved, err := r.managementAudit.save(persistContext, entry, r.repo.AppendAudit)
 	cancel()
-	key := fmt.Sprintf("%s\x00%s\x00%d\x00%d", kind, target, revision, entry.OccurredAt.UnixNano())
-	r.mu.Lock()
-	if err != nil {
-		r.dirtyAudits[key] = entry
-		r.auditPersistError = err.Error()
-	} else if len(r.dirtyAudits) == 0 {
-		r.auditPersistError = ""
-	}
-	r.mu.Unlock()
 	if err != nil {
 		slog.Error("persist management audit", "kind", kind, "target", target, "error", err)
 	} else {
-		r.broker.Publish(api.Event{Type: "management.audit", Data: entry})
+		r.broker.Publish(api.Event{Type: "management.audit", Data: saved})
 	}
 }
 
@@ -1053,7 +1059,7 @@ func (r *Runtime) source(id string) (domain.Source, error) {
 
 func (r *Runtime) rebuildIndexLocked() {
 	groups := r.routes.Groups()
-	index, states, conflicts, err := buildCatalogIndexWithCalculations(r.catalogs, r.calculationPlan, r.calculationRetiredPoints, groups)
+	index, states, conflicts, err := r.buildCatalogWithCalculations(r.catalogs, groups)
 	if err != nil {
 		return
 	}

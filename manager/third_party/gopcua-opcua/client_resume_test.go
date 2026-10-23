@@ -188,9 +188,12 @@ const (
 )
 
 type resumePeerConfig struct {
-	failure      resumeFailure
-	openAccepted chan struct{}
-	openRelease  chan struct{}
+	failure           resumeFailure
+	openAccepted      chan struct{}
+	openRelease       chan struct{}
+	publishFault      ua.StatusCode
+	publishFaultCount int
+	callFault         ua.StatusCode
 }
 
 type resumePeer struct {
@@ -214,6 +217,7 @@ type resumePeer struct {
 	transferTokens      []uint32
 	republished         []uint32
 	replayedAck         bool
+	callCount           int
 }
 
 func newResumePeer(t *testing.T, parent context.Context, config ...resumePeerConfig) *resumePeer {
@@ -365,6 +369,18 @@ func (p *resumePeer) response(request ua.Request, conn *uacp.Conn, channel int) 
 			}
 		}
 		p.mu.Unlock()
+		if p.cfg.publishFaultCount > 0 {
+			if count <= p.cfg.publishFaultCount {
+				header.ServiceResult = p.cfg.publishFault
+				return &ua.ServiceFault{ResponseHeader: header}
+			}
+			if count == p.cfg.publishFaultCount+1 {
+				return &ua.PublishResponse{ResponseHeader: header, SubscriptionID: 300,
+					NotificationMessage: resumeNotification(1, 11)}
+			}
+			<-p.ctx.Done()
+			return nil
+		}
 		if channel == 1 && count > 1 {
 			select {
 			case <-p.cut:
@@ -425,6 +441,12 @@ func (p *resumePeer) response(request ua.Request, conn *uacp.Conn, channel int) 
 		return &ua.DeleteSubscriptionsResponse{ResponseHeader: header, Results: make([]ua.StatusCode, len(req.SubscriptionIDs))}
 	case *ua.CloseSessionRequest:
 		return &ua.CloseSessionResponse{ResponseHeader: header}
+	case *ua.CallRequest:
+		p.mu.Lock()
+		p.callCount++
+		p.mu.Unlock()
+		header.ServiceResult = p.cfg.callFault
+		return &ua.ServiceFault{ResponseHeader: header}
 	default:
 		header.ServiceResult = ua.StatusBadServiceUnsupported
 		return &ua.ServiceFault{ResponseHeader: header}

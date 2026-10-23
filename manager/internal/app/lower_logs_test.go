@@ -17,7 +17,7 @@ func TestLowerLogIngestIsIdempotentAndRejectsSequenceGaps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime.lowerLogs = logStore
+	runtime.lowerLogs = lowerlogs.NewService(runtime.repo, logStore, nil)
 	now := time.Now().UTC()
 	batch := api.LowerLogBatch{SourceID: "source-a", BootID: "boot-a", FirstSequence: 1, Events: []api.LowerLogEvent{
 		{SourceID: "source-a", BootID: "boot-a", Sequence: 1, Timestamp: now, Level: "INFO", Component: "serial", PortID: "/dev/ttyWCH0", DeviceID: "11", Message: "poll ok"},
@@ -52,7 +52,7 @@ func TestLowerLogIngestRejectsUnknownSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime.lowerLogs = logStore
+	runtime.lowerLogs = lowerlogs.NewService(runtime.repo, logStore, nil)
 	_, err = runtime.IngestLowerLogs(context.Background(), api.LowerLogBatch{SourceID: "missing", BootID: "boot", FirstSequence: 1,
 		Events: []api.LowerLogEvent{{SourceID: "missing", BootID: "boot", Sequence: 1, Timestamp: time.Now().UTC(), Level: "INFO", Message: "x"}}})
 	if !errors.Is(err, domain.ErrNotFound) {

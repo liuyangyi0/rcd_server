@@ -56,6 +56,17 @@ afterEach(() => {
 });
 
 describe('point comparison rendered transitions', () => {
+  it.each(['/points?group=device-a&page=3', compareRoute + '&page=3'])('keeps pagination available on an empty stale page: %s', async (route) => {
+    const points = vi.spyOn(api, 'points').mockImplementation(async (params) => ({ ...pointPage(params), items: params.page === 3 ? [] : pointPage(params).items }));
+    const { user } = setup(route);
+    await screen.findByRole('button', { name: '返回末页' });
+    expect(screen.getByText('3 / 1 页')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '返回末页' }));
+    await screen.findByText('A_VALUE');
+    expect(screen.getByText('1 / 1 页')).toBeInTheDocument();
+    expect(points.mock.calls.some(([params]) => params.page === 1)).toBe(true);
+  });
+
   it('does not render false missing points while only one filtered side has returned', async () => {
     const right = deferred<PageResult<Point>>();
     const points = vi.spyOn(api, 'points').mockImplementation(async (params) => params.query && params.routeSourceId === 'lower-b' ? right.promise : pointPage(params));

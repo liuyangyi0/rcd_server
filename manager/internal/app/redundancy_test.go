@@ -18,8 +18,7 @@ func redundancyRuntime(t *testing.T) *Runtime {
 		topology := &domain.SourceTopology{SchemaVersion: 1, Ports: []domain.TopologyPort{{PortID: "COM1", PortName: "COM1", SendNodeID: "COM1_Send", SendMethodID: "COM1_SendCommand", Devices: []domain.TopologyDevice{{DeviceID: "1", DeviceAddress: 1, NodeIDs: []string{"KKS001", "KKS002"}}}}}}
 		r.OnCatalog(domain.SourceCatalog{SourceID: id, GroupID: "line", State: domain.CatalogReady, DiscoveredAt: time.Now(), Topology: topology, Nodes: []domain.CatalogNode{testNode("KKS001"), testNode("KKS002"), testStringNode("COM1_Send"), testMethodNode("COM1_SendCommand")}})
 		r.mu.Lock()
-		r.stationVersions[id] = domain.SourceStationVersions{ObservedAt: time.Now().UTC(), TopologyFingerprint: domain.SourceTopologyFingerprint(r.catalogs[id].Topology), Ports: []domain.StationVersionPort{{PortID: "COM1", Enabled: true, AppliedEnabled: true, Open: true, Devices: []domain.StationVersion{{DeviceID: "1", ReadEnabled: true, AppliedReadEnabled: true, CommunicationOK: true}}}}}
-		r.stationVersionEpoch[id] = 1
+		r.stations.replace(id, domain.SourceStationVersions{ObservedAt: time.Now().UTC(), TopologyFingerprint: domain.SourceTopologyFingerprint(r.catalogs[id].Topology), Ports: []domain.StationVersionPort{{PortID: "COM1", Enabled: true, AppliedEnabled: true, Open: true, Devices: []domain.StationVersion{{DeviceID: "1", ReadEnabled: true, AppliedReadEnabled: true, CommunicationOK: true}}}}}, 1, true)
 		r.mu.Unlock()
 		for _, node := range []string{"KKS001", "KKS002"} {
 			r.OnSample(id, testKey(node), domain.Sample{Type: domain.DataTypeDouble, Value: 1.0, Epoch: 1, SourceTimestamp: time.Now().UTC()})
@@ -46,10 +45,10 @@ func saveRedundancyTest(t *testing.T, r *Runtime, defaults, compare bool) {
 }
 func setStationGood(r *Runtime, id string, good bool) {
 	r.mu.Lock()
-	v := r.stationVersions[id].Clone()
+	v, _ := r.stations.snapshot(id)
 	v.Ports[0].Devices[0].CommunicationOK = good
 	v.ObservedAt = time.Now().UTC()
-	r.stationVersions[id] = v
+	r.stations.replace(id, v, 1, true)
 	r.mu.Unlock()
 }
 
@@ -114,7 +113,7 @@ func TestRedundancySwitchDelayManualIsolationAndPending(t *testing.T) {
 func TestRedundancyDefaultSwitchAndPersistence(t *testing.T) {
 	r := redundancyRuntime(t)
 	activateTestCalculation(t, r, "[[rules]]\nkks_calc = \"CENTRAL\"\ndata_type = \"double\"\nexpression = \"KKS001 * 2\"\n")
-	before := r.calculationRouteRevision
+	before := r.calculations.status().DefaultRouteRevision
 	saveRedundancyTest(t, r, true, false)
 	ctx := context.Background()
 	at := time.Now()
@@ -130,7 +129,7 @@ func TestRedundancyDefaultSwitchAndPersistence(t *testing.T) {
 	if err != nil || groups[0].DefaultSourceID != "source-b" {
 		t.Fatal(groups, err)
 	}
-	if r.calculationRouteRevision <= before {
+	if r.calculations.status().DefaultRouteRevision <= before {
 		t.Fatal("calculation route revision not advanced")
 	}
 	loaded, err := NewRuntime(ctx, r.repo, RuntimeOptions{})
@@ -189,9 +188,9 @@ func TestRedundancyRejectsStaleAndIncompleteCandidates(t *testing.T) {
 	r.openSession("auto")
 	setStationGood(r, "source-a", false)
 	r.mu.Lock()
-	v := r.stationVersions["source-b"].Clone()
+	v, _ := r.stations.snapshot("source-b")
 	v.ObservedAt = at.Add(-time.Minute)
-	r.stationVersions["source-b"] = v
+	r.stations.replace("source-b", v, 1, true)
 	r.mu.Unlock()
 	r.redundancyTick(ctx, at)
 	r.redundancyTick(ctx, at.Add(3*time.Second))
@@ -287,7 +286,7 @@ func TestRedundancyAlarmSurvivesRestartAndGroupDeletion(t *testing.T) {
 	if err != nil || len(alarms) != 0 {
 		t.Fatal(alarms, err)
 	}
-	if _, exists := restored.redundancyPolicies[group.ID]; exists {
+	if _, exists := restored.redundancy.configuredPolicy(group.ID); exists {
 		t.Fatal("deleted policy retained")
 	}
 }
@@ -340,8 +339,11 @@ func TestRedundancyCooldownAndCandidateChangedBeforeCommit(t *testing.T) {
 	setStationGood(r, "source-a", false)
 	r.redundancyTick(ctx, at.Add(time.Second))
 	r.configMu.Lock()
-	state := r.redundancyStates["line"]
+	state, version := r.redundancy.begin("line")
 	state.view.LastSwitchAt = at.Add(time.Second)
+	if !r.redundancy.commit("line", version, state) {
+		t.Fatal("stale test evaluation")
+	}
 	r.configMu.Unlock()
 	r.redundancyTick(ctx, at.Add(2*time.Second))
 	route, _ := r.routes.Route("auto", "line")

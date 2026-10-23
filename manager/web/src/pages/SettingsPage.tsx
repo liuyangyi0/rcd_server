@@ -9,6 +9,8 @@ import { PageHeader } from '../components/PageHeader';
 import { InlineNotice } from '../components/InlineNotice';
 import { CopyTextButton } from '../components/CopyTextButton';
 import { formatDateTime, shortClientName, shortSessionId } from '../lib/format';
+import { SoftwareVersions } from '../features/operations/SoftwareVersions';
+import { FleetStatus } from '../features/operations/FleetStatus';
 
 function formatBytes(value: number): string {
   if (value < 0) return '不可用';
@@ -72,6 +74,8 @@ export default function SettingsPage() {
 
       {loading ? <LoadingState /> : error ? <ErrorState error={error} onRetry={() => void Promise.all([overview.refetch(), groups.refetch(), sessions.refetch(), system.refetch()])} /> : (
         <div className="settings-layout">
+          <SoftwareVersions />
+          <FleetStatus />
           <section className="settings-section">
             <h2>服务接口</h2>
             <dl className="settings-list">

@@ -147,7 +147,7 @@ func TestLiveStationCommunicationReconnect(t *testing.T) {
 	client, _ := connectLiveManagerAnonymous(t, endpoint, "station-health-reconnect")
 	defer client.Close(context.Background())
 	ns := namespaceIndex(client.Namespaces())[ManagementNamespaceURI]
-	node := gu.NewStringNodeID(ns, "Groups/real-hardware/Members/rcd92-58/Ports/%2Fdev%2FttyWCH0/Devices/11/CommunicationState")
+	node := gu.NewStringNodeID(ns, "Groups/serial-acquisition/Members/rcd-58/Ports/%2Fdev%2FttyWCH0/Devices/11/CommunicationState")
 	notifications := make(chan *gopcua.PublishNotificationData, 64)
 	sub, err := client.Subscribe(ctx, &gopcua.SubscriptionParameters{Interval: 250 * time.Millisecond}, notifications)
 	if err != nil {
@@ -161,7 +161,7 @@ func TestLiveStationCommunicationReconnect(t *testing.T) {
 	setEnabled := func(enabled bool) error {
 		operationCtx, operationCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer operationCancel()
-		url := apiURL + "/api/v1/sources/rcd92-58"
+		url := apiURL + "/api/v1/sources/rcd-58"
 		request, _ := http.NewRequestWithContext(operationCtx, http.MethodGet, url, nil)
 		response, err := http.DefaultClient.Do(request)
 		if err != nil {

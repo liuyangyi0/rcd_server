@@ -17,6 +17,7 @@ docker exec $ContainerName apk add --no-cache musl-dev pkgconfig libudev-zero-de
 Write-Host "=== 4. 拷贝源码到容器 ===" -ForegroundColor Cyan
 docker exec $ContainerName mkdir -p /app
 docker cp src ${ContainerName}:/app/src
+docker cp crates ${ContainerName}:/app/crates
 docker cp serialport-rs ${ContainerName}:/app/serialport-rs
 docker cp Cargo.toml ${ContainerName}:/app/Cargo.toml
 docker cp Cargo.lock ${ContainerName}:/app/Cargo.lock

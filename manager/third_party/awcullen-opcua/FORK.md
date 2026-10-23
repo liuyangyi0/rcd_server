@@ -35,6 +35,12 @@ not silently move to a different server implementation.
   `(session, node)` monitored items after a route switch.
 - `Server.Sessions` returns immutable lifecycle snapshots. Endpoint caching is
   synchronized and returns defensive slice copies.
+- `QueueSessionNodeValue` / `DataChangeMonitoredItem.QueueValue` append a captured
+  command outcome to the initiating Session's matching Value monitors, even
+  when it equals the previous result. Already queued outcomes are retained,
+  stale poll samples are cleared, and disabled monitors remain disabled.
+  Client queue limits and publishing cadence still apply. Regression:
+  `server/command_notification_test.go`.
 - Username-token RSA ciphertext blocks use the modulus size, not the private
   exponent length. A valid key may have a shorter exponent; the old calculation
   rejected such keys during otherwise valid username connections. Endpoint,

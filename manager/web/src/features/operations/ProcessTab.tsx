@@ -10,6 +10,10 @@ import { EmptyState, ErrorState, LoadingState } from '../../components/PageState
 import { StatusBadge } from '../../components/StatusBadge';
 import { formatDateTime, formatDuration } from '../../lib/format';
 import { downloadText, operationFailure } from './shared';
+import { processMaintenanceActive, processMaintenanceBlocks } from '../../api/process';
+import { ProcessMaintenanceNotice } from './ProcessMaintenanceNotice';
+import { ProcessAgentIdentity } from './ProcessAgentIdentity';
+import { FleetStatus } from './FleetStatus';
 
 const stateLabels: Record<ProcessState, string> = { stopped: '已停止', starting: '正在启动', running: '运行中', stopping: '正在停止', failed: '进程失败', unknown: '状态未知' };
 const actionLabels: Record<ProcessAction, string> = { start: '启动', stop: '停止', restart: '重启' };
@@ -34,13 +38,14 @@ export function ProcessTab(props: Props) {
   const reportDirty = useCallback((value: boolean) => { setBindingDirty(value); props.onDirtyChange(value); }, [props.onDirtyChange]);
   const reportPending = useCallback((value: boolean) => { setControlPending(value); props.onControlPendingChange(value); }, [props.onControlPendingChange]);
   const scope = processTarget(props.target, binding.data);
-  const blocked = controlPending || Boolean(status.data?.pending_request_id || (status.data?.pending_operation && !processOperationTerminal(status.data.pending_operation)));
+  const blocked = controlPending || processMaintenanceActive(status.data) || Boolean(status.data?.pending_request_id || (status.data?.pending_operation && !processOperationTerminal(status.data.pending_operation)));
 
   return <div className="operations-tab-content operations-process">
-    <InlineNotice><strong>独立守护代理管理真实下级进程。</strong><p>进程运行不等于 OPC 已连接，也不等于串口采集正常。停止后仍可通过守护代理启动；不会改变 Session 选源或自动切换到其他来源。配置文件编辑需要下级 OPC 在线；进程管理和守护日志不受此限制。</p></InlineNotice>
+    <InlineNotice><strong>独立守护代理管理真实下级进程。</strong><p>进程运行不等于 OPC 已连接，也不等于串口采集正常。无活动维护时可通过守护代理启动；不会改变 Session 选源或自动切换到其他来源。配置文件编辑需要下级 OPC 在线；进程管理和守护日志不受此限制。</p></InlineNotice>
     {binding.error ? <ErrorState error={binding.error} title="无法读取守护绑定" onRetry={() => void binding.refetch()} /> : null}
     {!binding.data && binding.isPending ? <LoadingState label="正在读取守护代理绑定…" /> : binding.data ? <>
-      <BindingEditor target={props.target} binding={binding.data} writable={props.writable && !binding.error && !blocked} onDirtyChange={reportDirty} onBusyChange={props.onBusyChange} refresh={() => void binding.refetch()} refreshing={binding.isFetching} />
+      {binding.data.registry_device_id ? <FleetStatus sourceId={props.target.id} /> : null}
+      <BindingEditor target={props.target} binding={binding.data} writable={props.writable && !binding.error && !blocked && !binding.data.registry_device_id} onDirtyChange={reportDirty} onBusyChange={props.onBusyChange} refresh={() => void binding.refetch()} refreshing={binding.isFetching} />
       {scope ? <ProcessControl key={`${scope.bindingRevision}:${scope.instanceId}`} {...props} target={scope} binding={binding.data} writable={props.writable && !binding.error && !bindingDirty} onControlPendingChange={reportPending} /> : <EmptyState title="尚未绑定进程守护代理" description="填写此物理下级对应的代理地址和固定实例 ID，并显式保存。未绑定不会影响现有 OPC 数据，也不会自动发现或启动任何程序。" />}
       <ProcessHistoryView target={props.target} />
     </> : null}
@@ -72,7 +77,7 @@ function BindingEditor({ target, binding, writable, onDirtyChange, onBusyChange,
   return <section className="operations-process-card" aria-label="守护代理绑定">
     <div className="operations-port-heading"><h3>守护代理绑定</h3><span className="operations-muted">绑定版本 {binding.revision}</span></div>
     <dl className="operations-file-meta"><div><dt>代理地址</dt><dd>{binding.agent_url || '未配置'}</dd></div><div><dt>固定实例 ID</dt><dd>{binding.instance_id || '未配置'}</dd></div></dl>
-    <div className="operations-editor-actions"><button className="button button-small button-secondary" type="button" disabled={save.isPending || dirty} onClick={() => { setBaseline(binding); setAgentUrl(binding.agent_url); setInstanceId(binding.instance_id); setEditing(true); setMessage(''); save.reset(); }}>编辑守护绑定</button><button className="button button-small button-outline" type="button" disabled={refreshing || save.isPending} onClick={refresh}><RefreshCw size={14} aria-hidden="true" />刷新绑定（保留编辑）</button></div>
+    <div className="operations-editor-actions"><button className="button button-small button-secondary" type="button" disabled={!writable || save.isPending || dirty} onClick={() => { setBaseline(binding); setAgentUrl(binding.agent_url); setInstanceId(binding.instance_id); setEditing(true); setMessage(''); save.reset(); }}>编辑守护绑定</button><button className="button button-small button-outline" type="button" disabled={refreshing || save.isPending} onClick={refresh}><RefreshCw size={14} aria-hidden="true" />刷新绑定（保留编辑）</button></div>
     {editing ? <form className="operations-process-binding" onSubmit={(event) => { event.preventDefault(); void saveDraft(); }}>
       <label className="field"><span>守护代理 URL</span><input aria-label="守护代理 URL" type="url" maxLength={2048} value={agentUrl} disabled={save.isPending} placeholder="http://lower-host:8090" onChange={(event) => { setAgentUrl(event.target.value); setMessage(''); save.reset(); }} /></label>
       <label className="field"><span>固定实例 ID</span><input aria-label="固定实例 ID" maxLength={256} value={instanceId} disabled={save.isPending} onChange={(event) => { setInstanceId(event.target.value); setMessage(''); save.reset(); }} /></label>
@@ -123,6 +128,8 @@ function ProcessControl({ target, binding, writable, connected, restartIntent, o
   const currentWritable = useRef(writable);
   currentWritable.current = writable;
   const snapshot = status.data;
+  const latestStatus = useRef({ snapshot, unavailable: Boolean(status.error) || status.isFetching });
+  latestStatus.current = { snapshot, unavailable: Boolean(status.error) || status.isFetching };
   const requestId = tracked?.requestId || snapshot?.pending_request_id || snapshot?.pending_operation?.request_id || '';
   const busy = mutation.isPending || checking;
   // Persist the original request before sending it, but do not query/resolve it
@@ -189,12 +196,12 @@ function ProcessControl({ target, binding, writable, connected, restartIntent, o
   }, [job.data?.request_id, job.data?.state, connected, tracked?.config?.name, tracked?.config?.revision, configCheck?.requestId, verifyConfiguration]);
 
   const openAction = (action: ProcessAction) => {
-    if (actionsDisabled || !snapshot) return;
+    if (actionsDisabled || !snapshot || processMaintenanceBlocks(snapshot, action)) return;
     setConfirmed(false); setLocalError(''); mutation.reset();
     setConfirming({ action, snapshot, config: action === 'stop' ? undefined : restartIntent });
   };
   const submitAction = async () => {
-    if (!confirming || !confirmed || confirmationStale || actionsDisabled) return;
+    if (!confirming || !confirmed || confirmationStale || actionsDisabled || processMaintenanceBlocks(snapshot, confirming.action)) return;
     const captured = confirming;
     setLocalError(''); setChecking(true);
     let request: TrackedRequest | undefined;
@@ -204,6 +211,14 @@ function ProcessControl({ target, binding, writable, connected, restartIntent, o
         if (current.revision !== captured.config.revision) throw new ApiError(409, { code: 'conflict', message: '所保存文件已再次变化，未发送进程动作。请回到配置页核对；不能把当前磁盘版本当成之前确认的版本。' }, '配置版本冲突');
       }
       if (!alive.current || !currentWritable.current) return;
+      const latest = latestStatus.current;
+      // Query notifications can be batched until after this async continuation.
+      // Check the cache as well as the rendered state before recording any POST.
+      const cached = client.getQueryState<SourceProcessStatus>(processKeys.status(target));
+      const current = cached?.data ?? latest.snapshot;
+      if (latest.unavailable || cached?.status === 'error' || cached?.fetchStatus === 'fetching' || !current || current.revision !== captured.snapshot.revision || processMaintenanceBlocks(current, captured.action)) {
+        throw new ApiError(409, { code: 'conflict', message: '代理状态或维护保护已变化，未发送进程动作。请取消并刷新核对。' }, '维护状态变化');
+      }
       request = { requestId: newRequestId(), action: captured.action, expectedRevision: captured.snapshot.revision, config: captured.config, expectedConfigRevisions: captured.action === 'restart' && captured.config ? { [captured.config.name]: captured.config.revision } : undefined };
       writeTracking(target, request); setTracked(request); setConfigCheck(undefined); setPollRound((value) => value + 1); setConfirming(undefined);
       await mutation.mutateAsync({ revision: request.expectedRevision, action: request.action, requestId: request.requestId, expectedConfigRevisions: request.expectedConfigRevisions });
@@ -229,6 +244,7 @@ function ProcessControl({ target, binding, writable, connected, restartIntent, o
   };
 
   return <>
+    {snapshot ? <ProcessAgentIdentity value={snapshot.agent_identity} stale={Boolean(status.error)} /> : null}
     <section className="operations-process-card" aria-label="下级进程状态">
       <div className="operations-port-heading"><h3>下级进程</h3><button className="button button-small button-secondary" type="button" disabled={status.isFetching || job.isFetching} onClick={refresh}><RefreshCw size={14} aria-hidden="true" />刷新进程与作业</button></div>
       {status.error ? <ErrorState error={status.error} title="代理状态未确认，不能判断进程已停止" onRetry={refresh} /> : null}
@@ -236,24 +252,26 @@ function ProcessControl({ target, binding, writable, connected, restartIntent, o
         <div className="operations-state-row"><StatusBadge state={status.error || snapshot.state === 'unknown' ? 'warning' : snapshot.state === 'running' ? 'good' : snapshot.state === 'failed' ? 'bad' : 'unknown'} label={status.error ? '旧状态，仅供核对' : stateLabels[snapshot.state]} /><span>期望：{snapshot.desired_state === 'running' ? '运行' : '停止'}</span><span>OPC：{connected ? '已连接' : '未连接'}</span></div>
         <dl className="operations-file-meta"><div><dt>进程编号 PID</dt><dd>{snapshot.pid || '—'}</dd></div><div><dt>代理状态版本</dt><dd><code>{snapshot.revision}</code></dd></div><div><dt>启动时间</dt><dd>{formatDateTime(snapshot.started_at)}</dd></div><div><dt>已运行时间（采样值）</dt><dd>{formatDuration(snapshot.uptime_seconds ?? 0)}</dd></div><div><dt>程序路径</dt><dd>{snapshot.executable || '代理未提供'}</dd></div><div><dt>工作目录</dt><dd>{snapshot.work_dir || '代理未提供'}</dd></div><div><dt>守护自动拉起策略</dt><dd>{snapshot.restart_policy === 'on-failure' ? '异常退出后拉起' : snapshot.restart_policy === 'never' ? '不自动拉起' : '代理未提供'}</dd></div><div><dt>累计重启尝试（含手动）</dt><dd>{snapshot.restart_count ?? 0} 次</dd></div><div><dt>最近退出</dt><dd>{formatDateTime(snapshot.last_exit_at)} · 退出码 {snapshot.exit_code ?? '—'}{snapshot.last_stop_forced ? ' · 上次停止使用了强制终止' : ''}</dd></div></dl>
         {snapshot.last_error ? <div className="top-error" role="alert">最近进程错误：{snapshot.last_error}</div> : null}
+        <ProcessMaintenanceNotice snapshot={snapshot} stale={Boolean(status.error)} />
       </> : null}
       {effectiveIntent ? <InlineNotice tone={configApplied ? 'info' : 'warning'}><strong>{configApplied ? '已核对配置' : '待核对配置'}：{effectiveIntent.name}</strong><p>所保存版本 <code>{effectiveIntent.revision}</code>。{configApplied ? '该版本已由下级确认生效；此确认仅对应本次请求及此文件版本，不代表其他配置或串口采集健康。' : '启动或重启应用该下级当前磁盘的全部已保存配置，不是单文件原子应用；重启成功后还需核对运行版本。'}</p>{!busy && restartIntent ? <button className="button button-small button-outline" type="button" onClick={onClearRestartIntent}>仅管理进程，不核对该配置</button> : null}</InlineNotice> : null}
       {pending ? <InlineNotice tone="warning">进程作业待完成或结果未知，暂不接受新的控制。可继续查看日志、刷新状态或关闭面板；关闭不会取消已提交动作，也不会自动重发。</InlineNotice> : null}
-      <div className="operations-editor-actions"><button className="button button-primary" type="button" disabled={actionsDisabled || !['stopped', 'failed'].includes(snapshot?.state ?? '')} onClick={() => openAction('start')}><Play size={15} aria-hidden="true" />启动下级</button><button className="button button-outline" type="button" disabled={actionsDisabled || snapshot?.state !== 'running'} onClick={() => openAction('stop')}><Square size={15} aria-hidden="true" />停止下级</button><button className="button button-secondary" type="button" disabled={actionsDisabled || snapshot?.state !== 'running'} onClick={() => openAction('restart')}><RotateCw size={15} aria-hidden="true" />重启下级</button></div>
-      <p className="operations-muted">手动停止会保留守护代理，随后可再次启动。自动拉起策略只读，由代理启动参数配置；不会自动故障切源。</p>
+      <div className="operations-editor-actions"><button className="button button-primary" type="button" disabled={actionsDisabled || processMaintenanceBlocks(snapshot, 'start') || !['stopped', 'failed'].includes(snapshot?.state ?? '')} onClick={() => openAction('start')}><Play size={15} aria-hidden="true" />启动下级</button><button className="button button-outline" type="button" disabled={actionsDisabled || processMaintenanceBlocks(snapshot, 'stop') || snapshot?.state !== 'running'} onClick={() => openAction('stop')}><Square size={15} aria-hidden="true" />停止下级</button><button className="button button-secondary" type="button" disabled={actionsDisabled || processMaintenanceBlocks(snapshot, 'restart') || snapshot?.state !== 'running'} onClick={() => openAction('restart')}><RotateCw size={15} aria-hidden="true" />重启下级</button></div>
+      <p className="operations-muted">手动停止会保留守护代理；再次启动仍须满足当前维护限制。自动拉起策略只读，由代理启动参数配置；不会自动故障切源。</p>
       {localError ? <div className="top-error" role="alert">{localError}</div> : null}
       {resolveError ? <div className="top-error" role="alert">{resolveError} 本页不会自动重试封存请求或改用新的动作编号；可手动刷新，同一请求仍只作对账。</div> : null}
       {requestId ? <div className="operations-process-job" role="status"><strong>{job.data ? jobLabels[job.data.state] : busy ? '正在提交，等待受理' : '请求结果尚未确认'}</strong><p>请求编号：<code>{requestId}</code></p>{job.data ? <p>动作：{actionLabels[job.data.action]} · 最后更新 {formatDateTime(job.data.updated_at)}{job.data.forced ? ' · 使用过强制停止' : ''}</p> : null}{job.data?.error_code === 'unconfirmed_cancelled' ? <p>本次未确认作业已封存，不会再次执行；请核对当前进程状态。</p> : job.data?.error ? <p>{job.data.error}</p> : null}{job.error ? <p>暂未取得作业权威结果；包括临时 404 在内的查询失败不会当作未执行。{apiErrorMessage(job.error)}</p> : null}{!terminal ? <p>{!reconciliationEnabled ? '正在等待首次提交响应；此时不会查询或封存该请求。' : polling ? '仅在此页可见时查询该请求，最多自动查询两分钟；不会重发控制动作。' : '自动查询窗口已结束，结果仍未确认。请手动刷新进程与作业；不会自动解锁或重发。'}</p> : job.data?.state === 'succeeded' ? <p>进程动作已确认完成；OPC 连接、串口采集与配置生效状态仍需分别核对。</p> : null}</div> : null}
       {job.data?.state === 'succeeded' && tracked?.config && job.data.action !== 'stop' ? <div className={configCheck?.state === 'applied' ? 'success-banner' : 'operations-confirm-inline'} role="status"><p>{configCheck?.text || '等待 OPC 重新连接后核对配置是否真正生效。进程运行不代表配置已应用。'}</p><button className="button button-small button-outline" type="button" disabled={!connected || configCheck?.state === 'checking'} onClick={() => void verifyConfiguration(job.data!, tracked.config!)}>核对配置生效状态</button></div> : null}
     </section>
     <section className="operations-process-card" aria-label="守护进程日志"><div className="operations-port-heading"><h3>守护日志 · stdout / stderr</h3><button className="button button-small button-outline" type="button" onClick={() => setShowLog((value) => !value)}><ScrollText size={15} aria-hidden="true" />{showLog ? '收起守护日志' : '读取守护日志'}</button></div><p className="operations-muted">下级停止后仍可经守护代理读取固定日志尾部，最多 64 KiB；不查询任意文件，不后台轮询。</p>{showLog ? <ProcessOutput target={target} /> : null}</section>
-    <Modal open={Boolean(confirming)} title={`确认${confirming ? actionLabels[confirming.action] : ''}下级进程`} description="此操作作用于物理下级的整个进程，不是重连 OPC，也不是切换当前 Session 的数据源。" onClose={() => { if (!busy) setConfirming(undefined); }} footer={<><button className="button button-secondary" type="button" disabled={busy} onClick={() => setConfirming(undefined)}>取消</button><button className={`button ${confirming?.action === 'start' ? 'button-primary' : 'button-danger'}`} type="button" disabled={!confirmed || confirmationStale || actionsDisabled} onClick={() => void submitAction()}>{busy ? '正在核对并提交…' : `确认${confirming ? actionLabels[confirming.action] : ''}进程`}</button></>}>
+    <Modal open={Boolean(confirming)} title={`确认${confirming ? actionLabels[confirming.action] : ''}下级进程`} description="此操作作用于物理下级的整个进程，不是重连 OPC，也不是切换当前 Session 的数据源。" onClose={() => { if (!busy) setConfirming(undefined); }} footer={<><button className="button button-secondary" type="button" disabled={busy} onClick={() => setConfirming(undefined)}>取消</button><button className={`button ${confirming?.action === 'start' ? 'button-primary' : 'button-danger'}`} type="button" disabled={!confirmed || confirmationStale || actionsDisabled || Boolean(confirming && processMaintenanceBlocks(snapshot, confirming.action))} onClick={() => void submitAction()}>{busy ? '正在核对并提交…' : `确认${confirming ? actionLabels[confirming.action] : ''}进程`}</button></>}>
       <div className="operations-process-confirm">
       <p>物理来源：<strong>{target.id}</strong>；实例：<code>{target.instanceId}</code>；当前 PID：{confirming?.snapshot.pid || '—'}。</p>
       <p>停止或重启会中断该下级全部串口、站点、命令与所有客户端的数据；不会自动切换其他来源。守护代理不随下级停止，之后仍可启动。</p>
       <p>启动或重启将应用当前磁盘的全部已保存配置；未保存的浏览器草稿不会应用。只有明确提交后才执行，接受请求不代表执行完成。</p>
       {confirming?.config ? <p>本次核对 {confirming.config.name} 的版本 <code>{confirming.config.revision}</code>。{!connected ? '当前 OPC 离线，提交前无法重新读取文件；启动后会核对实际运行版本。' : '提交前会再次读取文件版本；发现变更则不发送动作。'}</p> : null}
       {confirmationStale ? <InlineNotice tone="warning">代理状态版本已变化。请取消，刷新状态后重新确认。</InlineNotice> : null}
+      {confirming && processMaintenanceBlocks(snapshot, confirming.action) ? <InlineNotice tone="warning">维护保护已阻止此动作，请取消并核对发布状态。</InlineNotice> : null}
       {localError ? <div className="top-error" role="alert">{localError}</div> : null}
       <label className="operations-check"><input type="checkbox" checked={confirmed} disabled={busy} onChange={(event) => setConfirmed(event.target.checked)} /><span>我确认此操作影响该物理下级的全部站点及所有客户端，并已核对实例、进程和已保存配置。</span></label>
       </div>

@@ -13,21 +13,7 @@ import (
 	"rcd_manager/internal/calculation"
 )
 
-type CalculationStatus struct {
-	RoutingMode              string    `json:"routing_mode"`
-	ActiveRevision           uint64    `json:"active_revision"`
-	ConfigHash               string    `json:"config_hash,omitempty"`
-	RuleCount                int       `json:"rule_count"`
-	GoodCount                int       `json:"good_count"`
-	BadCount                 int       `json:"bad_count"`
-	DefaultRouteRevision     uint64    `json:"default_route_revision"`
-	LastEvaluationAt         time.Time `json:"last_evaluation_at,omitempty,omitzero"`
-	LastEvaluationDurationMS float64   `json:"last_evaluation_duration_ms"`
-	LastError                string    `json:"last_error,omitempty"`
-	PendingRestart           bool      `json:"pending_restart"`
-	PendingRevision          uint64    `json:"pending_revision,omitempty"`
-	PendingHash              string    `json:"pending_hash,omitempty"`
-}
+type CalculationStatus = calculation.Status
 
 type CalculationResultPage struct {
 	Items  []calculation.Result `json:"items"`
@@ -111,7 +97,7 @@ func (h *Handler) calculationStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	value, err := service.GetCalculationStatus(r.Context())
-	if err == nil && value.ActiveRevision != 0 {
+	if err == nil {
 		setETag(w, value.ActiveRevision)
 	}
 	h.respond(w, value, err, http.StatusOK)
@@ -281,7 +267,7 @@ func (h *Handler) calculationVersions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) restoreCalculationVersion(w http.ResponseWriter, r *http.Request) {
-	revision, ok := requireRevision(w, r)
+	revision, ok := requireCalculationRestoreRevision(w, r)
 	if !ok {
 		return
 	}
@@ -300,6 +286,16 @@ func (h *Handler) restoreCalculationVersion(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	h.respond(w, nil, err, http.StatusOK)
+}
+
+// Zero is a real, observed state for calculations with no active version, not
+// a missing precondition. Only the explicit strong ETag from status may express
+// that state; other write APIs keep their strictly-positive revision contract.
+func requireCalculationRestoreRevision(w http.ResponseWriter, r *http.Request) (uint64, bool) {
+	if strings.TrimSpace(r.Header.Get("If-Match")) == `"0"` {
+		return 0, true
+	}
+	return requireRevision(w, r)
 }
 
 func (h *Handler) exportCalculationResults(w http.ResponseWriter, r *http.Request) {
@@ -333,7 +329,7 @@ func (h *Handler) exportCalculationResults(w http.ResponseWriter, r *http.Reques
 
 func decodeCalculationContent(w http.ResponseWriter, r *http.Request) (string, bool) {
 	var body struct {
-		Content string `json:"content"`
+		Content     string                    `json:"content"`
 		StateInputs *[]calculation.StateInput `json:"state_inputs,omitempty"`
 	}
 	if decodeCalculationJSON(w, r, &body) != nil {
@@ -341,7 +337,14 @@ func decodeCalculationContent(w http.ResponseWriter, r *http.Request) (string, b
 	}
 	if body.StateInputs != nil {
 		content, err := calculation.ReplaceStateInputs(body.Content, *body.StateInputs)
-		if err != nil { status:=http.StatusUnprocessableEntity;if errors.Is(err,calculation.ErrConfigTooLarge) {status=http.StatusRequestEntityTooLarge};writeError(w, status, "invalid_configuration", err.Error(), nil); return "", false }
+		if err != nil {
+			status := http.StatusUnprocessableEntity
+			if errors.Is(err, calculation.ErrConfigTooLarge) {
+				status = http.StatusRequestEntityTooLarge
+			}
+			writeError(w, status, "invalid_configuration", err.Error(), nil)
+			return "", false
+		}
 		return content, true
 	}
 	return body.Content, true

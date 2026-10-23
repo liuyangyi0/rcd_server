@@ -7,7 +7,9 @@
 //! binary 入口仍然在 `src/main.rs`。
 
 pub mod broadcast;
+pub mod build_info;
 pub mod calc_engine;
+pub mod command_tracking;
 pub mod config;
 pub mod csv_parser;
 pub mod file_scanner;
@@ -17,5 +19,6 @@ pub mod model;
 pub mod operations;
 pub mod protocol;
 pub mod runtime_cache;
+pub mod runtime_paths;
 pub mod serial;
 pub mod server;

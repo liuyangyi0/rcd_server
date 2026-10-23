@@ -146,6 +146,7 @@ export interface Point {
 }
 
 export interface CommandAudit {
+  tracking?: { protocol: string; phase: string; attemptCount?: number; sentCount?: number; auditIncomplete: boolean; historyGap?: boolean };
   id: string;
   createdAt: string;
   completedAt?: string;

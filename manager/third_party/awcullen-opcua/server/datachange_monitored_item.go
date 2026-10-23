@@ -317,6 +317,22 @@ func (mi *DataChangeMonitoredItem) ForceSample() {
 	}
 }
 
+// QueueValue publishes a captured command result, including an equal-valued
+// result of a different command. Unlike a route refresh it preserves already
+// queued results. Normal client queue limits and publishing cadence still apply.
+func (mi *DataChangeMonitoredItem) QueueValue(value ua.DataValue) {
+	mi.Lock()
+	defer mi.Unlock()
+	if mi.deleted || mi.monitoringMode == ua.MonitoringModeDisabled {
+		return
+	}
+	// Poll takes the same lock. Discard older samples so they cannot regress the
+	// explicit terminal result on the next publish pass.
+	mi.prequeue.Clear()
+	mi.enqueue(withTimestamps(value, mi.timestampsToReturn))
+	mi.previousQueuedValue = value
+}
+
 // AddTriggeredItem adds a item to be triggered by this item.
 func (mi *DataChangeMonitoredItem) AddTriggeredItem(item MonitoredItem) bool {
 	mi.Lock()

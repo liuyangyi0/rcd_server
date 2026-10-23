@@ -136,7 +136,9 @@ export function useCalculationStatus() {
 }
 
 export function useCalculationResults(params: ListParams, enabled = true) {
-  return useQuery({ queryKey: calculationKeys.results(params), queryFn: ({ signal }) => calculationApi.results(params, signal), enabled, placeholderData: (previous) => previous });
+  // Only retain data for this exact query key. Reusing another filter/page's
+  // results would label old Good values as the newly selected Bad result set.
+  return useQuery({ queryKey: calculationKeys.results(params), queryFn: ({ signal }) => calculationApi.results(params, signal), enabled });
 }
 
 export function useCalculationRules(params: ListParams, enabled = true) {

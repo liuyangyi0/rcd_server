@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Info } from 'lucide-react';
 import type { Group, Source, UaSession } from '../../api/types';
 import { apiErrorMessage } from '../../api/client';
@@ -28,6 +28,8 @@ export function SourceSwitchDialog(props: SourceSwitchDialogProps) {
 }
 
 function SourceSwitchForm({ mode, group, sources: allSources, sessions, initialSessionId, onClose, onSuccess }: SourceSwitchDialogProps) {
+  const mounted = useRef(false);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const sources = useMemo(() => allSources.filter((source) => sourceHasGroup(source, group.id)), [allSources, group.id]);
   const [sessionId] = useState(initialSessionId ?? '');
   const session = sessions.find((item) => item.id === sessionId);
@@ -51,9 +53,11 @@ function SourceSwitchForm({ mode, group, sources: allSources, sessions, initialS
         groupId: group.id,
         input: { sourceId, revision: editRevision },
       });
+      if (!mounted.current) return;
       onSuccess?.(`会话 ${shortSessionId(session.id)} 的整逻辑组 ${group.id} 已切换至 ${sourceId}；其他组与 Session 不变`);
     } else {
       await defaultMutation.mutateAsync({ groupId: group.id, input: { sourceId, revision: editRevision } });
+      if (!mounted.current) return;
       onSuccess?.(`分组 ${group.id} 的默认数据源已设为 ${sourceId}`);
     }
     onClose();
@@ -74,7 +78,7 @@ function SourceSwitchForm({ mode, group, sources: allSources, sessions, initialS
       onClose={onClose}
       footer={
         <>
-          <button className="button button-secondary" type="button" onClick={onClose}>取消</button>
+          <button className="button button-secondary" type="button" onClick={onClose}>{pending ? '关闭（请求继续执行）' : '取消'}</button>
           <button className="button button-primary" type="button" disabled={pending || staleSelection || group.pendingCommandCount > 0 || unavailable || selectedUnavailable || !confirmed || (mode === 'session' && !sourceId) || unchanged} onClick={() => { void handleSubmit().catch(() => { /* Mutation state renders the actionable error below. */ }); }}>
             {pending ? '正在提交…' : mode === 'default' ? '确认设置' : '确认切换'}
           </button>

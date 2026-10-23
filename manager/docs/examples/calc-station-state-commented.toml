@@ -1,5 +1,7 @@
 # 管理端 calc.toml 示例：把站点通信状态用在计算公式中
-# 适用版本：RcdManager 0.7.3-state-inputs.1 及支持 state_inputs 的后续版本。
+# 同名状态 OPC 输出适用版本：RcdManager 0.6.18-state-output.20261023.1 及后续版本。
+# 数字开头别名已随0.6.12-state-names.20261021.1部署到30/58/46；其他旧版可能拒绝。
+# 激活此类名称后不要直接恢复不支持的旧二进制；先调整配置并校验，保留当前数据。
 # 编码：UTF-8。以 # 开头的文字都是说明，不参与计算。
 #
 # 注意：这是教学示例，不是现场完整计算表！
@@ -9,11 +11,11 @@
 # 管理端配置保存在数据库中；仅把这个文件复制到服务器目录不会自动生效。
 #
 # 先理解两个概念：
-#   state_inputs：给一个站点的通信状态起名字，供公式读取。
+#   state_inputs：给站点通信状态起名字，直接发布同名只读 UInt32 OPC 点，也供公式读取。
 #   rules：使用这个名字计算结果，并把结果发布给 OPC 客户端。
 #
 # 例如：
-#   来源 real-lower → /dev/ttyWCH0 → 11 号站点
+#   来源 rcd-46 → /dev/ttyWCH0 → 11 号站点
 #   给它起名字 EXAMPLE_FIXED_STATE；公式中就直接写 EXAMPLE_FIXED_STATE。
 #   不用把 Groups/.../CommunicationState 那条很长的 OPC 路径写进公式。
 #
@@ -33,10 +35,10 @@
 # 即使错误输入的数值为 0，也不能当成一个质量正常的“未知状态”。
 #
 # 二、示例使用的测试环境 ID（来源绑定关系可能调整，以 Web 当前配置为准）
-#   real-lower    对应 192.168.10.46 的下级。
-#   rcd93-30      对应 192.168.10.30 的下级。
-#   rcd92-58      对应 192.168.10.58 的下级。
-#   real-hardware 是逻辑组 ID。
+#   rcd-46    对应 192.168.10.46 的下级。
+#   rcd-30      对应 192.168.10.30 的下级。
+#   rcd-58      对应 192.168.10.58 的下级。
+#   serial-acquisition 是逻辑组 ID。
 # source_id/group_id 填内部 ID，不填 IP、不填显示名称。
 # 修改 Web 的显示名称不会改变这些 ID，也不需要同步修改本示例的 ID。
 #
@@ -55,7 +57,7 @@
 
 [[state_inputs]]
 # 公式使用的变量名。这里的名字由你决定，不是设备原有 KKS。
-# 使用英文字母、数字、下划线；不能以数字开头，最长 128 字符。
+# 使用英文字母、数字、下划线；允许数字开头，但不能是纯数字，最长128字符。
 # 不要使用 IF/true/false，不要与其他状态变量、原始点、计算输出重名。
 name = "EXAMPLE_FIXED_STATE"
 
@@ -64,9 +66,9 @@ name = "EXAMPLE_FIXED_STATE"
 mode = "fixed"
 
 [[state_inputs.targets]]
-# 选择 .46 下级。若要固定观察 .58，只把这里改成 rcd92-58，
+# 选择 .46 下级。若要固定观察 .58，只把这里改成 rcd-58，
 # 同时确认该来源确实有下面的串口和站点。
-source_id = "real-lower"
+source_id = "rcd-46"
 
 # 串口填写原始名称。这里直接写 /dev/ttyWCH0，不写 %2Fdev%2FttyWCH0。
 port_id = "/dev/ttyWCH0"
@@ -89,41 +91,41 @@ name = "EXAMPLE_DEFAULT_STATE"
 mode = "group_default"
 
 # 填逻辑组 ID，不填显示名称。此模式必须填写 group_id。
-group_id = "real-hardware"
+group_id = "serial-acquisition"
 
-# 默认来源是 real-lower 时，读取下面这个站点。
+# 默认来源是 rcd-46 时，读取下面这个站点。
 [[state_inputs.targets]]
-source_id = "real-lower"
+source_id = "rcd-46"
 port_id = "/dev/ttyWCH0"
 device_id = "11"
 
-# 默认来源是 rcd93-30 时，读取下面这个站点。
+# 默认来源是 rcd-30 时，读取下面这个站点。
 [[state_inputs.targets]]
-source_id = "rcd93-30"
+source_id = "rcd-30"
 port_id = "/dev/ttyWCH0"
 device_id = "11"
 
-# 默认来源是 rcd92-58 时，读取下面这个站点。
+# 默认来源是 rcd-58 时，读取下面这个站点。
 [[state_inputs.targets]]
-source_id = "rcd92-58"
+source_id = "rcd-58"
 port_id = "/dev/ttyWCH0"
 device_id = "11"
 
 # 上面三组映射允许串口名、站号不同，只要它们确实是同一逻辑位置的设备，
-# 且目标站点属于 real-hardware 组即可；不能仅凭相同站号就认定是同一设备。
+# 且目标站点属于 serial-acquisition 组即可；不能仅凭相同站号就认定是同一设备。
 # 该组每个候选来源都必须有映射，不能只填写当前默认的那个。
 # 以后向组内新增来源，还需为它补齐映射再校验、激活。
 # 默认来源离线不会自动改用另一个来源，本状态值将变为 5。
 
 
 # -----------------------------------------------------------------------------
-# 计算规则 1：直接输出固定来源的状态数值，供 Web 和 OPC 客户端查看
+# 可选规则 1：兼容已有的另一名称输出；仅读状态时无需添加这条规则
 # -----------------------------------------------------------------------------
 
 [[rules]]
 # 这是最终输出点名称，与上面的输入变量名不同。
 # 激活后 OPC 节点为 ns=2;s=EXAMPLE_FIXED_STATE_OUT，是只读的 UInt32。
-# 状态输入别名 EXAMPLE_FIXED_STATE 本身不会自动新增一个 ns=2 业务点。
+# 状态输入本身已发布 ns=2;s=EXAMPLE_FIXED_STATE，无需本规则也可直接读取。
 kks_calc = "EXAMPLE_FIXED_STATE_OUT"
 
 # UInt32 是无符号整数，适合表示 0～5 的状态。
@@ -174,8 +176,8 @@ min_limit = 0
 max_limit = 5
 default_value = 0
 
-# 举例：默认来源为 real-lower，取 .46 的状态；
-# 在 Web 把组默认来源改成 rcd92-58 后，改取 .58 的状态。
+# 举例：默认来源为 rcd-46，取 .46 的状态；
+# 在 Web 把组默认来源改成 rcd-58 后，改取 .58 的状态。
 # 但某个 OPC 客户端修改 SelectedSourceId，不会改变这条计算规则的取数目标。
 
 

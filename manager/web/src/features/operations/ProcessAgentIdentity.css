@@ -1,0 +1,4 @@
+.process-agent-identity h3 { margin-bottom: 12px; }
+.process-agent-identity dd { overflow-wrap: anywhere; }
+.process-agent-identity .operations-file-meta > div { min-width: 0; }
+.process-agent-identity summary { cursor: pointer; margin-block: 10px; }

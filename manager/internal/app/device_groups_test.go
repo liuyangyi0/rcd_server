@@ -35,6 +35,12 @@ func (f *deviceRecordingLower) Write(_ context.Context, key domain.NodeKey, valu
 	}
 	return status, nil
 }
+func (f *deviceRecordingLower) WriteLegacyCommandAtEpoch(ctx context.Context, key domain.NodeKey, value any, _ uint64, ready func() bool) (domain.StatusCode, error) {
+	if !ready() {
+		return domain.StatusBadTimeout, context.DeadlineExceeded
+	}
+	return f.Write(ctx, key, value)
+}
 func (f *deviceRecordingLower) Call(_ context.Context, key domain.NodeKey, payload string) (string, domain.StatusCode, error) {
 	f.recordMu.Lock()
 	defer f.recordMu.Unlock()
@@ -85,7 +91,7 @@ func deviceRuntimeMapped(t *testing.T, mapped bool) (*Runtime, map[string]*devic
 		t.Fatal(err)
 	}
 	for id, client := range clients {
-		runtime.lowers[id] = lowerHandle{client: client}
+		installTestLower(runtime, id, lowerHandle{client: client})
 		runtime.OnLowerStatus(connectedStatus(id, 1))
 		primeWriteAck(runtime, id, "tty"+id, 1)
 		value := 10.0
@@ -118,8 +124,8 @@ func TestDeviceGroupsSplitTwoSessionsWithoutExtraConnections(t *testing.T) {
 			t.Fatalf("%s/%s=%#v", check.session, check.node, sample)
 		}
 	}
-	if len(runtime.lowers) != 2 {
-		t.Fatalf("lower connections multiplied by device count: %d", len(runtime.lowers))
+	if runtime.connections.count() != 2 {
+		t.Fatalf("lower connections multiplied by device count: %d", runtime.connections.count())
 	}
 	if sample := runtime.ReadSample("left", testKey("ttya_Send")); sample.StatusCode != domain.StatusBadConfigurationError {
 		t.Fatalf("split-port status must be ambiguous: %#v", sample)
@@ -492,7 +498,7 @@ func TestPassiveSendResetOnlyUpdatesInitiatingSessionAndControlNode(t *testing.T
 func TestPassiveSendHistoryCannotDispatchToHotRetiredTarget(t *testing.T) {
 	runtime := seededRuntime(t)
 	lower := &deviceRecordingLower{}
-	runtime.lowers["source-a"] = lowerHandle{client: lower}
+	installTestLower(runtime, "source-a", lowerHandle{client: lower})
 	runtime.OnLowerStatus(connectedStatus("source-a", 1))
 	primeWriteAck(runtime, "source-a", "COM1", 1)
 	_ = runtime.openSession("s")

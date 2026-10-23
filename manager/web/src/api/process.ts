@@ -6,6 +6,7 @@ export type ProcessState = 'stopped' | 'starting' | 'running' | 'stopping' | 'fa
 export type ProcessAction = 'start' | 'stop' | 'restart';
 export type ProcessOperationState = 'accepted' | 'running' | 'succeeded' | 'failed' | 'unknown';
 export interface ProcessBinding {
+	registry_device_id?: string;
   source_id: string;
   source_revision: number;
   agent_url: string;
@@ -14,7 +15,17 @@ export interface ProcessBinding {
   updated_at?: string;
 }
 export interface ProcessTarget extends OperationsTarget { bindingRevision: number; instanceId: string }
+export interface ProcessAgentIdentity {
+  build: { schema_version: 1; component: 'agent'; version: string; commit: string; built_at: string; release_id: string; source_sha256: string; dirty: boolean; target: string };
+  boot_id: string;
+  started_at: string;
+  reported_at: string;
+}
 export interface ProcessSnapshot {
+	 lifecycle_supported?: boolean;
+	 gateway_instance_id?: string;
+	 manual_stopped?: boolean;
+	 lifecycle?: { request_id: string; manager_instance_id: string; actor: string; action: ProcessAction; phase: string; state: ProcessOperationState; error?: string };
   schema_version?: number;
   instance_id: string;
   revision: string;
@@ -32,6 +43,10 @@ export interface ProcessSnapshot {
   restart_count?: number;
   last_exit_at?: string;
   last_stop_forced?: boolean;
+  maintenance_enabled?: boolean;
+  maintenance_deployment_id?: string;
+  maintenance_phase?: string;
+  agent_identity?: ProcessAgentIdentity;
 }
 export interface ProcessOperation {
   source_id: string;
@@ -116,6 +131,33 @@ function snapshot(value: ProcessSnapshot, instanceId: string): ProcessSnapshot {
   opaqueRevision(value.revision);
   if (value.schema_version !== undefined && value.schema_version !== 0 && value.schema_version !== 1) invalid('进程协议版本暂不兼容');
   if (value.state === 'running' && (!Number.isInteger(value.pid) || Number(value.pid) <= 1)) invalid('运行状态缺少有效的进程编号');
+  if (value.maintenance_enabled !== undefined && typeof value.maintenance_enabled !== 'boolean') invalid('维护能力字段无效');
+  const id = value.maintenance_deployment_id;
+  const phase = value.maintenance_phase;
+  const identifier = (item: unknown) => typeof item === 'string' && /^[A-Za-z0-9:_.-]{1,128}$/.test(item);
+  if ((value.lifecycle_supported !== undefined && typeof value.lifecycle_supported !== 'boolean') ||
+      (value.manual_stopped !== undefined && typeof value.manual_stopped !== 'boolean') ||
+      (value.lifecycle_supported && !identifier(value.gateway_instance_id))) invalid('安全启停能力或目标身份无效');
+  if (value.lifecycle !== undefined) {
+    const job = value.lifecycle;
+    if (!job || !identifier(job.request_id) || !identifier(job.manager_instance_id) || !identifier(job.phase) ||
+        !actions.includes(job.action) || !operationStates.includes(job.state) || typeof job.actor !== 'string' ||
+        !job.actor.trim() || job.actor.length > 128 || /[\x00-\x1f]/.test(job.actor)) invalid('安全启停作业格式无效');
+  }
+  // An unknown future phase still fences ordinary controls. A broken pair must
+  // not silently become an idle/legacy snapshot.
+  if (id !== undefined || phase !== undefined) {
+    if (!identifier(id) || !identifier(phase) || value.maintenance_enabled === false) invalid('维护状态字段不完整或矛盾');
+  }
+  if (value.agent_identity !== undefined) {
+    const agent = value.agent_identity;
+    const build = agent?.build;
+    const text = (item: unknown) => typeof item === 'string' && item.length > 0 && new TextEncoder().encode(item).length <= 256 && !/[\x00-\x1f\x7f-\x9f]/.test(item);
+    const timestamp = (item: unknown) => typeof item === 'string' && item.length <= 64 && /^\d{4}-\d\d-\d\dT/.test(item) && Number.isFinite(Date.parse(item));
+    if (!agent || !identifier(agent.boot_id) || !timestamp(agent.started_at) || !timestamp(agent.reported_at) ||
+        !build || build.schema_version !== 1 || build.component !== 'agent' || typeof build.dirty !== 'boolean' ||
+        ![build.version, build.commit, build.built_at, build.release_id, build.source_sha256, build.target].every(text)) invalid('守护代理运行身份无效或超限');
+  }
   return value;
 }
 function operation(value: ProcessOperation, target: ProcessTarget, requestId?: string, action?: ProcessAction): ProcessOperation {
@@ -132,6 +174,11 @@ export function processTarget(target: OperationsTarget, binding?: ProcessBinding
   return binding?.agent_url && binding.instance_id ? { ...target, bindingRevision: binding.revision, instanceId: binding.instance_id } : undefined;
 }
 export function processOperationTerminal(value?: ProcessOperation): boolean { return value?.state === 'succeeded' || value?.state === 'failed'; }
+export function processMaintenanceActive(value?: ProcessSnapshot): boolean { return Boolean(value?.maintenance_deployment_id || value?.maintenance_phase || (value?.lifecycle && !['succeeded', 'failed'].includes(value.lifecycle.state))); }
+export function processMaintenanceBlocks(value: ProcessSnapshot | undefined, action: ProcessAction): boolean {
+  void action;
+  return processMaintenanceActive(value) || !value?.lifecycle_supported;
+}
 export function processLogLimit(value: number): number { return Number.isFinite(value) ? Math.max(4, Math.min(MAX_PROCESS_LOG_BYTES, Math.trunc(value))) : MAX_PROCESS_LOG_BYTES; }
 
 export const processApi = {

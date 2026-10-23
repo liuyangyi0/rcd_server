@@ -6,7 +6,7 @@ import type { EventEnvelope } from '../api/types';
 
 export type StreamState = 'connecting' | 'connected' | 'disconnected' | 'mock';
 
-const EVENT_NAMES = ['source.status', 'source.sample', 'source.event', 'source.operation', 'station_versions_changed', 'lower_logs_changed', 'calculation_config_changed', 'calculation_results_changed', 'calculation_state_inputs_changed', 'group.changed', 'selection.changed', 'session.changed', 'command.changed', 'catalog.changed', 'alarm.changed', 'management.audit', 'configuration.changed', 'redundancy.changed', 'resync'];
+const EVENT_NAMES = ['source.status', 'source.sample', 'source.event', 'source.operation', 'source.process', 'station_versions_changed', 'lower_logs_changed', 'calculation_config_changed', 'calculation_results_changed', 'calculation_state_inputs_changed', 'group.changed', 'selection.changed', 'session.changed', 'command.changed', 'catalog.changed', 'alarm.changed', 'management.audit', 'configuration.changed', 'redundancy.changed', 'resync'];
 
 export function eventInvalidatesPoints(type: string): boolean {
   return type.includes('sample') || type.includes('catalog') || type.includes('selection') ||
@@ -21,8 +21,17 @@ export function eventInvalidatesManagementAudit(type: string): boolean {
   return type === 'management.audit';
 }
 
+export function eventInvalidatesOverview(type: string): boolean {
+  return ['source.status', 'source.sample', 'catalog.changed', 'group.changed',
+    'selection.changed', 'session.changed', 'command.changed', 'alarm.changed',
+    'redundancy.changed', 'configuration.changed'].includes(type);
+}
+
 export function eventInvalidatesOperations(type: string, key: readonly unknown[]): boolean {
   if (key[0] !== 'source-operations') return false;
+  // Agent binding and lifecycle changes need not cause an OPC disconnect.
+  // Refresh process evidence, not config drafts or potentially large logs.
+  if (type === 'source.process') return key[3] === 'status' || (key[3] === 'process' && key[7] !== 'log');
   return type === 'source.operation' || type === 'source.status' || (type === 'station_versions_changed' && key[3] === 'status') || (type === 'command.changed' && key[3] === 'status');
 }
 
@@ -33,6 +42,41 @@ export function useEventStream(): StreamState {
   useEffect(() => {
     if (isMockMode) return;
     const source = new EventSource(`${API_BASE}/events`, { withCredentials: true });
+    // A log query may take longer than the lower's 500 ms push cadence. Keep
+    // its in-flight snapshot, coalesce by physical source, and retain one
+    // trailing refresh for changes that arrived while that snapshot was read.
+    type LogRefresh = { running: boolean; dirty: boolean; lastStarted: number; timer?: number };
+    const logRefreshes = new Map<string, LogRefresh>();
+    let disposed = false;
+    const queueLogRefresh = (sourceId?: string) => {
+      const key = sourceId ?? '';
+      const refresh: LogRefresh = logRefreshes.get(key) ?? { running: false, dirty: false, lastStarted: Number.NEGATIVE_INFINITY };
+      logRefreshes.set(key, refresh);
+      refresh.dirty = true;
+      const schedule = () => {
+        if (disposed || refresh.running || refresh.timer !== undefined) return;
+        const run = () => {
+          refresh.timer = undefined;
+          if (disposed) return;
+          refresh.dirty = false;
+          refresh.running = true;
+          refresh.lastStarted = Date.now();
+          void queryClient.invalidateQueries({
+            queryKey: sourceId ? ['lower-logs', sourceId] : ['lower-logs'], refetchType: 'active',
+          }, { cancelRefetch: false }).catch(() => {
+            // Query errors remain visible to their page; an SSE callback must
+            // not turn a failed read into an unhandled promise rejection.
+          }).finally(() => {
+            refresh.running = false;
+            if (refresh.dirty) schedule();
+          });
+        };
+        const wait = Math.max(0, 1000 - (Date.now() - refresh.lastStarted));
+        if (wait === 0) run();
+        else refresh.timer = window.setTimeout(run, wait);
+      };
+      schedule();
+    };
 
     const invalidate = (event: MessageEvent<string>) => {
       let envelope: EventEnvelope = { type: event.type || 'message' };
@@ -56,7 +100,20 @@ export function useEventStream(): StreamState {
         void queryClient.invalidateQueries();
         return;
       }
-      void queryClient.invalidateQueries({ queryKey: queryKeys.overview });
+      if (type === 'source.process') {
+        void queryClient.invalidateQueries({
+          queryKey: envelope.sourceId ? ['source-operations', envelope.sourceId] : ['source-operations'],
+          predicate: (query) => eventInvalidatesOperations(type, query.queryKey),
+          refetchType: 'active',
+        }, { cancelRefetch: false });
+        // Fleet binding changes can also increment the source revision. Keep
+        // the drawer's captured target intact; its existing revision guard
+        // disables writes until the operator explicitly reopens it.
+        void queryClient.invalidateQueries({ queryKey: queryKeys.allSources, refetchType: 'active' }, { cancelRefetch: false });
+        void queryClient.invalidateQueries({ queryKey: ['fleet'], refetchType: 'active' }, { cancelRefetch: false });
+        return;
+      }
+      if (eventInvalidatesOverview(type)) void queryClient.invalidateQueries({ queryKey: queryKeys.overview, refetchType: 'active' });
       if (type === 'source.status' || type.includes('catalog')) {
         void queryClient.invalidateQueries({ queryKey: queryKeys.allSources });
         void queryClient.invalidateQueries({ queryKey: queryKeys.groups });
@@ -79,7 +136,7 @@ export function useEventStream(): StreamState {
         void queryClient.invalidateQueries({ queryKey: queryKeys.allDeviceVersions, refetchType: 'active' });
       }
       if (type === 'lower_logs_changed') {
-        void queryClient.invalidateQueries({ queryKey: envelope.sourceId ? ['lower-logs', envelope.sourceId] : ['lower-logs'], refetchType: 'active' });
+        queueLogRefresh(envelope.sourceId);
       }
 	  if (type === 'calculation_config_changed') {
 		void queryClient.invalidateQueries({ queryKey: ['calculations'] });
@@ -115,7 +172,9 @@ export function useEventStream(): StreamState {
         void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
       }
       if (type.includes('command')) {
-        void queryClient.invalidateQueries({ queryKey: queryKeys.allCommands, refetchType: 'active' });
+        // Do not restart an in-flight read for every command event. Bursts can
+        // otherwise starve both results and the retry/error state indefinitely.
+        void queryClient.invalidateQueries({ queryKey: queryKeys.allCommands, refetchType: 'active' }, { cancelRefetch: false });
         // Pending commands lock both defaults and Session routes immediately.
         void queryClient.invalidateQueries({ queryKey: queryKeys.groups });
       }
@@ -141,6 +200,10 @@ export function useEventStream(): StreamState {
     for (const name of EVENT_NAMES) source.addEventListener(name, invalidate as EventListener);
 
     return () => {
+      disposed = true;
+      for (const refresh of logRefreshes.values()) {
+        if (refresh.timer !== undefined) window.clearTimeout(refresh.timer);
+      }
       for (const name of EVENT_NAMES) source.removeEventListener(name, invalidate as EventListener);
       source.close();
     };

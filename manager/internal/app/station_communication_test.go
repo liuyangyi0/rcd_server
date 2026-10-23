@@ -10,13 +10,14 @@ import (
 
 func TestStationCommunicationRejectsStaleEpochAndCachedHealth(t *testing.T) {
 	r := &Runtime{
-		statuses:            map[string]opc.LowerStatus{"a": {Connection: opc.ConnectionConnected, Session: opc.SessionActive, Epoch: 2}},
-		stationVersionEpoch: map[string]uint64{"a": 2},
-		stationVersions: map[string]domain.SourceStationVersions{"a": {
-			ObservedAt: time.Now().UTC(), Ports: []domain.StationVersionPort{{PortID: "COM1", Enabled: true, AppliedEnabled: true, Open: true,
-				Devices: []domain.StationVersion{{DeviceID: "1", ReadEnabled: true, AppliedReadEnabled: true, CommunicationOK: true}}}},
-		}},
+		calculations: newTestCalculationService(),
+		statuses:     map[string]opc.LowerStatus{"a": {Connection: opc.ConnectionConnected, Session: opc.SessionActive, Epoch: 2}},
 	}
+	s := domain.SourceStationVersions{
+		ObservedAt: time.Now().UTC(), Ports: []domain.StationVersionPort{{PortID: "COM1", Enabled: true, AppliedEnabled: true, Open: true,
+			Devices: []domain.StationVersion{{DeviceID: "1", ReadEnabled: true, AppliedReadEnabled: true, CommunicationOK: true}}}},
+	}
+	r.stations.replace("a", s, 2, true)
 	assert := func(want uint32) {
 		t.Helper()
 		if got := r.StationCommunication("a", "COM1", "1").State; got != want {
@@ -24,17 +25,16 @@ func TestStationCommunicationRejectsStaleEpochAndCachedHealth(t *testing.T) {
 		}
 	}
 	assert(1)
-	r.stationVersionEpoch["a"] = 1
+	r.stations.replace("a", s, 1, true)
 	assert(0)
-	delete(r.stationVersionEpoch, "a") // topology replacement invalidates epoch
+	r.stations.invalidateEpoch("a") // topology replacement invalidates epoch
 	assert(0)
-	r.stationVersionEpoch["a"] = 2
-	s := r.stationVersions["a"]
+	r.stations.replace("a", s, 2, true)
 	s.Cached = true
-	r.stationVersions["a"] = s
+	r.stations.replace("a", s, 2, true)
 	assert(0)
 	s.Cached, s.ObservedAt = false, time.Now().Add(-time.Minute)
-	r.stationVersions["a"] = s
+	r.stations.replace("a", s, 2, true)
 	assert(0)
 	r.statuses["a"] = opc.LowerStatus{Connection: opc.ConnectionDisconnected, Epoch: 2}
 	assert(5)

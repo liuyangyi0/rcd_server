@@ -54,6 +54,21 @@ func TestLowerOperationsHTTPPinsPhysicalTargetAndBothRevisions(t *testing.T) {
 	}
 }
 
+func TestConfigDraftPreparationPinsSourceAndDoesNotMutate(t *testing.T) {
+	f := &operationServiceStub{}
+	w := operationHTTP(t, f, http.MethodPost, "/api/v1/sources/lower-a/operations/config/prepare", `{"source_revision":5,"name":"config.toml","content":"[settings]","edits":[{"path":["settings","command_retry_count"],"value":5}]}`, "")
+	if w.Code != 200 || f.calls != 1 || f.revision != 5 || f.request.Action != "prepare_config" || f.request.Mutates() || f.request.Feature() != "configuration_forms" {
+		t.Fatalf("status=%d result=%s request=%+v", w.Code, w.Body.String(), f.request)
+	}
+	for _, body := range []string{`{"name":"config.toml","content":"x"}`, `{"source_revision":5,"name":"../config.toml","content":"x"}`, `{"source_revision":5,"name":"config.toml","content":"x","edits":{}}`} {
+		f = &operationServiceStub{}
+		w = operationHTTP(t, f, http.MethodPost, "/api/v1/sources/lower-a/operations/config/prepare", body, "")
+		if w.Code < 400 || f.calls != 0 {
+			t.Fatalf("accepted %s: %d", body, w.Code)
+		}
+	}
+}
+
 func TestLowerOperationsHTTPRejectsMissingAndStaleTokensWithoutDispatch(t *testing.T) {
 	for _, tc := range []struct {
 		body, revision string

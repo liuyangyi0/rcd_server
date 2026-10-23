@@ -98,6 +98,23 @@ impl FileRepository {
             "read_config" => self.read_config(request),
             "validate_config" => self.validate_config(request),
             "write_config" => self.write_config(request),
+            "prepare_config" => {
+                if config_name(request)? != "config.toml" {
+                    return Err(OperationError::new("unsupported", "此文件请使用原文编辑"));
+                }
+                let content = required_string(request, "content")?;
+                let edits: Vec<rcd_config_form::Edit> =
+                    serde_json::from_value(request.get("edits").cloned().unwrap_or(json!([])))
+                        .map_err(|_| OperationError::new("invalid_request", "参数修改格式无效"))?;
+                let form = rcd_config_form::prepare(
+                    content,
+                    &edits,
+                    rcd_config_form::Profile::Acquisition,
+                )
+                .map_err(|message| OperationError::new("invalid_request", message))?;
+                serde_json::to_value(form)
+                    .map_err(|_| OperationError::new("operation_failed", "参数草稿编码失败"))
+            }
             "list_logs" => self.list_logs(),
             "read_log" => self.read_log(request),
             _ => Err(OperationError::new("unsupported", "不支持的文件操作")),
@@ -750,8 +767,20 @@ fn validate_set(files: &BTreeMap<String, ConfigFile>) -> Validation {
     use crate::calc_engine::{parser, tokenizer};
 
     let mut result = Validation::default();
+    // Match startup behavior: manager mode never loads the rollback calc.toml.
+    // A stale/incompatible unused copy must not block serial settings updates.
+    // Switching back to local includes it in validation again before saving.
+    let manager_calculation = files
+        .get("config.toml")
+        .and_then(|file| std::str::from_utf8(&file.bytes).ok())
+        .and_then(|text| toml::from_str::<crate::config::Config>(text).ok())
+        .is_some_and(|config| config.calculation.mode == crate::config::CalculationMode::Manager);
     let mut texts = BTreeMap::new();
     for (name, file) in files {
+        if manager_calculation && name == "calc.toml" {
+            result.warning("calc.toml 是 manager 模式下未生效的回滚副本，本次不加载；切回 local 前会重新校验。");
+            continue;
+        }
         match std::str::from_utf8(&file.bytes) {
             Ok(content) => {
                 texts.insert(name.as_str(), content);
@@ -771,7 +800,11 @@ fn validate_set(files: &BTreeMap<String, ConfigFile>) -> Validation {
         if !name.ends_with(".csv") {
             continue;
         }
-        let (config, records) = match crate::csv_parser::validate_csv_content(content) {
+        let parsed =
+            crate::csv_parser::validate_csv_content_with_point_warnings(content, |warning| {
+                result.warning(format!("{name}: {warning}"));
+            });
+        let (config, records) = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
                 result.error(format!("{name}: {error}"));
@@ -1558,6 +1591,304 @@ transmit_settle_guard_ms = 1
     }
 
     #[test]
+    fn manager_calculation_copy_does_not_block_serial_settings_but_local_requires_it() {
+        let mut fixture = Fixture::new();
+        fs::write(
+            fixture.repository.config_dir.join("calc.toml"),
+            "invalid rollback copy",
+        )
+        .unwrap();
+        let before = fixture.read("config.toml");
+        let manager = format!("{APPLICATION}\n[calculation]\nmode='manager'\n");
+        let validation = fixture
+            .repository
+            .handle(&json!({"action":"validate_config","name":"config.toml","content":manager}))
+            .unwrap();
+        assert_eq!(validation["valid"], true);
+        assert!(!validation["warnings"].as_array().unwrap().is_empty());
+        let saved = fixture
+            .write(
+                "config.toml",
+                &manager,
+                before["revision"].as_str().unwrap(),
+            )
+            .unwrap();
+        let local = manager.replace("mode='manager'", "mode='local'");
+        assert!(fixture
+            .write("config.toml", &local, saved["revision"].as_str().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn parameter_form_does_not_write_until_validated_cas_save() {
+        let mut fixture = Fixture::new();
+        let before = fixture.read("config.toml");
+        let form = fixture.repository.handle(&json!({"action":"prepare_config","name":"config.toml","content":APPLICATION,"edits":[{"path":["settings","command_retry_count"],"value":5}]})).unwrap();
+        assert_eq!(fixture.read("config.toml")["revision"], before["revision"]);
+        let draft = form["content"].as_str().unwrap();
+        assert!(draft.contains("command_retry_count = 5"));
+        let validation = fixture
+            .repository
+            .handle(&json!({"action":"validate_config","name":"config.toml","content":draft}))
+            .unwrap();
+        assert_eq!(validation["valid"], true);
+        let saved = fixture
+            .write("config.toml", draft, before["revision"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(saved["restart_required"], true);
+        assert_eq!(saved["active_revision"], before["revision"]);
+        assert!(fixture
+            .write(
+                "config.toml",
+                APPLICATION,
+                before["revision"].as_str().unwrap()
+            )
+            .is_err());
+        let invalid = draft.replace("command_retry_count = 5", "command_retry_count = 0");
+        let validation = fixture
+            .repository
+            .handle(&json!({"action":"validate_config","name":"config.toml","content":invalid}))
+            .unwrap();
+        assert_eq!(validation["valid"], false);
+    }
+
+    #[test]
+    fn legacy_csv_does_not_block_transmit_guard_validation_and_cas_save() {
+        let mut fixture = Fixture::new();
+        let csv_path = fixture.repository.config_dir.join("rcd_a.csv");
+        let mut legacy = fs::read_to_string(&csv_path).unwrap();
+        for (canonical, old) in [
+            ("com,", "COM,"),
+            ("baud_rate,", "BaudRate,"),
+            ("is_special,false,", "IsSpecial,FALSE,"),
+            ("com_index,", "ComIndex,"),
+            ("device_id,", "DeviceID,"),
+            ("data_len,", "DataLen,"),
+            ("kks_prefix,", "Pre,"),
+            (
+                crate::csv_parser::RECORD_CSV_HEADER,
+                "KKS,Type,F_Type,byte_index,bit_index,Def,Max,Min,LH",
+            ),
+        ] {
+            legacy = legacy.replace(canonical, old);
+        }
+        fs::write(&csv_path, &legacy).unwrap();
+        let before = fixture.read("config.toml");
+        let prepared = fixture
+            .repository
+            .handle(&json!({
+                "action":"prepare_config", "name":"config.toml", "content":APPLICATION,
+                "edits":[{"path":["settings","transmit_settle_guard_ms"],"value":5}]
+            }))
+            .unwrap();
+        let draft = prepared["content"].as_str().unwrap();
+        assert!(draft.contains("transmit_settle_guard_ms = 5"));
+        let validation = fixture
+            .repository
+            .handle(&json!({
+                "action":"validate_config", "name":"config.toml", "content":draft
+            }))
+            .unwrap();
+        assert_eq!(validation["valid"], true, "{validation}");
+        assert_eq!(fixture.read("config.toml")["revision"], before["revision"]);
+        let saved = fixture
+            .write("config.toml", draft, before["revision"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(saved["restart_required"], true);
+        assert_eq!(saved["active_revision"], before["revision"]);
+        assert_eq!(fs::read(&csv_path).unwrap(), legacy.as_bytes());
+        assert!(fixture
+            .write(
+                "config.toml",
+                APPLICATION,
+                before["revision"].as_str().unwrap()
+            )
+            .is_err());
+        let invalid = draft.replace(
+            "transmit_settle_guard_ms = 5",
+            "transmit_settle_guard_ms = 101",
+        );
+        assert!(fixture
+            .write("config.toml", &invalid, saved["revision"].as_str().unwrap())
+            .is_err());
+        assert_eq!(fixture.read("config.toml")["revision"], saved["revision"]);
+        assert_eq!(fs::read(&csv_path).unwrap(), legacy.as_bytes());
+    }
+
+    #[test]
+    fn timing_edit_reports_point_bounds_but_keeps_application_configuration_strict() {
+        let mut fixture = Fixture::new();
+        let csv_path = fixture.repository.config_dir.join("rcd_a.csv");
+        let invalid = csv("COM1", 1, "D1_", "TEMP")
+            .replace("com,", "COM,")
+            .replace("is_special,false,", "IsSpecial,FALSE,")
+            .replace("TEMP,uint,status,1,0", "TEMP,uint,status,20,0.15");
+        fs::write(&csv_path, &invalid).unwrap();
+        let before = fixture.read("config.toml");
+        let prepared = fixture
+            .repository
+            .handle(&json!({
+                "action":"prepare_config", "name":"config.toml", "content":APPLICATION,
+                "edits":[
+                    {"path":["settings","transmit_settle_guard_ms"],"value":5},
+                    {"path":["settings","command_interval_ms"],"value":500}
+                ]
+            }))
+            .unwrap();
+        let draft = prepared["content"].as_str().unwrap();
+        let validation = fixture
+            .repository
+            .handle(&json!({
+                "action":"validate_config", "name":"config.toml", "content":draft
+            }))
+            .unwrap();
+        assert_eq!(validation["valid"], true);
+        assert!(validation["errors"].as_array().unwrap().is_empty());
+        let warnings = validation["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1, "{validation}");
+        let message = warnings[0].as_str().unwrap();
+        for detail in ["rcd_a.csv", "第 9 行", "D1_TEMP", "byte_index=20"] {
+            assert!(message.contains(detail), "missing {detail}: {message}");
+        }
+        let saved = fixture
+            .write("config.toml", draft, before["revision"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(saved["content"], draft);
+        assert_eq!(saved["active_revision"], before["revision"]);
+        assert_eq!(saved["restart_required"], true);
+        assert_eq!(fs::read(&csv_path).unwrap(), invalid.as_bytes());
+        for broken in [
+            draft.replace(
+                "transmit_settle_guard_ms = 5",
+                "transmit_settle_guard_ms = 101",
+            ),
+            "[settings\ninvalid".to_string(),
+        ] {
+            let error = fixture
+                .write("config.toml", &broken, saved["revision"].as_str().unwrap())
+                .unwrap_err();
+            assert_eq!(error.code, "invalid_request");
+            assert_eq!(fixture.read("config.toml")["content"], draft);
+            assert_eq!(fs::read(&csv_path).unwrap(), invalid.as_bytes());
+        }
+    }
+
+    #[test]
+    fn point_bounds_csv_can_be_saved_with_backup_but_not_overwrite_another_revision() {
+        let mut fixture = Fixture::new();
+        let before = fixture.read("rcd_a.csv");
+        let draft = before["content"]
+            .as_str()
+            .unwrap()
+            .replace("status,1,0", "status,20,0.15");
+        let validation = fixture
+            .repository
+            .handle(&json!({"action":"validate_config","name":"rcd_a.csv","content":draft}))
+            .unwrap();
+        assert_eq!(validation["valid"], true);
+        assert_eq!(validation["warnings"].as_array().unwrap().len(), 1);
+        let saved = fixture
+            .write("rcd_a.csv", &draft, before["revision"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(saved["content"], draft);
+        assert_eq!(saved["active_revision"], before["revision"]);
+        assert_eq!(saved["restart_required"], true);
+        assert_eq!(saved["backups"].as_array().unwrap().len(), 1);
+        let stale = fixture
+            .write(
+                "rcd_a.csv",
+                before["content"].as_str().unwrap(),
+                before["revision"].as_str().unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(stale.code, "conflict");
+        assert_eq!(fixture.read("rcd_a.csv")["content"], draft);
+    }
+
+    #[test]
+    fn point_warnings_are_bounded_and_do_not_hide_global_conflicts() {
+        let mut fixture = Fixture::new();
+        let mut content = csv("COM1", 1, "D1_", "TEMP").replace("status,1,0", "status,20,0");
+        for index in 0..150 {
+            content.push_str(&format!("P{index},uint,status,20,0,0,255,0,0\n"));
+        }
+        fs::write(fixture.repository.config_dir.join("rcd_a.csv"), content).unwrap();
+        let validation = fixture
+            .repository
+            .handle(&json!({"action":"validate_config","name":"config.toml","content":APPLICATION}))
+            .unwrap();
+        assert_eq!(validation["valid"], true);
+        assert_eq!(validation["warnings_truncated"], true);
+        assert!(validation["warnings"].as_array().unwrap().len() <= 101);
+        for conflicting in [
+            csv("COM2", 2, "D1_", "TEMP"),
+            csv("COM1", 1, "D2_", "OTHER"),
+            csv("COM1", 2, "D2_", "OTHER").replace("115200", "57600"),
+        ] {
+            fs::write(fixture.repository.config_dir.join("rcd_b.csv"), conflicting).unwrap();
+            let validation = fixture
+                .repository
+                .handle(
+                    &json!({"action":"validate_config","name":"config.toml","content":APPLICATION}),
+                )
+                .unwrap();
+            assert_eq!(validation["valid"], false);
+            assert!(!validation["errors"].as_array().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn command_interval_parameter_save_requires_restart_and_retains_revision_guards() {
+        let mut fixture = Fixture::new();
+        let before = fixture.read("config.toml");
+        let form = fixture
+            .repository
+            .handle(&json!({
+                "action":"prepare_config", "name":"config.toml", "content":APPLICATION,
+                "edits":[{"path":["settings","command_interval_ms"],"value":500}]
+            }))
+            .unwrap();
+        let draft = form["content"].as_str().unwrap();
+        assert!(draft.contains("command_interval_ms = 500"));
+        assert_eq!(fixture.read("config.toml")["revision"], before["revision"]);
+        let validation = fixture
+            .repository
+            .handle(&json!({
+                "action":"validate_config", "name":"config.toml", "content":draft
+            }))
+            .unwrap();
+        assert_eq!(validation["valid"], true);
+        let saved = fixture
+            .write("config.toml", draft, before["revision"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(saved["restart_required"], true);
+        assert_eq!(saved["active_revision"], before["revision"]);
+        assert!(fixture
+            .write(
+                "config.toml",
+                APPLICATION,
+                before["revision"].as_str().unwrap()
+            )
+            .is_err());
+        for value in ["-1", "60001", "1.5", "\"500\""] {
+            let invalid = draft.replace(
+                "command_interval_ms = 500",
+                &format!("command_interval_ms = {value}"),
+            );
+            let validation = fixture
+                .repository
+                .handle(&json!({
+                    "action":"validate_config", "name":"config.toml", "content":invalid
+                }))
+                .unwrap();
+            assert_eq!(
+                validation["valid"], false,
+                "accepted invalid interval {value}"
+            );
+        }
+    }
+
+    #[test]
     fn configuration_save_is_atomic_backed_up_and_restore_clears_restart_flag() {
         let mut fixture = Fixture::new();
         let before = fixture.read("rcd_a.csv");
@@ -1613,7 +1944,7 @@ transmit_settle_guard_ms = 1
         let valid_csv = csv_before["content"].as_str().unwrap();
         let invalid_csvs = [
             valid_csv.replace("is_special,false", "is_special,maybe"),
-            valid_csv.replace("TEMP,uint,status,1,0", "TEMP,uint,status,0,0"),
+            valid_csv.replace("data_len,8", "data_len,256"),
             valid_csv.replace("TEMP,uint,status", "TEMP,unknown,status"),
             format!("{valid_csv}TEMP,uint,status,1,0,0,255,0,0\n"),
         ];

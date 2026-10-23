@@ -301,6 +301,8 @@ pub struct MonitoredItem {
     queue_overflow: bool,
     timestamps_to_return: TimestampsToReturn,
     last_data_value: Option<DataValue>,
+    #[cfg(feature = "preserve-source-timestamps")]
+    last_sample_at: Option<DateTime>,
     /// Value skipped due to sampling interval, we keep these
     /// so that we can generate a new notification later.
     sample_skipped_data_value: Option<DataValue>,
@@ -328,6 +330,8 @@ impl MonitoredItem {
             discard_oldest: request.discard_oldest,
             timestamps_to_return: request.timestamps_to_return,
             last_data_value: None,
+            #[cfg(feature = "preserve-source-timestamps")]
+            last_sample_at: None,
             sample_skipped_data_value: None,
             queue_size: request.queue_size,
             notification_queue: VecDeque::new(),
@@ -401,33 +405,54 @@ impl MonitoredItem {
 
     fn filter_by_sampling_interval(
         &self,
-        old: &DataValue,
-        new: &DataValue,
+        _old: &DataValue,
+        _new: &DataValue,
         from_subscription_tick: bool,
+        _now: &DateTime,
     ) -> bool {
-        let (Some(old), Some(new)) = (&old.source_timestamp, &new.source_timestamp) else {
-            // Always include measurements without source timestamp, we don't know enough about these,
-            // assume the server implementation did filtering elsewhere.
-            return true;
-        };
+        #[cfg(feature = "preserve-source-timestamps")]
+        {
+            self.sampling_due(_now, from_subscription_tick)
+        }
 
-        let elapsed = new.as_chrono().signed_duration_since(old.as_chrono());
+        #[cfg(not(feature = "preserve-source-timestamps"))]
+        {
+            let (old, new) = (_old, _new);
+            let (Some(old), Some(new)) = (&old.source_timestamp, &new.source_timestamp) else {
+                // Always include measurements without source timestamp, we don't know enough about these,
+                // assume the server implementation did filtering elsewhere.
+                return true;
+            };
 
+            let elapsed = new.as_chrono().signed_duration_since(old.as_chrono());
+
+            match self.sampling_interval {
+                SamplingInterval::Subscription => {
+                    // If the sampling interval is set to subscription, we use the subscription's
+                    // sampling interval, so we should never allow notifications through unless
+                    // it's due to a subscription tick.
+                    // This means we always store the sampled value in `sample_skipped_data_value`,
+                    // then we can use it later if we get a subscription tick.
+                    from_subscription_tick
+                }
+                // If the sampling interval is set to zero, we always allow notifications through.
+                SamplingInterval::Zero => true,
+                SamplingInterval::NonZero(interval) => {
+                    // If the sampling interval is set to non-zero, we use that.
+                    elapsed >= interval
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "preserve-source-timestamps")]
+    fn sampling_due(&self, now: &DateTime, from_subscription_tick: bool) -> bool {
         match self.sampling_interval {
-            SamplingInterval::Subscription => {
-                // If the sampling interval is set to subscription, we use the subscription's
-                // sampling interval, so we should never allow notifications through unless
-                // it's due to a subscription tick.
-                // This means we always store the sampled value in `sample_skipped_data_value`,
-                // then we can use it later if we get a subscription tick.
-                from_subscription_tick
-            }
-            // If the sampling interval is set to zero, we always allow notifications through.
+            SamplingInterval::Subscription => from_subscription_tick,
             SamplingInterval::Zero => true,
-            SamplingInterval::NonZero(interval) => {
-                // If the sampling interval is set to non-zero, we use that.
-                elapsed >= interval
-            }
+            SamplingInterval::NonZero(interval) => self.last_sample_at.is_none_or(|last| {
+                now.as_chrono().signed_duration_since(last.as_chrono()) >= interval
+            }),
         }
     }
 
@@ -455,17 +480,30 @@ impl MonitoredItem {
     ///
     /// Users that want to avoid this should just set the sampling interval to 0.
     pub(super) fn maybe_enqueue_skipped_value(&mut self, now: &DateTime) -> bool {
-        match self.sample_skipped_data_value.take() {
-            Some(value) if value.source_timestamp.is_some_and(|v| v <= *now) => {
-                self.notify_data_value(value, now, true);
-                true
+        #[cfg(feature = "preserve-source-timestamps")]
+        {
+            if !self.sampling_due(now, true) {
+                return false;
             }
-            Some(value) => {
-                // If there is no new sample, we can keep the last skipped value.
-                self.sample_skipped_data_value = Some(value);
-                false
+            return match self.sample_skipped_data_value.take() {
+                Some(value) => self.notify_data_value(value, now, true),
+                None => false,
+            };
+        }
+        #[cfg(not(feature = "preserve-source-timestamps"))]
+        {
+            match self.sample_skipped_data_value.take() {
+                Some(value) if value.source_timestamp.is_some_and(|v| v <= *now) => {
+                    self.notify_data_value(value, now, true);
+                    true
+                }
+                Some(value) => {
+                    // If there is no new sample, we can keep the last skipped value.
+                    self.sample_skipped_data_value = Some(value);
+                    false
+                }
+                None => false,
             }
-            None => false,
         }
     }
 
@@ -479,7 +517,15 @@ impl MonitoredItem {
             return false;
         }
 
+        #[cfg(feature = "preserve-source-timestamps")]
+        let extra_enqueued = false;
+        #[cfg(feature = "preserve-source-timestamps")]
+        {
+            self.sample_skipped_data_value = None;
+        }
+        #[cfg(not(feature = "preserve-source-timestamps"))]
         let mut extra_enqueued = false;
+        #[cfg(not(feature = "preserve-source-timestamps"))]
         if let Some(skipped_value) = self.sample_skipped_data_value.take() {
             // We may use the skipped value if it is in the past,
             // and if it is earlier than the value we are currently reporting.
@@ -509,11 +555,11 @@ impl MonitoredItem {
             match (&self.last_data_value, &self.filter) {
                 (Some(last_dv), FilterType::DataChangeFilter(filter)) => (
                     filter.is_changed(&value, last_dv),
-                    self.filter_by_sampling_interval(last_dv, &value, from_subscription_tick),
+                    self.filter_by_sampling_interval(last_dv, &value, from_subscription_tick, now),
                 ),
                 (Some(last_dv), FilterType::None) => (
                     value.value != last_dv.value || value.status != last_dv.status,
-                    self.filter_by_sampling_interval(last_dv, &value, from_subscription_tick),
+                    self.filter_by_sampling_interval(last_dv, &value, from_subscription_tick, now),
                 ),
                 (None, _) => (true, true),
                 _ => (false, false),
@@ -526,14 +572,17 @@ impl MonitoredItem {
         // If we're outside the sampling interval, keep the value for now,
         // but shift it to the next sample.
         if !matches_sampling_interval {
-            value.source_timestamp = self
-                .last_data_value
-                .as_ref()
-                .and_then(|dv| dv.source_timestamp)
-                .unwrap_or(*now)
-                .as_chrono()
-                .checked_add_signed(self.sampling_interval_as_time_delta())
-                .map(|v| v.into());
+            #[cfg(not(feature = "preserve-source-timestamps"))]
+            {
+                value.source_timestamp = self
+                    .last_data_value
+                    .as_ref()
+                    .and_then(|dv| dv.source_timestamp)
+                    .unwrap_or(*now)
+                    .as_chrono()
+                    .checked_add_signed(self.sampling_interval_as_time_delta())
+                    .map(|v| v.into());
+            }
 
             self.sample_skipped_data_value = Some(value);
             // We need to return true here, so that the subscription knows it needs to tick this
@@ -542,6 +591,10 @@ impl MonitoredItem {
         }
 
         self.last_data_value = Some(value.clone());
+        #[cfg(feature = "preserve-source-timestamps")]
+        {
+            self.last_sample_at = Some(*now);
+        }
 
         match self.timestamps_to_return {
             TimestampsToReturn::Neither | TimestampsToReturn::Invalid => {
@@ -785,11 +838,19 @@ pub(super) mod tests {
             queue_overflow: false,
             timestamps_to_return: opcua_types::TimestampsToReturn::Both,
             last_data_value: None,
+            #[cfg(feature = "preserve-source-timestamps")]
+            last_sample_at: None,
             sample_skipped_data_value: None,
             any_new_notification: false,
             eu_range: None,
         };
 
+        #[cfg(feature = "preserve-source-timestamps")]
+        let now = initial_value
+            .as_ref()
+            .and_then(|v| v.source_timestamp)
+            .unwrap_or_else(DateTime::now);
+        #[cfg(not(feature = "preserve-source-timestamps"))]
         let now = DateTime::now();
         if let Some(val) = initial_value {
             v.notify_data_value(val, &now, true);
@@ -810,6 +871,98 @@ pub(super) mod tests {
         }
 
         v
+    }
+
+    #[cfg(feature = "preserve-source-timestamps")]
+    #[test]
+    fn delayed_quality_change_preserves_source_time() {
+        let source = DateTime::now();
+        let good = DataValue {
+            value: Some(Variant::Double(0.0)),
+            status: Some(StatusCode::Good),
+            source_timestamp: Some(source),
+            ..Default::default()
+        };
+        let mut item = new_monitored_item(
+            1,
+            ReadValueId {
+                node_id: NodeId::new(2, "test"),
+                attribute_id: AttributeId::Value as u32,
+                ..Default::default()
+            },
+            MonitoringMode::Reporting,
+            FilterType::None,
+            SamplingInterval::NonZero(chrono::TimeDelta::milliseconds(100)),
+            true,
+            Some(good.clone()),
+        );
+        let start = item.last_sample_at.unwrap();
+        let at = |ms| DateTime::from(start.as_chrono() + chrono::TimeDelta::milliseconds(ms));
+        let bad = DataValue {
+            status: Some(StatusCode::BadNoCommunication),
+            ..good
+        };
+        assert!(item.notify_data_value(bad, &at(50), false));
+        assert_eq!(
+            item.sample_skipped_data_value
+                .as_ref()
+                .unwrap()
+                .source_timestamp,
+            Some(source)
+        );
+        assert!(!item.maybe_enqueue_skipped_value(&at(99)));
+        assert!(item.maybe_enqueue_skipped_value(&at(100)));
+        let notified = item.last_data_value.as_ref().unwrap();
+        assert_eq!(notified.status, Some(StatusCode::BadNoCommunication));
+        assert_eq!(notified.source_timestamp, Some(source));
+    }
+
+    #[cfg(feature = "preserve-source-timestamps")]
+    #[test]
+    fn coalesced_latest_value_drops_obsolete_quality_and_keeps_old_source_clock() {
+        let source = DateTime::now();
+        let good = DataValue {
+            value: Some(Variant::Double(0.0)),
+            status: Some(StatusCode::Good),
+            source_timestamp: Some(source),
+            ..Default::default()
+        };
+        let mut item = new_monitored_item(
+            1,
+            ReadValueId {
+                node_id: NodeId::new(2, "test"),
+                attribute_id: AttributeId::Value as u32,
+                ..Default::default()
+            },
+            MonitoringMode::Reporting,
+            FilterType::None,
+            SamplingInterval::NonZero(chrono::TimeDelta::milliseconds(100)),
+            true,
+            Some(good.clone()),
+        );
+        let start = item.last_sample_at.unwrap();
+        let at = |ms| DateTime::from(start.as_chrono() + chrono::TimeDelta::milliseconds(ms));
+        let bad = DataValue {
+            status: Some(StatusCode::BadNoCommunication),
+            ..good.clone()
+        };
+        assert!(item.notify_data_value(bad, &at(50), false));
+        assert!(!item.notify_data_value(good.clone(), &at(60), false));
+        assert!(!item.maybe_enqueue_skipped_value(&at(100)));
+        let older = DateTime::from(source.as_chrono() - chrono::TimeDelta::seconds(1));
+        assert!(item.notify_data_value(
+            DataValue {
+                value: Some(Variant::Double(1.0)),
+                source_timestamp: Some(older),
+                ..good
+            },
+            &at(150),
+            false
+        ));
+        assert_eq!(
+            item.last_data_value.as_ref().unwrap().source_timestamp,
+            Some(older)
+        );
     }
 
     #[test]
@@ -915,6 +1068,20 @@ pub(super) mod tests {
         assert!(filter.is_changed(&v1, &v2));
     }
 
+    // Legacy tests advance the source clock while holding server time fixed.
+    // The opt-in path intentionally samples on server time; advance both in
+    // shared tests, keeping the legacy inputs unchanged when it is disabled.
+    fn test_clock(start: chrono::DateTime<Utc>, _ms: i64) -> DateTime {
+        #[cfg(feature = "preserve-source-timestamps")]
+        {
+            (start + TimeDelta::milliseconds(_ms)).into()
+        }
+        #[cfg(not(feature = "preserve-source-timestamps"))]
+        {
+            start.into()
+        }
+    }
+
     #[test]
     fn monitored_item_filter() {
         let start = Utc::now();
@@ -942,7 +1109,7 @@ pub(super) mod tests {
                 2.0,
                 (start + Duration::try_milliseconds(50).unwrap()).into()
             ),
-            &start.into(),
+            &test_clock(start, 50),
             false
         ));
         assert_eq!(1, item.notification_queue.len());
@@ -953,7 +1120,7 @@ pub(super) mod tests {
                 1.5,
                 (start + Duration::try_milliseconds(100).unwrap()).into()
             ),
-            &start.into(),
+            &test_clock(start, 100),
             false
         ));
         // Sampling is disabled, don't notify anything.
@@ -963,7 +1130,7 @@ pub(super) mod tests {
                 3.0,
                 (start + Duration::try_milliseconds(250).unwrap()).into()
             ),
-            &start.into(),
+            &test_clock(start, 250),
             false
         ));
         item.set_monitoring_mode(MonitoringMode::Reporting);
@@ -973,7 +1140,7 @@ pub(super) mod tests {
                 2.0,
                 (start + Duration::try_milliseconds(100).unwrap()).into()
             ),
-            &start.into(),
+            &test_clock(start, 100),
             false
         ));
         // Now in deadband
@@ -982,7 +1149,7 @@ pub(super) mod tests {
                 2.5,
                 (start + Duration::try_milliseconds(200).unwrap()).into()
             ),
-            &start.into(),
+            &test_clock(start, 200),
             false
         ));
         // And outside deadband
@@ -991,7 +1158,7 @@ pub(super) mod tests {
                 3.0,
                 (start + Duration::try_milliseconds(250).unwrap()).into()
             ),
-            &start.into(),
+            &test_clock(start, 250),
             false
         ));
         assert_eq!(item.notification_queue.len(), 3);
@@ -1013,7 +1180,6 @@ pub(super) mod tests {
             true,
             Some(DataValue::new_at(0, start.into())),
         );
-        let now = start.into();
         item.queue_size = 5;
         for i in 0..4 {
             assert!(item.notify_data_value(
@@ -1021,7 +1187,7 @@ pub(super) mod tests {
                     i as i32 + 1,
                     (start + Duration::try_milliseconds(100 * i + 100).unwrap()).into(),
                 ),
-                &now,
+                &test_clock(start, 100 * i + 100),
                 false
             ));
         }
@@ -1029,7 +1195,7 @@ pub(super) mod tests {
 
         assert!(item.notify_data_value(
             DataValue::new_at(5, (start + Duration::try_milliseconds(600).unwrap()).into(),),
-            &now,
+            &test_clock(start, 600),
             false
         ));
 
@@ -1111,7 +1277,11 @@ pub(super) mod tests {
         // and send the new value, since its timestamp is not after the next sample.
         // This is to avoid cases where we indefinitely delay notifications.
         let t = start + TimeDelta::milliseconds(100);
-        assert!(item.notify_data_value(DataValue::new_at(2, t.into()), &start.into(), false));
+        assert!(item.notify_data_value(
+            DataValue::new_at(2, t.into()),
+            &test_clock(start, 100),
+            false
+        ));
         assert!(item.sample_skipped_data_value.is_none());
         assert_eq!(item.notification_queue.len(), 2);
         item.notification_queue.drain(..);
@@ -1126,7 +1296,10 @@ pub(super) mod tests {
         let t = start + TimeDelta::milliseconds(300);
         assert!(item.notify_data_value(DataValue::new_at(4, t.into()), &t.into(), false));
         assert!(item.sample_skipped_data_value.is_none());
+        #[cfg(not(feature = "preserve-source-timestamps"))]
         assert_eq!(item.notification_queue.len(), 2);
+        #[cfg(feature = "preserve-source-timestamps")]
+        assert_eq!(item.notification_queue.len(), 1); // latest sample supersedes the skipped one
 
         item.notification_queue.drain(..);
         // A skipped value should also be enqueued on tick.

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { setOperatorName } from '../lib/operator';
+import { agentIdentityFixture } from '../features/operations/processIdentityFixture';
 import { MAX_PROCESS_LOG_BYTES, PROCESS_TIMEOUT_MS, processApi, processKeys, processOperationTerminal, processTarget, type ProcessBinding, type ProcessOperation, type ProcessTarget, type SourceProcessStatus } from './process';
 
 const target: ProcessTarget = { id: 'lower/a b', revision: 7, bindingRevision: 4, instanceId: 'fixed-a' };
@@ -11,6 +12,41 @@ function log(text = 'stdout\n中文 stderr') { return { source_id: target.id, so
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); window.localStorage.clear(); });
 
 describe('independent lower-process API', () => {
+  it('preserves running agent identity without replacing source or child identity', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(json({ ...status, agent_identity: agentIdentityFixture })));
+    const result = await processApi.status(target);
+    expect(result.agent_identity).toEqual(agentIdentityFixture);
+    expect(result.instance_id).toBe(target.instanceId);
+    expect(result.started_at).toBeUndefined();
+  });
+  it.each([
+    null, {}, { ...agentIdentityFixture, boot_id: 'wrong/boot' },
+    { ...agentIdentityFixture, started_at: 'invalid' },
+    { ...agentIdentityFixture, reported_at: '' },
+    ...[{ component: 'manager' }, { schema_version: 2 }, { dirty: 'false' }, { version: '' }, { commit: 'a'.repeat(257) }, { release_id: 'bad\nvalue' }].map(fields => ({ ...agentIdentityFixture, build: { ...agentIdentityFixture.build, ...fields } })),
+  ])('rejects malformed or wrong-component agent identity: %j', async (agent_identity) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(json({ ...status, agent_identity })));
+    await expect(processApi.status(target)).rejects.toMatchObject({ status: 502, code: 'invalid_response' });
+  });
+  it.each([
+    {}, { maintenance_enabled: false }, { maintenance_enabled: true },
+    { maintenance_deployment_id: 'release-a', maintenance_phase: 'stopped' },
+    { maintenance_enabled: true, maintenance_deployment_id: 'release-a', maintenance_phase: 'future_phase' },
+  ])('keeps optional maintenance capability and unknown phases: %j', async (fields) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(json({ ...status, ...fields })));
+    expect(await processApi.status(target)).toMatchObject(fields);
+  });
+
+  it.each([
+    { maintenance_enabled: 'true' }, { maintenance_enabled: null },
+    { maintenance_deployment_id: 'release-a' }, { maintenance_phase: 'stopped' },
+    { maintenance_enabled: false, maintenance_deployment_id: 'release-a', maintenance_phase: 'ready' },
+    { maintenance_deployment_id: 'a'.repeat(129), maintenance_phase: 'ready' },
+    { maintenance_deployment_id: 'release-a', maintenance_phase: 'bad\nphase' },
+  ])('rejects incomplete or contradictory maintenance status: %j', async (fields) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(json({ ...status, ...fields })));
+    await expect(processApi.status(target)).rejects.toMatchObject({ status: 502, code: 'invalid_response' });
+  });
   it('keeps binding CAS separate and never derives an agent from an OPC endpoint', async () => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(json(binding)));
     vi.stubGlobal('fetch', fetchMock); setOperatorName('值班员');

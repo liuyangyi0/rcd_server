@@ -15,6 +15,44 @@
 
 ## OPC UA
 
+### 网页配置操作（按目标下级能力显示）
+
+入口为“下级 OPC → 目标来源的运维 → 配置”。操作作用于所选物理来源，不跟随 Session 选源。
+
+1. 选择下级公布的文件。`config.toml` 在支持 `configuration_forms` 时展示参数表单；可搜索中文名称或字段名，枚举使用下拉框。
+2. 修改后点击“校验当前草稿”；参数表单的修改会先自动合并进草稿，再校验。不再单独点击“生成配置草稿”。参数准备、校验和刷新都不写文件。
+3. 校验通过后“保存到下级”；保存前比较来源 revision 与文件 SHA-256，自动备份、原子替换。保存失败保留草稿，结果不明时先核对，不能自动重试。
+4. 保存后明确重启才应用。现有 RCD 若已绑定支持安全生命周期的 Agent，可前往“进程”页操作；新 Communicate 尚未接入该能力，不能假定能从网页重启。
+
+参数默认只显示常用项，可按类别下拉筛选或搜索全部字段；默认值和只读项单独标记。“配置原文”用于高级 TOML/CSV 编辑；“导入、下载与备份”收纳可选工具，“文件版本与放弃更改”收纳版本核对和刷新。已有草稿载入文件或备份需再次确认，不能静默覆盖。未保存的参数、文件均阻止误切换；后台刷新只更新比较信息，不覆盖草稿或升级原保存 revision。
+
+管理端`0.6.13-ui.20261022.1`起，网页内部跳转或浏览器后退后，可重新打开同一来源、同一来源配置版本的运维面板，继续原文件和参数草稿。草稿只在当前网页登录的内存中保留，不写浏览器磁盘；刷新/关闭浏览器前仍须保存或导出。成功保存、明确放弃或退出登录会清除对应缓存。恢复草稿仍使用编辑开始时的文件版本；远端文件已变化时不能直接保存，需显式载入新文件并合并，不会换成新revision强行覆盖。
+
+参数定义的后台读取不锁定原文输入；显式校验、保存等操作进入忙碌状态。准备失败或内容超限时保留参数修改，不继续校验或保存。
+
+采集程序的重点参数：
+
+| 参数 | 意义 |
+| --- | --- |
+| `settings.command_retry_count` | **最大总发送次数，包含首次**。3 不是再重试 3 次；收到有效 ACK 后仍立即结束 |
+| `settings.command_interval_ms` | 同一串口不同控制事务之间的最小间隔，0–60000ms；0 不追加等待，保存后重启生效，详见下文 |
+| `settings.query_retry_count` | 普通轮询失败补发次数，0 或 1 |
+| `settings.timeout` | 串口读取超时，毫秒 |
+| `settings.poll_interval_ms` | 轮询间隔，毫秒 |
+| `settings.parity_switch_delay_ms` / `transmit_settle_guard_ms` | 校验位切换保护 / 发送完成保护，毫秒 |
+
+原文件缺少受支持且带默认值的 `settings` 项时，页面标明“程序默认值”，仅修改的项会写入。其它已有标量也可编辑；复杂数组、未展示的可选项仍使用原文。全局波特率要与各串口 CSV 核对；预留但未生效的流控字段只读，避免误认为配置后有效。本功能不会主动替换现场的 5 ms 等已有值。
+
+下级 `calculation.mode = "manager"` 时，未使用的本地 `calc.toml` 不阻止保存串口参数；切回 `local` 必须重新通过计算规则校验。
+
+采集点表格式见[CSV 填写与校验规则](acquisition-csv-rules.md)。点地址和位范围越界保留具体提示，但不阻止保存；程序配置语法、类型和范围，以及 CSV 结构、通信头部、重复点或设备冲突仍阻止保存。软件不自动改长度或点地址，由配置编写人员修正。新保存规则及页面简化已随采集和管理端 `0.6.16-config.20261023.1` 发布30、58、46，见[本次记录](../validation/configuration-workflow-deployment-20261023.md)；旧版下级仍需升级，不能只刷新管理网页。
+
+新 Communicate 只管理启动时绑定的 `config.toml`、`points.csv`。支持参数表单及相同保存规则，但不冒充采集开关、日志或 Agent 能力；身份与点表路径绑定不能远程修改，未完成协议不得启用。配置专用下级进入抽屉默认显示配置页，不请求它不支持的采集状态接口。
+
+表单需要本轮新版下级与管理端配合；旧下级仍可使用已支持的原文配置功能。新 Communicate 的配置方法沿用已获确认的匿名 OPC 运维边界，只限受信任内网；网页登录并不保护绕过 Web 的 OPC 直连。
+
+### 能力与方法
+
 在现有命名空间末尾追加 `urn:SerialServer:operations`；管理客户端必须按 URI 解析索引。
 
 | NodeId（String） | 类型 | 含义 |
@@ -26,7 +64,7 @@
 能力描述：
 
 ```json
-{"schema_version":1,"features":["acquisition","configuration","logs","station_versions","calculation_mode","logging_configuration"],"max_config_bytes":2097152,"max_log_bytes":65536,"configuration_apply":"restart"}
+{"schema_version":1,"features":["acquisition","configuration","configuration_forms","logs","station_versions","calculation_mode","logging_configuration"],"max_config_bytes":2097152,"max_log_bytes":65536,"configuration_apply":"restart"}
 ```
 
 请求为有界 JSON 对象。业务错误放在正常方法结果中，不将文件不存在、版本冲突或日志轮转误报为 OPC 通道断开：
@@ -55,6 +93,7 @@
 | `list_configs` | 无 | `{items: ConfigFile[]}` |
 | `read_config` | `name, backup_id?` | `ConfigDocument` |
 | `validate_config` | `name, content` | `{valid, errors: string[], warnings: string[], restart_required}` |
+| `prepare_config` | `name=config.toml, content, edits[]` | `{content, fields[]}`；仅准备草稿，不校验整套配置、不落盘 |
 | `write_config` | `name, content, expected_revision` | 保存后的 `ConfigDocument` |
 | `list_logs` | 无 | `{items: LogFile[]}` |
 | `read_log` | `name, generation?, offset?, limit?, query?, level?, tail?` | `LogChunk` |
@@ -90,6 +129,7 @@
 | GET | `/configs` | 配置列表 |
 | GET | `/config?name=…&backup_id=…` | 当前配置或备份草稿 |
 | POST | `/config/validate` | 只校验，不写文件 |
+| POST | `/config/prepare` | 参数定义或草稿生成；必须携带 `source_revision`，不写文件 |
 | PUT | `/config` | 保存配置 |
 | GET | `/logs` | 日志文件列表 |
 | GET | `/log?name=…&generation=…&offset=…&limit=…&q=…&level=…&tail=true` | 日志分页 |
@@ -98,7 +138,28 @@
 
 所有修改型 PUT 必须携带 `If-Match: "下级版本"` 和 JSON 中的 `source_revision`，以同时阻止下级内容冲突、来源 Endpoint 被改后的误操作。日志等级使用 `config.toml` 的内容 SHA256 作为下级版本；缺少版本返回 428，冲突或 busy 返回 409；离线返回 503，调用超时返回 504；写超时后结果可能已生效，前端必须提示核对而不是重复提交。
 
+`prepare_config` 的 `edits` 为 `{path:["settings","command_retry_count"],value:5}` 数组；表数组索引使用从 0 起的整数，非展示用的点分隔字符串。空数组只返回参数定义。响应字段提供类型、标签、提示、选项、默认值与只读标记；管理端验证响应类型和路径再传给 Web。不信任来自下级的操作者、来源身份或文件路径。
+
 沿用现有同源检查与操作员标识，不新增登录或修改 OPC 安全设置。管理审计记录动作、目标、版本、结果和内容摘要，不把配置正文或日志正文写进审计。采集控制审计以 `operation_revision` 关联本次提交；若其他端口随后修改了配置，返回的 `snapshot_revision` 单独记录，不混用两个版本。
+
+## 控制命令最小发送间隔
+
+新版采集程序提供 `settings.command_interval_ms`。入口为“下级 OPC → 目标来源的运维 → 配置 → config.toml → 参数设置”，搜索“控制命令最小间隔”。例如在已有配置的 `[settings]` 中增加：
+
+```toml
+command_interval_ms = 500 # 示例：同一串口上一条控制命令结束后，至少等500毫秒再开始下一条
+```
+
+- 范围为 **0–60000 毫秒的整数**；缺省为 0，表示不追加等待，保持原有行为。示例值并未自动写入现场，应按设备处理能力选择。
+- 每台下级配置一个值，各物理串口分别计时；不是所有串口共用一把计时锁，也不是每站单独配置。来自多台管理端、旧 OPC 入口和 TCP 入口的控制命令最终经过同一个串口执行线程。
+- 等待中的命令保留原载荷、FIFO 位置和维护占用，普通采集轮询、备机监听及满足准入条件的版本查询继续运行；不同串口不互相等待。
+- 这是**不同控制命令事务之间**的间隔，不是轮询间隔，也不改变同一命令内部重试次数、重试时序或 ACK 判断。收到有效 `00 50 50` 仍立即结束该条重试。
+- 等待计入命令原有期限，不能通过配置间隔延长期限。过期命令明确失败且不再发送；管理端执行结果不明时仍不自动重投。间隔过长或积压过多可能导致未发送就超时，不能把队列当成无限期任务表。
+- 例如设置 500ms，并不表示每 500ms 一定发送一条：还要等待上一条交换、轮询安全点和实际排队。管理端队列默认总期限为 30 秒，关联下发还受当前短调用预算约束（通常最多 5 秒）；不要把允许填写的 60000ms 当成现有调用可以等待 60 秒。已进入串口的报文不能撤回，过期保护会阻止尚未开始的发送和后续重试，不保证远端设备没有执行已发出的命令。
+- 点击“校验 → 保存”只更新磁盘；需要明确重启目标下级后生效。必须更新采集程序，**仅升级管理端不够**。旧下级尚未提供该参数时，不应仅凭手动添加字段就认为运行中已经生效。
+- 该参数不用于机组同步通信程序的周期整包发送；后者仍使用自己的刷新/超时配置。
+
+2026-10-22 曾通过运维平台将 30、58、46 的采集程序及管理端更新到 `0.6.14-command.20261022.2`，网页字段为“控制命令最小间隔（ms）”，当次三台保持默认 0ms。该发布时页面尚需“生成草稿”；本轮源码已将其合并进校验操作。不会因本说明中的示例值自动修改任何下级。[当次部署及只读验收记录](../validation/command-chain-deployment-20261022.md)。
 
 ## 与进程管理的配合
 

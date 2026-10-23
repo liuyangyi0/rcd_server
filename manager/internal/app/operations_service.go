@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -41,13 +40,16 @@ func (r *Runtime) persistLowerStatusTransition(previous, current opc.LowerStatus
 		events = append(events, domain.SourceEvent{SourceID: current.SourceID, Kind: change.kind,
 			Previous: change.before, Current: change.after, Message: current.LastError, OccurredAt: occurredAt})
 	}
-	r.statusPersistMu.Lock()
-	r.dirtySourceEvents = append(r.dirtySourceEvents, events...)
-	// Alarm rows represent current conditions, so a newer status supersedes an
-	// older retry candidate for the same source. Event history remains ordered
-	// and is never discarded on a transient SQLite failure.
-	r.dirtyAlarmStatuses[current.SourceID] = current
-	r.statusPersistMu.Unlock()
+	// Callers publish transitions after releasing r.mu. Another callback may
+	// already have committed a newer state. Keep the historical transition, but
+	// derive desired alarms from the authoritative state, not this old argument.
+	r.mu.RLock()
+	desired, present := r.statuses[current.SourceID]
+	if !present {
+		desired = opc.LowerStatus{SourceID: current.SourceID}
+	}
+	r.statusHistory.enqueue(events, desired)
+	r.mu.RUnlock()
 	// Lower status callbacks are part of the OPC connection supervision path.
 	// Never make them wait for SQLite; a single worker drains the durable queue.
 	select {
@@ -57,74 +59,21 @@ func (r *Runtime) persistLowerStatusTransition(previous, current opc.LowerStatus
 }
 
 func (r *Runtime) retryDirtyStatuses(ctx context.Context) {
-	r.statusRetryMu.Lock()
-	defer r.statusRetryMu.Unlock()
-	var persistErr error
-	persistedEvents := false
-	persistedAlarms := false
-	for {
-		r.statusPersistMu.Lock()
-		if len(r.dirtySourceEvents) == 0 {
-			r.dirtySourceEvents = nil
-			r.statusPersistMu.Unlock()
-			break
-		}
-		event := r.dirtySourceEvents[0]
-		r.statusPersistMu.Unlock()
-		if _, err := r.repo.AppendSourceEvent(ctx, event); err != nil {
-			persistErr = err
-			break
-		}
-		persistedEvents = true
-		r.statusPersistMu.Lock()
-		r.dirtySourceEvents[0] = domain.SourceEvent{}
-		r.dirtySourceEvents = r.dirtySourceEvents[1:]
-		r.statusPersistMu.Unlock()
-	}
-	if persistErr == nil {
-		r.statusPersistMu.Lock()
-		sourceIDs := make([]string, 0, len(r.dirtyAlarmStatuses))
-		for sourceID := range r.dirtyAlarmStatuses {
-			sourceIDs = append(sourceIDs, sourceID)
-		}
-		r.statusPersistMu.Unlock()
-		sort.Strings(sourceIDs)
-		for _, sourceID := range sourceIDs {
-			r.statusPersistMu.Lock()
-			status := r.dirtyAlarmStatuses[sourceID]
-			r.statusPersistMu.Unlock()
-			if err := r.reconcileStatusAlarms(ctx, status); err != nil {
-				persistErr = err
-				break
-			}
-			persistedAlarms = true
-			r.statusPersistMu.Lock()
-			// A newer callback may have replaced this source's desired alarm
-			// state while SQLite was busy. Remove only the state just reconciled.
-			if current, exists := r.dirtyAlarmStatuses[sourceID]; exists && lowerStatusEqualForAlarms(current, status) {
-				delete(r.dirtyAlarmStatuses, sourceID)
-			}
-			r.statusPersistMu.Unlock()
-		}
-	}
-	r.mu.Lock()
-	if persistErr != nil {
-		r.statusPersistError = persistErr.Error()
-	} else {
-		r.statusPersistError = ""
-	}
-	r.mu.Unlock()
+	// Trying independent sources must not multiply SQLite's busy timeout into
+	// an unbounded pause of the shared maintenance worker. Preserve unfinished
+	// work for its next pass and honor an earlier shutdown/request deadline.
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	persistedEvents, persistedAlarms := r.statusHistory.flush(ctx, func(ctx context.Context, event domain.SourceEvent) error {
+		_, err := r.repo.AppendSourceEvent(ctx, event)
+		return err
+	}, r.reconcileStatusAlarms)
 	if persistedEvents {
 		r.broker.Publish(api.Event{Type: "source.event"})
 	}
 	if persistedAlarms {
 		r.broker.Publish(api.Event{Type: "alarm.changed"})
 	}
-}
-
-func lowerStatusEqualForAlarms(left, right opc.LowerStatus) bool {
-	return left.SourceID == right.SourceID && left.Connection == right.Connection && left.Session == right.Session &&
-		left.Subscription == right.Subscription && left.Catalog == right.Catalog && left.LastError == right.LastError
 }
 
 func (r *Runtime) reconcileStatusAlarms(ctx context.Context, status opc.LowerStatus) error {

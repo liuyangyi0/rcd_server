@@ -52,6 +52,9 @@ func (b OPCBackend) GroupForNode(identifier string) (string, bool) {
 	return b.Runtime.GroupForNode(identifier)
 }
 func (b OPCBackend) PendingCount(groupID string) int { return b.Runtime.routes.PendingCount(groupID) }
+func (b OPCBackend) CommandQueueCounts(groupID string) (uint32, uint32) {
+	return b.Runtime.routes.CommandQueueCounts(groupID)
+}
 func (b OPCBackend) GroupRedundancy(group string) (domain.RedundancyView, error) {
 	return b.Runtime.Redundancy(context.Background(), group)
 }
@@ -76,6 +79,9 @@ func (b OPCBackend) CalculationMetadata() opc.CalculationMetadata {
 func (b OPCBackend) ReadGroupCommand(sessionID, groupID string) domain.Sample {
 	return b.Runtime.ReadGroupCommand(sessionID, groupID)
 }
+func (b OPCBackend) ReadGroupCommandResult(sessionID, groupID string) domain.Sample {
+	return b.Runtime.ReadGroupCommandResult(sessionID, groupID)
+}
 func (b OPCBackend) WriteGroupCommand(ctx context.Context, sessionID, groupID string, value any) (domain.StatusCode, error) {
 	return b.Runtime.writeCommand(ctx, sessionID, domain.NodeKey{}, value, groupID)
 }
@@ -98,10 +104,7 @@ func (r *Runtime) openSession(sessionID string) error {
 	if len(r.routes.Sessions()) >= r.options.MaxSessions {
 		return fmt.Errorf("maximum %d upstream sessions reached", r.options.MaxSessions)
 	}
-	automatic := make(map[string]bool)
-	for id, policy := range r.redundancyPolicies {
-		automatic[id] = policy.Enabled
-	}
+	automatic := r.redundancy.automaticGroups()
 	session, err := r.routes.OpenSessionWithAutomatic(sessionID, automatic)
 	if err == nil {
 		r.broker.Publish(api.Event{Type: "session.changed", Data: session})
@@ -241,6 +244,9 @@ func (r *Runtime) pointForIdentifier(identifier string) (indexedPoint, bool) {
 }
 
 func (r *Runtime) WriteCommand(ctx context.Context, sessionID string, key domain.NodeKey, value any) (domain.StatusCode, error) {
+	if opc.IsSynchronizationInput(key) {
+		return r.writeSynchronizationInput(ctx, sessionID, key, value)
+	}
 	return r.writeCommand(ctx, sessionID, key, value, "")
 }
 
@@ -270,44 +276,77 @@ func (r *Runtime) writeCommand(ctx context.Context, sessionID string, key domain
 		return domain.StatusBadWaitingForResponse, err
 	}
 	port := route.Port
-	command, err := r.routes.BeginCommandWithDetails(sessionID, route.GroupID, port, "Write", key.Identifier, payload)
+	// Freeze the topology mapping at acceptance; a later catalog must not
+	// reinterpret the physical destination of an already queued payload.
+	route.PhysicalPort = r.commandPhysicalPort(route)
+	command, err := r.routes.EnqueueWrite(sessionID, route.GroupID, port, key.Identifier, payload)
 	if err != nil {
 		r.configMu.Unlock()
 		return commandErrorStatus(err), err
 	}
-	if err := r.repo.SaveCommand(context.Background(), command); err != nil {
-		_, _ = r.routes.FinishCommand(command.ID, domain.CommandFailed, domain.StatusCode(0x80010000), err.Error())
-		r.configMu.Unlock()
-		return domain.StatusCode(0x80010000), fmt.Errorf("persist command before dispatch: %w", err)
-	}
 	target, targetOK := r.captureLowerCommandTarget(command.SourceID, port, true)
 	r.rememberCommandRoute(sessionID, key.Identifier, route, command, target.globalEpoch)
 	if targetOK {
-		r.commandMu.Lock()
-		r.pendingCommandMeta[command.ID] = pendingCommandMeta{
+		r.commands.register(command.ID, pendingCommandMeta{
 			generation: target.generation, epoch: target.globalEpoch, baselineSequence: target.baselineSequence,
-		}
-		r.commandMu.Unlock()
+			queued: &queuedCommandDispatch{route: route, target: target},
+		})
 	}
 	r.configMu.Unlock()
-	// Publish Waiting before dispatch. A fast lower source may publish its ACK
+	// Publish Queued before dispatch. A fast lower source may publish its ACK
 	// before Write returns, so publishing afterward could regress the audit feed.
+	r.tracking.audit.record(command)
 	r.broker.Publish(api.Event{Type: "command.changed", Data: command})
 	if !targetOK {
 		r.finishCommand(command.ID, domain.CommandFailed, domain.StatusBadNoCommunication, opc.ErrLowerUnavailable.Error())
 		return domain.StatusBadNoCommunication, opc.ErrLowerUnavailable
 	}
-	operationContext, cancel := context.WithTimeout(ctx, r.options.CommandTimeout)
+	r.commands.readyQueued(command.ID)
+	// The first command preserves synchronous admission errors. Further writes
+	// return Good once accepted, without waiting for the preceding hardware ACK.
+	if active, dispatch, claimed := r.commands.claimQueued(command.SourceID, port, command.ID); claimed {
+		return r.executeQueuedWrite(active, dispatch)
+	}
+	return domain.StatusGood, nil
+}
+
+func (r *Runtime) executeQueuedWrite(command domain.PendingCommand, dispatch queuedCommandDispatch) (domain.StatusCode, error) {
+	r.releaseDispatches.Add(1)
+	defer r.releaseDispatches.Add(-1)
+	target, current := r.captureLowerCommandTarget(command.SourceID, command.Port, true)
+	if r.closing.Load() || !current || target.globalEpoch != dispatch.target.globalEpoch || target.generation != dispatch.target.generation {
+		r.finishCommand(command.ID, domain.CommandFailed, domain.StatusBadNoCommunication, "queued command target disconnected or changed; not sent")
+		return domain.StatusBadNoCommunication, opc.ErrLowerUnavailable
+	}
+	remaining := time.Until(command.StartedAt.Add(r.options.CommandPendingTTL))
+	if remaining <= 0 {
+		r.finishCommand(command.ID, domain.CommandTimedOut, domain.StatusBadTimeout, "queued command expired before dispatch; not sent")
+		return domain.StatusBadTimeout, context.DeadlineExceeded
+	}
+	if remaining > r.options.CommandTimeout {
+		remaining = r.options.CommandTimeout
+	}
+	r.mu.RLock()
+	parent := r.runContext
+	r.mu.RUnlock()
+	if parent == nil {
+		parent = context.Background()
+	}
+	operationContext, cancel := context.WithTimeout(parent, remaining)
 	defer cancel()
-	status, err := writePinned(operationContext, target, route.Key, payload)
+	r.tracking.audit.record(command)
+	r.broker.Publish(api.Event{Type: "command.changed", Data: command})
+	status, err := r.dispatchCommand(operationContext, command, dispatch.route, dispatch.target, command.Request)
 	if err != nil || !statusIsGood(status) {
-		if errors.Is(operationContext.Err(), context.DeadlineExceeded) {
+		state := domain.CommandFailed
+		if errors.Is(operationContext.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) || status == domain.StatusBadTimeout {
 			status = domain.StatusBadTimeout
+			state = domain.CommandTimedOut
 		}
 		if statusIsGood(status) {
 			status = domain.StatusBadNoCommunication
 		}
-		r.finishCommand(command.ID, domain.CommandFailed, status, commandDispatchError(status, err))
+		r.finishCommand(command.ID, state, status, commandDispatchError(status, err))
 		return status, err
 	}
 	if terminal, _ := r.armCommand(command.ID); terminal != nil {
@@ -338,17 +377,15 @@ func (r *Runtime) callCommand(ctx context.Context, sessionID string, key domain.
 		r.configMu.Unlock()
 		return "", domain.StatusBadWaitingForResponse, err
 	}
+	route.PhysicalPort = r.commandPhysicalPort(route)
 	port := route.Port
 	command, err := r.routes.BeginCommandWithDetails(sessionID, route.GroupID, port, "Call", key.Identifier, hexData)
 	if err != nil {
 		r.configMu.Unlock()
 		return "", commandErrorStatus(err), err
 	}
-	if err := r.repo.SaveCommand(context.Background(), command); err != nil {
-		_, _ = r.routes.FinishCommand(command.ID, domain.CommandFailed, domain.StatusCode(0x80010000), err.Error())
-		r.configMu.Unlock()
-		return "", domain.StatusCode(0x80010000), fmt.Errorf("persist command before dispatch: %w", err)
-	}
+	r.releaseDispatches.Add(1)
+	defer r.releaseDispatches.Add(-1)
 	// A Method call must report the physical serial result, not merely that the
 	// lower OPC server accepted a fire-and-forget RPC. Reuse the lower _Send
 	// variable because it is the compatibility protocol that carries the
@@ -356,14 +393,13 @@ func (r *Runtime) callCommand(ctx context.Context, sessionID string, key domain.
 	target, targetOK := r.captureLowerCommandTarget(command.SourceID, port, true)
 	r.rememberCommandRoute(sessionID, key.Identifier, route, command, target.globalEpoch)
 	if targetOK {
-		r.commandMu.Lock()
-		r.pendingCommandMeta[command.ID] = pendingCommandMeta{
+		r.commands.register(command.ID, pendingCommandMeta{
 			generation: target.generation, epoch: target.globalEpoch, baselineSequence: target.baselineSequence,
 			done: make(chan pendingCommandTerminal, 1),
-		}
-		r.commandMu.Unlock()
+		})
 	}
 	r.configMu.Unlock()
+	r.tracking.audit.record(command)
 	r.broker.Publish(api.Event{Type: "command.changed", Data: command})
 	if !targetOK {
 		r.finishCommand(command.ID, domain.CommandFailed, domain.StatusBadNoCommunication, opc.ErrLowerUnavailable.Error())
@@ -371,10 +407,10 @@ func (r *Runtime) callCommand(ctx context.Context, sessionID string, key domain.
 	}
 	operationContext, cancel := context.WithTimeout(ctx, r.options.CommandTimeout)
 	defer cancel()
-	status, err := writePinned(operationContext, target, route.SendKey, hexData)
+	status, err := r.dispatchCommand(operationContext, command, route, target, hexData)
 	if err != nil || !statusIsGood(status) {
 		state := domain.CommandFailed
-		if errors.Is(operationContext.Err(), context.DeadlineExceeded) {
+		if errors.Is(operationContext.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) || status == domain.StatusBadTimeout {
 			state = domain.CommandTimedOut
 			status = domain.StatusBadTimeout
 		} else if statusIsGood(status) {
@@ -434,22 +470,14 @@ func (r *Runtime) completeCommandFromAck(sourceID, port string, sample domain.Sa
 	if ack != "1" && ack != "2" && ack != "3" {
 		return
 	}
-	r.commandMu.Lock()
-	meta, exists := r.pendingCommandMeta[command.ID]
-	sampleGeneration := sample.Epoch >> 32
-	if !exists || sample.Epoch != meta.epoch || sequence <= meta.baselineSequence ||
-		(sampleGeneration != 0 && sampleGeneration != meta.generation) {
-		r.commandMu.Unlock()
-		return
-	}
 	if ack == "2" {
-		r.commandMu.Unlock()
 		return
 	}
 	// The Rust lower can publish Waiting("2") and Received("1") inside one
 	// 250 ms sampling window. QueueSize=1 then exposes only the terminal 1.
-	// Exact source, epoch and a sequence newer than the pre-dispatch baseline
-	// already reject retained/late ACKs, so observing 2 is useful but optional.
+	// The lower adapter fences subscription delivery across its pre-write Read
+	// and Write. Only timestamped transitions newer than that baseline enter this
+	// sequence; observing 2 is useful but optional for a coalesced terminal ACK.
 	// The ACK DataValue can carry lower-server notification information bits
 	// (notably 0x80 when Waiting and Received share one publish interval).
 	// Those bits describe the monitored-item queue, not the command outcome.
@@ -458,19 +486,9 @@ func (r *Runtime) completeCommandFromAck(sourceID, port string, sample domain.Sa
 	if ack == "3" {
 		terminal = pendingCommandTerminal{state: domain.CommandFailed, status: domain.StatusBadUnexpectedError, message: "lower source rejected command"}
 	}
-	if !meta.armed {
-		meta.terminal = &terminal
-		r.pendingCommandMeta[command.ID] = meta
-		r.commandMu.Unlock()
-		return
+	if r.commands.observe(command.ID, terminal, false, sample.Epoch, sequence) {
+		r.finishCommand(command.ID, terminal.state, terminal.status, terminal.message)
 	}
-	done := meta.done
-	r.commandMu.Unlock()
-	if done != nil {
-		done <- terminal
-		return
-	}
-	r.finishCommand(command.ID, terminal.state, terminal.status, terminal.message)
 }
 
 func passiveSendValue(value string) bool {
@@ -502,20 +520,46 @@ func (r *Runtime) writePassiveSendValue(ctx context.Context, sessionID string, k
 		r.configMu.Unlock()
 		return commandErrorStatus(err), err
 	}
-	if _, pending := r.routes.PendingCommand(route.SourceID, route.Port); pending {
+	if err := r.checkProcessMaintenanceLocked(route.SourceID); err != nil {
+		r.configMu.Unlock()
+		return domain.StatusBadWaitingForResponse, err
+	}
+	if r.routes.HasPortCommands(route.SourceID, route.Port) {
 		r.configMu.Unlock()
 		return domain.StatusBadWaitingForResponse, domain.ErrCommandPending
 	}
 	target, targetOK := r.captureLowerCommandTarget(route.SourceID, route.Port, false)
-	r.configMu.Unlock()
 	if !targetOK {
+		r.configMu.Unlock()
 		return domain.StatusBadNoCommunication, opc.ErrLowerUnavailable
 	}
+	// Reserve the same physical port and group as a hardware command before
+	// releasing admission. A reset must not overtake a just-accepted command,
+	// race its ACK variable, or disappear from a maintenance drain snapshot.
+	// It has no hardware transaction or command audit and never enters the FIFO.
+	reservation, err := r.routes.BeginCommandWithDetails(sessionID, route.GroupID, route.Port, domain.CommandKindPassiveReset, key.Identifier, "")
+	if err != nil {
+		r.configMu.Unlock()
+		return commandErrorStatus(err), err
+	}
+	r.releaseDispatches.Add(1)
+	r.configMu.Unlock()
+	defer r.releaseDispatches.Add(-1)
+	defer func() {
+		changes, _ := r.routes.CommitCommandFinish(reservation.ID)
+		for _, change := range changes {
+			r.queueSessionRefresh(change.SessionID, change.Route.GroupID)
+			r.broker.Publish(api.Event{Type: "selection.changed", Data: change})
+		}
+	}()
 	operationContext, cancel := context.WithTimeout(ctx, r.options.CommandTimeout)
 	defer cancel()
 	status, err := writePinned(operationContext, target, route.Key, payload)
 	if errors.Is(operationContext.Err(), context.DeadlineExceeded) {
 		return domain.StatusBadTimeout, operationContext.Err()
+	}
+	if err != nil && status.IsGood() {
+		status = domain.StatusBadNoCommunication
 	}
 	if err == nil && status.IsGood() {
 		r.rememberPassiveCommand(sessionID, key.Identifier, groupHint, route, payload)
@@ -524,81 +568,36 @@ func (r *Runtime) writePassiveSendValue(ctx context.Context, sessionID string, k
 }
 
 func (r *Runtime) armCommand(commandID string) (*pendingCommandTerminal, <-chan pendingCommandTerminal) {
-	r.commandMu.Lock()
-	defer r.commandMu.Unlock()
-	meta, exists := r.pendingCommandMeta[commandID]
-	if !exists {
-		return nil, nil
-	}
-	meta.armed = true
-	r.pendingCommandMeta[commandID] = meta
-	if meta.terminal == nil {
-		return nil, meta.done
-	}
-	terminal := *meta.terminal
-	return &terminal, meta.done
+	return r.commands.arm(commandID)
 }
 
 func (r *Runtime) finishCommand(id string, state domain.CommandState, status domain.StatusCode, message string) {
-	r.commandMu.Lock()
-	command, exists := r.dirtyCommands[id]
-	if !exists {
-		var err error
-		command, err = r.routes.PrepareCommandFinish(id, state, status, message, time.Now().UTC())
-		if err != nil {
-			r.commandMu.Unlock()
+	command, routeChanges, cancelled, err := r.commands.finish(id, state, status, message, r.finishCommandHistory)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
 			return
 		}
-	}
-	if err := r.repo.SaveCommand(context.Background(), command); err != nil {
-		r.dirtyCommands[id] = command
-		r.setCommandPersistError(err)
-		r.commandMu.Unlock()
-		slog.Error("save command audit", "command_id", command.ID, "error", err)
+		slog.Error("release command", "command_id", command.ID, "error", err)
 		return
 	}
-	routeChanges, err := r.routes.CommitCommandFinish(id)
-	if err != nil && !errors.Is(err, domain.ErrNotFound) {
-		r.dirtyCommands[id] = command
-		r.setCommandPersistError(err)
-		r.commandMu.Unlock()
-		slog.Error("release persisted command", "command_id", command.ID, "error", err)
-		return
+	r.tracking.audit.record(command)
+	for _, queued := range cancelled {
+		r.finishCommandHistory(queued)
+		r.tracking.audit.record(queued)
+		r.broker.Publish(api.Event{Type: "command.changed", Data: queued})
 	}
-	delete(r.dirtyCommands, id)
-	delete(r.pendingCommandMeta, id)
-	if len(r.dirtyCommands) == 0 {
-		r.setCommandPersistError(nil)
-	}
-	r.commandMu.Unlock()
-	r.finishCommandHistory(command)
 	for _, change := range routeChanges {
 		r.queueSessionRefresh(change.SessionID, change.Route.GroupID)
 		r.broker.Publish(api.Event{Type: "selection.changed", Data: change})
 	}
 	r.broker.Publish(api.Event{Type: "command.changed", Data: command})
-}
-
-func (r *Runtime) setCommandPersistError(err error) {
-	r.mu.Lock()
-	if err == nil {
-		r.commandPersistError = ""
-	} else {
-		r.commandPersistError = err.Error()
-	}
-	r.mu.Unlock()
+	// An unconfirmed timeout/write failure must not release a burst of old
+	// commands into a port whose previous transaction may still be running.
+	r.startQueuedWrite(command.SourceID, command.Port)
 }
 
 func (r *Runtime) retryDirtyCommands() {
-	r.commandMu.Lock()
-	commands := make([]domain.PendingCommand, 0, len(r.dirtyCommands))
-	for _, command := range r.dirtyCommands {
-		commands = append(commands, command)
-	}
-	r.commandMu.Unlock()
-	for _, command := range commands {
-		r.finishCommand(command.ID, command.State, command.StatusCode, command.Error)
-	}
+	r.tracking.audit.flush()
 }
 
 type lowerCommandTarget struct {
@@ -612,7 +611,7 @@ type lowerCommandTarget struct {
 func (r *Runtime) captureLowerCommandTarget(sourceID, port string, requireSubscription bool) (lowerCommandTarget, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	handle, ok := r.lowers[sourceID]
+	handle, ok := r.connections.handle(sourceID)
 	if !ok {
 		return lowerCommandTarget{}, false
 	}
@@ -691,6 +690,7 @@ func (r *Runtime) commandSweeper() {
 }
 
 func (r *Runtime) sweepExpiredCommands(now time.Time) {
+	r.cancelDisconnectedQueued()
 	for _, command := range r.routes.ExpiredPending(now, r.options.CommandPendingTTL) {
 		r.finishCommand(command.ID, domain.CommandTimedOut, domain.StatusBadTimeout, "command timed out")
 	}
@@ -707,7 +707,7 @@ func (r *Runtime) retryMissingLowers() {
 			continue
 		}
 		r.mu.RLock()
-		_, exists := r.lowers[source.ID]
+		_, exists := r.connections.handle(source.ID)
 		r.mu.RUnlock()
 		if exists {
 			continue
@@ -725,9 +725,7 @@ func (r *Runtime) retryDirtyUpstream() {
 	if r.closing.Load() {
 		return
 	}
-	r.mu.RLock()
-	dirty := r.upstreamReconcileDirty
-	r.mu.RUnlock()
+	dirty, _ := r.publication.status()
 	if !dirty {
 		return
 	}
@@ -737,33 +735,15 @@ func (r *Runtime) retryDirtyUpstream() {
 }
 
 func (r *Runtime) retryDirtyAudits(ctx context.Context) {
-	r.mu.RLock()
-	dirty := make(map[string]domain.AuditEntry, len(r.dirtyAudits))
-	for key, entry := range r.dirtyAudits {
-		dirty[key] = entry
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if r.managementAudit.retry(ctx, r.repo.AppendAudit) {
+		r.broker.Publish(api.Event{Type: "management.audit"})
 	}
-	r.mu.RUnlock()
-	persisted := false
-	for key, entry := range dirty {
-		persistContext, cancel := context.WithTimeout(ctx, 2*time.Second)
-		_, err := r.repo.AppendAudit(persistContext, entry)
-		cancel()
-		r.mu.Lock()
-		if err != nil {
-			r.auditPersistError = err.Error()
-			r.mu.Unlock()
-			continue
-		}
-		if current, exists := r.dirtyAudits[key]; exists && current.OccurredAt.Equal(entry.OccurredAt) {
-			delete(r.dirtyAudits, key)
-		}
-		if len(r.dirtyAudits) == 0 {
-			r.auditPersistError = ""
-		}
-		r.mu.Unlock()
-		persisted = true
-	}
-	if persisted {
+}
+
+func (r *Runtime) drainManagementAudits(ctx context.Context) {
+	if r.managementAudit.drain(ctx, r.repo.AppendAudit) {
 		r.broker.Publish(api.Event{Type: "management.audit"})
 	}
 }
@@ -778,32 +758,13 @@ func (r *Runtime) retryDirtyCatalogs(ctx context.Context) {
 }
 
 func (r *Runtime) persistDirtyCatalogs(ctx context.Context) {
-	r.mu.RLock()
-	dirty := cloneCatalogMap(r.dirtyCatalogs)
-	r.mu.RUnlock()
-	for sourceID, catalog := range dirty {
-		if err := r.repo.ReplaceSourceCatalog(ctx, catalog); err != nil {
-			r.mu.Lock()
-			r.catalogPersistError = err.Error()
-			r.mu.Unlock()
-			continue
-		}
-		r.mu.Lock()
-		current, exists := r.dirtyCatalogs[sourceID]
-		if exists && current.DiscoveredAt.Equal(catalog.DiscoveredAt) {
-			delete(r.dirtyCatalogs, sourceID)
-		}
-		if len(r.dirtyCatalogs) == 0 {
-			r.catalogPersistError = ""
-		}
-		r.mu.Unlock()
-	}
+	r.catalogPersistence.flush(ctx)
 }
 
 func (r *Runtime) lowerClient(sourceID string) (opc.LowerClient, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	handle, ok := r.lowers[sourceID]
+	handle, ok := r.connections.handle(sourceID)
 	if !ok {
 		return nil, false
 	}

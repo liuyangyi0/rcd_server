@@ -1,9 +1,9 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { operationKeys, type AcquisitionSnapshot, type ConfigDocument, type OperationsCapabilities } from '../../api/operations';
+import { operationKeys, operationsApi, type AcquisitionSnapshot, type ConfigDocument, type ConfigForm, type OperationsCapabilities } from '../../api/operations';
 import { queryKeys } from '../../api/queries';
 import type { Source } from '../../api/types';
 import SourcesPage from '../../pages/SourcesPage';
@@ -17,7 +17,7 @@ function server() {
   const capabilities: OperationsCapabilities = { source_id: source.id, source_revision: 2, supported: true, schema_version: 1, features: ['acquisition', 'configuration', 'logs'], max_config_bytes: 2_097_152, max_log_bytes: 65_536, configuration_apply: 'restart' };
   const acquisition: AcquisitionSnapshot = { source_id: source.id, source_revision: 2, schema_version: 1, revision: 'lower-r1', ports: [{ port_id: '/dev/ttyS0', port_name: 'COM-A', enabled: true, applied_enabled: true, open: true, pending_commands: 0, control_pending: false, devices: [{ device_id: '1', name: '站点一', read_enabled: true, applied_read_enabled: true, communication_ok: true, last_data_at: '2026-08-28T01:00:00Z' }] }] };
   const document: ConfigDocument = { source_id: source.id, source_revision: 2, name: 'serial.toml', kind: 'serial', revision: 'file-1', active_revision: 'file-1', restart_required: false, size_bytes: 14, content: 'enabled = true', backups: [{ id: 'backup-1', created_at: '2026-08-28T01:00:00Z', size_bytes: 15 }] };
-  const state = { capabilities, acquisition, document, sources: [source], sourceRemoved: false, saveFailure: 0, saveFailureCode: 'conflict', controlFailure: 0, controlFailureCode: 'timeout', valid: true, logGeneration: 'g1', logText: '[INFO] old line', emptyLogs: false };
+  const state = { capabilities, acquisition, document, sources: [source], sourceRemoved: false, saveFailure: 0, saveFailureCode: 'conflict', controlFailure: 0, controlFailureCode: 'timeout', valid: true, warnings: [] as string[], logGeneration: 'g1', logText: '[INFO] old line', emptyLogs: false };
   const fetchMock = vi.fn().mockImplementation((raw: string, init?: RequestInit) => {
     const url = new URL(raw, 'http://localhost');
     const id = decodeURIComponent(url.pathname.match(/sources\/([^/]+)\/(?:operations|process)/)?.[1] || source.id);
@@ -34,7 +34,7 @@ function server() {
       return Promise.resolve(json({ ...state.acquisition, status: 'Applied' }));
     }
     if (url.pathname.endsWith('/configs')) return Promise.resolve(json({ source_id: id, source_revision: 2, items: [{ ...state.document, content: undefined, backups: undefined }] }));
-    if (url.pathname.endsWith('/config/validate')) return Promise.resolve(json({ valid: state.valid, errors: state.valid ? [] : ['配置语法错误'], warnings: [], restart_required: true }));
+    if (url.pathname.endsWith('/config/validate')) return Promise.resolve(json({ valid: state.valid, errors: state.valid ? [] : ['配置语法错误'], warnings: state.warnings, restart_required: true }));
     if (url.pathname.endsWith('/config') && init?.method === 'PUT') {
       if (state.saveFailure) {
         if (state.saveFailure === 409 && state.saveFailureCode === 'conflict') state.document = { ...state.document, revision: 'file-other', content: 'changed elsewhere' };
@@ -66,9 +66,153 @@ async function configuration() {
   await userEvent.setup().click(await screen.findByRole('tab', { name: '配置' }));
   return screen.findByLabelText('配置内容 serial.toml');
 }
-afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
+afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); vi.useRealTimers(); });
+
+function RouteHarness() {
+  const navigate = useNavigate();
+  return <><button onClick={() => navigate('/away')}>离开来源页面</button><button onClick={() => navigate('/')}>返回来源页面</button><Routes><Route path="/" element={<SourceOperationsDrawer source={source} onClose={() => undefined} />} /><Route path="/away" element={<p>其他页面</p>} /></Routes></>;
+}
 
 describe('physical lower-source operations drawer', () => {
+  it('restores the original config baseline and draft after an SPA route unmount', async () => {
+    const { state, fetchMock } = server();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    render(<QueryClientProvider client={client}><MemoryRouter><RouteHarness /></MemoryRouter></QueryClientProvider>);
+    const editor = await configuration(); const user = userEvent.setup();
+    await user.clear(editor); await user.type(editor, 'draft retained across browser navigation');
+    await user.click(screen.getByRole('button', { name: '离开来源页面' }));
+    expect(screen.queryByLabelText('配置内容 serial.toml')).not.toBeInTheDocument();
+    state.document = { ...state.document, revision: 'file-new', content: 'changed by another user' };
+    client.setQueryData(operationKeys.config(target, 'serial.toml'), state.document);
+    await user.click(screen.getByRole('button', { name: '返回来源页面' }));
+    expect(await screen.findByLabelText('配置内容 serial.toml')).toHaveValue('draft retained across browser navigation');
+    expect(screen.getByText(/已恢复本次网页登录期间离开页面前的未保存草稿和原版本/)).toBeInTheDocument();
+    expect(screen.getByText(/下级文件已被其他操作修改/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '保存到下级' })).toBeDisabled();
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(0);
+    client.clear();
+  });
+
+  it('does not disable or blur raw typing while parameter definitions are slow', async () => {
+    const { state } = server();
+    state.document = { ...state.document, name: 'config.toml' };
+    state.capabilities.features.push('configuration_forms');
+    const prepare = vi.spyOn(operationsApi, 'prepare').mockImplementation(() => new Promise<ConfigForm>(() => {}));
+    const view = mount(); const user = userEvent.setup();
+    await user.click(await screen.findByRole('tab', { name: '配置' }));
+    await user.click(await screen.findByText('配置原文（高级编辑；点表 CSV 也在此编辑）'));
+    const editor = screen.getByLabelText('配置内容 config.toml');
+    expect(editor).toBeEnabled();
+    await user.clear(editor); await user.type(editor, 'continuous raw configuration edit');
+    await waitFor(() => expect(prepare).toHaveBeenCalledTimes(1));
+    expect(editor).toHaveValue('continuous raw configuration edit');
+    expect(editor).toHaveFocus(); expect(editor).toBeEnabled();
+    expect(prepare.mock.calls[0][2]).toBe('continuous raw configuration edit');
+    view.client.clear();
+  });
+
+  it('recovers ungenerated parameter edits after leaving and returning to the source', async () => {
+    const { state } = server();
+    state.document = { ...state.document, name: 'config.toml', content: 'command_retry_count=3' };
+    state.capabilities.features.push('configuration_forms');
+    vi.spyOn(operationsApi, 'prepare').mockResolvedValue({ source_id: source.id, source_revision: 2, content: state.document.content, fields: [{ path: ['command_retry_count'], key: 'command_retry_count', label: '命令下发次数', hint: '', kind: 'integer', value: 3, options: [], inherited: false, readonly: false }] });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    render(<QueryClientProvider client={client}><MemoryRouter><RouteHarness /></MemoryRouter></QueryClientProvider>);
+    const user = userEvent.setup(); await user.click(await screen.findByRole('tab', { name: '配置' }));
+    const input = await screen.findByLabelText('命令下发次数'); await user.clear(input); await user.type(input, '5');
+    await user.click(screen.getByRole('button', { name: '离开来源页面' }));
+    await user.click(screen.getByRole('button', { name: '返回来源页面' }));
+    expect(await screen.findByLabelText('命令下发次数')).toHaveValue(5);
+    expect(screen.getByRole('button', { name: '校验当前草稿' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '保存到下级' })).toBeDisabled();
+    client.clear();
+  });
+  it('sets the lower command interval through draft validation and CAS save without restarting', async () => {
+    const { state, fetchMock } = server();
+    state.document = { ...state.document, name: 'config.toml', content: '# preserved\n[settings]\ncommand_retry_count=3\n' };
+    state.capabilities.features.push('configuration_forms');
+    const prepare = vi.spyOn(operationsApi, 'prepare').mockImplementation(async (_target, _name, content, edits = []) => ({
+      source_id: source.id, source_revision: 2,
+      content: edits.length ? `${content}command_interval_ms = 500\n` : content,
+      fields: [{ path: ['settings', 'command_interval_ms'], key: 'settings.command_interval_ms', label: '控制命令最小间隔(ms)', hint: '保存后重启下级生效，0..60000', kind: 'integer', value: edits.length ? 500 : 0, options: [], inherited: !edits.length, readonly: false }],
+    }));
+    const view = mount(); const user = userEvent.setup();
+    await user.click(await screen.findByRole('tab', { name: '配置' }));
+    const input = await screen.findByLabelText('控制命令最小间隔(ms)');
+    expect(input).toHaveValue(0);
+    await user.clear(input); await user.type(input, '500');
+    expect(screen.getByRole('button', { name: '保存到下级' })).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: '校验当前草稿' }));
+    await waitFor(() => expect(screen.getByLabelText('配置内容 config.toml')).toHaveValue('# preserved\n[settings]\ncommand_retry_count=3\ncommand_interval_ms = 500\n'));
+    expect(prepare.mock.calls.find((call) => call[3]?.length)?.[3]).toEqual([{ path: ['settings', 'command_interval_ms'], value: 500 }]);
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(0);
+    await waitFor(() => expect(screen.getByRole('button', { name: '保存到下级' })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: '保存到下级' }));
+    expect(await screen.findByText(/配置已保存到下级文件；需要手动重启下级后生效/)).toBeInTheDocument();
+    const writes = fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT');
+    expect(writes).toHaveLength(1);
+    expect(new Headers(writes[0][1]?.headers).get('If-Match')).toBe('"file-1"');
+    expect(JSON.parse(String(writes[0][1]?.body))).toMatchObject({ source_revision: 2, name: 'config.toml', content: state.document.content });
+    expect(fetchMock.mock.calls.some(([url]) => /process\/.*(?:restart|control)/.test(String(url)))).toBe(false);
+    view.client.clear();
+  });
+  it('allows saving with point warnings but blocks application configuration errors', async () => {
+    const { state, fetchMock } = server(); mount();
+    const editor = await configuration(); const user = userEvent.setup();
+    state.warnings = ['rcd_example.csv: 第 83 行 EXAMPLE_AI4: byte_index=20 超出状态数据长度 1..=19'];
+    await user.clear(editor); await user.type(editor, 'changed config');
+    await user.click(screen.getByRole('button', { name: '校验当前草稿' }));
+    expect(await screen.findByText('配置可以保存，以下提示不阻止保存')).toBeInTheDocument();
+    expect(screen.getByText(state.warnings[0])).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '保存到下级' })).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: '保存到下级' }));
+    await screen.findByText(/配置已保存到下级文件/);
+    state.valid = false;
+    await user.type(editor, ' invalid');
+    await user.click(screen.getByRole('button', { name: '校验当前草稿' }));
+    expect(await screen.findByText('配置语法错误')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '保存到下级' })).toBeDisabled();
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(1);
+  });
+
+  it('retains dirty content until a backup replacement is explicitly confirmed', async () => {
+    const { fetchMock } = server(); mount(); const editor = await configuration(); const user = userEvent.setup();
+    await user.clear(editor); await user.type(editor, 'keep unsaved draft');
+    await user.click(screen.getByText('导入、下载与备份（可选）'));
+    await user.selectOptions(screen.getByLabelText('自动备份版本'), 'backup-1');
+    await user.click(screen.getByRole('button', { name: '载入备份为草稿' }));
+    const confirm = await screen.findByRole('button', { name: '确认替换草稿' });
+    expect(editor).toHaveValue('keep unsaved draft');
+    await user.click(confirm);
+    expect(editor).toHaveValue('enabled = false');
+    expect(screen.getByRole('button', { name: '保存到下级' })).toBeDisabled();
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(0);
+  });
+
+  it('does not validate or save when parameter preparation fails', async () => {
+    const { state, fetchMock } = server();
+    state.document = { ...state.document, name: 'config.toml' };
+    state.capabilities.features.push('configuration_forms');
+    const prepare = vi.spyOn(operationsApi, 'prepare').mockResolvedValue({ source_id: source.id, source_revision: 2, content: state.document.content, fields: [{ path: ['settings', 'command_interval_ms'], key: 'settings.command_interval_ms', label: '命令间隔', hint: '', kind: 'integer', value: 0, options: [], inherited: true, readonly: false }] });
+    mount(); const user = userEvent.setup();
+    await user.click(await screen.findByRole('tab', { name: '配置' }));
+    await user.type(await screen.findByLabelText('命令间隔'), '500');
+    prepare.mockRejectedValue(new Error('prepare offline'));
+    await user.click(screen.getByRole('button', { name: '校验当前草稿' }));
+    await screen.findByText(/校验未完成/);
+    expect(screen.getByLabelText('命令间隔')).toHaveValue(500);
+    expect(screen.getByRole('button', { name: '保存到下级' })).toBeDisabled();
+    expect(fetchMock.mock.calls.some(([url, init]) => String(url).endsWith('/config/validate') || init?.method === 'PUT')).toBe(false);
+  });
+
+  it('opens configuration-only lowers without requesting unsupported acquisition status', async () => {
+    const { state, fetchMock } = server();
+    state.capabilities.features = ['configuration'];
+    mount();
+    expect(await screen.findByLabelText('配置内容 serial.toml')).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: '配置' })).toHaveAttribute('aria-selected', 'true');
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/operations/status'))).toBe(false);
+  });
   it('retains a dirty panel when the parent source list deletes its source, until explicit close', async () => {
     const { state, fetchMock } = server();
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
@@ -92,6 +236,7 @@ describe('physical lower-source operations drawer', () => {
     expect(editor).toHaveValue('unsaved draft survives source deletion');
     expect(screen.getByRole('button', { name: '保存到下级' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '校验当前草稿' })).toBeDisabled();
+    await user.click(screen.getByText('导入、下载与备份（可选）'));
     expect(screen.getByRole('button', { name: '下载草稿' })).toBeEnabled();
     expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(0);
 
@@ -223,6 +368,7 @@ describe('physical lower-source operations drawer', () => {
 
   it('loads backups only into drafts and never sends their hash as If-Match', async () => {
     const { fetchMock } = server(); mount(); const editor = await configuration(); const user = userEvent.setup();
+    await user.click(screen.getByText('导入、下载与备份（可选）'));
     await user.selectOptions(screen.getByLabelText('自动备份版本'), 'backup-1');
     await user.click(screen.getByRole('button', { name: '载入备份为草稿' }));
     await waitFor(() => expect(editor).toHaveValue('enabled = false'));

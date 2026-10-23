@@ -244,6 +244,27 @@ var migrations = []string{
 		UPDATE alarms SET state='Resolved', resolved_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), revision=revision+1
 		WHERE source_id='' AND kind='group/' || OLD.id || '/data_difference' AND state='Open';
 	END;`,
+	`CREATE TABLE manager_identity (id INTEGER PRIMARY KEY CHECK(id=1), instance_id TEXT NOT NULL);
+	CREATE TABLE command_trace (
+	 command_id TEXT PRIMARY KEY REFERENCES command_audit(id) ON DELETE CASCADE,
+	 protocol TEXT NOT NULL, gateway TEXT NOT NULL, boot TEXT NOT NULL, port TEXT NOT NULL,
+	 request_hash TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0, snapshot TEXT, history_gap INTEGER NOT NULL DEFAULT 0);
+	CREATE TABLE command_trace_events (
+	 command_id TEXT NOT NULL REFERENCES command_audit(id) ON DELETE CASCADE,
+	 revision INTEGER NOT NULL, snapshot TEXT NOT NULL, PRIMARY KEY(command_id,revision));
+	CREATE TABLE command_trace_cursor (source_id TEXT NOT NULL, gateway TEXT NOT NULL, cursor INTEGER NOT NULL, PRIMARY KEY(source_id,gateway));`,
+	`CREATE TABLE software_version_cache (
+	 source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+	 component TEXT NOT NULL CHECK(component IN ('lower','agent')),
+	 binding TEXT NOT NULL, snapshot TEXT NOT NULL,
+	 PRIMARY KEY(source_id,component));
+	 CREATE TRIGGER software_version_source_reset AFTER UPDATE OF endpoint,security_policy,security_mode,username ON sources
+	 WHEN OLD.endpoint!=NEW.endpoint OR OLD.security_policy!=NEW.security_policy OR OLD.security_mode!=NEW.security_mode OR OLD.username!=NEW.username
+	 BEGIN DELETE FROM software_version_cache WHERE source_id=NEW.id AND component='lower'; END;`,
+	`CREATE TABLE fleet_snapshot (platform TEXT PRIMARY KEY, snapshot TEXT NOT NULL, received_at TEXT NOT NULL);
+	 CREATE TABLE fleet_binding (source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+	 platform TEXT NOT NULL, device_id TEXT NOT NULL, machine TEXT NOT NULL, applied_at TEXT NOT NULL,
+	 UNIQUE(platform,device_id));`,
 }
 
 func migrate(ctx context.Context, db *sql.DB) error {

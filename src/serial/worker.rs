@@ -15,6 +15,9 @@ use log::{debug, error, info, warn};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+pub(super) use super::command_transaction::execute_command_with_ack;
+use super::command_transaction::{execute_queued_command, send_ack_status};
 use super::manager::{QueuedCommand, SerialConfig, SerialManager};
 use super::port_config::SerialPortConfig;
 use crate::broadcast::Broadcaster;
@@ -79,6 +82,9 @@ pub fn spawn_serial_worker(
             system_record,
         );
         manager.operations = Some(operations.clone());
+        manager.command_pacing = super::command_pacing::CommandPacing::new(Duration::from_millis(
+            software_config.settings.command_interval_ms,
+        ));
         for index in 0..manager.port_config.devices.len() {
             let id = manager.port_config.devices[index].config.device_id;
             if !operations.initial_device_read_enabled(&port_name, id) {
@@ -89,11 +95,12 @@ pub fn spawn_serial_worker(
         manager.refresh_operations_state();
 
         info!(
-            "串口 {} worker 已启动，当前角色: {:?}，设备数: {}，端口启用: {}",
+            "串口 {} worker 已启动，当前角色: {:?}，设备数: {}，端口启用: {}，控制命令间隔: {}ms",
             port_name,
             manager.current_run,
             manager.port_config.devices.len(),
-            manager.port_config.status
+            manager.port_config.status,
+            software_config.settings.command_interval_ms,
         );
 
         let mut restart_count = 0u32;
@@ -136,6 +143,7 @@ pub fn spawn_serial_worker(
                     );
                     reject_queued_commands(&mut manager, None, &ack_status_tx, "worker_panic");
                     if cancel.is_cancelled() {
+                        reject_incoming_commands(&manager, &rx, &ack_status_tx);
                         break;
                     }
                     std::thread::sleep(Duration::from_secs(1));
@@ -179,6 +187,8 @@ fn run_worker_loop(
 
         if cancel.is_cancelled() {
             info!("串口 {} worker 收到取消信号，退出", port_name);
+            reject_queued_commands(manager, None, ack_status_tx, "worker_shutdown");
+            reject_incoming_commands(manager, rx, ack_status_tx);
             return;
         }
 
@@ -224,6 +234,7 @@ fn run_worker_loop(
 
         let completed_normal_slot =
             matches!(&cycle_result, CycleResult::QuerySent(_) | CycleResult::Idle);
+        let command_handled = matches!(&cycle_result, CycleResult::CommandHandled);
         match cycle_result {
             CycleResult::QuerySent(query) => {
                 let device_id = manager
@@ -264,8 +275,12 @@ fn run_worker_loop(
             CycleResult::Idle | CycleResult::CommandHandled => {}
         }
 
-        // 主机模式：轮询下一个设备；备机模式：index 由 extract_frame 从转发头解析。
-        if manager.current_run == RunLocation::Primary {
+        // A control transaction takes priority over the current acquisition
+        // slot, but does not consume it. Advancing here would skip a station
+        // whenever a queued command interrupts its turn (and alternating
+        // commands could permanently starve that station).
+        // 备机模式：index 由 extract_frame 从转发头解析。
+        if manager.current_run == RunLocation::Primary && !command_handled {
             manager.index = (manager.index + 1) % manager.port_config.devices.len();
             if completed_normal_slot && manager.index == 0 {
                 manager.execute_one_scheduled_station_version_query();
@@ -322,6 +337,56 @@ fn log_worker_heartbeat(manager: &SerialManager, port_name: &str, last_log: &mut
         queued_commands
     );
     *last_log = Instant::now();
+}
+
+/// Accepted commands may still be in the ingress channel rather than the
+/// pacing FIFO when cancellation arrives. Reject them without applying port
+/// settings or performing any serial I/O, and release their admission permits.
+fn reject_incoming_commands(
+    manager: &SerialManager,
+    rx: &Receiver<Command>,
+    ack_status_tx: &Sender<CommandAckUpdate>,
+) {
+    while let Ok(command) = rx.try_recv() {
+        drop(command.permit);
+        let report_ack = matches!(&command.command, CommandType::SendDataWithAck(_));
+        if matches!(
+            &command.command,
+            CommandType::SendData(_) | CommandType::SendDataWithAck(_)
+        ) {
+            if let Some(operations) = &manager.operations {
+                operations.command_tracker().update(
+                    &manager.port_config.port_number,
+                    command.ack_id,
+                    |v| {
+                        if !v.terminal() {
+                            v.phase = "Failed".into();
+                            v.error = "worker_shutdown_before_send".into();
+                        }
+                    },
+                );
+            }
+            if report_ack {
+                send_ack_status(
+                    manager,
+                    ack_status_tx,
+                    command.ack_id,
+                    CommandAckStatus::Failed,
+                );
+            }
+        }
+        if let Some(receipt) = command.control_receipt {
+            let outcome = Err("serial worker shut down before applying control".into());
+            if let Some(operations) = &manager.operations {
+                operations.complete_control(
+                    &manager.port_config.port_number,
+                    receipt.revision,
+                    &outcome,
+                );
+            }
+            let _ = receipt.reply.send(outcome);
+        }
+    }
 }
 
 /// 处理接收通道中的所有待处理命令。
@@ -536,6 +601,15 @@ fn enqueue_or_reject_command(
     };
 
     if let Some(reason) = reject_reason {
+        drop(permit);
+        if let Some(operations) = &manager.operations {
+            operations
+                .command_tracker()
+                .update(&manager.port_config.port_number, ack_id, |v| {
+                    v.phase = "Failed".into();
+                    v.error = reason.into();
+                });
+        }
         warn!(
             "[串口命令拒绝] port={} device_id={} reason={} report_ack={} action=drop_command",
             manager.serial_config.port_name, data.device_id, reason, report_ack,
@@ -598,6 +672,17 @@ fn reject_queued_commands(
         rejected.len(),
     );
     for command in rejected {
+        drop(command._permit);
+        if let Some(operations) = &manager.operations {
+            operations.command_tracker().update(
+                &manager.port_config.port_number,
+                command.ack_id,
+                |v| {
+                    v.phase = "Failed".into();
+                    v.error = reason.into();
+                },
+            );
+        }
         if command.report_ack {
             send_ack_status(
                 manager,
@@ -617,16 +702,9 @@ fn run_primary_cycle(
     ack_status_tx: &Sender<CommandAckUpdate>,
     command_retry_count: u32,
 ) -> CycleResult {
-    let mut queue = manager.command_queue.lock().unwrap_or_else(|e| {
-        warn!("命令队列锁中毒，恢复: {}", e);
-        e.into_inner()
-    });
-    if let Some(cmd) = queue.pop_front() {
-        drop(queue);
-        execute_queued_command(manager, cmd, ack_status_tx, command_retry_count);
+    if execute_next_ready_command(manager, ack_status_tx, command_retry_count).is_some() {
         return CycleResult::CommandHandled;
     }
-    drop(queue);
 
     if manager.port_config.devices.is_empty() {
         return CycleResult::Idle;
@@ -696,126 +774,88 @@ fn run_secondary_cycle(
     ack_status_tx: &Sender<CommandAckUpdate>,
     command_retry_count: u32,
 ) -> CycleResult {
-    let mut queue = manager.command_queue.lock().unwrap_or_else(|e| {
-        warn!("命令队列锁中毒，恢复: {}", e);
-        e.into_inner()
-    });
-    if let Some(cmd) = queue.pop_front() {
-        drop(queue);
-        let report_ack = cmd.report_ack;
-        execute_queued_command(manager, cmd, ack_status_tx, command_retry_count);
-        if report_ack {
-            return CycleResult::CommandHandled;
-        }
+    if execute_next_ready_command(manager, ack_status_tx, command_retry_count) == Some(true) {
+        return CycleResult::CommandHandled;
     }
     // 备机始终需要监听转发数据
     CycleResult::PassiveReceive
 }
 
-fn execute_queued_command(
+/// A waiting control remains in the original FIFO, retaining its admission
+/// permit. Returning None allows the caller to continue normal acquisition.
+/// Expired heads bypass only the pacing check so they can fail without I/O.
+fn execute_next_ready_command(
     manager: &mut SerialManager,
-    command: QueuedCommand,
     ack_status_tx: &Sender<CommandAckUpdate>,
     command_retry_count: u32,
-) -> bool {
-    if command
-        .expires_at
-        .is_some_and(|deadline| Instant::now() >= deadline)
-    {
-        warn!(
-            "[串口命令过期] port={} device_id={} ack_id={:?} action=drop_without_sending",
-            manager.serial_config.port_name, command.data.device_id, command.ack_id,
-        );
-        if command.report_ack {
-            send_ack_status(
-                manager,
-                ack_status_tx,
-                command.ack_id,
-                CommandAckStatus::Failed,
-            );
+) -> Option<bool> {
+    let now = Instant::now();
+    let command = {
+        let mut queue = manager.command_queue.lock().unwrap_or_else(|e| {
+            warn!("命令队列锁中毒，恢复: {}", e);
+            e.into_inner()
+        });
+        let head = queue.front()?;
+        let expired = head.expires_at.is_some_and(|deadline| now >= deadline);
+        if !expired && !manager.command_pacing.ready(now) {
+            return None;
         }
-        return false;
+        queue.pop_front()?
+    };
+    let report_ack = command.report_ack;
+    let already_expired = command
+        .expires_at
+        .is_some_and(|deadline| Instant::now() >= deadline);
+    execute_queued_command(manager, command, ack_status_tx, command_retry_count);
+    if !already_expired {
+        manager.command_pacing.completed(Instant::now());
     }
+    Some(report_ack)
+}
 
-    if !command.report_ack {
-        return manager.send_command(command.data);
-    }
-
-    execute_command_with_ack(
-        manager,
-        command.data,
-        command.ack_id,
-        command.expires_at,
-        ack_status_tx,
-        command_retry_count,
+#[cfg(test)]
+pub(super) fn test_secondary_cycle_is_passive(
+    manager: &mut SerialManager,
+    acknowledgements: &Sender<CommandAckUpdate>,
+) -> bool {
+    matches!(
+        run_secondary_cycle(manager, acknowledgements, 1),
+        CycleResult::PassiveReceive
     )
 }
 
-fn execute_command_with_ack(
+#[cfg(test)]
+pub(super) fn test_cancelled_worker(
     manager: &mut SerialManager,
-    command: SendData,
-    ack_id: Option<u64>,
-    expires_at: Option<Instant>,
-    ack_status_tx: &Sender<CommandAckUpdate>,
-    command_retry_count: u32,
-) -> bool {
-    let attempts = command_retry_count.max(1);
-    for attempt in 1..=attempts {
-        if expires_at.is_some_and(|deadline| Instant::now() >= deadline) {
-            warn!(
-                "[串口命令过期] port={} device_id={} ack_id={:?} attempt={} action=stop_retrying",
-                manager.serial_config.port_name, command.device_id, ack_id, attempt,
-            );
-            send_ack_status(manager, ack_status_tx, ack_id, CommandAckStatus::Failed);
-            return false;
-        }
-        debug!(
-            "串口 {} 下发命令 ACK 尝试 {}/{}",
-            manager.serial_config.port_name, attempt, attempts
-        );
-        if !manager.send_command(command.clone()) {
-            send_ack_status(manager, ack_status_tx, ack_id, CommandAckStatus::Failed);
-            return false;
-        }
-
-        send_ack_status(manager, ack_status_tx, ack_id, CommandAckStatus::Waiting);
-        if manager.receive_command_ack() {
-            send_ack_status(manager, ack_status_tx, ack_id, CommandAckStatus::Received);
-            return true;
-        }
-    }
-
-    send_ack_status(manager, ack_status_tx, ack_id, CommandAckStatus::Failed);
-    false
+    receiver: &Receiver<Command>,
+    state: &SystemState,
+    acknowledgements: &Sender<CommandAckUpdate>,
+) {
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    test_worker_until_cancelled(manager, receiver, state, acknowledgements, &cancel);
 }
 
-fn send_ack_status(
-    manager: &SerialManager,
-    ack_status_tx: &Sender<CommandAckUpdate>,
-    ack_id: Option<u64>,
-    status: CommandAckStatus,
+#[cfg(test)]
+pub(super) fn test_worker_until_cancelled(
+    manager: &mut SerialManager,
+    receiver: &Receiver<Command>,
+    state: &SystemState,
+    acknowledgements: &Sender<CommandAckUpdate>,
+    cancel: &CancellationToken,
 ) {
-    match status {
-        CommandAckStatus::Received => info!(
-            "[串口命令结果] port={} ack_id={:?} result=ack_received",
-            manager.serial_config.port_name, ack_id,
-        ),
-        CommandAckStatus::Failed => warn!(
-            "[串口命令结果] port={} ack_id={:?} result=failed",
-            manager.serial_config.port_name, ack_id,
-        ),
-        CommandAckStatus::Waiting => {}
-    }
-    if let Err(e) = ack_status_tx.send(CommandAckUpdate {
-        com: manager.port_config.port_number.clone(),
-        ack_id,
-        status,
-    }) {
-        warn!(
-            "串口 {} 命令 ACK 状态回写通道发送失败: {:?}",
-            manager.serial_config.port_name, e
-        );
-    }
+    let port = manager.serial_config.port_name.clone();
+    run_worker_loop(
+        manager,
+        &port,
+        receiver,
+        acknowledgements,
+        state,
+        cancel,
+        Duration::ZERO,
+        1,
+        0,
+    );
 }
 
 #[cfg(test)]

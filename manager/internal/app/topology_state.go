@@ -13,7 +13,7 @@ import (
 // r.mu. A check before acquiring the mutation lock lets a late callback poison
 // a newer connection, or a source removed/replaced while it was waiting.
 func (r *Runtime) lowerCallbackCurrentLocked(sourceID string, generation uint64) bool {
-	if r.closing.Load() || (generation != 0 && (!r.running.Load() || r.generations[sourceID] != generation)) {
+	if r.closing.Load() || (generation != 0 && (!r.running.Load() || !r.connections.current(sourceID, generation))) {
 		return false
 	}
 	_, exists := r.catalogs[sourceID]
@@ -37,7 +37,7 @@ func (r *Runtime) markCatalogQuarantineLocked(sourceID, reason string) bool {
 	catalog.State = domain.CatalogConflict
 	catalog.QuarantineReason = reason
 	r.catalogs[sourceID] = catalog
-	r.dirtyCatalogs[sourceID] = catalog
+	r.catalogPersistence.queue(catalog)
 	if _, exists := r.quarantinedSources[sourceID]; !exists {
 		r.conflictCount++
 	}

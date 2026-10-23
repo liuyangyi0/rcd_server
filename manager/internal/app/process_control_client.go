@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"rcd_manager/internal/buildinfo"
 	"rcd_manager/internal/domain"
 )
 
@@ -29,6 +30,15 @@ type ProcessAgentClient interface {
 }
 
 type processAgentHTTPClient struct{ client *http.Client }
+
+func (c *processAgentHTTPClient) SoftwareVersion(ctx context.Context, binding domain.ProcessBinding) (buildinfo.Info, error) {
+	var info buildinfo.Info
+	err := c.exchange(ctx, binding, http.MethodGet, "/api/v1/version", nil, &info)
+	if err == nil {
+		err = domain.ValidateSoftwareBuild(info, "agent")
+	}
+	return info, err
+}
 
 func newProcessAgentHTTPClient() ProcessAgentClient {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -63,6 +73,9 @@ func (c *processAgentHTTPClient) exchange(ctx context.Context, binding domain.Pr
 	request.Header.Set("Accept", "application/json")
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
+	}
+	if action, ok := body.(domain.ProcessActionRequest); ok {
+		request.Header.Set("If-Match", strconv.Quote(action.ExpectedRevision))
 	}
 	response, err := c.client.Do(request)
 	if err != nil {
@@ -106,17 +119,39 @@ func (c *processAgentHTTPClient) Status(ctx context.Context, binding domain.Proc
 }
 
 func (c *processAgentHTTPClient) Action(ctx context.Context, binding domain.ProcessBinding, request domain.ProcessActionRequest) (domain.ProcessOperation, error) {
-	return c.operation(ctx, binding, request, http.MethodPost, "/api/v1/process/actions", request)
+	return c.operation(ctx, binding, request, http.MethodPost, processAgentRoute(request)+"/actions", request)
+}
+
+func processAgentRoute(request domain.ProcessActionRequest) string {
+	if request.Lifecycle {
+		return "/api/v1/lifecycle"
+	}
+	return "/api/v1/process"
+}
+
+func (c *processAgentHTTPClient) Prepare(ctx context.Context, binding domain.ProcessBinding, request domain.ProcessActionRequest) (domain.ProcessActionRequest, error) {
+	status, err := c.Status(ctx, binding)
+	if err != nil {
+		return request, err
+	}
+	if status.LifecycleSupported {
+		if request.ConfigurationGuard != "" && !status.ConfigurationGuardSupported {
+			return request, &domain.OperationError{Code: "unsupported", Message: "Agent 未提供维护后的配置版本复核，未派发重启"}
+		}
+		request.Lifecycle, request.GatewayInstanceID = true, status.GatewayInstanceID
+		return request, request.Validate()
+	}
+	return request, &domain.OperationError{Code: "unsupported", Message: "代理未提供安全生命周期能力，请先升级并配置 Agent；未退回无保护操作"}
 }
 
 func (c *processAgentHTTPClient) Operation(ctx context.Context, binding domain.ProcessBinding, request domain.ProcessActionRequest) (domain.ProcessOperation, error) {
-	return c.operation(ctx, binding, request, http.MethodGet, "/api/v1/process/operations/"+url.PathEscape(request.RequestID), nil)
+	return c.operation(ctx, binding, request, http.MethodGet, processAgentRoute(request)+"/operations/"+url.PathEscape(request.RequestID), nil)
 }
 
 // Resolve is not a repeated process action. The agent atomically reads an
 // existing operation or stores a failed tombstone that fences any late Action.
 func (c *processAgentHTTPClient) Resolve(ctx context.Context, binding domain.ProcessBinding, request domain.ProcessActionRequest) (domain.ProcessOperation, error) {
-	return c.operation(ctx, binding, request, http.MethodPost, "/api/v1/process/operations/"+url.PathEscape(request.RequestID)+"/resolve", request)
+	return c.operation(ctx, binding, request, http.MethodPost, processAgentRoute(request)+"/operations/"+url.PathEscape(request.RequestID)+"/resolve", request)
 }
 
 func (c *processAgentHTTPClient) operation(ctx context.Context, binding domain.ProcessBinding, request domain.ProcessActionRequest, method, path string, body any) (domain.ProcessOperation, error) {

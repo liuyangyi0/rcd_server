@@ -33,7 +33,26 @@ func (h *Handler) lowerOperationRoutes() {
 	h.mux.HandleFunc("PUT "+base+"/calculation-mode", h.setSourceCalculationMode)
 	h.mux.HandleFunc("PUT "+base+"/logging", h.setSourceLoggingLevel)
 	h.mux.HandleFunc("POST "+base+"/config/validate", h.validateSourceConfig)
+	h.mux.HandleFunc("POST "+base+"/config/prepare", h.prepareSourceConfig)
 	h.mux.HandleFunc("PUT "+base+"/config", h.writeSourceConfig)
+}
+
+// Pure draft preparation: validate/write still own CAS and the audited commit.
+func (h *Handler) prepareSourceConfig(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SourceRevision uint64          `json:"source_revision"`
+		Name           string          `json:"name"`
+		Content        *string         `json:"content"`
+		Edits          json.RawMessage `json:"edits"`
+	}
+	if decodeOperationConfig(w, r, &body) != nil {
+		return
+	}
+	if body.SourceRevision == 0 {
+		writeError(w, http.StatusPreconditionRequired, "revision_required", "source_revision is required", nil)
+		return
+	}
+	h.executeSourceOperation(w, r, body.SourceRevision, domain.OperationRequest{Action: "prepare_config", Name: body.Name, Content: body.Content, Edits: body.Edits})
 }
 
 func (h *Handler) setSourceLoggingLevel(w http.ResponseWriter, r *http.Request) {

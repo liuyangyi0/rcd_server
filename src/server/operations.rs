@@ -71,6 +71,7 @@ pub(super) fn publish_operations(
             ("SoftwareVersion", software_version()),
             ("BuildCommit", build_commit()),
             ("StationVersionRevision", initial_station_revision.as_str()),
+            ("CommandRevision", "0"),
         ] {
             add_read_only_string(&mut address_space, ns, &root, name, value)?;
         }

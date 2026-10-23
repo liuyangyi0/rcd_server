@@ -384,6 +384,7 @@ export function normalizePoint(payload: unknown): Point {
 
 export function normalizeCommand(payload: unknown): CommandAudit {
   const body = record(payload);
+  const tracking = record(body.tracking);
 	const rawStatusCode = first(body, 'status_code', 'statusCode');
 	const createdAt = text(first(body, 'created_at', 'createdAt', 'started_at', 'startedAt'));
 	const completedAt = timestamp(first(body, 'completed_at', 'completedAt', 'finished_at', 'finishedAt'));
@@ -395,6 +396,9 @@ export function normalizeCommand(payload: unknown): CommandAudit {
 	}
   return {
     id: text(first(body, 'id', 'command_id', 'commandId')),
+    tracking: body.tracking ? { protocol: text(tracking.protocol), phase: text(tracking.phase),
+      attemptCount: tracking.attempt_count == null ? undefined : number(tracking.attempt_count),
+      sentCount: tracking.sent_count == null ? undefined : number(tracking.sent_count), auditIncomplete: bool(tracking.audit_incomplete), historyGap: bool(tracking.history_gap) } : undefined,
 		createdAt,
 		completedAt,
     sessionId: text(first(body, 'session_id', 'sessionId')) || undefined,

@@ -118,7 +118,7 @@ export default function SourcesPage() {
       />
 
       <div className="toolbar filter-toolbar">
-        <label className="search-field"><Search aria-hidden="true" size={17} /><input value={query} placeholder="搜索 Source ID、Endpoint 或分组" onChange={(event) => setQuery(event.target.value)} /></label>
+        <label className="search-field"><Search aria-hidden="true" size={17} /><input value={query} placeholder="搜索名称、Source ID、Endpoint 或分组" onChange={(event) => setQuery(event.target.value)} /></label>
         <label className="field inline-field"><span>分组</span><select value={groupId} onChange={(event) => setGroupId(event.target.value)}><option value="">全部分组</option>{groups.map((group) => <option key={group.id} value={group.id}>{group.name || group.id}</option>)}</select></label>
         <button className="button button-secondary" type="button" onClick={() => void Promise.all([groupsQuery.refetch(), sourcesQuery.refetch()])}><RefreshCw aria-hidden="true" size={16} />刷新</button>
       </div>
@@ -131,14 +131,14 @@ export default function SourcesPage() {
         ) : filteredSources.length === 0 ? <EmptyState title="没有匹配的来源" description="请调整筛选条件。" /> : (
           <div className="table-scroll">
             <table className="data-table responsive-table source-table">
-              <thead><tr><th>Source ID</th><th>默认归属 / 设备组</th><th>Endpoint</th><th>连接链路</th><th>目录</th><th>来源整体质量</th><th>最近活动</th><th>本次重连</th><th className="align-right">操作</th></tr></thead>
+              <thead><tr><th>来源名称 / ID</th><th>默认归属 / 设备组</th><th>Endpoint</th><th>连接链路</th><th>目录</th><th>来源整体质量</th><th>最近活动</th><th>本次重连</th><th className="align-right">操作</th></tr></thead>
               <tbody>{filteredSources.map((source) => {
                 const health = sourceHealth(source);
                 const catalogBad = source.catalogState.toLowerCase().includes('conflict') || source.catalogState.toLowerCase().includes('error');
                 const conflictTitle = source.catalogConflicts?.map((conflict) => `${conflict.kind} · ${conflict.identifier} · ${conflict.sourceIds.join(', ')} · ${conflict.message}`).join('\n');
                 return (
                   <tr key={source.id}>
-                    <td><strong>{source.id}</strong>{source.lastError ? <span className="sub-cell text-bad" title={conflictTitle}>{source.lastError}</span> : null}</td>
+                    <td><strong>{source.name || source.id}</strong>{source.name && source.name !== source.id ? <span className="sub-cell">{source.id}</span> : null}{source.lastError ? <span className="sub-cell text-bad" title={conflictTitle}>{source.lastError}</span> : null}</td>
                     <td><span>{source.groupId}<span className="sub-cell">默认归属组</span></span>{source.groupBindings?.length ? <span className="sub-cell" title={sourceGroupIds(source).join('、')}>{source.groupBindings.length} 台设备已绑定 · {sourceGroupIds(source).length} 个组</span> : null}</td>
                     <td className="endpoint-cell">{source.endpoint}</td>
                     <td><div className="status-sequence labelled-status"><span>连接 <b>{stateLabel(source.connectionState)}</b></span><span>会话 <b>{stateLabel(source.sessionState)}</b></span><span>订阅 <b>{stateLabel(source.subscriptionState)}</b></span></div><StatusBadge state={health} label={health === 'good' ? '链路正常' : '链路异常'} compact /><span className="sub-cell">{formatNumber(source.monitoredCount)} 个监控变量</span></td>

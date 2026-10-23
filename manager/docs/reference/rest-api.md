@@ -2,7 +2,7 @@
 
 ## 基本约定
 
-默认基地址为 `http://<manager-host>:8080`，当前测试环境使用 `8087`。自 `0.7.4-web-login.1` 起，管理接口要求管理员登录 cookie，包括导出、诊断、metrics 和 SSE；未登录返回 401。当前为单管理员模式，没有细分角色权限，HTTP 仍不加密，必须继续依赖隔离内网、防火墙/VLAN 和主机访问控制。
+程序默认HTTP端口为8080，当前现场使用8087；以下127.0.0.1:8080只表示隔离实例。管理接口要求管理员登录cookie，包括导出、诊断、metrics和SSE；未登录返回401。当前为单管理员模式，没有细分角色权限，HTTP仍不加密，必须依赖隔离内网、防火墙/VLAN和主机访问控制。
 
 登录使用 `POST /api/v1/auth/login`（JSON `username`、`password`），浏览器保存 HttpOnly cookie；`GET /api/v1/auth/session` 返回登录状态；`POST /api/v1/auth/logout` 退出；`POST /api/v1/auth/password` 接收 `current_password` 和 `new_password`，成功后需重新登录。登录/改密过于频繁返回 429。健康探针和 `POST /api/v1/lower-ingest/logs` 不使用浏览器登录，继续沿用各自原有校验。详见 [网页登录说明](../guides/web-login-and-usability.md)。
 
@@ -15,6 +15,28 @@ JSON 写请求必须满足：
 - `Sec-Fetch-Site` 若存在，只接受 `same-origin` 或 `none`。
 
 服务不开放 CORS。没有 `Origin` 的脚本请求可以通过同源检查，但管理接口仍要求登录 cookie；同源检查本身不是身份认证。
+
+### PowerShell脚本先登录
+
+以下配置和选源示例共用此登录会话。使用管理员提供的当前账号交互输入，不把密码写入脚本或命令行；会话到期后重新登录。首次要求改密时先在网页完成，否则后续管理请求返回403。
+
+```powershell
+$base = 'http://127.0.0.1:8080' # 隔离实例；现场地址/8087须经授权后替换
+$rcdCredential = Get-Credential -Message '输入RCD管理网页账号'
+$login = Invoke-RestMethod -Method Post `
+  -Uri "$base/api/v1/auth/login" `
+  -ContentType 'application/json' `
+  -Body (@{
+    username = $rcdCredential.UserName
+    password = $rcdCredential.GetNetworkCredential().Password
+  } | ConvertTo-Json) `
+  -SessionVariable rcdWeb
+Remove-Variable rcdCredential
+if ($login.password_change_required) { throw '请先在网页修改初始密码，再重新登录' }
+Invoke-RestMethod -Uri "$base/api/v1/auth/session" -WebSession $rcdWeb
+```
+
+后续Invoke-RestMethod都带`-WebSession $rcdWeb`。Web登录会话与OPC Session是两回事，登录成功不会创建或选择OPC Session。
 
 ## Endpoint 一览
 
@@ -43,6 +65,7 @@ JSON 写请求必须满足：
 | GET | `/api/v1/source-events` | 下级连接、Session、订阅、目录和错误状态历史 |
 | GET | `/api/v1/management-audit` | revision 化管理操作审计 |
 | GET | `/api/v1/system` | 运行参数、证书有效期、存储和进程队列信息 |
+| GET | `/api/v1/software-versions` | 当前管理端及其下级、Agent 的软件版本与离线缓存；`?refresh=1` 请求一次受限刷新，仍需登录 |
 | GET | `/api/v1/configuration` | 导出不含密码的配置 JSON |
 | POST | `/api/v1/configuration/import` | 配置预检或导入；实际导入只允许空管理器 |
 | GET | `/api/v1/diagnostics` | 下载不含数据库和密码的诊断 ZIP |
@@ -79,19 +102,21 @@ If-Match: "7"
 
 组的配置 revision、来源配置 revision，以及每个 Session/组的 selection revision 相互独立。修改默认源不会改变在线 Session 的 selection revision。
 
+计算历史恢复有一个明确例外：先读取`GET /api/v1/calculations/status`的`active_revision`和`ETag`，再调用`POST /api/v1/calculations/config/versions/{id}/restore`。确认没有活动版本时，状态返回`active_revision=0`、`ETag: "0"`，该恢复接口接受精确的`If-Match: "0"`；若已被其他人激活则返回409。不能用状态未加载来猜测0，不接受`W/"0"`或裸0，其他普通写接口仍拒绝0。恢复会复制历史配置为新版本并重新校验，不改写历史。
+
 ## 配置示例
 
-以下 PowerShell 示例创建一个组和一个无安全下级来源：
+以下PowerShell示例创建一个组和一个None安全策略下级来源，仅用于经授权的隔离配置；它会修改配置，不是只读巡检。先执行上面的登录段。
 
 ```powershell
-$base = 'http://127.0.0.1:8080'
-
 $group = Invoke-RestMethod -Method Post `
+  -WebSession $rcdWeb `
   -Uri "$base/api/v1/groups" `
   -ContentType 'application/json' `
   -Body (@{ id = 'line-a'; name = '一号线' } | ConvertTo-Json)
 
 $source = Invoke-RestMethod -Method Post `
+  -WebSession $rcdWeb `
   -Uri "$base/api/v1/sources" `
   -ContentType 'application/json' `
   -Body (@{
@@ -115,19 +140,21 @@ $source = Invoke-RestMethod -Method Post `
 来源完成首次发现、`catalog_state` 变为 `Ready` 后设置默认源：
 
 ```powershell
-$current = Invoke-RestMethod "$base/api/v1/groups/line-a"
+$current = Invoke-RestMethod -Uri "$base/api/v1/groups/line-a" -WebSession $rcdWeb
 Invoke-RestMethod -Method Put `
+  -WebSession $rcdWeb `
   -Uri "$base/api/v1/groups/line-a/default-source" `
   -Headers @{ 'If-Match' = '"' + $current.revision + '"' } `
   -ContentType 'application/json' `
   -Body (@{ source_id = 'line-a-primary' } | ConvertTo-Json)
 ```
 
-清除默认源时传空字符串。清除后仅影响以后激活的新 Session，已有 Session 的选源不变：
+清除默认源时传空字符串，不改变已有Session的原始点路由，但新Session不再取得该默认源，中央计算依赖该组时也可能变成配置错误：
 
 ```powershell
-$current = Invoke-RestMethod "$base/api/v1/groups/line-a"
+$current = Invoke-RestMethod -Uri "$base/api/v1/groups/line-a" -WebSession $rcdWeb
 Invoke-RestMethod -Method Put `
+  -WebSession $rcdWeb `
   -Uri "$base/api/v1/groups/line-a/default-source" `
   -Headers @{ 'If-Match' = '"' + $current.revision + '"' } `
   -ContentType 'application/json' `
@@ -248,15 +275,20 @@ Invoke-RestMethod -Method Put `
 
 ## Session 选源示例
 
-先读取在线 Session：
+使用前述登录会话读取在线OPC Session，再明确选择目标，不能默认改列表第一项。示例目标组为line-a；备用来源line-a-backup须已创建、属于该组且可选。
 
 ```powershell
-$sessions = Invoke-RestMethod "$base/api/v1/sessions"
-$session = $sessions.items[0]
+$sessions = Invoke-RestMethod -Uri "$base/api/v1/sessions" -WebSession $rcdWeb
+$sessions.items | Select-Object id
+$targetSessionId = Read-Host '输入已核对的目标OPC Session ID'
+$session = $sessions.items | Where-Object { $_.id -eq $targetSessionId } | Select-Object -First 1
+if ($null -eq $session) { throw '目标Session不存在或已结束' }
 $route = $session.routes.'line-a'
+if ($null -eq $route) { throw '目标Session没有line-a路由，先核对组配置' }
 $sessionPath = [uri]::EscapeDataString($session.id)
 
 Invoke-RestMethod -Method Put `
+  -WebSession $rcdWeb `
   -Uri "$base/api/v1/sessions/$sessionPath/groups/line-a/selection" `
   -Headers @{ 'If-Match' = '"' + $route.revision + '"' } `
   -ContentType 'application/json' `
@@ -317,11 +349,15 @@ GET /api/v1/points?group_id=device-a&source_id=line-a-secure&port_id=COM1&device
 
 ## SSE
 
-连接：
+在已登录的管理网页中，同源EventSource会自动携带登录cookie。下面可在该网页的开发者控制台观察一类事件，结束后关闭连接；不能在其它站点或未登录页面照抄认为已认证。
 
-```powershell
-curl.exe -N http://127.0.0.1:8080/api/v1/events
+```javascript
+const rcdEvents = new EventSource('/api/v1/events');
+rcdEvents.addEventListener('selection.changed', event => console.log(event.data));
+// 结束观察时执行：rcdEvents.close();
 ```
+
+脚本SSE客户端也必须复用登录会话cookie；只执行未认证的curl -N会返回401。不要将cookie值写进命令行、源码或报告。
 
 服务每 15 秒发送注释 heartbeat。当前命名事件包括：
 

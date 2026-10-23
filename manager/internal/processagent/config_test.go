@@ -25,6 +25,30 @@ func configFixture(t *testing.T) Config {
 	return Config{InstanceID: "lower-a", Executable: executable, DataDir: filepath.Join(dir, "agent state"), HTTPListen: "127.0.0.1:0", AutoStart: true, RestartPolicy: "never", StopTimeout: 15 * time.Second, StartTimeout: time.Minute, StartGrace: time.Second}
 }
 
+func TestMaintenanceConfigPinsLoopbackAndGateway(t *testing.T) {
+	for _, endpoint := range []string{"opc.tcp://127.0.0.1:4841", "opc.tcp://[::1]:4841"} {
+		cfg := configFixture(t)
+		cfg.MaintenanceEndpoint = endpoint
+		cfg.GatewayInstanceID = "gateway-a"
+		if _, err := cfg.normalized(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, endpoint := range []string{"opc.tcp://192.168.10.46:4841", "opc.tcp://localhost:4841", "http://127.0.0.1:4841", "opc.tcp://u:p@127.0.0.1:4841", "opc.tcp://127.0.0.1:4841?x=1", "opc.tcp://127.0.0.1:0", ""} {
+		cfg := configFixture(t)
+		cfg.MaintenanceEndpoint = endpoint
+		cfg.GatewayInstanceID = "gateway-a"
+		if _, err := cfg.normalized(); err == nil {
+			t.Fatalf("accepted %q", endpoint)
+		}
+	}
+	cfg := configFixture(t)
+	cfg.MaintenanceEndpoint = "opc.tcp://127.0.0.1:4841"
+	if _, err := cfg.normalized(); err == nil {
+		t.Fatal("accepted missing gateway binding")
+	}
+}
+
 func TestConfigLoadDefaultsAndCanonicalPaths(t *testing.T) {
 	fixture := configFixture(t)
 	workingDirectory, err := os.Getwd()
@@ -84,6 +108,31 @@ func TestConfigLoadRejectsUnknownOrPositionalArguments(t *testing.T) {
 				t.Fatalf("invalid launch arguments accepted: %#v", cfg)
 			}
 		})
+	}
+}
+
+func TestConfigLowerDirectoriesAreFixedLocalArguments(t *testing.T) {
+	fixture := configFixture(t)
+	base := []string{"--instance-id", fixture.InstanceID, "--executable", fixture.Executable, "--data-dir", fixture.DataDir}
+	dir := t.TempDir()
+	args := append([]string(nil), base...)
+	for _, name := range []string{"config", "state", "pki", "log"} {
+		args = append(args, "--lower-"+name+"-dir", dir)
+	}
+	cfg, err := Load(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, _ := filepath.EvalSymlinks(dir)
+	// flag.Visit has stable lexicographic order; each path is a separate argv.
+	want := []string{"--config-dir", canonical, "--log-dir", canonical, "--pki-dir", canonical, "--state-dir", canonical}
+	if !reflect.DeepEqual(cfg.Arguments, want) {
+		t.Fatalf("arguments = %q, want %q", cfg.Arguments, want)
+	}
+	for _, bad := range []string{"", filepath.Join(dir, "missing"), fixture.Executable} {
+		if _, err := Load(append(append([]string(nil), base...), "--lower-config-dir="+bad)); err == nil {
+			t.Fatalf("accepted invalid lower directory %q", bad)
+		}
 	}
 }
 

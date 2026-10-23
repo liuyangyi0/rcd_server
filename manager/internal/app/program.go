@@ -57,7 +57,8 @@ func RunProgram(ctx context.Context, cfg config.Config) error {
 	}
 	build := buildinfo.Current()
 	runtime, err := NewRuntime(ctx, repository, RuntimeOptions{
-		OPCEndpoint: endpoint, HTTPListen: cfg.HTTPListen, DataDir: cfg.DataDir, DatabasePath: cfg.DatabasePath, LogDir: cfg.LogDir,
+		FleetConfigFile: cfg.FleetConfigFile,
+		OPCEndpoint:     endpoint, HTTPListen: cfg.HTTPListen, DataDir: cfg.DataDir, DatabasePath: cfg.DatabasePath, LogDir: cfg.LogDir,
 		CertificateFile: pair.CertificatePath, PrivateKeyFile: pair.PrivateKeyPath,
 		Version: build.Version, GitSHA: build.Commit, MaxSources: cfg.MaxSources, MaxSessions: cfg.MaxUpstreamSessions,
 		CommandTimeout: cfg.CommandTimeout, CommandPendingTTL: cfg.CommandPendingTTL,
@@ -68,6 +69,11 @@ func RunProgram(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 	backend := OPCBackend{Runtime: runtime}
+	closeReleaseControl, err := runtime.startReleaseControl()
+	if err != nil {
+		return fmt.Errorf("manager local release control: %w", err)
+	}
+	defer closeReleaseControl()
 	upstream, err := opc.NewUpstreamServer(opc.UpstreamConfig{
 		EndpointURL: endpoint, ListenAddress: cfg.OPCListen,
 		CertificateFile: pair.CertificatePath, PrivateKeyFile: pair.PrivateKeyPath,
@@ -78,6 +84,7 @@ func RunProgram(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return fmt.Errorf("create upstream OPC server: %w", err)
 	}
+	runtime.SetCommandResultHandler(upstream.NotifyCommandResult)
 	runtime.SetRefreshHandler(func(sessionID, groupID string) {
 		refreshed := upstream.ForceSessionRefresh(sessionID, groupID)
 		if refreshed == 0 {

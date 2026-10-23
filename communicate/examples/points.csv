@@ -1,0 +1,3 @@
+name,task_id,data_type,description
+COMM_EXAMPLE_VALUE,example-task,Double,Placeholder definition only; no business mapping yet
+COMM_EXAMPLE_STATE,example-task,Boolean,Placeholder definition only; acquisition disabled

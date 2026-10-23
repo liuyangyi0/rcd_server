@@ -1,0 +1,111 @@
+---
+- name: Bind an immutable native Semaphore operation
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Require server-authenticated operation and current command pause
+      ansible.builtin.assert:
+        that:
+          - rcd_platform_release is defined
+          - rcd_platform_release.commands_paused is sameas true
+          - rcd_platform_release.component in ['lower', 'manager', 'agent', 'communicate'] or (rcd_platform_release.application is mapping and rcd_platform_release.application.component == rcd_platform_release.component)
+          - rcd_platform_release.hosts | length > 0
+          - rcd_platform_release.hosts | length <= 3
+          - rcd_platform_release.hosts | difference(groups['rcd_nodes']) | length == 0
+    - name: Initialize explicit not-started evidence for all selected machines
+      ansible.builtin.copy:
+        dest: "{{ rcd_platform_release.report_directory }}/{{ item.device_id }}.json"
+        mode: '0600'
+        content: "{{ {'schema_version': 1, 'operation_id': rcd_platform_release.operation_id, 'task_id': rcd_platform_release.task_id, 'device_id': item.device_id, 'host_alias': item.host_alias, 'state': 'not_started', 'error': '', 'binary_sha256': '', 'stages': [], 'acceptance': {}} | to_json }}"
+      loop: "{{ rcd_platform_release.targets }}"
+    - name: Construct the release-only group in server-defined 30 58 46 order
+      ansible.builtin.add_host:
+        name: "{{ item.host_alias }}"
+        groups: rcd_platform_selected
+        rcd_selected_device: "{{ item }}"
+      loop: "{{ rcd_platform_release.targets }}"
+
+- name: Install exactly one component per selected machine
+  hosts: rcd_platform_selected
+  order: inventory
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+  become: true
+  vars:
+    rcd_adapter_files: [application_profile.py, platform_release.py, release_probe.py, component_deployment.py, orchestration.py, release.py, deployment.py, recovery.py, resume.py, rollback_deployment.py]
+    rcd_tools: "{{ rcd_platform_workspace | default('/var/lib/rcd-release-platform') }}/{{ rcd_platform_release.operation_id }}"
+  tasks:
+    - name: Resolve only the administrator profile or registered application fixed profile
+      ansible.builtin.set_fact:
+        rcd_effective_profile: "{{ (rcd_release_profiles | default({})).get(rcd_platform_release.component, '/etc/rcd/release-platform/' ~ rcd_platform_release.component ~ '.json' if rcd_platform_release.application is mapping else '') }}"
+    - name: Validate administrator-owned component profile and device binding
+      ansible.builtin.assert:
+        that:
+          - ansible_host == rcd_selected_device.address
+          - rcd_effective_profile is match('^/[^\r\n]+$')
+          - rcd_platform_release.operation_id is match('^[a-f0-9]{64}$')
+    - name: Prepare unique tool and incoming directories
+      ansible.builtin.file:
+        path: "{{ rcd_tools }}/{{ item }}"
+        state: directory
+        mode: '0700'
+      loop: [tools, incoming]
+    - name: Copy the recorded publisher source (never package-provided scripts)
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../release/{{ item }}"
+        dest: "{{ rcd_tools }}/tools/{{ item }}"
+        mode: '0600'
+      loop: "{{ rcd_adapter_files }}"
+    - name: Transfer only the package binary and public manifest
+      ansible.builtin.copy:
+        src: "{{ rcd_platform_release.package_directory }}/{{ item }}"
+        dest: "{{ rcd_tools }}/incoming/{{ item }}"
+        mode: '0600'
+      loop: [binary, manifest.json]
+    - name: Resolve the immutable manifest digest on the controller
+      ansible.builtin.stat:
+        path: "{{ rcd_platform_release.package_directory }}/manifest.json"
+        checksum_algorithm: sha256
+      delegate_to: localhost
+      become: false
+      register: rcd_manifest_stat
+    - name: Bind fixed publisher arguments
+      ansible.builtin.set_fact:
+        rcd_arguments: >-
+          {{ ['--profile', rcd_effective_profile, '--host', ansible_host,
+              '--component', rcd_platform_release.component, '--operation-id', rcd_platform_release.operation_id,
+              '--task-id', rcd_platform_release.task_id | string, '--device-id', rcd_selected_device.device_id,
+              '--host-alias', inventory_hostname] }}
+    - name: Pin registered application identity to this project
+      ansible.builtin.set_fact:
+        rcd_arguments: "{{ rcd_arguments + ['--project-id', rcd_platform_release.project_id | string, '--definition-sha256', rcd_platform_release.application.definition_sha256] }}"
+      when: rcd_platform_release.application is mapping
+    - name: Check compatibility and stage without stopping anything
+      ansible.builtin.command:
+        argv: "{{ [rcd_python | default('/usr/bin/python3'), rcd_tools ~ '/tools/platform_release.py', 'stage'] + rcd_arguments + ['--incoming', rcd_tools ~ '/incoming', '--manifest-sha256', rcd_manifest_stat.stat.checksum] }}"
+        expand_argument_vars: false
+      register: rcd_staged
+      changed_when: (rcd_staged.stdout | from_json).changed
+    - name: Execute the original operation once; always retrieve structured evidence
+      block:
+        - name: Record uncertain execution before the only remote mutation request
+          ansible.builtin.copy:
+            dest: "{{ rcd_platform_release.report_directory }}/{{ rcd_selected_device.device_id }}.json"
+            mode: '0600'
+            content: "{{ {'schema_version': 1, 'operation_id': rcd_platform_release.operation_id, 'task_id': rcd_platform_release.task_id, 'device_id': rcd_selected_device.device_id, 'host_alias': inventory_hostname, 'state': 'unknown', 'error': '已进入执行，等待目标机原事务结果；不会重投', 'binary_sha256': '', 'stages': [], 'acceptance': {}} | to_json }}"
+          delegate_to: localhost
+          become: false
+        - name: Install verify and safely recover where possible
+          ansible.builtin.command:
+            argv: "{{ [rcd_python | default('/usr/bin/python3'), rcd_tools ~ '/tools/platform_release.py', 'execute'] + rcd_arguments + ['--initiator', rcd_platform_release.actor, '--commands-paused'] }}"
+            expand_argument_vars: false
+          register: rcd_execution
+          changed_when: true
+      always:
+        - name: Fetch the original transaction result without rerunning it
+          ansible.builtin.fetch:
+            src: "{{ (rcd_staged.stdout | from_json).report_path }}"
+            dest: "{{ rcd_platform_release.report_directory }}/{{ rcd_selected_device.device_id }}.json"
+            flat: true

@@ -1,0 +1,14 @@
+# Isolated controller only; validated on 46 with CPython 3.13.15.
+ansible-core==2.19.13
+bcrypt==5.0.0
+cffi==2.1.1
+cryptography==50.0.1
+invoke==3.0.3
+jinja2==3.1.6
+markupsafe==3.0.3
+packaging==26.3
+paramiko==5.0.0
+pycparser==3.0
+pynacl==1.6.2
+pyyaml==6.0.3
+resolvelib==1.2.1

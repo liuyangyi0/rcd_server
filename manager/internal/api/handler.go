@@ -73,6 +73,7 @@ func (h *Handler) routes() {
 	h.processControlRoutes()
 	h.lowerLogRoutes()
 	h.calculationRoutes()
+	h.commandTrackingRoutes()
 	h.redundancyRoutes()
 
 	h.mux.HandleFunc("GET /api/v1/sessions", h.listSessions)
@@ -87,6 +88,8 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /api/v1/source-events", h.listSourceEvents)
 	h.mux.HandleFunc("GET /api/v1/management-audit", h.listManagementAudit)
 	h.mux.HandleFunc("GET /api/v1/system", h.systemInfo)
+	h.mux.HandleFunc("GET /api/v1/software-versions", h.softwareVersions)
+	h.mux.HandleFunc("GET /api/v1/fleet",h.fleetStatus)
 	h.mux.HandleFunc("GET /api/v1/configuration", h.exportConfiguration)
 	h.mux.HandleFunc("POST /api/v1/configuration/import", h.importConfiguration)
 	h.mux.HandleFunc("GET /api/v1/diagnostics", h.diagnosticBundle)

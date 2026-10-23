@@ -186,18 +186,13 @@ func TestRuntimeRetriesQueuedStatusEventsAndAlarms(t *testing.T) {
 	disconnected := opc.LowerStatus{SourceID: "source-a", Connection: opc.ConnectionDisconnected,
 		Session: opc.SessionInactive, Subscription: opc.SubscriptionInactive, Catalog: domain.CatalogReady,
 		LastError: "temporary outage", UpdatedAt: now}
-	runtime.statusPersistMu.Lock()
-	runtime.dirtySourceEvents = append(runtime.dirtySourceEvents, domain.SourceEvent{SourceID: "source-a", Kind: "connection",
-		Previous: string(opc.ConnectionConnected), Current: string(opc.ConnectionDisconnected), Message: disconnected.LastError, OccurredAt: now})
-	runtime.dirtyAlarmStatuses["source-a"] = disconnected
-	runtime.statusPersistMu.Unlock()
+	runtime.statusHistory.enqueue([]domain.SourceEvent{{SourceID: "source-a", Kind: "connection",
+		Previous: string(opc.ConnectionConnected), Current: string(opc.ConnectionDisconnected), Message: disconnected.LastError, OccurredAt: now}}, disconnected)
 
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	runtime.retryDirtyStatuses(canceled)
-	runtime.statusPersistMu.Lock()
-	queuedEvents, queuedAlarms := len(runtime.dirtySourceEvents), len(runtime.dirtyAlarmStatuses)
-	runtime.statusPersistMu.Unlock()
+	queuedEvents, queuedAlarms, _ := runtime.statusHistory.state()
 	if queuedEvents != 1 || queuedAlarms != 1 {
 		t.Fatalf("canceled retry lost durable work: events=%d alarms=%d", queuedEvents, queuedAlarms)
 	}
@@ -206,9 +201,7 @@ func TestRuntimeRetriesQueuedStatusEventsAndAlarms(t *testing.T) {
 	}
 
 	runtime.retryDirtyStatuses(context.Background())
-	runtime.statusPersistMu.Lock()
-	queuedEvents, queuedAlarms = len(runtime.dirtySourceEvents), len(runtime.dirtyAlarmStatuses)
-	runtime.statusPersistMu.Unlock()
+	queuedEvents, queuedAlarms, _ = runtime.statusHistory.state()
 	if queuedEvents != 0 || queuedAlarms != 0 {
 		t.Fatalf("successful retry retained durable work: events=%d alarms=%d", queuedEvents, queuedAlarms)
 	}
@@ -322,7 +315,7 @@ func TestRuntimeWritePinsRouteAndLocksGroupUntilAck(t *testing.T) {
 	}
 	client := &fakeLowerClient{writeStatus: domain.StatusGood}
 	runtime.mu.Lock()
-	runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+	installTestLower(runtime, "source-a", lowerHandle{client: client, generation: 1, cancel: func() {}})
 	runtime.statuses["source-a"] = connectedStatus("source-a", 1)
 	runtime.mu.Unlock()
 	primeWriteAck(runtime, "source-a", "COM1", 1)
@@ -391,7 +384,7 @@ func TestRuntimeWriteWaitsForCurrentEpochAckBaseline(t *testing.T) {
 	}
 	client := &fakeLowerClient{writeStatus: domain.StatusGood}
 	runtime.mu.Lock()
-	runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+	installTestLower(runtime, "source-a", lowerHandle{client: client, generation: 1, cancel: func() {}})
 	runtime.statuses["source-a"] = connectedStatus("source-a", 6)
 	runtime.mu.Unlock()
 	primeWriteAck(runtime, "source-a", "COM1", 6)
@@ -448,7 +441,7 @@ func TestRuntimeWriteAcceptsCollapsedTerminalAndRejectsMismatchedEpoch(t *testin
 	}
 	client := &fakeLowerClient{writeStatus: domain.StatusGood}
 	runtime.mu.Lock()
-	runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+	installTestLower(runtime, "source-a", lowerHandle{client: client, generation: 1, cancel: func() {}})
 	runtime.statuses["source-a"] = connectedStatus("source-a", 7)
 	runtime.mu.Unlock()
 	primeWriteAck(runtime, "source-a", "COM1", 7)
@@ -478,7 +471,7 @@ func TestRuntimePassiveSendValuesDoNotCreatePendingCommands(t *testing.T) {
 			}
 			client := &fakeLowerClient{writeStatus: domain.StatusGood}
 			runtime.mu.Lock()
-			runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+			installTestLower(runtime, "source-a", lowerHandle{client: client, generation: 1, cancel: func() {}})
 			runtime.statuses["source-a"] = connectedStatus("source-a", 1)
 			runtime.mu.Unlock()
 			if status, err := runtime.WriteCommand(context.Background(), "session", testKey("COM1_Send"), payload); err != nil || status != domain.StatusGood {
@@ -506,7 +499,7 @@ func TestRuntimeWriteAcceptsAckThatArrivesBeforeWriteReturns(t *testing.T) {
 		runtime.OnSample("source-a", testKey("COM1_Send"), domain.Sample{Type: domain.DataTypeString, Value: "1", StatusCode: domain.StatusGood, Epoch: 3})
 	}
 	runtime.mu.Lock()
-	runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+	installTestLower(runtime, "source-a", lowerHandle{client: client, generation: 1, cancel: func() {}})
 	runtime.statuses["source-a"] = connectedStatus("source-a", 3)
 	runtime.mu.Unlock()
 	primeWriteAck(runtime, "source-a", "COM1", 3)
@@ -532,7 +525,7 @@ func TestRuntimeWriteAcceptsImmediateFailureAckWithoutWaiting(t *testing.T) {
 		runtime.OnSample("source-a", testKey("COM1_Send"), domain.Sample{Type: domain.DataTypeString, Value: "3", StatusCode: domain.StatusGood, Epoch: 4})
 	}
 	runtime.mu.Lock()
-	runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+	installTestLower(runtime, "source-a", lowerHandle{client: client, generation: 1, cancel: func() {}})
 	runtime.statuses["source-a"] = connectedStatus("source-a", 4)
 	runtime.mu.Unlock()
 	primeWriteAck(runtime, "source-a", "COM1", 4)
@@ -560,7 +553,7 @@ func TestRuntimeMethodWaitsForPhysicalAckAndUsesSendVariable(t *testing.T) {
 		})
 	}
 	runtime.mu.Lock()
-	runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+	installTestLower(runtime, "source-a", lowerHandle{client: client, generation: 1, cancel: func() {}})
 	runtime.statuses["source-a"] = connectedStatus("source-a", 9)
 	runtime.mu.Unlock()
 	primeWriteAck(runtime, "source-a", "COM1", 9)
@@ -598,7 +591,7 @@ func TestRuntimeMethodReportsClosedSerialFailureToCallerAndSessionValue(t *testi
 		})
 	}
 	runtime.mu.Lock()
-	runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+	installTestLower(runtime, "source-a", lowerHandle{client: client, generation: 1, cancel: func() {}})
 	runtime.statuses["source-a"] = connectedStatus("source-a", 10)
 	runtime.mu.Unlock()
 	primeWriteAck(runtime, "source-a", "COM1", 10)
@@ -626,7 +619,7 @@ func TestRuntimeMethodPreservesImmediateLowerBadStatusAndAuditError(t *testing.T
 	}
 	client := &fakeLowerClient{writeStatus: domain.StatusBadOutOfService}
 	runtime.mu.Lock()
-	runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+	installTestLower(runtime, "source-a", lowerHandle{client: client, generation: 1, cancel: func() {}})
 	runtime.statuses["source-a"] = connectedStatus("source-a", 12)
 	runtime.mu.Unlock()
 	primeWriteAck(runtime, "source-a", "COM1", 12)
@@ -653,7 +646,7 @@ func TestRuntimeMethodAckTimeoutReturnsBadTimeoutAndUnlocksGroup(t *testing.T) {
 	}
 	client := &fakeLowerClient{writeStatus: domain.StatusGood}
 	runtime.mu.Lock()
-	runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+	installTestLower(runtime, "source-a", lowerHandle{client: client, generation: 1, cancel: func() {}})
 	runtime.statuses["source-a"] = connectedStatus("source-a", 11)
 	runtime.mu.Unlock()
 	primeWriteAck(runtime, "source-a", "COM1", 11)
@@ -681,7 +674,7 @@ func TestRuntimeWriteTimeoutPersistsTerminalStateAndUnlocksGroup(t *testing.T) {
 	}
 	client := &fakeLowerClient{writeStatus: domain.StatusGood}
 	runtime.mu.Lock()
-	runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+	installTestLower(runtime, "source-a", lowerHandle{client: client, generation: 1, cancel: func() {}})
 	runtime.statuses["source-a"] = connectedStatus("source-a", 5)
 	runtime.mu.Unlock()
 	primeWriteAck(runtime, "source-a", "COM1", 5)
@@ -705,7 +698,7 @@ func TestRuntimePinnedWriteAcceptsTerminalAckAfterCatalogConflict(t *testing.T) 
 	}
 	client := &fakeLowerClient{writeStatus: domain.StatusGood}
 	runtime.mu.Lock()
-	runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+	installTestLower(runtime, "source-a", lowerHandle{client: client, generation: 1, cancel: func() {}})
 	runtime.statuses["source-a"] = connectedStatus("source-a", 6)
 	runtime.mu.Unlock()
 	primeWriteAck(runtime, "source-a", "COM1", 6)
@@ -910,9 +903,7 @@ func TestRuntimeDeleteGroupResolvesDisconnectedSourceAlarms(t *testing.T) {
 	disconnected := opc.LowerStatus{SourceID: "source-a", Connection: opc.ConnectionDisconnected,
 		Session: opc.SessionInactive, Subscription: opc.SubscriptionInactive, Catalog: domain.CatalogConflict,
 		LastError: "connection lost"}
-	runtime.statusPersistMu.Lock()
-	runtime.dirtyAlarmStatuses["source-a"] = disconnected
-	runtime.statusPersistMu.Unlock()
+	runtime.statusHistory.enqueue(nil, disconnected)
 	runtime.retryDirtyStatuses(context.Background())
 	if err := runtime.DeleteGroup(context.Background(), "line", 2); err != nil {
 		t.Fatal(err)
@@ -995,10 +986,11 @@ func TestRuntimeSourceResetDiscardsDirtyCatalogFromPreviousEndpoint(t *testing.T
 	if err != nil || len(stale.Nodes) == 0 {
 		t.Fatalf("load stale catalog nodes=%d err=%v", len(stale.Nodes), err)
 	}
-	runtime.mu.Lock()
-	runtime.dirtyCatalogs["source-b"] = stale
-	runtime.catalogPersistError = "simulated prior write failure"
-	runtime.mu.Unlock()
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := runtime.catalogPersistence.save(cancelled, stale); err == nil {
+		t.Fatal("cancelled catalog write unexpectedly succeeded")
+	}
 	_, err = runtime.UpdateSource(context.Background(), "source-b", 1, api.SourceMutation{
 		ID: "source-b", GroupID: "line", Name: "source-b", Endpoint: "opc.tcp://127.0.0.1:5841",
 		SecurityPolicy: "None", SecurityMode: "None", Enabled: true,
@@ -1007,8 +999,8 @@ func TestRuntimeSourceResetDiscardsDirtyCatalogFromPreviousEndpoint(t *testing.T
 		t.Fatal(err)
 	}
 	runtime.mu.RLock()
-	_, stillDirty := runtime.dirtyCatalogs["source-b"]
-	persistError := runtime.catalogPersistError
+	stillDirty := runtime.catalogPersistence.contains("source-b")
+	_, persistError := runtime.catalogPersistence.status()
 	runtime.mu.RUnlock()
 	if stillDirty || persistError != "" {
 		t.Fatalf("reset retained stale dirty catalog: dirty=%v error=%q", stillDirty, persistError)
@@ -1063,7 +1055,7 @@ func TestRuntimeRetiredCommandNodesAreNeverDispatched(t *testing.T) {
 	}
 	client := &fakeLowerClient{writeStatus: domain.StatusGood}
 	runtime.mu.Lock()
-	runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+	installTestLower(runtime, "source-a", lowerHandle{client: client, generation: 1, cancel: func() {}})
 	runtime.statuses["source-a"] = connectedStatus("source-a", 1)
 	for _, identifier := range []string{"COM1_Send", "COM1_SendCommand"} {
 		point := runtime.index.pointByNode[identifier]
@@ -1094,7 +1086,7 @@ func TestRuntimeMissingSelectedSourceCommandNodesAreNeverDispatched(t *testing.T
 	}
 	client := &fakeLowerClient{writeStatus: domain.StatusGood}
 	runtime.mu.Lock()
-	runtime.lowers["source-a"] = lowerHandle{client: client, generation: 1, cancel: func() {}}
+	installTestLower(runtime, "source-a", lowerHandle{client: client, generation: 1, cancel: func() {}})
 	runtime.statuses["source-a"] = connectedStatus("source-a", 1)
 	delete(runtime.index.sourceNodes["source-a"], "COM1_Send")
 	delete(runtime.index.sourceNodes["source-a"], "COM1_SendCommand")
@@ -1156,7 +1148,7 @@ func TestRuntimeCloseSerializesWithDynamicLowerStart(t *testing.T) {
 		t.Fatal("runtime still running after close")
 	}
 	runtime.mu.RLock()
-	lowerCount := len(runtime.lowers)
+	lowerCount := runtime.connections.count()
 	runtime.mu.RUnlock()
 	if lowerCount != 0 {
 		t.Fatalf("lower handles after close = %d", lowerCount)
@@ -1278,12 +1270,12 @@ func TestRuntimeGracefulCloseFlushesDirtyDurableState(t *testing.T) {
 		StartedAt: now.Add(-time.Second), FinishedAt: now}
 	audit := domain.AuditEntry{Kind: "close.flush", Actor: "test", Target: "runtime", Revision: 1, OccurredAt: now}
 	runtime.mu.Lock()
-	runtime.dirtyCatalogs[catalog.SourceID] = catalog
-	runtime.dirtyAudits["close-flush"] = audit
+	runtime.catalogPersistence.queue(catalog)
+	_, _ = runtime.managementAudit.save(context.Background(), audit, func(context.Context, domain.AuditEntry) (domain.AuditEntry, error) {
+		return domain.AuditEntry{}, errors.New("injected audit failure")
+	})
 	runtime.mu.Unlock()
-	runtime.commandMu.Lock()
-	runtime.dirtyCommands[command.ID] = command
-	runtime.commandMu.Unlock()
+	runtime.tracking.audit.put(domain.CommandDetail{Command: command})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if err := runtime.CloseContext(ctx); err != nil {
@@ -1320,7 +1312,7 @@ func TestRuntimeRetriesLowerFactoryFailure(t *testing.T) {
 		t.Fatalf("source-a status after factory failure = %#v, exists=%v", status, ok)
 	}
 	runtime.mu.RLock()
-	_, exists := runtime.lowers["source-a"]
+	_, exists := runtime.connections.handle("source-a")
 	runtime.mu.RUnlock()
 	if exists {
 		t.Fatal("failed lower factory left a registered handle")
@@ -1328,7 +1320,7 @@ func TestRuntimeRetriesLowerFactoryFailure(t *testing.T) {
 	failSourceA = false
 	runtime.retryMissingLowers()
 	runtime.mu.RLock()
-	_, exists = runtime.lowers["source-a"]
+	_, exists = runtime.connections.handle("source-a")
 	runtime.mu.RUnlock()
 	if !exists {
 		t.Fatal("missing lower was not restarted")
@@ -1391,7 +1383,9 @@ func TestRuntimeManagementAuditUsesInternalContextAndAffectsHealth(t *testing.T)
 		t.Fatalf("audit entries=%#v total=%d err=%v", entries, total, err)
 	}
 	runtime.mu.Lock()
-	runtime.auditPersistError = "disk unavailable"
+	_, _ = runtime.managementAudit.save(context.Background(), domain.AuditEntry{Kind: "health.failure"}, func(context.Context, domain.AuditEntry) (domain.AuditEntry, error) {
+		return domain.AuditEntry{}, errors.New("disk unavailable")
+	})
 	runtime.mu.Unlock()
 	health := runtime.Health(context.Background())
 	if health.OK || health.Checks["management_audit_persistence"] != "disk unavailable" {
@@ -1540,7 +1534,7 @@ func TestRuntimeRetriesFailedUpstreamReconciliation(t *testing.T) {
 		t.Fatalf("health after failed reconciliation = %#v", health)
 	}
 	runtime.mu.RLock()
-	dirty := runtime.upstreamReconcileDirty
+	dirty, _ := runtime.publication.status()
 	runtime.mu.RUnlock()
 	if !dirty {
 		t.Fatal("failed reconciliation was not marked dirty")
@@ -1554,7 +1548,7 @@ func TestRuntimeRetriesFailedUpstreamReconciliation(t *testing.T) {
 		t.Fatalf("health after successful retry = %#v", health)
 	}
 	runtime.mu.RLock()
-	dirty = runtime.upstreamReconcileDirty
+	dirty, _ = runtime.publication.status()
 	runtime.mu.RUnlock()
 	if dirty {
 		t.Fatal("successful reconciliation did not clear dirty state")
@@ -1634,10 +1628,11 @@ func primeWriteAck(runtime *Runtime, sourceID, port string, epoch uint64) {
 }
 
 type fakeLowerClient struct {
-	mu          sync.Mutex
-	lastWrite   any
-	writeStatus domain.StatusCode
-	writeHook   func()
+	mu                 sync.Mutex
+	lastWrite          any
+	writeStatus        domain.StatusCode
+	writeHook          func()
+	legacyBaselineHook func()
 }
 
 type blockingLowerClient struct {
@@ -1670,6 +1665,15 @@ func (f *fakeLowerClient) Write(_ context.Context, _ domain.NodeKey, value any) 
 		hook()
 	}
 	return f.writeStatus, nil
+}
+func (f *fakeLowerClient) WriteLegacyCommandAtEpoch(ctx context.Context, key domain.NodeKey, value any, _ uint64, ready func() bool) (domain.StatusCode, error) {
+	if f.legacyBaselineHook != nil {
+		f.legacyBaselineHook()
+	}
+	if !ready() {
+		return domain.StatusBadTimeout, context.DeadlineExceeded
+	}
+	return f.Write(ctx, key, value)
 }
 func (*fakeLowerClient) Call(context.Context, domain.NodeKey, string) (string, domain.StatusCode, error) {
 	return "OK", domain.StatusGood, nil

@@ -22,7 +22,10 @@ type StateInput struct {
 	Targets []StateTarget `toml:"targets" json:"targets"`
 }
 
-var stateName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+// Match the identifiers already supported by the expression tokenizer, including
+// digit-leading KKS names. At least one letter or underscore keeps bare numbers
+// unambiguously numeric literals. Do not broaden the expression grammar here.
+var stateName = regexp.MustCompile(`^[A-Za-z0-9_]*[A-Za-z_][A-Za-z0-9_]*$`)
 
 func validateStateInputs(inputs []StateInput) error {
 	if len(inputs) > MaxRules {
@@ -65,7 +68,12 @@ func cloneStateInputs(inputs []StateInput) []StateInput {
 	return out
 }
 
-func (p *Plan) StateInputs() []StateInput { return cloneStateInputs(p.config.StateInputs) }
+func (p *Plan) StateInputs() []StateInput {
+	if p == nil {
+		return nil
+	}
+	return cloneStateInputs(p.config.StateInputs)
+}
 func (p *Plan) StateDependencies(output string) map[string]bool {
 	found := map[string]bool{}
 	visited := map[string]bool{}

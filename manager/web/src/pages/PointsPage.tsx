@@ -112,7 +112,7 @@ export default function PointsPage() {
 
       <section className="table-panel content-panel">
         {compare && !comparisonConfigured ? <EmptyState title="选择两个来源开始比较" description="对比限定在同一分组，不会修改默认源或任何在线 Session。" /> : sessionRequested && sessionsQuery.isPending ? <LoadingState label="正在核对目标 Session…" /> : sessionRequested && sessionsQuery.error ? <ErrorState error={sessionsQuery.error} onRetry={() => void sessionsQuery.refetch()} /> : sessionEnded ? <EmptyState title="目标 Session 已结束" description="原会话的旧点值已停止展示。请显式选择其他在线 Session；不会自动更换查看目标或回退到默认源。" /> : !compare && !routeReady ? <EmptyState title={view === 'session' ? '请选择在线 Session' : '请选择分组和来源'} description="选择只用于查看，不会修改默认源或任何 Session 路由。" /> : error ? <ErrorState error={error} onRetry={refreshPoints} /> : loading ? <LoadingState label={compare ? '正在加载同一查询的双来源点位…' : undefined} /> : compare ? (
-          comparison.length === 0 ? <EmptyState title="没有匹配的点位" description="请调整搜索、目录成员或质量条件。" /> : <>
+          comparison.length === 0 ? <><EmptyState title="没有匹配的点位" description="请调整搜索、目录成员或质量条件。" /><Pagination onPageSizeChange={(size) => updateParams({ size, page: 1 })} page={activeData?.page ?? page} pageSize={PAGE_SIZE} total={activeData?.total ?? 0} onPageChange={(nextPage) => updateParams({ page: nextPage })} /></> : <>
             <div className={`table-scroll${comparisonQuery.isFetching ? ' is-refreshing' : ''}`}>
               <table className="data-table comparison-table"><thead><tr><th>Node ID / 类型</th><th>{leftSourceId} 当前值</th><th>{leftSourceId} 质量 / 时间</th><th>{rightSourceId} 当前值</th><th>{rightSourceId} 质量 / 时间</th><th>比较</th></tr></thead><tbody>{comparison.map(({ left, right }) => {
                 const point = left ?? right!;
@@ -130,7 +130,7 @@ export default function PointsPage() {
             <Pagination onPageSizeChange={(size) => updateParams({ size, page: 1 })} page={activeData?.page ?? page} pageSize={PAGE_SIZE} total={activeData?.total ?? 0} onPageChange={(nextPage) => updateParams({ page: nextPage })} />
           </>
         ) : points.length === 0 ? (
-          <EmptyState title={query || groupId || quality || catalogSourceId || portId || deviceId ? '没有匹配的点位' : '暂无点位目录'} description={query || groupId || quality || catalogSourceId || portId || deviceId ? '请调整搜索或筛选条件。' : '首次目录发现完成后，点位将显示在这里。'} />
+          <><EmptyState title={query || groupId || quality || catalogSourceId || portId || deviceId ? '没有匹配的点位' : '暂无点位目录'} description={query || groupId || quality || catalogSourceId || portId || deviceId ? '请调整搜索或筛选条件。' : '首次目录发现完成后，点位将显示在这里。'} /><Pagination onPageSizeChange={(size) => updateParams({ size, page: 1 })} page={pointsQuery.data?.page ?? page} pageSize={pointsQuery.data?.pageSize ?? PAGE_SIZE} total={pointsQuery.data?.total ?? 0} onPageChange={(nextPage) => updateParams({ page: nextPage })} /></>
         ) : (
           <>
             <div className={`table-scroll${pointsQuery.isFetching ? ' is-refreshing' : ''}`}>

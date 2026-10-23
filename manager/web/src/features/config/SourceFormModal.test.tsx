@@ -1,9 +1,10 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Group, Source } from '../../api/types';
 import { SourceFormModal, validOpcEndpoint } from './SourceFormModal';
+import { api } from '../../api/client';
 
 const group: Group = { id: 'fire', name: 'Fire', defaultSourceId: '', selectionRevision: 1, sourceCount: 1, goodPoints: 0, badPoints: 0, totalPoints: 0, pendingCommandCount: 0, status: 'good' };
 const source: Source = {
@@ -13,9 +14,36 @@ const source: Source = {
   catalogState: 'Ready', reconnectCount: 0, monitoredCount: 1, goodPoints: 1, badPoints: 0, totalPoints: 1, revision: 2,
 };
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('SourceFormModal', () => {
+  it('does not close a new editor when an earlier closed editor finishes saving', async () => {
+    let finish!: (saved: Source) => void;
+    const pending = new Promise<Source>((resolve) => { finish = resolve; });
+    const update = vi.spyOn(api, 'updateSource').mockReturnValue(pending);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const invalidate = vi.spyOn(client, 'invalidateQueries');
+    const onClose = vi.fn();
+    const onSaved = vi.fn();
+    const form = (open: boolean, target: Source) => <QueryClientProvider client={client}><SourceFormModal open={open} source={target} groups={[group]} onClose={onClose} onSaved={onSaved} /></QueryClientProvider>;
+    const view = render(form(true, source));
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: '保存并应用' }));
+    await waitFor(() => expect(update).toHaveBeenCalledOnce());
+    expect(screen.getByLabelText('显示名称')).toBeDisabled();
+    expect(screen.getByRole('button', { name: '关闭（请求继续执行）' })).toBeEnabled();
+    view.rerender(form(false, source));
+    view.rerender(form(true, { ...source, id: 'rcd-2', name: 'RCD 2' }));
+    await user.clear(screen.getByLabelText('显示名称'));
+    await user.type(screen.getByLabelText('显示名称'), '新的未保存草稿');
+    await act(async () => { finish(source); await pending; });
+    await waitFor(() => expect(invalidate).toHaveBeenCalledTimes(5));
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onSaved).not.toHaveBeenCalled();
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(screen.getByLabelText('显示名称')).toHaveValue('新的未保存草稿');
+  });
+
   it('accepts a valid OPC endpoint path', () => {
     expect(validOpcEndpoint('opc.tcp://10.0.0.5:4840/UA/RcdServer')).toBe(true);
   });

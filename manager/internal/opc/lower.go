@@ -29,6 +29,12 @@ type observedNode struct {
 type observedVersion struct {
 	epoch     uint64
 	timestamp time.Time
+	strict    bool
+}
+
+type legacyCommandFence struct {
+	epoch   uint64
+	pending *gu.DataValue
 }
 
 type LowerSupervisor struct {
@@ -45,6 +51,7 @@ type LowerSupervisor struct {
 	running              atomic.Bool
 	epoch                atomic.Uint64
 	commandMu            sync.Mutex
+	commandFences        map[string]*legacyCommandFence
 	stationRevisionEpoch uint64
 	stationRevision      string
 	operationCalls       atomic.Int32
@@ -214,6 +221,11 @@ func (s *LowerSupervisor) runConnection(parent context.Context, epoch uint64) er
 	}()
 
 	namespaces := namespaceIndex(client.Namespaces())
+	if s.cfg.ExpectedGatewayID != "" {
+		if err := verifyGateway(connectCtx, client, s.cfg.ExpectedGatewayID); err != nil {
+			return err
+		}
+	}
 	s.updateStatus(func(st *LowerStatus) {
 		st.Connection = ConnectionConnected
 		st.Session = SessionActive
@@ -241,6 +253,16 @@ func (s *LowerSupervisor) runConnection(parent context.Context, epoch uint64) er
 	s.mu.Unlock()
 	s.sink.OnCatalog(catalog)
 	stationRevisionNode := s.discoverStationVersionRevisionNode(parent, client, namespaces)
+	commandRevisionNode := ""
+	if ns, ok := namespaces[domain.OperationsNamespaceURI]; ok {
+		candidate := gu.NewStringNodeID(ns, "Operations/CommandRevision")
+		probeCtx, cancel := context.WithTimeout(parent, s.cfg.OperationTimeout)
+		res, probeErr := client.Read(probeCtx, &gu.ReadRequest{NodesToRead: []*gu.ReadValueID{{NodeID: candidate, AttributeID: gu.AttributeIDValue}}})
+		cancel()
+		if probeErr == nil && res != nil && len(res.Results) == 1 && res.Results[0] != nil && res.Results[0].Status == gu.StatusOK {
+			commandRevisionNode = candidate.String()
+		}
+	}
 
 	runCtx, cancelRun := context.WithCancel(parent)
 	defer cancelRun()
@@ -256,7 +278,7 @@ func (s *LowerSupervisor) runConnection(parent context.Context, epoch uint64) er
 		}
 	})
 
-	subs, err := s.subscribeBatches(runCtx, monitorClient, nodes, stationRevisionNode, epoch, monitorErr)
+	subs, err := s.subscribeBatches(runCtx, monitorClient, nodes, stationRevisionNode, epoch, monitorErr, commandRevisionNode)
 	if err != nil {
 		return err
 	}
@@ -464,7 +486,12 @@ func (s *LowerSupervisor) subscribeBatches(
 	stationRevisionNode string,
 	epoch uint64,
 	errCh chan<- error,
+	commandRevisionNodes ...string,
 ) ([]*monitor.Subscription, error) {
+	commandRevisionNode := ""
+	if len(commandRevisionNodes) > 0 {
+		commandRevisionNode = commandRevisionNodes[0]
+	}
 	ids := make([]string, 0, len(nodes))
 	for id := range nodes {
 		ids = append(ids, id)
@@ -476,7 +503,7 @@ func (s *LowerSupervisor) subscribeBatches(
 		MaxKeepAliveCount:          3000,
 		MaxNotificationsPerPublish: 10000,
 	}
-	if len(ids) == 0 && stationRevisionNode == "" {
+	if len(ids) == 0 && stationRevisionNode == "" && commandRevisionNode == "" {
 		return nil, nil
 	}
 	// A source owns one Subscription. MonitoredItems are still added in bounded
@@ -484,6 +511,14 @@ func (s *LowerSupervisor) subscribeBatches(
 	// Subscription per batch exhausts the Rust server's per-Session limit once
 	// a source grows beyond roughly 5000 points.
 	sub, err := m.Subscribe(ctx, params, func(_ *monitor.Subscription, msg *monitor.DataChangeMessage) {
+		if msg != nil && msg.NodeID != nil && commandRevisionNode != "" && msg.NodeID.String() == commandRevisionNode {
+			if msg.Error == nil && s.epoch.Load() == epoch {
+				if sink, ok := s.sink.(interface{ OnCommandRevision(string, uint64) }); ok {
+					sink.OnCommandRevision(s.cfg.Source.ID, epoch)
+				}
+			}
+			return
+		}
 		if msg == nil || msg.Error != nil || msg.NodeID == nil || msg.DataValue == nil {
 			if msg != nil && msg.Error != nil {
 				select {
@@ -546,6 +581,12 @@ func (s *LowerSupervisor) subscribeBatches(
 		// This management invalidation is optional. Any monitored-item rejection
 		// must leave the business subscription healthy; the 60 s status poll is
 		// the bounded fallback for old or resource-constrained lower servers.
+	}
+	if commandRevisionNode != "" {
+		nodeID, err := gu.ParseNodeID(commandRevisionNode)
+		if err == nil {
+			_, _ = sub.AddMonitorItems(ctx, monitor.Request{NodeID: nodeID, MonitoringMode: gu.MonitoringModeReporting, MonitoringParameters: &gu.MonitoringParameters{SamplingInterval: 50, QueueSize: 1, DiscardOldest: true}})
+		}
 	}
 	return []*monitor.Subscription{sub}, nil
 }
@@ -633,7 +674,7 @@ func (s *LowerSupervisor) WriteAtEpoch(ctx context.Context, key domain.NodeKey, 
 	if err != nil {
 		return domain.StatusBadNoCommunication, err
 	}
-	baselineTimestamp, hasBaseline := readServerTimestamp(ctx, client, nodeID)
+	baselineTimestamp, hasBaseline := commandWriteBaseline(ctx, client, nodeID, key)
 	variant, err := gu.NewVariant(value)
 	if err != nil {
 		return domain.StatusBadConfigurationError, err
@@ -657,6 +698,136 @@ func (s *LowerSupervisor) WriteAtEpoch(ctx context.Context, key domain.NodeKey, 
 
 type opcValueReader interface {
 	Read(context.Context, *gu.ReadRequest) (*gu.ReadResponse, error)
+}
+
+func commandWriteBaseline(ctx context.Context, client opcValueReader, nodeID *gu.NodeID, key domain.NodeKey) (time.Time, bool) {
+	if !strings.HasSuffix(key.Identifier, "_Send") {
+		return time.Time{}, false
+	}
+	return readServerTimestamp(ctx, client, nodeID)
+}
+
+type opcValueWriter interface {
+	opcValueReader
+	Write(context.Context, *gu.WriteRequest) (*gu.WriteResponse, error)
+}
+
+func (s *LowerSupervisor) WriteLegacyCommandAtEpoch(ctx context.Context, key domain.NodeKey, value any, expectedEpoch uint64, ready func() bool) (domain.StatusCode, error) {
+	client, nodeID, dataType, epoch, err := s.operationTargetAtEpoch(key, expectedEpoch)
+	if err != nil {
+		return domain.StatusBadNoCommunication, err
+	}
+	return s.writeFencedLegacyCommand(ctx, client, nodeID, key, dataType, value, epoch, ready)
+}
+
+// A subscription notification can lag behind the value read before a Write.
+// Fence delivery across that read and Write, install its timestamp in the SAME
+// watermark used by subscription/probe delivery, then discard provisional ACKs
+// already observed by the coordinator. Buffer only the newest command sample;
+// no mutex is held across RPCs and other command nodes/raw sampling keep flowing.
+func (s *LowerSupervisor) writeFencedLegacyCommand(ctx context.Context, client opcValueWriter, nodeID *gu.NodeID, key domain.NodeKey, dataType domain.DataType, value any, epoch uint64, ready func() bool) (domain.StatusCode, error) {
+	if !strings.HasSuffix(key.Identifier, "_Send") || dataType != domain.DataTypeString {
+		return domain.StatusBadConfigurationError, errors.New("legacy command requires a String _Send node")
+	}
+	variant, err := gu.NewVariant(value)
+	if err != nil {
+		return domain.StatusBadConfigurationError, err
+	}
+	id := nodeID.String()
+	s.commandMu.Lock()
+	if s.epoch.Load() != epoch {
+		s.commandMu.Unlock()
+		return domain.StatusBadNoCommunication, ErrLowerUnavailable
+	}
+	if s.commandFences == nil {
+		s.commandFences = make(map[string]*legacyCommandFence)
+	}
+	if previous := s.commandFences[id]; previous != nil && previous.epoch == epoch {
+		s.commandMu.Unlock()
+		return domain.StatusBadWaitingForResponse, errors.New("legacy command baseline is already being established")
+	}
+	fence := &legacyCommandFence{epoch: epoch}
+	s.commandFences[id] = fence
+	s.commandMu.Unlock()
+	defer s.finishLegacyCommandFence(id, key, dataType, epoch, fence, false)
+	response, err := client.Read(ctx, &gu.ReadRequest{
+		TimestampsToReturn: gu.TimestampsToReturnBoth,
+		NodesToRead:        []*gu.ReadValueID{{NodeID: nodeID, AttributeID: gu.AttributeIDValue}},
+	})
+	if err != nil {
+		return domain.StatusBadNoCommunication, err
+	}
+	if response == nil || len(response.Results) != 1 || response.Results[0] == nil || response.Results[0].Value == nil ||
+		!domain.StatusCode(response.Results[0].Status).IsGood() || response.Results[0].ServerTimestamp.IsZero() {
+		return domain.StatusBadNoCommunication, errors.New("legacy ACK baseline cannot be confirmed; command not sent")
+	}
+	baseline := response.Results[0].ServerTimestamp
+	if strings.TrimSpace(fmt.Sprint(response.Results[0].Value.Value())) == "2" {
+		return domain.StatusBadWaitingForResponse, errors.New("lower port is still awaiting the previous ACK; command not sent")
+	}
+	s.commandMu.Lock()
+	s.mu.Lock()
+	if s.epoch.Load() != epoch {
+		s.mu.Unlock()
+		s.commandMu.Unlock()
+		return domain.StatusBadNoCommunication, ErrLowerUnavailable
+	}
+	if s.versions == nil {
+		s.versions = make(map[string]observedVersion)
+	}
+	previous := s.versions[nodeID.String()]
+	if previous.epoch == epoch && baseline.Before(previous.timestamp) {
+		s.mu.Unlock()
+		s.commandMu.Unlock()
+		return domain.StatusBadNoCommunication, errors.New("legacy ACK clock moved backwards; command not sent")
+	}
+	s.versions[nodeID.String()] = observedVersion{epoch: epoch, timestamp: baseline, strict: true}
+	s.mu.Unlock()
+	if ready != nil && !ready() {
+		s.commandMu.Unlock()
+		return domain.StatusBadTimeout, errors.New("original command reservation is no longer available; command not sent")
+	}
+	s.commandMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return domain.StatusBadTimeout, err
+	}
+	if s.epoch.Load() != epoch {
+		return domain.StatusBadNoCommunication, ErrLowerUnavailable
+	}
+	result, err := client.Write(ctx, &gu.WriteRequest{NodesToWrite: []*gu.WriteValue{{
+		NodeID: nodeID, AttributeID: gu.AttributeIDValue,
+		Value: &gu.DataValue{EncodingMask: gu.DataValueValue, Value: variant},
+	}}})
+	if err != nil {
+		return domain.StatusBadNoCommunication, err
+	}
+	if result == nil || len(result.Results) != 1 {
+		return domain.StatusBadNoCommunication, errors.New("legacy write returned no result")
+	}
+	status := domain.StatusCode(result.Results[0])
+	if status.IsGood() {
+		if !s.finishLegacyCommandFence(id, key, dataType, epoch, fence, true) {
+			return domain.StatusBadNoCommunication, ErrLowerUnavailable
+		}
+		s.startCommandAckProbe(client, nodeID, key, dataType, epoch, baseline)
+	}
+	return status, nil
+}
+
+func (s *LowerSupervisor) finishLegacyCommandFence(id string, key domain.NodeKey, dataType domain.DataType, epoch uint64, fence *legacyCommandFence, deliver bool) bool {
+	s.commandMu.Lock()
+	defer s.commandMu.Unlock()
+	if s.commandFences[id] != fence {
+		return false
+	}
+	delete(s.commandFences, id)
+	if s.epoch.Load() != epoch {
+		return false
+	}
+	if deliver && fence.pending != nil {
+		s.emitCommandSampleLocked(id, key, dataType, fence.pending, epoch)
+	}
+	return true
 }
 
 func readServerTimestamp(ctx context.Context, client opcValueReader, nodeID *gu.NodeID) (time.Time, bool) {
@@ -749,17 +920,30 @@ func (s *LowerSupervisor) emitCommandSample(nodeID string, key domain.NodeKey, d
 	if value == nil || s.epoch.Load() != epoch {
 		return false
 	}
+	if fence := s.commandFences[nodeID]; fence != nil && fence.epoch == epoch {
+		// Zero/older timestamps cannot replace a reliable buffered transition.
+		if !value.ServerTimestamp.IsZero() && (fence.pending == nil || value.ServerTimestamp.After(fence.pending.ServerTimestamp)) {
+			copy := *value
+			fence.pending = &copy
+		}
+		return false
+	}
+	return s.emitCommandSampleLocked(nodeID, key, dataType, value, epoch)
+}
+
+func (s *LowerSupervisor) emitCommandSampleLocked(nodeID string, key domain.NodeKey, dataType domain.DataType, value *gu.DataValue, epoch uint64) bool {
 	timestamp := value.ServerTimestamp
 	s.mu.Lock()
 	if s.versions == nil {
 		s.versions = make(map[string]observedVersion)
 	}
 	version := s.versions[nodeID]
-	if version.epoch == epoch && !timestamp.IsZero() && !version.timestamp.IsZero() && !timestamp.After(version.timestamp) {
+	if version.epoch == epoch && ((version.strict && timestamp.IsZero()) ||
+		(!timestamp.IsZero() && !version.timestamp.IsZero() && !timestamp.After(version.timestamp))) {
 		s.mu.Unlock()
 		return false
 	}
-	s.versions[nodeID] = observedVersion{epoch: epoch, timestamp: timestamp}
+	s.versions[nodeID] = observedVersion{epoch: epoch, timestamp: timestamp, strict: version.epoch == epoch && version.strict}
 	s.mu.Unlock()
 	return s.emitObservedSample(nodeID, key, dataType, value, epoch)
 }

@@ -2,6 +2,7 @@
 //! applied state is reported by the serial worker, never inferred from enqueue.
 
 pub mod files;
+mod maintenance;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -60,16 +61,16 @@ impl fmt::Display for OperationError {
 impl std::error::Error for OperationError {}
 
 pub fn capabilities() -> Value {
-    json!({"schema_version":1,"features":["acquisition","configuration","logs","station_versions","calculation_mode","logging_configuration"],
+    json!({"schema_version":1,"features":["acquisition","configuration","configuration_forms","logs","station_versions","calculation_mode","logging_configuration","command_tracking","maintenance_gate_v1","maintenance_config_guard_v1"],
         "max_config_bytes":2_097_152,"max_log_bytes":65_536,"configuration_apply":"restart"})
 }
 
 pub fn software_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    crate::build_info::current().version
 }
 
 pub fn build_commit() -> &'static str {
-    option_env!("RCD_BUILD_COMMIT").unwrap_or("unknown")
+    crate::build_info::current().commit
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -146,6 +147,9 @@ struct State {
 }
 
 struct Inner {
+    maintenance: maintenance::Gate,
+    commands: crate::command_tracking::Tracker,
+    submit_command: Mutex<Option<CommandSubmit>>,
     state: Mutex<State>,
     senders: Mutex<HashMap<String, mpsc::Sender<Command>>>,
     files: Mutex<files::FileRepository>,
@@ -156,6 +160,17 @@ struct Inner {
     active_logging_spec: String,
     logging_environment_override: bool,
 }
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // A bounded shutdown flush, not I/O in the normal serial exchange.
+        if !self.commands.flush(Duration::from_secs(2)) {
+            log::warn!("command journal shutdown incomplete; unfinished evidence will be Unknown after restart");
+        }
+    }
+}
+
+type CommandSubmit = Arc<dyn Fn(&Value) -> Result<Value, OperationError> + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CalculationStatus {
@@ -186,11 +201,19 @@ pub struct Operations {
     inner: Arc<Inner>,
 }
 
+pub(crate) struct WeakOperations(Weak<Inner>);
+impl WeakOperations {
+    pub(crate) fn upgrade(&self) -> Option<Operations> {
+        self.0.upgrade().map(|inner| Operations { inner })
+    }
+}
+
 /// A command reserves its physical port from admission until the worker has
 /// finished it (including ACK retries). Clones share one reservation.
 #[derive(Clone)]
 pub struct CommandPermit(Arc<PermitInner>);
 struct PermitInner {
+    _maintenance: maintenance::Admission,
     owner: Weak<Inner>,
     port_id: String,
 }
@@ -215,6 +238,9 @@ impl Drop for PermitInner {
 }
 
 impl Operations {
+    pub(crate) fn downgrade(&self) -> WeakOperations {
+        WeakOperations(Arc::downgrade(&self.inner))
+    }
     pub fn new(
         config_dir: PathBuf,
         log_dir: PathBuf,
@@ -239,15 +265,40 @@ impl Operations {
         ports: &[SerialPortConfig],
         shutdown: CancellationToken,
     ) -> io::Result<Self> {
+        Self::new_with_directories(
+            config_dir.clone(),
+            config_dir,
+            log_dir,
+            log_basename,
+            ports,
+            shutdown,
+        )
+    }
+
+    pub fn new_with_directories(
+        config_dir: PathBuf,
+        state_dir: PathBuf,
+        log_dir: PathBuf,
+        log_basename: String,
+        ports: &[SerialPortConfig],
+        shutdown: CancellationToken,
+    ) -> io::Result<Self> {
         let config_dir = fs::canonicalize(config_dir)?;
+        let state_dir = fs::canonicalize(state_dir)?;
+        if !state_dir.is_dir() || state_dir.parent().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid operations state directory",
+            ));
+        }
         if !config_dir.is_dir() || config_dir.parent().is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid operations configuration directory",
             ));
         }
-        let state_path = config_dir.join("operations.json");
-        let station_state_path = config_dir.join("station_versions.json");
+        let state_path = state_dir.join("operations.json");
+        let station_state_path = state_dir.join("station_versions.json");
         let mut saved = read_state(&state_path)?;
         let mut station_saved = read_station_state(&station_state_path)?;
         let station_state_before_reconcile =
@@ -359,9 +410,20 @@ impl Operations {
             .filter(|value| !value.trim().is_empty());
         let logging_environment_override = environment_logging_spec.is_some();
         let active_logging_spec = environment_logging_spec.unwrap_or(configured_logging_spec);
+        let commands =
+            crate::command_tracking::Tracker::open(state_dir.join("command-journal.sqlite"));
+        let maintenance = maintenance::Gate::open(
+            state_dir.join("maintenance.sqlite"),
+            commands.identity()["gateway_instance_id"]
+                .as_str()
+                .unwrap_or_default(),
+        );
         let repository = files::FileRepository::new(config_dir, log_dir, log_basename)?;
         Ok(Self {
             inner: Arc::new(Inner {
+                maintenance,
+                commands,
+                submit_command: Mutex::new(None),
                 state: Mutex::new(State {
                     saved,
                     station_saved,
@@ -459,6 +521,7 @@ impl Operations {
     }
 
     pub fn status(&self) -> Value {
+        let maintenance = self.maintenance_status();
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let calculation = self
             .inner
@@ -471,8 +534,11 @@ impl Operations {
             "revision":state.saved.revision,
             "software_version":software_version(),
             "build_commit":build_commit(),
+            "build_info":crate::build_info::current(),
             "station_revision":state.station_saved.revision,
             "calculation":calculation,
+            "command_tracking":self.inner.commands.identity(),
+            "maintenance":maintenance,
             "ports":state.ports.values().collect::<Vec<_>>()
         })
     }
@@ -506,7 +572,63 @@ impl Operations {
 
     pub fn execute(&self, request: &Value) -> Result<Value, OperationError> {
         let action = string_arg(request, "action")?;
+        // Keep the admission alive through queued controls/config writes. Once
+        // the RPC returns Pending, the existing port control flag owns draining.
+        // submit_command uses the shared physical command permit instead, so
+        // idempotent lookups of already accepted commands remain available.
+        let _mutation = match action {
+            "set_port_enabled"
+            | "set_device_read_enabled"
+            | "set_device_module_type"
+            | "query_device_version"
+            | "set_calculation_mode"
+            | "set_logging_level"
+            | "write_config" => Some(self.inner.maintenance.admit()?),
+            _ => None,
+        };
         match action {
+            "maintenance_status" => Ok(self.maintenance_status()),
+            "enter_maintenance" | "leave_maintenance" => self.change_maintenance(request, action),
+            "validate_maintenance_configs" => self.validate_maintenance_configs(request),
+            "command_tracking_status" => Ok(self.inner.commands.identity()),
+            "submit_command" => {
+                let handler = self
+                    .inner
+                    .submit_command
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                    .ok_or_else(|| {
+                        OperationError::new("unavailable", "command handler is not ready")
+                    })?;
+                handler(request)
+            }
+            "get_command" => {
+                let value = self
+                    .inner
+                    .commands
+                    .get(
+                        string_arg(request, "manager_instance_id")?,
+                        string_arg(request, "command_id")?,
+                    )
+                    .map_err(|e| OperationError::new("audit_unavailable", e))?;
+                Ok(json!({"command":value,"health":self.inner.commands.identity()}))
+            }
+            "list_command_events" => {
+                let cursor = request["after"]
+                    .as_str()
+                    .unwrap_or("0")
+                    .parse::<u64>()
+                    .map_err(|_| OperationError::new("invalid_request", "invalid cursor"))?;
+                self.inner
+                    .commands
+                    .events(
+                        string_arg(request, "manager_instance_id")?,
+                        cursor,
+                        request["limit"].as_u64().unwrap_or(200) as usize,
+                    )
+                    .map_err(|e| OperationError::new("audit_unavailable", e))
+            }
             "status" => Ok(self.status()),
             "set_port_enabled" | "set_device_read_enabled" => {
                 self.set_control(request, action, CONTROL_WAIT)
@@ -516,8 +638,8 @@ impl Operations {
             "set_calculation_mode" => self.set_calculation_mode(request),
             "get_logging" => self.get_logging(),
             "set_logging_level" => self.set_logging_level(request),
-            "list_configs" | "read_config" | "validate_config" | "write_config" | "list_logs"
-            | "read_log" => self
+            "list_configs" | "read_config" | "validate_config" | "write_config"
+            | "prepare_config" | "list_logs" | "read_log" => self
                 .inner
                 .files
                 .lock()
@@ -528,6 +650,141 @@ impl Operations {
                 "unsupported operations action",
             )),
         }
+    }
+
+    pub fn command_tracker(&self) -> crate::command_tracking::Tracker {
+        self.inner.commands.clone()
+    }
+
+    fn pending_port_operations(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ports
+            .values()
+            .filter(|port| port.control_pending || port.pending_commands != 0)
+            .count()
+    }
+
+    fn maintenance_status(&self) -> Value {
+        // Gate -> operations is the only nested lock order. Never call with
+        // Operations.state held: completion drops its port lock before admission.
+        self.inner
+            .maintenance
+            .snapshot(|| self.pending_port_operations())
+    }
+
+    fn change_maintenance(&self, request: &Value, action: &str) -> Result<Value, OperationError> {
+        if request["schema_version"].as_u64() != Some(1) {
+            return Err(OperationError::new(
+                "invalid_request",
+                "unsupported maintenance schema_version",
+            ));
+        }
+        self.inner
+            .commands
+            .validate_identity(
+                string_arg(request, "expected_gateway_instance_id")?,
+                string_arg(request, "expected_boot_id")?,
+            )
+            .map_err(|error| OperationError::new("conflict", error))?;
+        let deployment = string_arg(request, "deployment_id")?;
+        let token_text = string_arg(request, "fencing_token")?;
+        let token = token_text
+            .parse::<u64>()
+            .map_err(|_| OperationError::new("invalid_request", "invalid fencing token"))?;
+        if token.to_string() != token_text {
+            return Err(OperationError::new(
+                "invalid_request",
+                "fencing token must be canonical decimal",
+            ));
+        }
+        if action == "enter_maintenance" {
+            self.inner.maintenance.enter(deployment, token)?;
+        } else {
+            self.inner
+                .maintenance
+                .leave(deployment, token, || self.pending_port_operations())?;
+        }
+        Ok(self.maintenance_status())
+    }
+
+    pub fn register_command_submit(&self, handler: CommandSubmit) {
+        *self
+            .inner
+            .submit_command
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(handler);
+    }
+
+    fn validate_maintenance_configs(&self, request: &Value) -> Result<Value, OperationError> {
+        if request["schema_version"].as_u64() != Some(1) {
+            return Err(OperationError::new(
+                "invalid_request",
+                "unsupported configuration guard schema",
+            ));
+        }
+        self.inner
+            .commands
+            .validate_identity(
+                string_arg(request, "expected_gateway_instance_id")?,
+                string_arg(request, "expected_boot_id")?,
+            )
+            .map_err(|e| OperationError::new("conflict", e))?;
+        let deployment = string_arg(request, "deployment_id")?;
+        let token = string_arg(request, "fencing_token")?;
+        let owns = |snapshot: &Value| {
+            snapshot["active"].as_bool() == Some(true)
+                && snapshot["drained"].as_bool() == Some(true)
+                && snapshot["deployment_id"].as_str() == Some(deployment)
+                && snapshot["fencing_token"].as_str() == Some(token)
+        };
+        if !owns(&self.maintenance_status()) {
+            return Err(OperationError::new(
+                "conflict",
+                "configuration check requires our drained maintenance fence",
+            ));
+        }
+        let expected = request["expected_config_revisions"]
+            .as_object()
+            .filter(|v| !v.is_empty() && v.len() <= 256)
+            .ok_or_else(|| {
+                OperationError::new("invalid_request", "expected file revisions are required")
+            })?;
+        let current = self
+            .inner
+            .files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .handle(&json!({"action":"list_configs"}))?;
+        let items = current["items"].as_array().ok_or_else(|| {
+            OperationError::new("operation_failed", "invalid configuration inventory")
+        })?;
+        for (name, hash) in expected {
+            let hash = hash
+                .as_str()
+                .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+                .ok_or_else(|| {
+                    OperationError::new("invalid_request", "invalid expected configuration hash")
+                })?;
+            if !items.iter().any(|v| {
+                v["name"].as_str() == Some(name.as_str()) && v["revision"].as_str() == Some(hash)
+            }) {
+                return Err(OperationError::new(
+                    "conflict",
+                    format!("configuration {name} changed before safe restart"),
+                ));
+            }
+        }
+        let snapshot = self.maintenance_status();
+        if !owns(&snapshot) {
+            return Err(OperationError::new(
+                "conflict",
+                "configuration maintenance fence changed",
+            ));
+        }
+        Ok(snapshot)
     }
 
     fn set_calculation_mode(&self, request: &Value) -> Result<Value, OperationError> {
@@ -894,21 +1151,22 @@ impl Operations {
         &self,
         port_id: &str,
         device_id: u8,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<maintenance::Admission>, OperationError> {
+        let admission = self.inner.maintenance.admit()?;
         let device_id_text = device_id.to_string();
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if self.inner.shutdown.is_cancelled() {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(port) = state.ports.get(port_id) else {
-            return Ok(false);
+            return Ok(None);
         };
         let Some(device) = port
             .devices
             .iter()
             .find(|device| device.device_id == device_id_text)
         else {
-            return Ok(false);
+            return Ok(None);
         };
         if !port.enabled
             || !port.applied_enabled
@@ -920,16 +1178,16 @@ impl Operations {
             || (device.station_version.detected_module_type == ModuleType::LegacyRussian
                 && device.station_version.type_mismatch)
         {
-            return Ok(false);
+            return Ok(None);
         }
-        mark_station_query_pending(
+        let result = mark_station_query_pending(
             &mut state,
             &self.inner.station_state_path,
             port_id,
             &device_id_text,
-        )
-        .map(|_| true)
-        .map_err(|error| error.to_string())
+        );
+        drop(state);
+        result.map(|_| Some(admission))
     }
 
     /// Records a dedicated query result without touching normal acquisition health/counters.
@@ -1004,6 +1262,7 @@ impl Operations {
     }
 
     pub(crate) fn admit_command(&self, port_id: &str) -> Result<CommandPermit, OperationError> {
+        let admission = self.inner.maintenance.admit()?;
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if self.inner.shutdown.is_cancelled() {
             return Err(
@@ -1015,7 +1274,7 @@ impl Operations {
             .ports
             .get_mut(port_id)
             .ok_or_else(|| OperationError::new("not_found", "unknown port"))?;
-        if port.control_pending {
+        if port.control_pending || port.pending_commands > 0 {
             return Err(OperationError::new("busy", "port control is still pending"));
         }
         if !port.enabled || !port.applied_enabled {
@@ -1026,6 +1285,7 @@ impl Operations {
         }
         port.pending_commands += 1;
         Ok(CommandPermit(Arc::new(PermitInner {
+            _maintenance: admission,
             owner: Arc::downgrade(&self.inner),
             port_id: port_id.into(),
         })))
@@ -1843,6 +2103,231 @@ mode = "local"
         (root, operations, ports, rx)
     }
 
+    fn maintenance_request(operations: &Operations, action: &str, token: &str) -> Value {
+        let identity = operations.command_tracker().identity();
+        json!({"schema_version":1,"action":action,"deployment_id":"test-deploy",
+            "fencing_token":token,"expected_gateway_instance_id":identity["gateway_instance_id"],
+            "expected_boot_id":identity["boot_id"]})
+    }
+
+    #[test]
+    fn maintenance_configuration_guard_checks_after_drain_and_rejects_late_edits() {
+        let (root, operations, _ports, _rx) = fixture();
+        let config = root.path().join("config/config.toml");
+        fs::write(&config, "[calculation]\nmode=\"manager\"\n").unwrap();
+        let inventory = operations
+            .execute(&json!({"action":"list_configs"}))
+            .unwrap();
+        let revision = inventory["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "config.toml")
+            .unwrap()["revision"]
+            .clone();
+        let mut guard = maintenance_request(&operations, "validate_maintenance_configs", "1");
+        guard["expected_config_revisions"] = json!({"config.toml":revision});
+        assert_eq!(operations.execute(&guard).unwrap_err().code, "conflict");
+        operations
+            .execute(&maintenance_request(&operations, "enter_maintenance", "1"))
+            .unwrap();
+        assert!(operations.execute(&guard).unwrap()["drained"]
+            .as_bool()
+            .unwrap());
+        // A second manager cannot write once the gateway fence is held.
+        assert_eq!(
+            operations
+                .execute(&json!({"action":"write_config"}))
+                .unwrap_err()
+                .code,
+            "busy"
+        );
+        // Direct fixture mutation models an edit between the early manager check
+        // and Agent entering maintenance. The authoritative second check catches it.
+        fs::write(&config, "[calculation]\nmode=\"local\"\n").unwrap();
+        assert_eq!(operations.execute(&guard).unwrap_err().code, "conflict");
+    }
+
+    #[test]
+    fn maintenance_blocks_all_mutating_operations_but_keeps_status_and_polling_alive() {
+        let (_root, operations, ports, _rx) = fixture();
+        let permit = operations.admit_command(&ports[0].port_number).unwrap();
+        let entered = operations
+            .execute(&maintenance_request(&operations, "enter_maintenance", "1"))
+            .unwrap();
+        assert_eq!(entered["drained"], false);
+        assert_eq!(
+            operations
+                .admit_command(&ports[0].port_number)
+                .unwrap_err()
+                .code,
+            "busy"
+        );
+        for action in [
+            "set_port_enabled",
+            "set_device_read_enabled",
+            "set_device_module_type",
+            "query_device_version",
+            "set_calculation_mode",
+            "set_logging_level",
+            "write_config",
+        ] {
+            assert_eq!(
+                operations
+                    .execute(&json!({"action":action}))
+                    .unwrap_err()
+                    .code,
+                "busy",
+                "{action}"
+            );
+        }
+        assert!(
+            matches!(operations.begin_automatic_station_query(&ports[0].port_number, 0), Err(e) if e.code == "busy")
+        );
+        operations.report_runtime(&ports[0].port_number, true, true, [(0, true, true, None)]);
+        assert_eq!(operations.status()["ports"][0]["open"], true);
+        assert_eq!(
+            operations
+                .execute(&maintenance_request(&operations, "leave_maintenance", "1"))
+                .unwrap_err()
+                .code,
+            "busy"
+        );
+        let clone = permit.clone();
+        drop(permit);
+        assert_eq!(operations.maintenance_status()["drained"], false);
+        drop(clone);
+        assert_eq!(operations.maintenance_status()["drained"], true);
+        operations
+            .execute(&maintenance_request(&operations, "leave_maintenance", "1"))
+            .unwrap();
+        assert!(operations.admit_command(&ports[0].port_number).is_ok());
+    }
+
+    #[test]
+    fn maintenance_cannot_release_while_pending_control_outlives_rpc() {
+        let (_root, operations, _ports, rx) = fixture();
+        let pending = operations
+            .set_control(&stop_read("1"), "set_device_read_enabled", Duration::ZERO)
+            .unwrap();
+        assert_eq!(pending["status"], "Pending");
+        let command = rx.try_recv().unwrap();
+        operations
+            .execute(&maintenance_request(&operations, "enter_maintenance", "1"))
+            .unwrap();
+        assert_eq!(operations.maintenance_status()["pending_admissions"], 0);
+        assert_eq!(
+            operations.maintenance_status()["pending_port_operations"],
+            1
+        );
+        assert_eq!(
+            operations
+                .execute(&maintenance_request(&operations, "leave_maintenance", "1"))
+                .unwrap_err()
+                .code,
+            "busy"
+        );
+        operations.complete_control(
+            &command.com,
+            command.control_receipt.unwrap().revision,
+            &Ok(()),
+        );
+        assert_eq!(operations.maintenance_status()["drained"], true);
+    }
+
+    #[test]
+    fn maintenance_restart_preserves_fence_and_requires_current_boot() {
+        let (root, operations, ports, _rx) = fixture();
+        let enter = maintenance_request(&operations, "enter_maintenance", "1");
+        let old_leave = maintenance_request(&operations, "leave_maintenance", "1");
+        operations.execute(&enter).unwrap();
+        drop(operations);
+        let restarted = Operations::new(
+            root.path().join("config"),
+            root.path().join("logs"),
+            "test".into(),
+            &ports,
+        )
+        .unwrap();
+        assert_eq!(restarted.maintenance_status()["admission_blocked"], true);
+        assert_eq!(restarted.execute(&old_leave).unwrap_err().code, "conflict");
+        restarted
+            .execute(&maintenance_request(&restarted, "leave_maintenance", "1"))
+            .unwrap();
+        assert_eq!(restarted.maintenance_status()["admission_blocked"], false);
+    }
+
+    #[test]
+    fn maintenance_drains_automatic_version_transaction() {
+        let (_root, operations, ports, _rx) = fixture();
+        let port = &ports[0].port_number;
+        operations.report_runtime(port, true, true, [(0, true, true, None)]);
+        {
+            let mut state = operations.inner.state.lock().unwrap();
+            state.ports.get_mut(port).unwrap().devices[0]
+                .station_version
+                .configured_module_type = ModuleType::Domestic;
+        }
+        let admission = operations
+            .begin_automatic_station_query(port, 0)
+            .unwrap()
+            .unwrap();
+        operations
+            .execute(&maintenance_request(&operations, "enter_maintenance", "1"))
+            .unwrap();
+        assert_eq!(operations.maintenance_status()["drained"], false);
+        assert!(
+            matches!(operations.begin_automatic_station_query(port, 0), Err(e) if e.code == "busy")
+        );
+        operations
+            .report_station_query_result(port, 0, Err("isolated query timeout".into()))
+            .unwrap();
+        assert_eq!(operations.maintenance_status()["drained"], false); // guard still owns exchange
+        drop(admission);
+        assert_eq!(operations.maintenance_status()["drained"], true);
+    }
+
+    #[test]
+    fn explicit_state_directory_keeps_configuration_and_identity_separate() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config");
+        let state = root.path().join("state");
+        let logs = root.path().join("logs");
+        for path in [&config, &state, &logs] {
+            fs::create_dir(path).unwrap();
+        }
+        fs::write(config.join("config.toml"), APPLICATION_CONFIG).unwrap();
+        let create = || {
+            Operations::new_with_directories(
+                config.clone(),
+                state.clone(),
+                logs.clone(),
+                "test".into(),
+                &[],
+                CancellationToken::new(),
+            )
+            .unwrap()
+        };
+        let first = create();
+        let identity = first.status()["command_tracking"]["gateway_instance_id"].clone();
+        assert!(identity.as_str().is_some_and(|id| !id.is_empty()));
+        assert!(state.join("command-journal.sqlite").is_file());
+        assert!(!config.join("command-journal.sqlite").exists());
+        assert!(!config.join("operations.json").exists());
+        assert!(!config.join("station_versions.json").exists());
+        drop(first);
+        let second = create();
+        assert_eq!(
+            second.status()["command_tracking"]["gateway_instance_id"],
+            identity
+        );
+        assert_eq!(
+            fs::read_to_string(config.join("config.toml")).unwrap(),
+            APPLICATION_CONFIG
+        );
+        assert_eq!(second.status()["build_info"]["component"], "lower");
+    }
+
     fn stop_read(expected: &str) -> Value {
         json!({"action":"set_device_read_enabled","port_id":"TEST-NOT-A-SERIAL-DEVICE","device_id":"0","enabled":false,"expected_revision":expected})
     }
@@ -2025,7 +2510,8 @@ mode = "local"
         );
         assert!(operations
             .begin_automatic_station_query(&ports[0].port_number, 0)
-            .unwrap());
+            .unwrap()
+            .is_some());
         operations
             .report_station_query_result(
                 &ports[0].port_number,
@@ -2074,7 +2560,8 @@ mode = "local"
         );
         assert!(operations
             .begin_automatic_station_query(&ports[0].port_number, 0)
-            .unwrap());
+            .unwrap()
+            .is_some());
         drop(operations);
 
         let restarted = Operations::new(
@@ -2115,7 +2602,8 @@ mode = "local"
         );
         assert!(operations
             .begin_automatic_station_query(&ports[0].port_number, 0)
-            .unwrap());
+            .unwrap()
+            .is_some());
         operations
             .report_station_query_result(
                 &ports[0].port_number,

@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"rcd_manager/internal/domain"
 	"rcd_manager/internal/opc"
@@ -17,12 +18,14 @@ type commandRoute struct {
 	Port         string
 	Key          domain.NodeKey
 	SendKey      domain.NodeKey
+	PhysicalPort string
 }
 
 type commandHistoryEntry struct {
 	Route     commandRoute
 	CommandID string
 	Sample    domain.Sample
+	Result    string
 }
 
 func commandAddress(payload string) (uint32, error) {
@@ -219,8 +222,18 @@ func (r *Runtime) rememberPassiveCommand(sessionID, identifier, groupHint string
 }
 
 func (r *Runtime) finishCommandHistory(command domain.PendingCommand) {
+	type notification struct {
+		key    domain.NodeKey
+		sample domain.Sample
+	}
+	var notifications []notification
+	result, _ := json.Marshal(struct {
+		CommandID  string              `json:"command_id"`
+		State      domain.CommandState `json:"state"`
+		StatusCode domain.StatusCode   `json:"status_code"`
+		Error      string              `json:"error"`
+	}{command.ID, command.State, command.StatusCode, command.Error})
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	for key, entry := range r.commandHistory {
 		if entry.CommandID != command.ID {
 			continue
@@ -231,8 +244,47 @@ func (r *Runtime) finishCommandHistory(command domain.PendingCommand) {
 		}
 		entry.Sample.StatusCode = command.StatusCode
 		entry.Sample.SourceTimestamp = command.FinishedAt
+		entry.Result = string(result)
 		r.commandHistory[key] = entry
+		identifier := strings.TrimPrefix(key, command.SessionID+"\x00")
+		node := domain.NodeKey{NamespaceURI: "urn:SerialServer", Identifier: identifier}
+		if group, found := strings.CutPrefix(identifier, "group:"); found {
+			node = domain.NodeKey{NamespaceURI: "urn:RcdManager:management", Identifier: "Groups/" + group + "/Send"}
+			notifications = append(notifications, notification{
+				key:    domain.NodeKey{NamespaceURI: node.NamespaceURI, Identifier: "Groups/" + group + "/CommandResult"},
+				sample: domain.Sample{Type: domain.DataTypeString, Value: entry.Result, StatusCode: domain.StatusGood, SourceTimestamp: command.FinishedAt},
+			})
+		}
+		notifications = append(notifications, notification{node, entry.Sample})
 	}
+	handler := r.commandResultHandler
+	r.mu.Unlock()
+	if handler != nil {
+		for _, notification := range notifications {
+			handler(command.SessionID, notification.key, notification.sample)
+		}
+	}
+}
+
+// CommandResult is a diagnostic snapshot: Good means the reported outcome is
+// known, not that the hardware succeeded. The old Send quality is unchanged.
+func (r *Runtime) ReadGroupCommandResult(sessionID, groupID string) domain.Sample {
+	if _, err := r.routes.Route(sessionID, groupID); err != nil {
+		return badCommandSample()
+	}
+	r.mu.RLock()
+	entry, ok := r.commandHistory[historyKey(sessionID, "group:"+groupID)]
+	r.mu.RUnlock()
+	if !ok || entry.Result == "" {
+		return domain.Sample{Type: domain.DataTypeString, Value: "", StatusCode: domain.StatusBadWaitingInitialData}
+	}
+	return domain.Sample{Type: domain.DataTypeString, Value: entry.Result, StatusCode: domain.StatusGood, SourceTimestamp: entry.Sample.SourceTimestamp}
+}
+
+func (r *Runtime) SetCommandResultHandler(handler func(string, domain.NodeKey, domain.Sample)) {
+	r.mu.Lock()
+	r.commandResultHandler = handler
+	r.mu.Unlock()
 }
 
 func (r *Runtime) commandHistorySample(sessionID, identifier string) (domain.Sample, bool) {

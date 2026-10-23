@@ -23,6 +23,22 @@ const LOG_CONFIG_PATH_ENV: &str = "RCD_CONFIG";
 static SERIAL_FRAME_LOGS_ENABLED: AtomicBool = AtomicBool::new(false);
 static OPCUA_TRANSPORT_ERRORS_ENABLED: AtomicBool = AtomicBool::new(false);
 static STARTUP_LOG_LOCATION: OnceLock<(PathBuf, String)> = OnceLock::new();
+static COMMAND_AUDIT_PUSH: OnceLock<HttpLogSink> = OnceLock::new();
+pub(crate) const COMMAND_AUDIT_TARGET: &str = "rcd_server::command_audit";
+
+/// Low-volume command summaries bypass the ordinary log level for HTTP only.
+/// Delivery remains bounded/non-blocking; disabled HTTP is never enabled here.
+pub(crate) fn command_audit(message: &str, warning: bool) {
+    let level = if warning {
+        log::Level::Warn
+    } else {
+        log::Level::Info
+    };
+    if let Some(push) = COMMAND_AUDIT_PUSH.get() {
+        push.enqueue_command_audit(level, message);
+    }
+    log::log!(target: COMMAND_AUDIT_TARGET, level, "{}", message);
+}
 
 /// The destination selected when logging initialized, not a later config
 /// draft. RCD_CONFIG is deliberately scoped to logging, not business files.
@@ -125,6 +141,9 @@ pub fn init_with_config(config: LoggingConfig) -> LoggingRuntime {
     };
 
     let duplicate = duplicate_to_stderr(&config);
+    if let Some(sink) = &push_sink {
+        let _ = COMMAND_AUDIT_PUSH.set(sink.clone());
+    }
     let _ = STARTUP_LOG_LOCATION.set((log_dir.clone(), config.basename.clone()));
     let write_mode = write_mode_from(&config.write_mode);
 
@@ -236,10 +255,10 @@ fn configured_config_path() -> Result<PathBuf, std::io::Error> {
     if let Some(path) = std::env::var_os(LOG_CONFIG_PATH_ENV) {
         return Ok(PathBuf::from(path));
     }
-    let exe = std::env::current_exe()?;
-    Ok(config_path_for_exe(&exe))
+    Ok(crate::runtime_paths::current()?.config.join("config.toml"))
 }
 
+#[cfg(test)]
 pub(crate) fn config_path_for_exe(exe: &Path) -> PathBuf {
     exe.parent()
         .map(|p| p.join("config").join("config.toml"))
@@ -247,6 +266,9 @@ pub(crate) fn config_path_for_exe(exe: &Path) -> PathBuf {
 }
 
 fn log_dir(configured_dir: Option<&str>) -> Result<PathBuf, std::io::Error> {
+    if let Some(path) = crate::runtime_paths::current()?.log_override {
+        return Ok(path);
+    }
     let exe = std::env::current_exe()?;
     Ok(log_dir_for_exe(&exe, configured_dir))
 }
@@ -404,7 +426,8 @@ impl LogLineFilter for CombinedLogFilter {
         if let Some(push) = &self.push {
             // The worker never writes through `log`, but keep this guard so a
             // later diagnostic cannot accidentally create a feedback loop.
-            if record.target() != "rcd_server::log_push" {
+            if record.target() != "rcd_server::log_push" && record.target() != COMMAND_AUDIT_TARGET
+            {
                 push.enqueue(record);
             }
         }

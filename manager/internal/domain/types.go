@@ -25,6 +25,7 @@ const (
 	StatusBadUnexpectedError    StatusCode = 0x80010000
 	StatusBadNoCommunication    StatusCode = 0x80310000
 	StatusBadWaitingInitialData StatusCode = 0x80320000
+	StatusBadNotSupported       StatusCode = 0x803D0000
 	StatusBadConfigurationError StatusCode = 0x80890000
 	StatusBadOutOfService       StatusCode = 0x808D0000
 	StatusBadWaitingForResponse StatusCode = 0x80B20000
@@ -169,6 +170,7 @@ type Session struct {
 type CommandState string
 
 const (
+	CommandQueued   CommandState = "Queued"
 	CommandWaiting  CommandState = "Waiting"
 	CommandReceived CommandState = "Received"
 	CommandFailed   CommandState = "Failed"
@@ -176,20 +178,21 @@ const (
 )
 
 type PendingCommand struct {
-	ID         string       `json:"id"`
-	SessionID  string       `json:"session_id"`
-	GroupID    string       `json:"group_id"`
-	SourceID   string       `json:"source_id"`
-	Port       string       `json:"port"`
-	Kind       string       `json:"kind"`
-	NodeID     string       `json:"node_id,omitempty"`
-	Request    string       `json:"request,omitempty"`
-	Response   string       `json:"response,omitempty"`
-	State      CommandState `json:"state"`
-	StatusCode StatusCode   `json:"status_code"`
-	Error      string       `json:"error,omitempty"`
-	StartedAt  time.Time    `json:"started_at"`
-	FinishedAt time.Time    `json:"finished_at,omitempty,omitzero"`
+	Tracking   *CommandTrackingSummary `json:"tracking,omitempty"`
+	ID         string                  `json:"id"`
+	SessionID  string                  `json:"session_id"`
+	GroupID    string                  `json:"group_id"`
+	SourceID   string                  `json:"source_id"`
+	Port       string                  `json:"port"`
+	Kind       string                  `json:"kind"`
+	NodeID     string                  `json:"node_id,omitempty"`
+	Request    string                  `json:"request,omitempty"`
+	Response   string                  `json:"response,omitempty"`
+	State      CommandState            `json:"state"`
+	StatusCode StatusCode              `json:"status_code"`
+	Error      string                  `json:"error,omitempty"`
+	StartedAt  time.Time               `json:"started_at"`
+	FinishedAt time.Time               `json:"finished_at,omitempty,omitzero"`
 }
 
 type AuditEntry struct {

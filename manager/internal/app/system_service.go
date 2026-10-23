@@ -35,16 +35,14 @@ func (r *Runtime) SystemInfo(ctx context.Context) (api.SystemInfo, error) {
 	var memory goruntime.MemStats
 	goruntime.ReadMemStats(&memory)
 	subscribers, dropped := r.broker.Stats()
-	r.commandMu.Lock()
-	dirtyCommands := len(r.dirtyCommands)
-	r.commandMu.Unlock()
-	r.statusPersistMu.Lock()
-	dirtyStatusEvents, dirtyStatusAlarms := len(r.dirtySourceEvents), len(r.dirtyAlarmStatuses)
-	r.statusPersistMu.Unlock()
+	dirtyCommands := r.tracking.audit.dirtyCount()
+	dirtyAudits, _ := r.managementAudit.state()
+	dirtyCatalogs, _ := r.catalogPersistence.status()
+	dirtyStatusEvents, dirtyStatusAlarms, _ := r.statusHistory.state()
 	r.mu.RLock()
 	metrics := api.RuntimeMetrics{Goroutines: goruntime.NumGoroutine(), AllocatedBytes: memory.Alloc, HeapObjects: memory.HeapObjects,
-		RefreshQueueDepth: len(r.refreshQueue), DirtyCatalogs: len(r.dirtyCatalogs), DirtyCommands: dirtyCommands,
-		DirtyAudits: len(r.dirtyAudits), DirtyStatusEvents: dirtyStatusEvents, DirtyStatusAlarms: dirtyStatusAlarms,
+		RefreshQueueDepth: len(r.refreshQueue), DirtyCatalogs: dirtyCatalogs, DirtyCommands: dirtyCommands,
+		DirtyAudits: dirtyAudits, DirtyStatusEvents: dirtyStatusEvents, DirtyStatusAlarms: dirtyStatusAlarms,
 		EventSubscribers: subscribers, DroppedEventNotifications: dropped}
 	r.mu.RUnlock()
 	dataBytes, _ := directorySize(r.options.DataDir)
@@ -79,7 +77,7 @@ func (r *Runtime) ExportConfiguration(_ context.Context) (api.ConfigurationDocum
 		Groups: make([]api.GroupMutation, 0, len(groups)), Sources: make([]api.ExportSource, 0, len(sources))}
 	for _, group := range groups {
 		document.Groups = append(document.Groups, api.GroupMutation{ID: group.ID, Name: group.Name, DefaultSourceID: group.DefaultSourceID})
-		if policy, ok := r.redundancyPolicies[group.ID]; ok {
+		if policy, ok := r.redundancy.configuredPolicy(group.ID); ok {
 			document.Redundancy = append(document.Redundancy, policy.Clone())
 		}
 	}
@@ -137,13 +135,13 @@ func (r *Runtime) ImportConfiguration(ctx context.Context, request api.Configura
 		return api.ConfigurationImportResult{}, err
 	}
 	for _, policy := range policies {
-		r.redundancyPolicies[policy.GroupID] = policy.Clone()
+		r.redundancy.replacePolicy(policy)
 	}
 	catalogs := make(map[string]domain.SourceCatalog, len(persistedSources))
 	for _, source := range persistedSources {
 		catalogs[source.ID] = domain.SourceCatalog{SourceID: source.ID, GroupID: source.GroupID, State: domain.CatalogDiscovering}
 	}
-	index, _, conflicts, err := buildCatalogIndexWithCalculations(catalogs, r.calculationPlan, r.calculationRetiredPoints, persistedGroups)
+	index, _, conflicts, err := r.buildCatalogWithCalculations(catalogs, persistedGroups)
 	if err != nil {
 		return api.ConfigurationImportResult{}, err
 	}

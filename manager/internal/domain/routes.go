@@ -20,6 +20,8 @@ type RouteTable struct {
 	pendingByKey    map[string]PendingCommand
 	pendingByID     map[string]string
 	pendingByGroup  map[string]int
+	queuedByID      map[string]PendingCommand
+	queuedByPort    map[string][]string
 	nextCommandID   atomic.Uint64
 	clock           func() time.Time
 }
@@ -32,6 +34,8 @@ func NewRouteTable(groups []Group, sources []Source) (*RouteTable, error) {
 		pendingByKey:   make(map[string]PendingCommand),
 		pendingByID:    make(map[string]string),
 		pendingByGroup: make(map[string]int),
+		queuedByID:     make(map[string]PendingCommand),
+		queuedByPort:   make(map[string][]string),
 		clock:          time.Now,
 	}
 	for _, group := range groups {
@@ -449,6 +453,9 @@ func (t *RouteTable) BeginCommandWithDetails(sessionID, groupID, port, kind, nod
 	if _, exists := t.pendingByKey[key]; exists {
 		return PendingCommand{}, ErrCommandPending
 	}
+	if len(t.queuedByPort[key]) != 0 {
+		return PendingCommand{}, ErrCommandPending
+	}
 	id := t.newCommandIDLocked()
 	command := PendingCommand{
 		ID: id, SessionID: sessionID, GroupID: groupID, SourceID: route.SourceID,
@@ -509,6 +516,17 @@ func (t *RouteTable) FinishCommand(id string, state CommandState, status StatusC
 	if !ok {
 		return PendingCommand{}, ErrNotFound
 	}
+	if _, queued := t.queuedByID[id]; queued {
+		command := t.queuedByID[id]
+		t.removeQueuedLocked(id)
+		t.pendingByGroup[command.GroupID]--
+		if t.pendingByGroup[command.GroupID] == 0 {
+			delete(t.pendingByGroup, command.GroupID)
+		}
+		command.State, command.StatusCode, command.Error = state, status, message
+		command.FinishedAt = t.clock().UTC()
+		return command, nil
+	}
 	return t.finishCommandLocked(key, state, status, message, t.clock().UTC()), nil
 }
 
@@ -526,6 +544,9 @@ func (t *RouteTable) PrepareCommandFinish(id string, state CommandState, status 
 		return PendingCommand{}, ErrNotFound
 	}
 	command := t.pendingByKey[key]
+	if queued, exists := t.queuedByID[id]; exists {
+		command = queued
+	}
 	command.State = state
 	command.StatusCode = status
 	command.Error = message
@@ -537,23 +558,55 @@ func (t *RouteTable) PrepareCommandFinish(id string, state CommandState, status 
 // CommitCommandFinish releases a command only after its terminal audit row has
 // been durably written.
 func (t *RouteTable) CommitCommandFinish(id string) ([]SessionRouteChange, error) {
+	changes, _, err := t.CommitCommandFinishWithQueue(id, false)
+	return changes, err
+}
+
+// Cancel the waiting tail and release the active reservation under one lock.
+// An ambiguous outcome must not allow a queued head to escape cancellation.
+func (t *RouteTable) CommitCommandFinishWithQueue(id string, cancelTail bool) ([]SessionRouteChange, []PendingCommand, error) {
 	t.configurationMu.RLock()
 	defer t.configurationMu.RUnlock()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	key, ok := t.pendingByID[id]
 	if !ok {
-		return nil, ErrNotFound
+		return nil, nil, ErrNotFound
 	}
 	command := t.pendingByKey[key]
-	delete(t.pendingByID, id)
-	delete(t.pendingByKey, key)
+	var cancelled []PendingCommand
+	var changes []SessionRouteChange
+	if cancelTail {
+		for _, queuedID := range append([]string(nil), t.queuedByPort[key]...) {
+			if queuedID == id {
+				continue
+			}
+			queued := t.queuedByID[queuedID]
+			t.removeQueuedLocked(queuedID)
+			t.pendingByGroup[queued.GroupID]--
+			queued.State, queued.StatusCode = CommandFailed, StatusBadNoCommunication
+			queued.Error = "preceding command outcome unconfirmed; queued command not sent"
+			queued.FinishedAt = t.clock().UTC()
+			cancelled = append(cancelled, queued)
+			if t.pendingByGroup[queued.GroupID] == 0 {
+				delete(t.pendingByGroup, queued.GroupID)
+				changes = append(changes, t.invalidateUnselectableRoutesLocked(queued.GroupID)...)
+			}
+		}
+	}
+	if queued, exists := t.queuedByID[id]; exists {
+		command = queued
+		t.removeQueuedLocked(id)
+	} else {
+		delete(t.pendingByID, id)
+		delete(t.pendingByKey, key)
+	}
 	t.pendingByGroup[command.GroupID]--
 	if t.pendingByGroup[command.GroupID] == 0 {
 		delete(t.pendingByGroup, command.GroupID)
-		return t.invalidateUnselectableRoutesLocked(command.GroupID), nil
+		changes = append(changes, t.invalidateUnselectableRoutesLocked(command.GroupID)...)
 	}
-	return nil, nil
+	return changes, cancelled, nil
 }
 
 func (t *RouteTable) invalidateUnselectableRoutesLocked(groupID string) []SessionRouteChange {
@@ -581,6 +634,16 @@ func (t *RouteTable) ExpiredPending(now time.Time, maxAge time.Duration) []Pendi
 	cutoff := now.Add(-maxAge)
 	result := make([]PendingCommand, 0)
 	for _, command := range t.pendingByKey {
+		// A passive reset's bounded RPC owns its short reservation until it
+		// returns. It has no hardware result to time out or persist as a command.
+		if command.Kind == CommandKindPassiveReset {
+			continue
+		}
+		if !command.StartedAt.After(cutoff) {
+			result = append(result, command)
+		}
+	}
+	for _, command := range t.queuedByID {
 		if !command.StartedAt.After(cutoff) {
 			result = append(result, command)
 		}
@@ -619,6 +682,9 @@ func (t *RouteTable) SweepExpired(now time.Time, maxAge time.Duration) []Pending
 	cutoff := now.Add(-maxAge)
 	keys := make([]string, 0)
 	for key, command := range t.pendingByKey {
+		if command.Kind == CommandKindPassiveReset {
+			continue
+		}
 		if !command.StartedAt.After(cutoff) {
 			keys = append(keys, key)
 		}
@@ -626,6 +692,19 @@ func (t *RouteTable) SweepExpired(now time.Time, maxAge time.Duration) []Pending
 	expired := make([]PendingCommand, 0, len(keys))
 	for _, key := range keys {
 		expired = append(expired, t.finishCommandLocked(key, CommandTimedOut, StatusBadTimeout, "command timed out", now.UTC()))
+	}
+	for id, command := range t.queuedByID {
+		if command.StartedAt.After(cutoff) {
+			continue
+		}
+		t.removeQueuedLocked(id)
+		t.pendingByGroup[command.GroupID]--
+		if t.pendingByGroup[command.GroupID] == 0 {
+			delete(t.pendingByGroup, command.GroupID)
+		}
+		command.State, command.StatusCode = CommandTimedOut, StatusBadTimeout
+		command.Error, command.FinishedAt = "queued command expired; not sent", now.UTC()
+		expired = append(expired, command)
 	}
 	return expired
 }
@@ -663,6 +742,13 @@ func (t *RouteTable) PendingCount(groupID string) int {
 	return t.pendingByGroup[groupID]
 }
 
+// TotalPending counts accepted commands, including those waiting for a port.
+func (t *RouteTable) TotalPending() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return len(t.pendingByID)
+}
+
 func (t *RouteTable) validateSourceLocked(groupID, sourceID string) error {
 	if err := t.validateSourceMembershipLocked(groupID, sourceID); err != nil {
 		return err
@@ -686,6 +772,11 @@ func (t *RouteTable) validateSourceMembershipLocked(groupID, sourceID string) er
 }
 
 func (t *RouteTable) sourceInUseLocked(sourceID string) bool {
+	for _, command := range t.queuedByID {
+		if command.SourceID == sourceID {
+			return true
+		}
+	}
 	for _, group := range t.groups {
 		if group.DefaultSourceID == sourceID {
 			return true

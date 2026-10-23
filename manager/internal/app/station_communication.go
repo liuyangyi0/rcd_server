@@ -19,13 +19,8 @@ func (r *Runtime) stationCommunicationLocked(sourceID, portID, deviceID string) 
 	if !exists {
 		return domain.StationCommunication{}
 	}
-	snapshot, hasSnapshot := r.stationVersions[sourceID]
-	epoch, hasEpoch := r.stationVersionEpoch[sourceID]
-	port, device, hasDevice := snapshot.Device(portID, deviceID)
-	fresh := hasSnapshot && hasDevice && hasEpoch && epoch == status.Epoch && !snapshot.Cached && snapshot.TopologyFingerprint == domain.SourceTopologyFingerprint(r.catalogs[sourceID].Topology)
-	if featureEpoch, known := r.stationFeatureEpoch[sourceID]; known && featureEpoch == status.Epoch && !r.stationFeatureSupported[sourceID] {
-		fresh = false
-	}
+	known, supported := r.stationSync.support(sourceID, status.Epoch)
 	online := status.Connection == opc.ConnectionConnected && status.Session == opc.SessionActive
-	return domain.ResolveStationCommunication(online, fresh, snapshot.ObservedAt, time.Now().UTC(), port, device)
+	return r.stations.communication(sourceID, portID, deviceID, status.Epoch,
+		domain.SourceTopologyFingerprint(r.catalogs[sourceID].Topology), online, known && !supported, time.Now().UTC())
 }

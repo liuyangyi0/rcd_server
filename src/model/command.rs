@@ -137,6 +137,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tracking_fields_do_not_enter_legacy_wire_encoding() {
+        let mut command = Command {
+            com: "COM1".into(),
+            command: CommandType::SendData(SendData {
+                device_id: 17,
+                command: vec![0x11, 0x08, 0x19],
+            }),
+            ack_id: None,
+            expires_at: None,
+            control_receipt: None,
+            permit: None,
+        };
+        let binary = bincode::serialize(&command).unwrap();
+        let json = serde_json::to_value(&command).unwrap();
+        command.ack_id = Some(u64::MAX);
+        command.expires_at = Some(Instant::now());
+        assert_eq!(binary, bincode::serialize(&command).unwrap());
+        assert_eq!(json, serde_json::to_value(&command).unwrap());
+    }
+
+    #[test]
     fn command_ack_status_maps_to_opc_string_values() {
         assert_eq!(CommandAckStatus::Received.as_opc_value(), "1");
         assert_eq!(CommandAckStatus::Waiting.as_opc_value(), "2");

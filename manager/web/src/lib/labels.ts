@@ -3,7 +3,7 @@ const STATE_LABELS: Record<string, string> = {
   active: '已激活', inactive: '未激活', creating: '创建中',
   running: '运行中', stopped: '已停止', closed: '已关闭', enabled: '已启用', disabled: '已停用', unknown: '未知',
   ready: '就绪', cached: '缓存目录', discovering: '发现中', catalogconflict: '目录冲突',
-  waiting: '等待响应', received: '成功', failed: '失败', timedout: '超时',
+  queued: '排队待发送', waiting: '等待响应', received: '成功', failed: '失败', timedout: '超时',
   success: '成功', pending: '处理中', manager: '管理端计算', local: '下级本地计算', unsupported: '不支持', offline: '离线',
   open: '未恢复', resolved: '已恢复', warning: '警告', critical: '严重',
 };

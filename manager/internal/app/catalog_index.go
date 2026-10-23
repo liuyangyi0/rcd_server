@@ -44,7 +44,9 @@ func buildCatalogIndexWithCalculations(catalogs map[string]domain.SourceCatalog,
 	calculationConflicts := make(map[string][]string)
 	if plan != nil {
 		outputs := make(map[string]struct{}, plan.RuleCount()+len(retired))
-		for _, input := range plan.StateInputs() { outputs[input.Name] = struct{}{} }
+		for _, input := range plan.StateInputs() {
+			outputs[input.Name] = struct{}{}
+		}
 		for _, node := range plan.CatalogNodes() {
 			outputs[node.Key.Identifier] = struct{}{}
 		}
@@ -88,7 +90,7 @@ func buildCatalogIndexWithCalculations(catalogs map[string]domain.SourceCatalog,
 }
 
 func (c *catalogIndex) addManagerCalculations(plan *calculation.Plan, retired map[string]indexedPoint, groups []domain.Group) error {
-	if c == nil || plan == nil || plan.RuleCount() == 0 {
+	if c == nil || plan == nil || len(plan.CatalogNodes()) == 0 {
 		if c == nil || len(retired) == 0 {
 			return nil
 		}
@@ -110,10 +112,29 @@ func (c *catalogIndex) addManagerCalculations(plan *calculation.Plan, retired ma
 	}
 	resolvedGroups := make(map[string]string, plan.RuleCount())
 	nodes := plan.CatalogNodes()
-	rules := plan.RuleViews()
-	for index, node := range nodes {
+	dependencies := make(map[string][]string, plan.RuleCount())
+	for _, rule := range plan.RuleViews() {
+		dependencies[rule.Output] = rule.Dependencies
+	}
+	for _, input := range plan.StateInputs() {
+		if input.Mode == "group_default" {
+			resolvedGroups[input.Name] = input.GroupID
+		} else if len(input.Targets) == 1 {
+			target := input.Targets[0]
+			for _, node := range c.sourceNodes[target.SourceID] {
+				if node.PortID == target.PortID && node.DeviceID == target.DeviceID && node.GroupID != "" {
+					resolvedGroups[input.Name] = node.GroupID
+					break
+				}
+			}
+		}
+	}
+	for _, node := range nodes {
 		owners := make(map[string]struct{})
-		for _, dependency := range rules[index].Dependencies {
+		if owner := resolvedGroups[node.Key.Identifier]; owner != "" {
+			owners[owner] = struct{}{}
+		}
+		for _, dependency := range dependencies[node.Key.Identifier] {
 			if groupID := resolvedGroups[dependency]; groupID != "" {
 				owners[groupID] = struct{}{}
 			} else if groupID, exists := c.groupByNode[dependency]; exists {

@@ -1,0 +1,76 @@
+---
+- name: RCD platform read-only runtime inspection
+  hosts: rcd_nodes
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Require the native platform binding and exactly one registered host
+      ansible.builtin.assert:
+        that:
+          - rcd_platform_inspection is defined
+          - ansible_play_hosts_all | length == 1
+          - inventory_hostname == rcd_platform_inspection.host_alias
+          - rcd_services is defined
+          - rcd_services | length in [2, 3]
+          - rcd_services | map(attribute='component') | sort in [['lower-stack', 'manager'], ['communicate', 'lower-stack', 'manager']]
+
+    - name: Inspect through structured command output (not a PTY script stream)
+      become: "{{ rcd_inspection_become | default(false) }}"
+      block:
+        - name: Allocate private inspection scratch directory
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: rcd-inspection-
+          register: rcd_inspection_scratch
+          check_mode: false
+
+        - name: Transfer only the fixed read-only probes
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/../release/{{ item }}"
+            dest: "{{ rcd_inspection_scratch.path }}/{{ item }}"
+            mode: '0600'
+          loop: [inspect_runtime.py, release_probe.py, host_metrics.py, application_profile.py]
+          check_mode: false
+
+        - name: Read fixed software entries and actual process images
+          ansible.builtin.command:
+            argv: >-
+              {{ ['/usr/bin/python3', rcd_inspection_scratch.path ~ '/inspect_runtime.py',
+                  '--services', rcd_services | to_json,
+                  '--applications', rcd_platform_inspection.applications | default([]) | to_json,
+                  '--release-roots', rcd_release_roots | default([]) | to_json] }}
+            expand_argument_vars: false
+          register: rcd_runtime
+          changed_when: false
+          check_mode: false
+
+        - name: Read compatibility and original release result without executing it again
+          ansible.builtin.command:
+            argv: >-
+              {{ ['/usr/bin/python3', rcd_inspection_scratch.path ~ '/release_probe.py',
+                  '--profiles', rcd_release_profiles | default({}) | to_json, '--host', ansible_host,
+                  '--operation', rcd_platform_inspection.release_operation | default(none) | to_json,
+                  '--applications', rcd_platform_inspection.applications | default([]) | to_json,
+                  '--project-id', rcd_platform_inspection.project_id | string] }}
+            expand_argument_vars: false
+          register: rcd_release_probe
+          changed_when: false
+          check_mode: false
+      always:
+        - name: Remove only this inspection's scratch directory
+          ansible.builtin.file:
+            path: "{{ rcd_inspection_scratch.path }}"
+            state: absent
+          when: rcd_inspection_scratch.path is defined
+          check_mode: false
+
+    - name: Save task-bound structured evidence on the Semaphore controller
+      ansible.builtin.copy:
+        dest: "{{ rcd_platform_inspection.report_path }}"
+        mode: '0600'
+        content: "{{ {'schema_version': 1, 'device_id': rcd_platform_inspection.device_id, 'task_id': rcd_platform_inspection.task_id, 'host_alias': inventory_hostname, 'probes': (rcd_runtime.stdout | from_json).probes, 'host_status': (rcd_runtime.stdout | from_json).host_status, 'release_info': rcd_release_probe.stdout | from_json} | to_json }}"
+      delegate_to: localhost
+      become: false
+      check_mode: false
+      no_log: true

@@ -135,6 +135,16 @@ pub(crate) struct HttpLogSink {
 }
 
 impl HttpLogSink {
+    pub(crate) fn enqueue_command_audit(&self, level: Level, message: &str) {
+        self.enqueue_pending(PendingRecord {
+            timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            level: level.to_string(),
+            component: crate::logging::COMMAND_AUDIT_TARGET.into(),
+            message: truncate_utf8(message, MAX_MESSAGE_BYTES),
+            urgent: true,
+        });
+    }
+
     pub(crate) fn enqueue(&self, record: &Record<'_>) {
         let level = record.level();
         let pending = PendingRecord {
@@ -144,6 +154,10 @@ impl HttpLogSink {
             message: truncate_utf8(&record.args().to_string(), MAX_MESSAGE_BYTES),
             urgent: matches!(level, Level::Warn | Level::Error),
         };
+        self.enqueue_pending(pending);
+    }
+
+    fn enqueue_pending(&self, pending: PendingRecord) {
         if pending.urgent {
             match self.high.try_send(pending) {
                 Ok(()) => (),
@@ -523,6 +537,20 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 }
 
 fn extract_log_context(message: &str) -> (Option<String>, Option<String>) {
+    if message.starts_with('{') {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(message) {
+            return (
+                value
+                    .get("port_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                value
+                    .get("device_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+            );
+        }
+    }
     let port = extract_token(message, &["port_id=", "port=", "串口="]).or_else(|| {
         message
             .split_whitespace()
@@ -756,5 +784,28 @@ mod tests {
             extract_log_context("poll failed port_id=/dev/ttyWCH0 device_id=13 timeout");
         assert_eq!(port.as_deref(), Some("/dev/ttyWCH0"));
         assert_eq!(device.as_deref(), Some("13"));
+    }
+
+    #[test]
+    fn command_audit_push_is_structured_urgent_and_nonblocking() {
+        let (normal, normal_rx) = mpsc::sync_channel(1);
+        let (high, high_rx) = mpsc::sync_channel(1);
+        let sink = HttpLogSink { normal, high };
+        let message =
+            r#"{"schema_version":1,"port_id":"/dev/ttyWCH0","device_id":"13","sent_count":3}"#;
+        sink.enqueue_command_audit(Level::Info, message);
+        let record = high_rx.try_recv().unwrap();
+        assert_eq!(record.component, crate::logging::COMMAND_AUDIT_TARGET);
+        assert!(record.urgent);
+        assert_eq!(
+            extract_log_context(&record.message),
+            (Some("/dev/ttyWCH0".into()), Some("13".into()))
+        );
+        // A full queue must never block the serial worker.
+        for _ in 0..10 {
+            sink.enqueue_command_audit(Level::Warn, message);
+        }
+        assert!(high_rx.try_recv().is_ok());
+        assert!(normal_rx.try_recv().is_ok());
     }
 }

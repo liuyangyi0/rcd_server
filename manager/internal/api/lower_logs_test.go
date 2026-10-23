@@ -13,8 +13,9 @@ import (
 
 type lowerLogFakeService struct {
 	*fakeService
-	batch LowerLogBatch
-	err   error
+	batch   LowerLogBatch
+	err     error
+	request LowerLogRequest
 }
 
 func (f *lowerLogFakeService) IngestLowerLogs(_ context.Context, batch LowerLogBatch) (LowerLogAck, error) {
@@ -26,7 +27,24 @@ func (f *lowerLogFakeService) IngestLowerLogs(_ context.Context, batch LowerLogB
 }
 
 func (f *lowerLogFakeService) ListLowerLogs(_ context.Context, request LowerLogRequest) (LowerLogPage, error) {
+	f.request = request
 	return LowerLogPage{Limit: request.Limit, Offset: request.Offset, PushState: "stored"}, nil
+}
+
+func TestLowerLogCommandAttemptFilters(t *testing.T) {
+	service := &lowerLogFakeService{fakeService: &fakeService{}}
+	handler := New(service, Options{})
+	for _, value := range []string{"all", "retried", "three", "invalid"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/lower-logs?source_id=a&limit=25&offset=25&command_attempts="+value, nil))
+		if value == "invalid" {
+			if response.Code != http.StatusBadRequest {
+				t.Fatal(response.Code)
+			}
+		} else if response.Code != http.StatusOK || service.request.CommandAttempts != value || service.request.Offset != 25 {
+			t.Fatalf("status=%d request=%+v", response.Code, service.request)
+		}
+	}
 }
 
 func TestLowerLogIngestAcceptsGzipAndReturnsAck(t *testing.T) {

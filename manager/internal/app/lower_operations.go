@@ -42,7 +42,7 @@ func (r *Runtime) lowerOperationsTargetLocked(id string) (lowerOperationsTarget,
 		return target, unavailableLowerOperation()
 	}
 	r.mu.RLock()
-	handle, exists := r.lowers[id]
+	handle, exists := r.connections.handle(id)
 	status := r.statuses[id]
 	topologyFingerprint := domain.SourceTopologyFingerprint(r.catalogs[id].Topology)
 	r.mu.RUnlock()
@@ -92,6 +92,7 @@ func (r *Runtime) ExecuteSourceOperation(ctx context.Context, id string, sourceR
 	r.configMu.Lock()
 	var target lowerOperationsTarget
 	var err error
+	var lease uint64
 	if request.Mutates() {
 		// A process restart deliberately makes OPC unavailable. Check the
 		// persistent maintenance fence before availability so a concurrent
@@ -112,6 +113,9 @@ func (r *Runtime) ExecuteSourceOperation(ctx context.Context, id string, sourceR
 	if err == nil {
 		target, err = r.lowerOperationsTargetLocked(id)
 	}
+	if err == nil && sourceRevision != 0 && sourceRevision != target.source.Revision {
+		err = &domain.RevisionConflictError{Expected: sourceRevision, Actual: target.source.Revision}
+	}
 	if err == nil && request.Mutates() {
 		if request.Feature() == "acquisition" || request.Feature() == "station_versions" {
 			if r.physicalPortCommandPending(id, request.PortID) {
@@ -119,10 +123,7 @@ func (r *Runtime) ExecuteSourceOperation(ctx context.Context, id string, sourceR
 			}
 		}
 		if err == nil {
-			if r.sourceOperations == nil {
-				r.sourceOperations = make(map[string]bool)
-			}
-			r.sourceOperations[id] = true
+			lease, err = r.maintenance.beginMutation(id)
 		}
 	}
 	r.configMu.Unlock()
@@ -130,11 +131,7 @@ func (r *Runtime) ExecuteSourceOperation(ctx context.Context, id string, sourceR
 		return nil, err
 	}
 	if request.Mutates() {
-		defer func() {
-			r.configMu.Lock()
-			delete(r.sourceOperations, id)
-			r.configMu.Unlock()
-		}()
+		defer r.maintenance.endMutation(id, lease)
 	}
 	operationContext, cancel := context.WithTimeout(ctx, lowerOperationsTimeout)
 	defer cancel()
@@ -240,13 +237,10 @@ func stationOperationOutcome(details map[string]any) string {
 }
 
 func (r *Runtime) checkSourceOperationLocked(id string) error {
-	if err := r.checkProcessMaintenanceLocked(id); err != nil {
-		return err
+	if r.release.Active {
+		return &domain.OperationError{Code: "busy", Message: "管理端正在软件维护，暂停下级运维写入"}
 	}
-	if r.sourceOperations[id] {
-		return &domain.OperationError{Code: "busy", Message: "该下级有运维修改正在执行，请刷新状态后重试"}
-	}
-	return nil
+	return r.maintenance.check(id, false)
 }
 
 func (r *Runtime) physicalPortCommandPending(sourceID, portID string) bool {
@@ -263,8 +257,7 @@ func (r *Runtime) physicalPortCommandPending(sourceID, portID string) bool {
 		}
 	}
 	r.mu.RUnlock()
-	_, pending := r.routes.PendingCommand(sourceID, port)
-	return pending
+	return r.routes.HasPortCommands(sourceID, port)
 }
 
 func bindOperationSource(result json.RawMessage, source domain.Source) (json.RawMessage, error) {

@@ -48,6 +48,7 @@ default = ["generated-address-space"]
 discovery-server-registration = ["async-opcua-client"]
 generated-address-space = ["async-opcua-core-namespace"]
 json = ["async-opcua-types/json"]
+preserve-source-timestamps = []
 
 [lib]
 name = "opcua_server"

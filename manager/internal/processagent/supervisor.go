@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"rcd_manager/internal/buildinfo"
 	"rcd_manager/internal/domain"
 )
 
@@ -41,6 +42,9 @@ type durableState struct {
 	RestartCount  uint64                 `json:"restart_count"`
 	Operations    []savedOperation       `json:"operations"`
 	LastSnapshot  domain.ProcessSnapshot `json:"last_snapshot"`
+	Maintenance   *MaintenanceJob        `json:"maintenance,omitempty"`
+	Lifecycle     *lifecycleState        `json:"lifecycle,omitempty"`
+	DeferredFence *MaintenanceJob        `json:"deferred_stop_fence,omitempty"`
 }
 
 type ownedChild struct {
@@ -52,25 +56,30 @@ type ownedChild struct {
 // Supervisor owns the *os.Process returned by its own exec.Cmd.Start. It never
 // accepts a PID from HTTP and never adopts or kills an unrelated process.
 type Supervisor struct {
-	mu         sync.Mutex
-	cfg        Config
-	state      durableState
-	snapshot   domain.ProcessSnapshot
-	bootID     string
-	child      *ownedChild
-	lock       *os.File
-	output     *rotatingLog
-	events     *rotatingLog
-	logger     *slog.Logger
-	jobs       chan domain.ProcessActionRequest
-	ctx        context.Context
-	cancel     context.CancelFunc
-	done       chan struct{}
-	closeOnce  sync.Once
-	closing    bool
-	storageErr error
-	retryAt    time.Time
-	failures   int
+	maintenanceMu   sync.Mutex
+	maintenancePeer maintenancePeer
+	mu              sync.Mutex
+	cfg             Config
+	state           durableState
+	snapshot        domain.ProcessSnapshot
+	bootID          string
+	agentStartedAt  time.Time
+	agentBuild      buildinfo.Info
+	child           *ownedChild
+	lock            *os.File
+	lifecycleLock   *os.File
+	output          *rotatingLog
+	events          *rotatingLog
+	logger          *slog.Logger
+	jobs            chan domain.ProcessActionRequest
+	ctx             context.Context
+	cancel          context.CancelFunc
+	done            chan struct{}
+	closeOnce       sync.Once
+	closing         bool
+	storageErr      error
+	retryAt         time.Time
+	failures        int
 }
 
 func New(cfg Config) (*Supervisor, error) {
@@ -89,12 +98,16 @@ func New(cfg Config) (*Supervisor, error) {
 	if err != nil {
 		return nil, err
 	}
-	output, err := openLog(cfg.DataDir, "process.log")
+	if err := os.MkdirAll(cfg.LogDir, 0o750); err != nil {
+		_ = lock.Close()
+		return nil, err
+	}
+	output, err := openLog(cfg.LogDir, "process.log")
 	if err != nil {
 		_ = lock.Close()
 		return nil, err
 	}
-	events, err := openLog(cfg.DataDir, "agent.log")
+	events, err := openLog(cfg.LogDir, "agent.log")
 	if err != nil {
 		_ = output.Close()
 		_ = lock.Close()
@@ -102,6 +115,11 @@ func New(cfg Config) (*Supervisor, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Supervisor{cfg: cfg, bootID: newID(), lock: lock, output: output, events: events, logger: slog.New(slog.NewJSONHandler(events, nil)), jobs: make(chan domain.ProcessActionRequest, 1), ctx: ctx, cancel: cancel, done: make(chan struct{})}
+	s.agentStartedAt = time.Now().UTC()
+	s.agentBuild = buildinfo.ForComponent("agent")
+	if cfg.MaintenanceEndpoint != "" {
+		s.maintenancePeer = opcMaintenancePeer{endpoint: cfg.MaintenanceEndpoint, gateway: cfg.GatewayInstanceID}
+	}
 	if err := s.load(); err != nil {
 		cancel()
 		_ = output.Close()
@@ -111,7 +129,7 @@ func New(cfg Config) (*Supervisor, error) {
 	}
 	// Reserve the restore operation before exposing HTTP so a simultaneous user
 	// request cannot race a second startup. Persisted manual stop wins AutoStart.
-	if s.state.DesiredState == "running" {
+	if s.state.DesiredState == "running" && !s.maintenanceActiveLocked() && !s.lifecycleActiveLocked() && s.state.DeferredFence == nil {
 		r := domain.ProcessActionRequest{RequestID: "boot." + s.bootID, InstanceID: cfg.InstanceID, Action: "start", ExpectedRevision: s.snapshot.Revision}
 		if _, err := s.Submit(r); err != nil {
 			cancel()
@@ -146,7 +164,7 @@ func (s *Supervisor) load() error {
 		if err := dec.Decode(new(any)); err != io.EOF {
 			return errors.New("unexpected trailing process-agent state data")
 		}
-		if s.state.SchemaVersion != 1 || s.state.InstanceID != s.cfg.InstanceID || (s.state.DesiredState != "running" && s.state.DesiredState != "stopped") || len(s.state.Operations) > retainedOperations {
+		if (s.state.SchemaVersion < 1 || s.state.SchemaVersion > 4) || s.state.InstanceID != s.cfg.InstanceID || (s.state.DesiredState != "running" && s.state.DesiredState != "stopped") || len(s.state.Operations) > retainedOperations {
 			return errors.New("process-agent state schema, identity, or capacity mismatch")
 		}
 		seen := map[string]bool{}
@@ -157,6 +175,12 @@ func (s *Supervisor) load() error {
 			}
 			seen[item.Request.RequestID] = true
 			if !item.Operation.Terminal() {
+				if item.Request.Lifecycle {
+					item.Operation.State, item.Operation.ErrorCode = "unknown", "agent_restarted"
+					item.Operation.Error = "Agent 重启，安全运维结果待确认；未重放原操作"
+					item.Operation.UpdatedAt = time.Now().UTC()
+					continue
+				}
 				// Do not replay a restart after an agent crash. The Linux parent-
 				// death contract stops its old owned child; a separate boot action
 				// restores desired state and remains visible in the journal.
@@ -171,6 +195,12 @@ func (s *Supervisor) load() error {
 			s.state.DesiredState = "running"
 		}
 	} else {
+		return err
+	}
+	if err := s.validateMaintenanceLoaded(); err != nil {
+		return err
+	}
+	if err := s.validateLifecycleLoaded(); err != nil {
 		return err
 	}
 	s.snapshot = domain.ProcessSnapshot{SchemaVersion: 1, InstanceID: s.cfg.InstanceID, State: "stopped", DesiredState: s.state.DesiredState, Executable: s.cfg.Executable, WorkDir: s.cfg.WorkDir, RestartPolicy: s.cfg.RestartPolicy, RestartCount: s.state.RestartCount, ExitCode: s.state.LastSnapshot.ExitCode, LastExitAt: s.state.LastSnapshot.LastExitAt, LastStopForced: s.state.LastSnapshot.LastStopForced}
@@ -237,6 +267,23 @@ func atomicState(path string, data []byte) error {
 
 func (s *Supervisor) snapshotLocked() domain.ProcessSnapshot {
 	value := s.snapshot
+	value.LifecycleSupported = s.lifecycleSupported()
+	_, guardSupported := s.maintenancePeer.(maintenanceConfigurationPeer)
+	value.ConfigurationGuardSupported = value.LifecycleSupported && guardSupported
+	value.GatewayInstanceID = s.cfg.GatewayInstanceID
+	value.ManualStopped = (s.state.DeferredFence != nil || (s.state.Lifecycle != nil && s.state.Lifecycle.Phase == "manual_stopped")) && s.state.DesiredState == "stopped" && !s.lifecycleActiveLocked()
+	if s.state.Lifecycle != nil {
+		view := s.state.Lifecycle.ProcessLifecycleView
+		value.Lifecycle = &view
+	}
+	value.AgentIdentity = &domain.ProcessAgentIdentity{Build: s.agentBuild, BootID: s.bootID, StartedAt: s.agentStartedAt, ReportedAt: time.Now().UTC()}
+	enabled := s.cfg.MaintenanceEndpoint != "" || s.maintenanceActiveLocked()
+	value.MaintenanceEnabled = &enabled
+	value.MaintenanceDeploymentID, value.MaintenancePhase = "", ""
+	if s.maintenanceActiveLocked() {
+		value.MaintenanceDeploymentID = s.state.Maintenance.DeploymentID
+		value.MaintenancePhase = s.state.Maintenance.Phase
+	}
 	if value.StartedAt != nil && value.PID > 0 {
 		value.UptimeSeconds = max(0, int64(time.Since(*value.StartedAt)/time.Second))
 	}
@@ -252,6 +299,10 @@ func (s *Supervisor) Snapshot() domain.ProcessSnapshot {
 func cloneOperation(value domain.ProcessOperation) domain.ProcessOperation {
 	if value.Snapshot != nil {
 		copy := *value.Snapshot
+		if copy.Lifecycle != nil {
+			view := *copy.Lifecycle
+			copy.Lifecycle = &view
+		}
 		value.Snapshot = &copy
 	}
 	return value
@@ -290,7 +341,7 @@ func (s *Supervisor) addLocked(req domain.ProcessActionRequest, state string) *s
 		// Resolution tombstones may arrive while a slow operation is pending;
 		// evict only a terminal entry, never that pending operation.
 		for i := range s.state.Operations {
-			if s.state.Operations[i].Operation.Terminal() {
+			if s.state.Operations[i].Operation.Terminal() && (s.state.Lifecycle == nil || s.state.Lifecycle.RequestID != s.state.Operations[i].Request.RequestID) {
 				copy(s.state.Operations[i:], s.state.Operations[i+1:])
 				s.state.Operations = s.state.Operations[:len(s.state.Operations)-1]
 				break
@@ -303,6 +354,19 @@ func (s *Supervisor) addLocked(req domain.ProcessActionRequest, state string) *s
 }
 
 func (s *Supervisor) Submit(req domain.ProcessActionRequest) (domain.ProcessOperation, error) {
+	if req.Lifecycle {
+		return domain.ProcessOperation{}, maintenanceError("invalid_request", "安全生命周期必须使用专用接口")
+	}
+	if err := req.Validate(); err != nil {
+		return domain.ProcessOperation{}, err
+	}
+	if req.DeploymentID != "" || req.FencingToken != "" {
+		return s.submitMaintenanceProcess(req)
+	}
+	return s.submit(req, false)
+}
+
+func (s *Supervisor) submit(req domain.ProcessActionRequest, maintenanceOwner bool) (domain.ProcessOperation, error) {
 	if err := req.Validate(); err != nil {
 		return domain.ProcessOperation{}, err
 	}
@@ -320,6 +384,9 @@ func (s *Supervisor) Submit(req domain.ProcessActionRequest) (domain.ProcessOper
 	if s.closing || s.storageErr != nil {
 		return domain.ProcessOperation{}, &domain.OperationError{Code: "operation_failed", Message: "守护正在关闭或持久化故障，不能接收操作"}
 	}
+	if err := s.maintenanceProcessAllowedLocked(req, maintenanceOwner); err != nil {
+		return domain.ProcessOperation{}, err
+	}
 	if req.ExpectedRevision != s.snapshot.Revision {
 		return domain.ProcessOperation{}, &domain.OperationError{Code: "conflict", Message: "进程状态版本已变化，请刷新后确认", CurrentRevision: s.snapshot.Revision}
 	}
@@ -329,6 +396,14 @@ func (s *Supervisor) Submit(req domain.ProcessActionRequest) (domain.ProcessOper
 	previousDesired := s.state.DesiredState
 	previousSnapshot := s.snapshot
 	item := s.addLocked(req, "accepted")
+	if maintenanceOwner {
+		s.state.Maintenance.LastProcessRequestID = req.RequestID
+		s.state.Maintenance.Phase = "starting"
+		if req.Action == "stop" || req.Action == "restart" {
+			s.state.Maintenance.Phase = "stopping"
+		}
+		s.state.Maintenance.UpdatedAt = time.Now().UTC()
+	}
 	s.state.DesiredState = "running"
 	if req.Action == "stop" {
 		s.state.DesiredState = "stopped"
@@ -363,13 +438,13 @@ func (s *Supervisor) Submit(req domain.ProcessActionRequest) (domain.ProcessOper
 // Resolve closes a transport-uncertainty window without retrying the action.
 // An absent request receives a durable terminal tombstone, so an in-flight late
 // POST with that same ID cannot start or restart the child afterwards.
-func (s *Supervisor) Resolve(req domain.ProcessActionRequest) (domain.ProcessOperation, error) {
+func (s *Supervisor) resolveRecorded(req domain.ProcessActionRequest) (domain.ProcessOperation, error) {
 	if err := req.Validate(); err != nil {
 		return domain.ProcessOperation{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if req.InstanceID != s.cfg.InstanceID {
+	if req.InstanceID != s.cfg.InstanceID || (req.Lifecycle && req.GatewayInstanceID != s.cfg.GatewayInstanceID) {
 		return domain.ProcessOperation{}, &domain.OperationError{Code: "not_found", Message: "守护实例标识不匹配"}
 	}
 	if item := s.findLocked(req.RequestID); item != nil {
@@ -382,6 +457,9 @@ func (s *Supervisor) Resolve(req domain.ProcessActionRequest) (domain.ProcessOpe
 		return domain.ProcessOperation{}, &domain.OperationError{Code: "operation_failed", Message: "守护不可写，暂时不能封存未确认作业"}
 	}
 	item := s.addLocked(req, "failed")
+	if req.Lifecycle {
+		s.state.SchemaVersion = 4
+	}
 	item.Operation.ErrorCode = "unconfirmed_cancelled"
 	item.Operation.Error = "未找到本次作业登记，已封存该编号以阻止迟到执行；请核对当前进程状态"
 	// Even after bounded history evicts this tombstone, its original revision
@@ -410,9 +488,17 @@ func (s *Supervisor) loop() {
 			s.bumpLocked()
 			_ = s.persistLocked()
 			s.mu.Unlock()
+			if s.lifecycleLock != nil {
+				_ = s.lifecycleLock.Close()
+				s.lifecycleLock = nil
+			}
 			return
 		case req := <-s.jobs:
-			s.perform(req)
+			if req.Lifecycle {
+				s.performLifecycle(req)
+			} else {
+				s.perform(req)
+			}
 		case <-ticker.C:
 			s.observeExitAndRetry()
 		}
@@ -471,10 +557,11 @@ func (s *Supervisor) finish(req domain.ProcessActionRequest, forced bool, err er
 		item.Operation.State, item.Operation.ErrorCode = "failed", "operation_failed"
 		item.Operation.Error = boundedError(err)
 		s.snapshot.State, s.snapshot.LastError = "failed", item.Operation.Error
-		if s.cfg.RestartPolicy == "on-failure" && s.state.DesiredState == "running" {
+		if s.cfg.RestartPolicy == "on-failure" && s.state.DesiredState == "running" && !s.maintenanceActiveLocked() {
 			s.scheduleRetryLocked()
 		}
 	}
+	s.maintenanceProcessFinishedLocked(req, err)
 	s.bumpLocked()
 	snap := s.snapshotLocked()
 	item.Operation.Snapshot = &snap
@@ -551,7 +638,7 @@ func (s *Supervisor) startOwned() error {
 	err := s.persistLocked()
 	s.mu.Unlock()
 	if err != nil {
-		_, _ = s.stopOwned()
+		_, _ = s.cleanupFailedStart()
 		return err
 	}
 	s.logger.Info("owned lower started", "instance_id", s.cfg.InstanceID, "pid", child.process.Pid)
@@ -589,7 +676,7 @@ func (s *Supervisor) startOwned() error {
 			case <-s.ctx.Done():
 				return s.ctx.Err()
 			case <-deadline.C:
-				_, _ = s.stopOwned()
+				_, _ = s.cleanupFailedStart()
 				return fmt.Errorf("lower did not listen at %s within %s; inspect process output", s.cfg.ReadyAddress, s.cfg.StartTimeout)
 			case <-tick.C:
 			}
@@ -709,7 +796,7 @@ func (s *Supervisor) observeExitAndRetry() {
 			}
 		}
 	}
-	if s.retryAt.IsZero() || time.Now().Before(s.retryAt) || s.state.DesiredState != "running" || s.storageErr != nil {
+	if s.maintenanceActiveLocked() || s.lifecycleActiveLocked() || s.state.DeferredFence != nil || s.retryAt.IsZero() || time.Now().Before(s.retryAt) || s.state.DesiredState != "running" || s.storageErr != nil {
 		return
 	}
 	s.retryAt = time.Time{}
@@ -740,6 +827,10 @@ func (s *Supervisor) Close() {
 		s.cancel()
 		s.mu.Unlock()
 		<-s.done
+		// A late OPC reply must not write state after another agent acquires the
+		// instance lock. Closing cancels the handshake, then joins its writer.
+		s.maintenanceMu.Lock()
+		defer s.maintenanceMu.Unlock()
 		_ = s.output.Close()
 		_ = s.events.Close()
 		_ = s.lock.Close()

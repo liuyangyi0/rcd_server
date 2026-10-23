@@ -1,0 +1,25 @@
+all:
+  children:
+    rcd_nodes:
+      hosts:
+        example_lower:
+          ansible_host: 192.0.2.30
+          ansible_user: operator
+          rcd_services:
+            - component: lower-stack
+              instance: example-lower
+              scope: system
+              unit: rcd-lower.service
+        example_manager:
+          ansible_host: 192.0.2.46
+          ansible_user: operator
+          rcd_services:
+            - component: lower-stack
+              instance: example-lower
+              scope: user
+              unit: rcd-process-agent@example-lower.service
+            - component: manager
+              instance: main
+              scope: user
+              unit: rcd-manager.service
+# Use SSH agent / --ask-pass / Ansible Vault. Never commit plaintext passwords.

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "manager_instance_id": "manager-golden",
+  "command_id": "cmd-golden",
+  "gateway_instance_id": "gateway-golden",
+  "boot_id": "boot-golden",
+  "port_id": "/dev/ttyWCH0",
+  "ack_id": "18446744073709551615",
+  "request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "request_preview": "1108",
+  "device_id": "17",
+  "accepted": true,
+  "status_code": 0,
+  "phase": "AckReceived",
+  "attempt_count": 2,
+  "sent_count": 2,
+  "attempts": [
+    { "attempt": 1, "sent": true, "result": "ack_timeout", "at": "2026-09-22T00:00:00Z" },
+    { "attempt": 2, "sent": true, "result": "AckReceived", "at": "2026-09-22T00:00:00.050Z" }
+  ],
+  "error": "",
+  "revision": 7,
+  "started_at": "2026-09-22T00:00:00Z",
+  "updated_at": "2026-09-22T00:00:00.051Z",
+  "audit_incomplete": false
+}

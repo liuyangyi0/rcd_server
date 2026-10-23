@@ -17,6 +17,11 @@ use log::{error, info, warn};
 use serialport::{ClearBuffer, DataBits, Parity, SerialPort, StopBits};
 
 use super::port_config::SerialPortConfig;
+use super::transport::{
+    minimum_transmit_timeout, read_before_deadline, transmit_timeout, wait_for_output_settle,
+    wire_duration, write_all_before_deadline, MAX_TRANSMIT_TIMEOUT,
+};
+use super::version_transaction::{self, VersionQueries, VersionReadError};
 use crate::broadcast::Broadcaster;
 use crate::config::RunLocation;
 use crate::logging;
@@ -35,12 +40,7 @@ const RESPONSE_FRAME_OVERHEAD_WITH_STATUS_LEN: usize = 4;
 const FORWARD_PREFIX_GRACE: Duration = Duration::from_millis(5);
 const FAILURE_LOG_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 const BAD_FRAME_LOG_MAX_BYTES: usize = 64;
-const OUTPUT_QUEUE_POLL_INTERVAL: Duration = Duration::from_micros(250);
-const MIN_TRANSMIT_IO_SLACK: Duration = Duration::from_millis(50);
-const MAX_TRANSMIT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_COMPLETION_GUARD: Duration = Duration::from_millis(5);
-const STATION_VERSION_RESPONSE_LEN: usize = 9;
-const STATION_VERSION_LATE_FRAME_QUARANTINE: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeviceFailureKind {
@@ -509,8 +509,9 @@ pub(crate) struct SerialManager {
     pub(crate) port: Option<Box<dyn SerialPort>>,
     pub(crate) operations: Option<crate::operations::Operations>,
     pub(crate) command_queue: Arc<Mutex<VecDeque<QueuedCommand>>>,
+    pub(super) command_pacing: super::command_pacing::CommandPacing,
     /// 启动/重新启用/改为国产后的一次性版本查询；同一设备去重。
-    station_version_query_queue: VecDeque<u8>,
+    station_version_query_queue: VersionQueries,
     pub(crate) serial_config: SerialConfig,
     pub(crate) port_config: SerialPortConfig,
     pub(crate) broadcaster: Broadcaster,
@@ -597,7 +598,8 @@ impl SerialManager {
             port,
             operations: None,
             command_queue: Arc::new(Mutex::new(VecDeque::new())),
-            station_version_query_queue: VecDeque::new(),
+            command_pacing: super::command_pacing::CommandPacing::default(),
+            station_version_query_queue: VersionQueries::default(),
             serial_config,
             port_config,
             broadcaster,
@@ -880,6 +882,9 @@ impl SerialManager {
 
     /// worker panic 后释放串口并向全部设备发布离线，随后由监督循环重新进入重连。
     pub(crate) fn prepare_worker_restart(&mut self) {
+        // An interrupted control may have emitted bytes. Reconnecting must not
+        // let a new control bypass the configured post-transaction spacing.
+        self.command_pacing.completed(Instant::now());
         self.port = None;
         self.rx_pending.clear();
         self.publish_port_offline_once();
@@ -934,18 +939,11 @@ impl SerialManager {
     }
 
     pub(crate) fn schedule_station_version_query(&mut self, device_id: u8) {
-        if !self
-            .station_version_query_queue
-            .iter()
-            .any(|queued| *queued == device_id)
-        {
-            self.station_version_query_queue.push_back(device_id);
-        }
+        self.station_version_query_queue.schedule(device_id);
     }
 
     pub(crate) fn cancel_scheduled_station_version_query(&mut self, device_id: u8) {
-        self.station_version_query_queue
-            .retain(|queued| *queued != device_id);
+        self.station_version_query_queue.cancel(device_id);
     }
 
     pub(crate) fn schedule_configured_domestic_version_queries(&mut self) {
@@ -959,14 +957,14 @@ impl SerialManager {
 
     /// 每轮完整的普通站点扫描后最多执行一个启动/重新启用查询。
     pub(crate) fn execute_one_scheduled_station_version_query(&mut self) {
-        let Some(device_id) = self.station_version_query_queue.pop_front() else {
+        let Some(device_id) = self.station_version_query_queue.next() else {
             return;
         };
         let Some(operations) = self.operations.clone() else {
             return;
         };
         match operations.begin_automatic_station_query(&self.port_config.port_number, device_id) {
-            Ok(true) => {
+            Ok(Some(_admission)) => {
                 let result = self.perform_station_version_query(device_id);
                 if let Err(error) = operations.report_station_query_result(
                     &self.port_config.port_number,
@@ -979,7 +977,12 @@ impl SerialManager {
                     );
                 }
             }
-            Ok(false) => {}
+            Ok(None) => {}
+            Err(error) if error.code == "busy" => {
+                // A maintenance window postpones the one-shot probe; it does
+                // not consume it or change the normal polling schedule.
+                self.schedule_station_version_query(device_id);
+            }
             Err(error) => error!(
                 "[版本查询启动失败] port={} device_id={} error={:?}",
                 self.serial_config.port_name, device_id, error
@@ -1035,88 +1038,24 @@ impl SerialManager {
             return Err("could not send station version query".into());
         }
 
-        let mut received = Vec::with_capacity(STATION_VERSION_RESPONSE_LEN);
-        let mut deadline = Instant::now() + self.serial_config.read_timeout;
-        let mut completion_deadline_extended = false;
-        let read_result: io::Result<()> = loop {
-            if received.len() >= STATION_VERSION_RESPONSE_LEN {
-                break Ok(());
-            }
-            let result = {
-                let port = self.port.as_mut().expect("version query checked open port");
-                read_before_deadline(port.as_mut(), &mut self.read_buf, deadline)
-            };
-            match result {
-                Ok(0) => {
-                    break Err(io::Error::new(
-                        ErrorKind::TimedOut,
-                        "empty version response",
-                    ))
-                }
-                Ok(count) => {
-                    received.extend_from_slice(&self.read_buf[..count]);
-                    if !completion_deadline_extended {
-                        deadline = Instant::now()
-                            + wire_duration(
-                                STATION_VERSION_RESPONSE_LEN,
-                                self.serial_config.baud_rate,
-                            )
-                            .saturating_add(RESPONSE_COMPLETION_GUARD);
-                        completion_deadline_extended = true;
-                    }
-                }
-                Err(error) => break Err(error),
-            }
-        };
-
-        match read_result {
-            Ok(()) => {
-                if received.len() != STATION_VERSION_RESPONSE_LEN {
-                    let message = format!(
-                        "station version response length must be exactly {STATION_VERSION_RESPONSE_LEN} bytes, got {}",
-                        received.len()
-                    );
-                    if logging::serial_frame_logs_enabled() || !received.is_empty() {
-                        info!(
-                            "[版本查询响应] port={} device_id={} frame_len={} frame_hex={:?} valid=false",
-                            self.serial_config.port_name,
-                            device_id,
-                            received.len(),
-                            format_hex(&received),
-                        );
-                    }
-                    self.quarantine_late_station_version_response();
-                    return Err(message);
-                }
-                let frame = &received[..STATION_VERSION_RESPONSE_LEN];
-                let result =
-                    protocol::parse_station_version_response(frame).map_err(str::to_string);
-                info!(
-                    "[版本查询响应] port={} device_id={} frame_len={} frame_hex={:?} valid={}",
-                    self.serial_config.port_name,
-                    device_id,
-                    received.len(),
-                    format_hex(&received),
-                    result.is_ok(),
-                );
-                if result.is_err() {
-                    self.quarantine_late_station_version_response();
-                } else {
-                    self.rx_pending.clear();
-                }
-                result
-            }
-            Err(error) if error.kind() == ErrorKind::TimedOut => {
-                self.quarantine_late_station_version_response();
-                Err(format!(
-                    "station version query timed out after {} ms",
-                    self.serial_config.read_timeout.as_millis()
-                ))
-            }
-            Err(error) => {
+        let result = version_transaction::receive(
+            self.port
+                .as_mut()
+                .expect("version query checked open port")
+                .as_mut(),
+            &mut self.read_buf,
+            self.serial_config.read_timeout,
+            self.serial_config.baud_rate,
+            &self.serial_config.port_name,
+            device_id,
+        );
+        self.rx_pending.clear();
+        match result {
+            Ok(value) => Ok(value),
+            Err(VersionReadError::Rejected(message)) => Err(message),
+            Err(VersionReadError::Transport(error)) => {
                 let message = format!("station version read failed: {error}");
                 self.port = None;
-                self.rx_pending.clear();
                 self.reconnect();
                 if self.port.is_some() {
                     self.quarantine_late_station_version_response();
@@ -1128,14 +1067,8 @@ impl SerialManager {
 
     fn quarantine_late_station_version_response(&mut self) {
         self.rx_pending.clear();
-        std::thread::sleep(STATION_VERSION_LATE_FRAME_QUARANTINE);
         if let Some(port) = self.port.as_ref() {
-            if let Err(error) = port.clear(ClearBuffer::Input) {
-                warn!(
-                    "[版本查询迟到帧清理失败] port={} error={:?}",
-                    self.serial_config.port_name, error
-                );
-            }
+            version_transaction::quarantine(port.as_ref(), &self.serial_config.port_name);
         }
         self.rx_pending.clear();
     }
@@ -1410,7 +1343,12 @@ impl SerialManager {
     /// 该路径只用于客户端下发命令后的 ACK 判断，不进入采集帧解析，也不更新
     /// 设备超时或解析失败计数。普通 ACK 超时和内容不匹配不改变缓存或广播状态；
     /// 串口未打开或发生非超时 I/O 错误时会进入重连流程并发布整口离线状态。
+    #[cfg(test)]
     pub(crate) fn receive_command_ack(&mut self) -> bool {
+        self.receive_command_ack_result().is_ok()
+    }
+
+    pub(super) fn receive_command_ack_result(&mut self) -> Result<(), &'static str> {
         if self.port.is_none() {
             warn!(
                 "[串口ACK读取失败] port={} phase=before_read cause=port_not_open action=publish_all_offline_reconnect",
@@ -1418,7 +1356,7 @@ impl SerialManager {
             );
             self.log_record("命令 ACK 读取失败：串口未打开".into());
             self.reconnect();
-            return false;
+            return Err("port_not_open");
         }
 
         let deadline = Instant::now() + self.serial_config.read_timeout;
@@ -1453,7 +1391,7 @@ impl SerialManager {
                         format_hex(&received)
                     );
                 }
-                return true;
+                return Ok(());
             }
             Ok(false) => {}
             Err(error) => {
@@ -1472,7 +1410,7 @@ impl SerialManager {
                 self.port = None;
                 self.rx_pending.clear();
                 self.reconnect();
-                return false;
+                return Err("ack_io_error");
             }
         }
 
@@ -1491,7 +1429,11 @@ impl SerialManager {
                 format_hex(&received),
             );
         }
-        false
+        Err(if received.is_empty() {
+            "ack_timeout"
+        } else {
+            "ack_mismatch"
+        })
     }
 
     /// 从串口读取并解析一帧数据；超时或坏帧立即按原有语义提交故障。
@@ -2478,88 +2420,9 @@ pub(crate) fn contains_command_ack(data: &[u8]) -> bool {
         .any(|window| window == COMMAND_ACK_BYTES)
 }
 
-fn serial_error_to_io(error: serialport::Error) -> io::Error {
-    io::Error::other(error.to_string())
-}
-
 fn io_error_with_context(error: io::Error, context: String) -> io::Error {
     let kind = error.kind();
     io::Error::new(kind, format!("{context} error={error}"))
-}
-
-/// 在统一截止时间内执行一次 read，并在结束后恢复端口原始超时配置。
-fn read_before_deadline(
-    port: &mut dyn SerialPort,
-    buffer: &mut [u8],
-    deadline: Instant,
-) -> io::Result<usize> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(io::Error::new(
-            ErrorKind::TimedOut,
-            "frame read deadline elapsed",
-        ));
-    }
-
-    let original_timeout = port.timeout();
-    port.set_timeout(remaining).map_err(serial_error_to_io)?;
-    let result = port.read(buffer);
-    let restore_result = port
-        .set_timeout(original_timeout)
-        .map_err(serial_error_to_io);
-    match (result, restore_result) {
-        (_, Err(error)) => Err(error),
-        (result, Ok(())) => result,
-    }
-}
-
-/// 在统一截止时间内写完一段数据，避免 `write_all` 的逐次超时被零星写入反复续期。
-fn write_all_before_deadline(
-    port: &mut dyn SerialPort,
-    mut data: &[u8],
-    deadline: Instant,
-) -> io::Result<()> {
-    while !data.is_empty() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(io::Error::new(
-                ErrorKind::TimedOut,
-                "serial write deadline elapsed",
-            ));
-        }
-
-        let original_timeout = port.timeout();
-        port.set_timeout(remaining).map_err(serial_error_to_io)?;
-        let result = port.write(data);
-        let restore_result = port
-            .set_timeout(original_timeout)
-            .map_err(serial_error_to_io);
-        let written = match (result, restore_result) {
-            (_, Err(error)) => return Err(error),
-            (result, Ok(())) => result?,
-        };
-        if written == 0 {
-            return Err(io::Error::new(
-                ErrorKind::WriteZero,
-                "serial write returned zero bytes",
-            ));
-        }
-        data = &data[written..];
-    }
-    Ok(())
-}
-
-fn wire_duration(byte_count: usize, baud_rate: u32) -> Duration {
-    if byte_count == 0 || baud_rate == 0 {
-        return Duration::ZERO;
-    }
-    // 起始位 + 8 数据位 + 校验位 + 最多 2 个停止位，使用 12 bit/byte 的保守值。
-    let bit_count = (byte_count as u128).saturating_mul(12);
-    let nanos = bit_count
-        .saturating_mul(1_000_000_000)
-        .div_ceil(u128::from(baud_rate))
-        .min(u128::from(u64::MAX));
-    Duration::from_nanos(nanos as u64)
 }
 
 /// 首字节已经到达后，用线速计算一次性的完整收帧预算。
@@ -2580,60 +2443,6 @@ fn response_completion_budget(
         })
         .unwrap_or(RESPONSE_FRAME_OVERHEAD + FORWARD_PREFIX_LEN);
     wire_duration(maximum_frame_len, baud_rate).saturating_add(RESPONSE_COMPLETION_GUARD)
-}
-
-fn transmit_wire_budget(byte_count: usize, baud_rate: u32) -> Duration {
-    wire_duration(byte_count, baud_rate)
-        .saturating_add(wire_duration(byte_count.min(16), baud_rate))
-}
-
-fn minimum_transmit_timeout(byte_count: usize, baud_rate: u32) -> Duration {
-    transmit_wire_budget(byte_count, baud_rate).saturating_add(MIN_TRANSMIT_IO_SLACK)
-}
-
-fn transmit_timeout(byte_count: usize, baud_rate: u32, configured: Duration) -> Duration {
-    let wire_budget = transmit_wire_budget(byte_count, baud_rate);
-    // 读取超时只是一个可复用的 I/O 余量，不得因为它大于发送保护上限就把所有
-    // 短命令误判为“帧过长”。余量限制在剩余的 5 秒总预算内。
-    let remaining_budget = MAX_TRANSMIT_TIMEOUT.saturating_sub(wire_budget);
-    let io_slack = configured.max(MIN_TRANSMIT_IO_SLACK).min(remaining_budget);
-    wire_budget.saturating_add(io_slack)
-}
-
-/// 等待驱动发送队列清空，再按完整段线速时间和短保护时间等待 UART 发完。
-/// `bytes_to_write` 不受驱动支持时仍使用线速时间兜底；不调用可能永久阻塞的 flush/tcdrain。
-fn wait_for_output_settle(
-    port: &dyn SerialPort,
-    byte_count: usize,
-    baud_rate: u32,
-    settle_guard: Duration,
-    deadline: Instant,
-) -> io::Result<()> {
-    while matches!(port.bytes_to_write(), Ok(queued) if queued > 0) {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(io::Error::new(
-                ErrorKind::TimedOut,
-                "serial output queue drain deadline elapsed",
-            ));
-        }
-        std::thread::sleep(OUTPUT_QUEUE_POLL_INTERVAL.min(remaining));
-    }
-
-    // 即使驱动报告队列为 0，字节仍可能已经进入 UART FIFO/移位寄存器；完整
-    // 线速时间是安全上界，额外保护时间用于校验位切换和 USB/XR17 调度抖动。
-    let settle = wire_duration(byte_count, baud_rate).saturating_add(settle_guard);
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if settle > remaining {
-        return Err(io::Error::new(
-            ErrorKind::TimedOut,
-            "serial output settle deadline elapsed",
-        ));
-    }
-    if !settle.is_zero() {
-        std::thread::sleep(settle);
-    }
-    Ok(())
 }
 
 // ============================================================
@@ -2875,7 +2684,8 @@ mod tests {
             port: None,
             operations: None,
             command_queue: Arc::new(Mutex::new(VecDeque::new())),
-            station_version_query_queue: VecDeque::new(),
+            command_pacing: super::super::command_pacing::CommandPacing::default(),
+            station_version_query_queue: VersionQueries::default(),
             serial_config: SerialConfig::new(
                 "COM1".to_string(),
                 28_800,
@@ -2934,6 +2744,7 @@ mod tests {
         input_clears: usize,
         flush_attempts: usize,
         drops: usize,
+        cancel_after_write: Option<tokio_util::sync::CancellationToken>,
     }
 
     struct ScriptedSerialPort {
@@ -3001,6 +2812,9 @@ mod tests {
             let mut observations = self.observations.lock().unwrap();
             observations.write_attempts += 1;
             observations.writes.push(buffer.to_vec());
+            if let Some(cancel) = observations.cancel_after_write.take() {
+                cancel.cancel();
+            }
             if succeeds {
                 Ok(buffer.len())
             } else {
@@ -3963,6 +3777,82 @@ mod tests {
     }
 
     #[test]
+    fn command_audit_retry_path_stops_on_first_second_or_third_ack() {
+        for successful_attempt in 1..=3 {
+            let mut manager = test_manager_with_devices(1);
+            manager.command_pacing =
+                super::super::command_pacing::CommandPacing::new(Duration::from_secs(60));
+            let mut reads = (1..successful_attempt)
+                .map(|_| ReadStep::Timeout)
+                .collect::<Vec<_>>();
+            // Fragmented ACK must still stop the loop immediately.
+            reads.push(ReadStep::Data(vec![0x00]));
+            reads.push(ReadStep::Data(vec![0x50, 0x50]));
+            let observations = install_scripted_port(&mut manager, reads, vec![]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            assert!(super::super::worker::execute_command_with_ack(
+                &mut manager,
+                status_query(),
+                Some(91),
+                None,
+                &tx,
+                3,
+                None,
+            ));
+            assert_eq!(
+                observations.lock().unwrap().writes.len(),
+                successful_attempt
+            );
+            let updates: Vec<_> = rx.try_iter().collect();
+            assert_eq!(updates.len(), successful_attempt + 1);
+            assert_eq!(
+                updates.last().unwrap().status,
+                crate::model::CommandAckStatus::Received
+            );
+            assert_eq!(manager.index, 0);
+            assert_eq!(manager.device_states[0].timeout_count, 0);
+        }
+    }
+
+    #[test]
+    fn command_audit_retry_path_exhausts_three_without_success() {
+        let mut manager = test_manager_with_devices(1);
+        let observations = install_scripted_port(
+            &mut manager,
+            vec![ReadStep::Timeout, ReadStep::Timeout, ReadStep::Timeout],
+            vec![],
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(!super::super::worker::execute_command_with_ack(
+            &mut manager,
+            status_query(),
+            Some(92),
+            None,
+            &tx,
+            3,
+            None,
+        ));
+        assert_eq!(observations.lock().unwrap().writes.len(), 3);
+        assert_eq!(
+            rx.try_iter().last().unwrap().status,
+            crate::model::CommandAckStatus::Failed
+        );
+    }
+
+    #[test]
+    fn command_audit_ack_reason_distinguishes_timeout_and_mismatch() {
+        let mut manager = test_manager_with_devices(1);
+        install_scripted_port(&mut manager, vec![ReadStep::Timeout], vec![]);
+        assert_eq!(manager.receive_command_ack_result(), Err("ack_timeout"));
+        install_scripted_port(
+            &mut manager,
+            vec![ReadStep::Data(vec![0, 0x50, 0x51]), ReadStep::Timeout],
+            vec![],
+        );
+        assert_eq!(manager.receive_command_ack_result(), Err("ack_mismatch"));
+    }
+
+    #[test]
     fn valid_frame_recovers_only_the_responding_device_after_port_offline() {
         let mut manager = test_manager_with_devices(2);
         manager.publish_port_offline_once();
@@ -4520,5 +4410,559 @@ mod tests {
         assert!(!restarted.initial_device_read_enabled(&port_id, 1));
         assert!(restarted.initial_device_read_enabled(&port_id, 2));
         assert_eq!(restarted.status()["revision"], "3");
+    }
+
+    fn queue_interval_test_command(
+        manager: &mut SerialManager,
+        ack_id: u64,
+        report_ack: bool,
+        expires_at: Option<Instant>,
+    ) {
+        manager
+            .command_queue
+            .lock()
+            .unwrap()
+            .push_back(QueuedCommand {
+                data: SendData {
+                    device_id: 1,
+                    command: vec![1, 9, 2, ack_id as u8],
+                },
+                report_ack,
+                ack_id: Some(ack_id),
+                expires_at,
+                _permit: None,
+            });
+    }
+
+    fn attach_command_chain_operations(manager: &mut SerialManager) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("config")).unwrap();
+        std::fs::create_dir(root.path().join("logs")).unwrap();
+        manager.operations = Some(
+            crate::operations::Operations::new(
+                root.path().join("config"),
+                root.path().join("logs"),
+                "test".into(),
+                &[manager.port_config.clone()],
+            )
+            .unwrap(),
+        );
+        root
+    }
+
+    #[test]
+    fn command_chain_failure_notification_preserves_precise_terminal_evidence() {
+        let mut manager = test_manager_with_devices(1);
+        let _root = attach_command_chain_operations(&mut manager);
+        let tracker = manager.operations.as_ref().unwrap().command_tracker();
+        let port = manager.port_config.port_number.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (index, phase) in ["Expired", "Unknown", "AckReceived", "Failed"]
+            .iter()
+            .enumerate()
+        {
+            let ack = index as u64 + 1;
+            let id = format!("terminal-{index}");
+            tracker.begin("chain", &id, &port, ack, "1108").unwrap();
+            tracker.update(&port, Some(ack), |value| {
+                value.phase = (*phase).into();
+                value.error = "precise original outcome".into();
+            });
+            super::super::command_transaction::send_ack_status(
+                &manager,
+                &tx,
+                Some(ack),
+                crate::model::CommandAckStatus::Failed,
+            );
+            assert_eq!(rx.try_recv().unwrap().ack_id, Some(ack));
+            let snapshot = tracker.get("chain", &id).unwrap().unwrap();
+            assert_eq!(snapshot.phase, *phase);
+            assert_eq!(snapshot.error, "precise original outcome");
+        }
+    }
+
+    #[test]
+    fn command_chain_expired_wait_reports_zero_sends_with_and_without_ack() {
+        for report_ack in [false, true] {
+            let mut manager = test_manager_with_devices(1);
+            let _root = attach_command_chain_operations(&mut manager);
+            let tracker = manager.operations.as_ref().unwrap().command_tracker();
+            tracker
+                .begin(
+                    "chain",
+                    "expired",
+                    &manager.port_config.port_number,
+                    71,
+                    "1108",
+                )
+                .unwrap();
+            let observations = install_scripted_port(&mut manager, vec![], vec![]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            assert!(!super::super::command_transaction::execute_queued_command(
+                &mut manager,
+                QueuedCommand {
+                    data: status_query(),
+                    report_ack,
+                    ack_id: Some(71),
+                    expires_at: Some(Instant::now()),
+                    _permit: None
+                },
+                &tx,
+                3,
+            ));
+            let snapshot = tracker.get("chain", "expired").unwrap().unwrap();
+            assert_eq!(snapshot.phase, "Expired");
+            assert_eq!(snapshot.error, "deadline_expired_before_send");
+            assert_eq!(snapshot.attempt_count, 0);
+            assert_eq!(snapshot.sent_count, 0);
+            assert_eq!(observations.lock().unwrap().write_attempts, 0);
+            assert_eq!(rx.try_iter().count(), usize::from(report_ack));
+        }
+    }
+
+    #[test]
+    fn command_chain_retry_write_failure_does_not_inherit_previous_ack_timeout() {
+        let mut manager = test_manager_with_devices(1);
+        let _root = attach_command_chain_operations(&mut manager);
+        let tracker = manager.operations.as_ref().unwrap().command_tracker();
+        tracker
+            .begin(
+                "chain",
+                "retry-write",
+                &manager.port_config.port_number,
+                72,
+                "1108",
+            )
+            .unwrap();
+        manager.last_reconnect = Instant::now();
+        let observations =
+            install_scripted_port(&mut manager, vec![ReadStep::Timeout], vec![true, false]);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        assert!(!super::super::worker::execute_command_with_ack(
+            &mut manager,
+            status_query(),
+            Some(72),
+            None,
+            &tx,
+            3,
+            None,
+        ));
+        let snapshot = tracker.get("chain", "retry-write").unwrap().unwrap();
+        assert_eq!(snapshot.phase, "Failed");
+        assert_eq!(snapshot.error, "write_failed");
+        assert_eq!(snapshot.attempt_count, 2);
+        assert_eq!(snapshot.sent_count, 1);
+        assert_eq!(snapshot.attempts[0].result, "ack_timeout");
+        assert_eq!(snapshot.attempts[1].result, "write_failed");
+        assert_eq!(observations.lock().unwrap().write_attempts, 2);
+    }
+
+    #[test]
+    fn command_chain_shutdown_rejects_ingress_and_control_receipts_without_io() {
+        let mut manager = test_manager_with_devices(1);
+        let _root = attach_command_chain_operations(&mut manager);
+        let operations = manager.operations.as_ref().unwrap().clone();
+        manager.refresh_operations_state();
+        let port = manager.port_config.port_number.clone();
+        let tracker = operations.command_tracker();
+        tracker
+            .begin("chain", "in-channel", &port, 73, "1108")
+            .unwrap();
+        tracker.update(&port, Some(73), |value| value.accepted = true);
+        let permit = operations.admit_command(&port).unwrap();
+        let observations = install_scripted_port(&mut manager, vec![], vec![]);
+        let state = crate::model::SystemState::new();
+        state.add_port(manager.port_config.to_runtime_state());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(crate::model::Command {
+            com: port.clone(),
+            command: crate::model::CommandType::SendDataWithAck(status_query()),
+            ack_id: Some(73),
+            expires_at: None,
+            control_receipt: None,
+            permit: Some(permit),
+        })
+        .unwrap();
+        let (reply, receipt) = std::sync::mpsc::channel();
+        tx.send(crate::model::Command {
+            com: port.clone(),
+            command: crate::model::CommandType::PortStatus(crate::model::command::PortStatus {
+                device_status: false,
+            }),
+            ack_id: None,
+            expires_at: None,
+            permit: None,
+            control_receipt: Some(crate::model::command::ControlReceipt { revision: 1, reply }),
+        })
+        .unwrap();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        super::super::worker::test_cancelled_worker(&mut manager, &rx, &state, &ack_tx);
+        assert!(rx.try_recv().is_err());
+        assert!(receipt.try_recv().unwrap().is_err());
+        assert!(
+            manager.port_config.status,
+            "shutdown must not apply queued settings"
+        );
+        assert_eq!(operations.status()["ports"][0]["pending_commands"], 0);
+        let snapshot = tracker.get("chain", "in-channel").unwrap().unwrap();
+        assert_eq!(snapshot.phase, "Failed");
+        assert_eq!(snapshot.error, "worker_shutdown_before_send");
+        assert_eq!(snapshot.sent_count, 0);
+        assert_eq!(observations.lock().unwrap().write_attempts, 0);
+        assert_eq!(ack_rx.try_recv().unwrap().ack_id, Some(73));
+    }
+
+    #[test]
+    fn command_chain_finished_transactions_release_the_physical_admission() {
+        for outcome in [
+            "ack",
+            "write_failure",
+            "ack_timeout",
+            "expired",
+            "without_ack",
+        ] {
+            let mut manager = test_manager_with_devices(1);
+            let _root = attach_command_chain_operations(&mut manager);
+            let reads = if outcome == "ack" {
+                vec![ReadStep::Data(vec![0, 0x50, 0x50])]
+            } else {
+                vec![ReadStep::Timeout]
+            };
+            install_scripted_port(&mut manager, reads, vec![outcome != "write_failure"]);
+            manager.last_reconnect = Instant::now();
+            manager.refresh_operations_state();
+            let operations = manager.operations.as_ref().unwrap().clone();
+            let port = manager.port_config.port_number.clone();
+            let tracker = operations.command_tracker();
+            tracker.begin("chain", outcome, &port, 74, "1108").unwrap();
+            let permit = operations.admit_command(&port).unwrap();
+            let (tx, _rx) = std::sync::mpsc::channel();
+            super::super::command_transaction::execute_queued_command(
+                &mut manager,
+                QueuedCommand {
+                    data: status_query(),
+                    report_ack: outcome != "without_ack",
+                    ack_id: Some(74),
+                    expires_at: (outcome == "expired").then(Instant::now),
+                    _permit: Some(permit),
+                },
+                &tx,
+                1,
+            );
+            assert!(tracker.get("chain", outcome).unwrap().unwrap().terminal());
+            assert_eq!(
+                operations.status()["ports"][0]["pending_commands"],
+                0,
+                "{outcome}"
+            );
+            // Restore only the test port state after an injected transport
+            // failure; this never opens an OS serial device.
+            manager.refresh_operations_state();
+            assert!(operations.admit_command(&port).is_ok(), "{outcome}");
+        }
+    }
+
+    #[test]
+    fn command_interval_paces_fifo_while_primary_polling_and_other_port_continue() {
+        let interval = Duration::from_secs(60);
+        let mut manager = test_manager_with_devices(1);
+        manager.command_pacing = super::super::command_pacing::CommandPacing::new(interval);
+        let observations = install_scripted_port(
+            &mut manager,
+            vec![
+                ReadStep::Data(vec![0, 0x50, 0x50]),
+                ReadStep::Data(vec![0, 0x50, 0x50]),
+            ],
+            vec![],
+        );
+        queue_interval_test_command(&mut manager, 11, true, None);
+        queue_interval_test_command(&mut manager, 12, true, None);
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        assert!(!super::super::worker::test_primary_cycle_is_idle(
+            &mut manager,
+            &ack_tx
+        ));
+        assert_eq!(manager.command_queue.lock().unwrap().len(), 1);
+        assert_eq!(observations.lock().unwrap().writes, vec![vec![1, 9, 2, 11]]);
+        assert!(!manager.command_pacing.ready(Instant::now()));
+
+        // During spacing the next control stays in the original FIFO, but the
+        // regular acquisition query still proceeds (no new sleeping worker).
+        super::super::worker::test_primary_cycle_is_idle(&mut manager, &ack_tx);
+        assert_eq!(manager.command_queue.lock().unwrap().len(), 1);
+        assert_eq!(
+            observations.lock().unwrap().writes[1],
+            status_query().command
+        );
+
+        let mut other = test_manager_with_devices(1);
+        other.command_pacing = super::super::command_pacing::CommandPacing::new(interval);
+        let other_writes = install_scripted_port(&mut other, vec![], vec![]);
+        queue_interval_test_command(&mut other, 13, false, None);
+        super::super::worker::test_primary_cycle_is_idle(&mut other, &ack_tx);
+        assert_eq!(other_writes.lock().unwrap().write_attempts, 1);
+
+        // Advance only the pacing state, not wall clock or an OS serial port.
+        manager.command_pacing.completed(Instant::now() - interval);
+        super::super::worker::test_primary_cycle_is_idle(&mut manager, &ack_tx);
+        assert!(manager.command_queue.lock().unwrap().is_empty());
+        assert_eq!(observations.lock().unwrap().writes[2], vec![1, 9, 2, 12]);
+        let received: Vec<_> = ack_rx
+            .try_iter()
+            .filter(|update| matches!(update.status, crate::model::CommandAckStatus::Received))
+            .map(|update| update.ack_id)
+            .collect();
+        assert_eq!(received, vec![Some(11), Some(12)]);
+    }
+
+    #[test]
+    fn command_interval_zero_preserves_back_to_back_non_ack_commands() {
+        let mut manager = test_manager_with_devices(1);
+        let observations = install_scripted_port(&mut manager, vec![], vec![]);
+        queue_interval_test_command(&mut manager, 21, false, None);
+        queue_interval_test_command(&mut manager, 22, false, None);
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        for _ in 0..2 {
+            super::super::worker::test_primary_cycle_is_idle(&mut manager, &ack_tx);
+        }
+        assert!(manager.command_queue.lock().unwrap().is_empty());
+        assert_eq!(
+            observations.lock().unwrap().writes,
+            vec![vec![1, 9, 2, 21], vec![1, 9, 2, 22]]
+        );
+        assert!(ack_rx.try_iter().next().is_none());
+    }
+
+    #[test]
+    fn command_chain_worker_control_preserves_the_next_acquisition_slot() {
+        for report_ack in [false, true] {
+            let mut manager = test_manager_with_devices(2);
+            manager.command_pacing =
+                super::super::command_pacing::CommandPacing::new(Duration::from_secs(60));
+            let mut reads = Vec::new();
+            if report_ack {
+                reads.push(ReadStep::Data(vec![0, 0x50, 0x50]));
+            }
+            reads.push(ReadStep::Data(valid_status_frame(1, cmd::READ_STATUS)));
+            let observations = install_scripted_port(&mut manager, reads, vec![]);
+            queue_interval_test_command(&mut manager, 23, report_ack, None);
+            let state = crate::model::SystemState::new();
+            state.add_port(manager.port_config.to_runtime_state());
+            let (_tx, rx) = std::sync::mpsc::channel();
+            let (ack_tx, _ack_rx) = std::sync::mpsc::channel();
+
+            // Stop the real worker loop at its next safe point, after exactly
+            // one control transaction. A control must not skip station 1.
+            let after_control = tokio_util::sync::CancellationToken::new();
+            observations.lock().unwrap().cancel_after_write = Some(after_control.clone());
+            super::super::worker::test_worker_until_cancelled(
+                &mut manager,
+                &rx,
+                &state,
+                &ack_tx,
+                &after_control,
+            );
+            assert_eq!(manager.index, 0, "control must not consume a polling slot");
+            assert_eq!(observations.lock().unwrap().write_attempts, 1);
+            assert!(!manager.command_pacing.ready(Instant::now()));
+
+            // Resume the same worker with no command. It must query station 1,
+            // then advance normally, preserving acquisition round-robin order.
+            let after_query = tokio_util::sync::CancellationToken::new();
+            observations.lock().unwrap().cancel_after_write = Some(after_query.clone());
+            super::super::worker::test_worker_until_cancelled(
+                &mut manager,
+                &rx,
+                &state,
+                &ack_tx,
+                &after_query,
+            );
+            assert_eq!(manager.index, 1, "normal polling must still advance");
+            let writes = &observations.lock().unwrap().writes;
+            assert_eq!(writes.len(), 2);
+            assert_eq!(writes[0], vec![1, 9, 2, 23]);
+            assert_eq!(writes[1], status_query().command);
+            assert!(
+                !manager.command_pacing.ready(Instant::now()),
+                "normal polling must not bypass the control cooldown"
+            );
+        }
+    }
+
+    #[test]
+    fn command_chain_worker_expired_control_does_not_skip_a_station() {
+        let mut manager = test_manager_with_devices(2);
+        manager.command_pacing =
+            super::super::command_pacing::CommandPacing::new(Duration::from_secs(60));
+        let observations = install_scripted_port(
+            &mut manager,
+            vec![ReadStep::Data(valid_status_frame(1, cmd::READ_STATUS))],
+            vec![],
+        );
+        queue_interval_test_command(&mut manager, 24, true, Some(Instant::now()));
+        let state = crate::model::SystemState::new();
+        state.add_port(manager.port_config.to_runtime_state());
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        let after_query = tokio_util::sync::CancellationToken::new();
+        observations.lock().unwrap().cancel_after_write = Some(after_query.clone());
+
+        // The expired FIFO head must be rejected without I/O. The first real
+        // write in this complete worker run must still poll station 1.
+        super::super::worker::test_worker_until_cancelled(
+            &mut manager,
+            &rx,
+            &state,
+            &ack_tx,
+            &after_query,
+        );
+        assert_eq!(manager.index, 1);
+        assert!(
+            manager.command_pacing.ready(Instant::now()),
+            "an unsent expired command must not start a control cooldown"
+        );
+        assert_eq!(
+            observations.lock().unwrap().writes,
+            vec![status_query().command]
+        );
+        let rejected = ack_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].ack_id, Some(24));
+        assert_eq!(rejected[0].status, crate::model::CommandAckStatus::Failed);
+    }
+
+    #[test]
+    fn command_interval_longer_than_deadline_expires_without_sending_or_extending_wait() {
+        let now = Instant::now();
+        let interval = Duration::from_secs(60);
+        let mut manager = test_manager_with_devices(1);
+        manager.device_states[0].read_enabled = false;
+        manager.command_pacing = super::super::command_pacing::CommandPacing::new(interval);
+        manager.command_pacing.completed(now);
+        let observations = install_scripted_port(&mut manager, vec![], vec![]);
+        queue_interval_test_command(&mut manager, 31, true, Some(now + Duration::from_secs(5)));
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        assert!(super::super::worker::test_primary_cycle_is_idle(
+            &mut manager,
+            &ack_tx
+        ));
+        assert_eq!(manager.command_queue.lock().unwrap().len(), 1);
+        assert_eq!(observations.lock().unwrap().write_attempts, 0);
+        // Model the same accepted command reaching its execution deadline.
+        manager
+            .command_queue
+            .lock()
+            .unwrap()
+            .front_mut()
+            .unwrap()
+            .expires_at = Some(now);
+        assert!(!super::super::worker::test_primary_cycle_is_idle(
+            &mut manager,
+            &ack_tx
+        ));
+        assert_eq!(observations.lock().unwrap().write_attempts, 0);
+        assert!(manager.command_queue.lock().unwrap().is_empty());
+        assert!(
+            manager.command_pacing.ready(now + interval),
+            "dropping an unsent expired command must not start another cooldown"
+        );
+        let terminal = ack_rx.try_iter().last().unwrap();
+        assert_eq!(terminal.ack_id, Some(31));
+        assert!(matches!(
+            terminal.status,
+            crate::model::CommandAckStatus::Failed
+        ));
+    }
+
+    #[test]
+    fn command_interval_secondary_wait_keeps_passive_receive_available() {
+        let mut manager = test_manager(RunLocation::Secondary, RunLocation::Secondary);
+        manager.command_pacing =
+            super::super::command_pacing::CommandPacing::new(Duration::from_secs(60));
+        manager.command_pacing.completed(Instant::now());
+        let observations = install_scripted_port(&mut manager, vec![], vec![]);
+        queue_interval_test_command(&mut manager, 41, true, None);
+        let (ack_tx, _) = std::sync::mpsc::channel();
+        assert!(super::super::worker::test_secondary_cycle_is_passive(
+            &mut manager,
+            &ack_tx
+        ));
+        assert_eq!(manager.command_queue.lock().unwrap().len(), 1);
+        assert_eq!(observations.lock().unwrap().write_attempts, 0);
+    }
+
+    #[test]
+    fn command_interval_does_not_block_station_version_transaction() {
+        let mut manager = test_manager_with_devices(1);
+        manager.command_pacing =
+            super::super::command_pacing::CommandPacing::new(Duration::from_secs(60));
+        manager.command_pacing.completed(Instant::now());
+        queue_interval_test_command(&mut manager, 51, true, None);
+        let observations = install_scripted_port(
+            &mut manager,
+            vec![ReadStep::Data(vec![0, 0, 4, 8, 1, 4, 0, 5, 0x16])],
+            vec![],
+        );
+        assert!(manager.perform_station_version_query(1).is_ok());
+        assert_eq!(manager.command_queue.lock().unwrap().len(), 1);
+        assert_eq!(observations.lock().unwrap().write_attempts, 1);
+        assert!(!manager.command_pacing.ready(Instant::now()));
+    }
+
+    #[test]
+    fn command_interval_port_disable_and_shutdown_cancel_without_waiting() {
+        for shutdown in [false, true] {
+            let mut manager = test_manager_with_devices(1);
+            manager.command_pacing =
+                super::super::command_pacing::CommandPacing::new(Duration::from_secs(60));
+            manager.command_pacing.completed(Instant::now());
+            queue_interval_test_command(&mut manager, 61, true, None);
+            let observations = install_scripted_port(&mut manager, vec![], vec![]);
+            let state = crate::model::SystemState::new();
+            state.add_port(manager.port_config.to_runtime_state());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+            if shutdown {
+                super::super::worker::test_cancelled_worker(&mut manager, &rx, &state, &ack_tx);
+            } else {
+                tx.send(crate::model::Command {
+                    com: manager.port_config.port_number.clone(),
+                    command: crate::model::CommandType::PortStatus(
+                        crate::model::command::PortStatus {
+                            device_status: false,
+                        },
+                    ),
+                    ack_id: None,
+                    expires_at: None,
+                    control_receipt: None,
+                    permit: None,
+                })
+                .unwrap();
+                super::super::worker::process_test_commands(&mut manager, &rx, &state, &ack_tx);
+                assert!(manager.port.is_none());
+            }
+            assert!(manager.command_queue.lock().unwrap().is_empty());
+            assert_eq!(observations.lock().unwrap().write_attempts, 0);
+            assert!(!manager.command_pacing.ready(Instant::now()));
+            let terminal = ack_rx.try_iter().last().unwrap();
+            assert!(matches!(
+                terminal.status,
+                crate::model::CommandAckStatus::Failed
+            ));
+        }
+    }
+
+    #[test]
+    fn command_interval_reconnect_and_worker_recovery_cannot_bypass_spacing() {
+        let mut manager = test_manager_with_devices(1);
+        manager.command_pacing =
+            super::super::command_pacing::CommandPacing::new(Duration::from_secs(60));
+        manager.command_pacing.completed(Instant::now());
+        // Existing reconnect cooldown prevents touching an actual OS port.
+        manager.last_reconnect = Instant::now();
+        manager.reconnect();
+        assert!(!manager.command_pacing.ready(Instant::now()));
+        manager.prepare_worker_restart();
+        assert!(!manager.command_pacing.ready(Instant::now()));
     }
 }

@@ -318,14 +318,31 @@ func (s *Subscription) SetTriggering(ctx context.Context, triggeringItemID uint3
 }
 
 func (s *Subscription) publishTimeout() time.Duration {
-	timeout := time.Duration(s.RevisedMaxKeepAliveCount) * s.RevisedPublishingInterval // expected keepalive interval
-	if timeout > uasc.MaxTimeout {
+	// A Publish may legitimately remain queued for a full keep-alive period.
+	// An equal TimeoutHint races the server's keep-alive tick, especially on
+	// quiet sources. Budget another period (or the normal request timeout,
+	// whichever is larger) for scheduling/network delay. This does not change
+	// sampling/publishing intervals or retry a Write/Call.
+	count, interval := time.Duration(s.RevisedMaxKeepAliveCount), s.RevisedPublishingInterval
+	requestTimeout := s.c.RequestTimeout()
+	if requestTimeout >= uasc.MaxTimeout {
 		return uasc.MaxTimeout
 	}
-	if requestTimeout := s.c.RequestTimeout(); timeout < requestTimeout {
+	if count <= 0 || interval <= 0 {
 		return requestTimeout
 	}
-	return timeout
+	if interval >= uasc.MaxTimeout/count {
+		return uasc.MaxTimeout
+	}
+	keepAlive := count * interval
+	margin := keepAlive
+	if requestTimeout > margin {
+		margin = requestTimeout
+	}
+	if margin >= uasc.MaxTimeout-keepAlive {
+		return uasc.MaxTimeout
+	}
+	return keepAlive + margin
 }
 
 func (s *Subscription) notify(ctx context.Context, data *PublishNotificationData) {

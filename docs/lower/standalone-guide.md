@@ -154,7 +154,7 @@ request_timeout_ms = 3000
 
 #### 前 7 行：设备配置头
 
-| 行号 | 第 1 列（标签，任意） | 第 2 列（值） | 说明 |
+| 行号 | 第 1 列（字段标签） | 第 2 列（值） | 说明 |
 |------|----------------------|--------------|------|
 | 1 | COM | `COM3` | 串口号 |
 | 2 | BaudRate | `9600` | 波特率（覆盖全局设置） |
@@ -164,7 +164,11 @@ request_timeout_ms = 3000
 | 6 | DataLen | `32` | 期望的数据字节数 |
 | 7 | KKSPrefix | `10HNA01_` | KKS 前缀（自动拼接到每个数据点名称前） |
 
-#### 第 8 行：分隔行（自动跳过）
+前 7 行顺序固定。网页保存校验接受标准字段名及已支持的旧标签，不接受任意标签；详细规则见[采集点表 CSV 填写与校验规则](../../manager/docs/guides/acquisition-csv-rules.md)。
+
+#### 第 8 行：点表列头
+
+填写下方 9 列的列名，不要另加分隔行。旧列头 `KKS,Type,F_Type,byte_index,bit_index,Def,Max,Min,LH` 同样支持；保存校验检查列数和顺序，不自动改写文件。
 
 #### 第 9 行起：数据记录表
 
@@ -190,7 +194,6 @@ ComIndex,1
 DeviceId,1
 DataLen,32
 KKSPrefix,10HNA01_
-separator_line,,,,,,,,,
 kks,type_,f_type,byte_index,bit_index,def,max,min,lh
 RunStatus,bool,DI,1,0,0,1,0,0
 FaultAlarm,bool,DI,1,1,0,1,0,0

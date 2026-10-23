@@ -66,14 +66,14 @@ expression = "KKS001 * 2 + 5"
 		}
 	}
 	runtime.mu.RLock()
-	routeRevisionBefore := runtime.calculationRouteRevision
+	routeRevisionBefore := runtime.calculations.status().DefaultRouteRevision
 	runtime.mu.RUnlock()
 	selected, _ = runtime.routes.Session("selected-session")
 	if _, err = runtime.selectSource("selected-session", "line", "source-a", selected.Routes["line"].Revision, "test"); err != nil {
 		t.Fatal(err)
 	}
 	runtime.mu.RLock()
-	routeRevisionAfterSessionSelection := runtime.calculationRouteRevision
+	routeRevisionAfterSessionSelection := runtime.calculations.status().DefaultRouteRevision
 	runtime.mu.RUnlock()
 	if routeRevisionAfterSessionSelection != routeRevisionBefore {
 		t.Fatalf("Session selection changed calculation route revision: %d -> %d", routeRevisionBefore, routeRevisionAfterSessionSelection)

@@ -6,21 +6,9 @@ import (
 	"rcd_manager/internal/api"
 	"rcd_manager/internal/domain"
 	"rcd_manager/internal/opc"
-	"sort"
 	"strings"
 	"time"
 )
-
-type redundancyState struct {
-	view               domain.RedundancyView
-	health             map[string]domain.SourceHealth
-	identity           map[string]string
-	differences        map[string]time.Time
-	comparisonIdentity string
-	alarmKnown         bool
-	alarmActive        bool
-	alarmMessage       string
-}
 
 func validateRedundancyImport(policies []domain.RedundancyPolicy, groups []domain.Group, sources []domain.Source) ([]domain.RedundancyPolicy, error) {
 	out := make([]domain.RedundancyPolicy, 0, len(policies))
@@ -53,18 +41,7 @@ func validateRedundancyImport(policies []domain.RedundancyPolicy, groups []domai
 }
 
 func (r *Runtime) redundancyPolicyLocked(id string) domain.RedundancyPolicy {
-	if p, ok := r.redundancyPolicies[id]; ok {
-		return p.Clone()
-	}
-	return domain.DefaultRedundancyPolicy(id)
-}
-func (r *Runtime) redundancyStateLocked(id string) *redundancyState {
-	s := r.redundancyStates[id]
-	if s == nil {
-		s = &redundancyState{health: map[string]domain.SourceHealth{}, identity: map[string]string{}, differences: map[string]time.Time{}}
-		r.redundancyStates[id] = s
-	}
-	return s
+	return r.redundancy.policy(id)
 }
 func (r *Runtime) Redundancy(_ context.Context, id string) (domain.RedundancyView, error) {
 	r.configMu.RLock()
@@ -72,12 +49,7 @@ func (r *Runtime) Redundancy(_ context.Context, id string) (domain.RedundancyVie
 	if _, ok := groupByID(r.routes.Groups(), id); !ok {
 		return domain.RedundancyView{}, domain.ErrNotFound
 	}
-	v := domain.RedundancyView{ComparisonState: "Disabled", Health: []domain.SourceHealth{}, Differences: []domain.PointDifference{}}
-	if s := r.redundancyStates[id]; s != nil {
-		v = s.view
-		v.Health = append([]domain.SourceHealth{}, v.Health...)
-		v.Differences = append([]domain.PointDifference{}, v.Differences...)
-	}
+	v := r.redundancy.view(id)
 	v.Policy = r.redundancyPolicyLocked(id)
 	if v.Policy.CompareEnabled && v.EvaluatedAt.IsZero() {
 		v.ComparisonState = "Unknown"
@@ -129,14 +101,7 @@ func (r *Runtime) SaveRedundancy(ctx context.Context, id string, revision uint64
 	if err != nil {
 		return p, err
 	}
-	r.redundancyPolicies[id] = saved.Clone()
-	// Reset qualification periods after every policy edit. Never inherit an old
-	// threshold timer, but retain cooldown and the last visible switch evidence.
-	s := r.redundancyStateLocked(id)
-	s.health = map[string]domain.SourceHealth{}
-	s.identity = map[string]string{}
-	s.differences = map[string]time.Time{}
-	s.comparisonIdentity = ""
+	r.redundancy.replacePolicy(saved)
 	r.audit(ctx, "group.redundancy", id, saved.Revision, map[string]any{"policy": saved.Clone()})
 	r.broker.Publish(api.Event{Type: "redundancy.changed", Data: map[string]string{"group_id": id}})
 	return saved.Clone(), nil
@@ -174,6 +139,10 @@ func (r *Runtime) redundancyWorker() {
 	}
 }
 func rawRedundancyPoint(p indexedPoint) bool {
+	name := p.Node.Key.Identifier
+	if strings.HasPrefix(name, "RcdSync.") || name == "TransmitStatus" || name == "InputRefreshIntervalMs" || name == "InputTimeoutMs" {
+		return false
+	}
 	return !p.Node.Retired && !p.Node.Writable && p.Node.Class == domain.NodeClassVariable && p.Node.ValueRank == -1 && p.Node.Kind != "command" && p.Node.Kind != "calculation" && p.Node.Kind != "manager_calculation"
 }
 
@@ -194,11 +163,11 @@ func (r *Runtime) redundancyTick(ctx context.Context, now time.Time) {
 	active := map[string]bool{}
 	for _, group := range groups {
 		p := r.redundancyPolicyLocked(group.ID)
-		if !p.Enabled && !p.CompareEnabled && r.redundancyStates[group.ID] == nil && p.Revision == 1 {
+		if !p.Enabled && !p.CompareEnabled && !r.redundancy.hasState(group.ID) && p.Revision == 1 {
 			continue
 		}
 		active[group.ID] = true
-		s := r.redundancyStateLocked(group.ID)
+		s, version := r.redundancy.begin(group.ID)
 		v := &s.view
 		v.EvaluatedAt = now
 		v.LastError = ""
@@ -207,6 +176,7 @@ func (r *Runtime) redundancyTick(ctx context.Context, now time.Time) {
 			s.health = map[string]domain.SourceHealth{}
 			s.identity = map[string]string{}
 			r.compareGroupLocked(ctx, group.ID, p, s, index, statuses, now)
+			r.redundancy.commit(group.ID, version, s)
 			continue
 		}
 		currentMembers := map[string]bool{}
@@ -217,33 +187,24 @@ func (r *Runtime) redundancyTick(ctx context.Context, now time.Time) {
 			currentMembers[source.ID] = true
 			healthy, reason := r.redundancyHealth(source, group.ID, index, statuses[source.ID])
 			identity := fmt.Sprintf("%d/%d/%p", source.Revision, statuses[source.ID].Epoch, index)
-			old, exists := s.health[source.ID]
-			since := old.Since
-			if !exists || old.Healthy != healthy || s.identity[source.ID] != identity {
-				since = now
-			}
-			h := domain.SourceHealth{SourceID: source.ID, Healthy: healthy, Reason: reason, Since: since}
-			s.health[source.ID] = h
-			s.identity[source.ID] = identity
-			v.Health = append(v.Health, h)
+			s.observe(source.ID, identity, healthy, reason, now)
 		}
-		for id := range s.health {
-			if !currentMembers[id] {
-				delete(s.health, id)
-				delete(s.identity, id)
-			}
-		}
+		s.retainMembers(currentMembers)
 		if p.Enabled {
 			r.automaticRoutesLocked(ctx, group, p, s, now)
 		}
 		r.compareGroupLocked(ctx, group.ID, p, s, index, statuses, now)
+		r.redundancy.commit(group.ID, version, s)
 	}
-	for id, s := range r.redundancyStates {
+	for _, id := range r.redundancy.stateIDs() {
 		if !active[id] {
+			s, version := r.redundancy.begin(id)
+			s.view.LastError = ""
 			r.persistDifferenceAlarm(ctx, domain.DefaultRedundancyPolicy(id), s, false, "分组已删除")
 			if s.view.LastError == "" {
-				delete(r.redundancyStates, id)
-				delete(r.redundancyPolicies, id)
+				r.redundancy.remove(id)
+			} else {
+				r.redundancy.commit(id, version, s)
 			}
 		}
 	}
@@ -259,7 +220,7 @@ func (r *Runtime) redundancyHealth(source domain.Source, group string, index *ca
 	if status.Connection != opc.ConnectionConnected || status.Session != opc.SessionActive || status.Subscription != opc.SubscriptionActive {
 		return false, "OPC 连接或订阅不可用"
 	}
-	if r.sourceOperations[source.ID] || r.sourceProcessOperations[source.ID] != "" {
+	if r.maintenance.maintained(source.ID) {
 		return false, "来源维护中"
 	}
 	count := 0
@@ -296,31 +257,12 @@ func (r *Runtime) redundancyHealth(source domain.Source, group string, index *ca
 }
 
 func (r *Runtime) automaticRoutesLocked(ctx context.Context, group domain.Group, p domain.RedundancyPolicy, s *redundancyState, now time.Time) {
-	if r.routes.PendingCount(group.ID) > 0 {
-		s.view.LastError = "命令等待 ACK，自动切源已锁定"
-		return
-	}
-	if !s.view.LastSwitchAt.IsZero() && now.Sub(s.view.LastSwitchAt) < time.Duration(p.CooldownSeconds)*time.Second {
-		return
-	}
-	target := ""
-	for _, id := range p.Priority {
-		h, ok := s.health[id]
-		if ok && h.Healthy && now.Sub(h.Since) >= time.Duration(p.HealthySeconds)*time.Second {
-			target = id
-			break
-		}
-	}
-	shouldSwitch := func(current string) bool {
-		h, ok := s.health[current]
-		return current != "" && ok && !h.Healthy && now.Sub(h.Since) >= time.Duration(p.FailureSeconds)*time.Second && target != "" && target != current
-	}
-	// No automatic failback: a recovered higher-priority member does not replace
-	// a currently healthy selection. Empty selections remain deliberate/unassigned.
+	selection := s.automaticSelection(p, r.routes.PendingCount(group.ID) > 0, now)
+	target := selection.target
 	if target == "" {
-		s.view.LastError = "没有经过稳定确认的健康备用来源"
 		return
 	}
+	// No automatic failback or filling an intentionally empty selection.
 	// Status callbacks do not all take configMu. Recheck the candidate against
 	// the latest connection before applying a decision made from the tick snapshot.
 	source, err := r.source(target)
@@ -341,7 +283,7 @@ func (r *Runtime) automaticRoutesLocked(ctx context.Context, group domain.Group,
 		s.view.LastSwitchAt = now
 		s.view.LastSwitchReason = fmt.Sprintf("%s：%s → %s；%s", targetRoute, from, to, s.health[from].Reason)
 	}
-	if p.DefaultAutomatic && shouldSwitch(group.DefaultSourceID) {
+	if p.DefaultAutomatic && selection.shouldSwitch(group.DefaultSourceID) {
 		before := group.DefaultSourceID
 		updated, err := r.setDefaultLocked(ctx, group.ID, target, group.Revision, "automatic")
 		if err != nil {
@@ -353,7 +295,7 @@ func (r *Runtime) automaticRoutesLocked(ctx context.Context, group domain.Group,
 	}
 	for _, session := range r.routes.Sessions() {
 		route, ok := session.Routes[group.ID]
-		if !ok || !route.Automatic || !shouldSwitch(route.SourceID) {
+		if !ok || !route.Automatic || !selection.shouldSwitch(route.SourceID) {
 			continue
 		}
 		updated, err := r.routes.SelectAutomatic(session.ID, group.ID, target, route.Revision)
@@ -370,82 +312,20 @@ func (r *Runtime) automaticRoutesLocked(ctx context.Context, group domain.Group,
 }
 
 func (r *Runtime) compareGroupLocked(ctx context.Context, group string, p domain.RedundancyPolicy, s *redundancyState, index *catalogIndex, statuses map[string]opc.LowerStatus, now time.Time) {
-	v := &s.view
-	v.ComparedCount = 0
-	v.SkippedCount = 0
-	v.DifferenceCount = 0
-	v.Differences = []domain.PointDifference{}
-	if !p.CompareEnabled {
-		v.ComparisonState = "Disabled"
-		s.differences = map[string]time.Time{}
-		r.persistDifferenceAlarm(ctx, p, s, false, "差异检测已关闭")
-		return
-	}
-	if index == nil {
-		v.ComparisonState = "Unknown"
-		return
-	}
 	identity := fmt.Sprintf("%d/%p/%d/%d", p.Revision, index, statuses[p.LeftSourceID].Epoch, statuses[p.RightSourceID].Epoch)
-	if identity != s.comparisonIdentity {
-		s.differences = map[string]time.Time{}
-		s.comparisonIdentity = identity
-	}
-	leftOK := s.health[p.LeftSourceID].Healthy
-	rightOK := s.health[p.RightSourceID].Healthy
-	seen := map[string]bool{}
-	for _, point := range index.groupPoints[group] {
-		if !rawRedundancyPoint(point) {
-			continue
+	update := s.compare(p, index != nil, identity, now, func(yield func(string, domain.Sample, domain.Sample, bool)) {
+		for _, point := range index.groupPoints[group] {
+			if !rawRedundancyPoint(point) {
+				continue
+			}
+			a, aOK := r.cache.Get(p.LeftSourceID, point.Node.Key)
+			b, bOK := r.cache.Get(p.RightSourceID, point.Node.Key)
+			current := aOK && bOK && a.Epoch == statuses[p.LeftSourceID].Epoch && b.Epoch == statuses[p.RightSourceID].Epoch
+			yield(point.Node.Key.Identifier, a, b, current)
 		}
-		id := point.Node.Key.Identifier
-		seen[id] = true
-		a, aOK := r.cache.Get(p.LeftSourceID, point.Node.Key)
-		b, bOK := r.cache.Get(p.RightSourceID, point.Node.Key)
-		different, comparable := domain.CompareSamples(a, b, p)
-		if !leftOK || !rightOK || !aOK || !bOK || a.Epoch != statuses[p.LeftSourceID].Epoch || b.Epoch != statuses[p.RightSourceID].Epoch || !comparable {
-			v.SkippedCount++
-			delete(s.differences, id)
-			continue
-		}
-		v.ComparedCount++
-		if !different {
-			delete(s.differences, id)
-			continue
-		}
-		since, ok := s.differences[id]
-		if !ok {
-			since = now
-			s.differences[id] = since
-		}
-		if now.Sub(since) < time.Duration(p.DifferenceSeconds)*time.Second {
-			continue
-		}
-		v.DifferenceCount++
-		if len(v.Differences) < 20 {
-			v.Differences = append(v.Differences, domain.PointDifference{NodeID: id, Left: a.Value, Right: b.Value, Since: since})
-		}
-	}
-	for id := range s.differences {
-		if !seen[id] {
-			delete(s.differences, id)
-		}
-	}
-	sort.Slice(v.Differences, func(i, j int) bool { return v.Differences[i].NodeID < v.Differences[j].NodeID })
-	switch {
-	case v.DifferenceCount > 0:
-		v.ComparisonState = "Different"
-		names := []string{}
-		for _, d := range v.Differences {
-			names = append(names, d.NodeID)
-		}
-		r.persistDifferenceAlarm(ctx, p, s, true, fmt.Sprintf("组 %s：%s 与 %s 有 %d 个持续差异点；%s", group, p.LeftSourceID, p.RightSourceID, v.DifferenceCount, strings.Join(names, ", ")))
-	case v.SkippedCount > 0 || v.ComparedCount == 0:
-		v.ComparisonState = "Unknown" // unavailable must not resolve an existing alarm
-	case len(s.differences) > 0:
-		v.ComparisonState = "Confirming"
-	default:
-		v.ComparisonState = "Equal"
-		r.persistDifferenceAlarm(ctx, p, s, false, "数据差异已恢复")
+	})
+	if update != nil {
+		r.persistDifferenceAlarm(ctx, p, s, update.active, update.message)
 	}
 }
 func (r *Runtime) persistDifferenceAlarm(ctx context.Context, p domain.RedundancyPolicy, s *redundancyState, active bool, message string) {

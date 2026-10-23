@@ -111,9 +111,13 @@ func (s *UpstreamServer) addBusinessVariableLocked(spec domain.CatalogNode) (*bu
 		access |= awu.AccessLevelsCurrentWrite
 	}
 	entry := &businessEntry{spec: spec}
+	description := ""
+	if strings.HasPrefix(spec.Key.Identifier, "DATA.Buildings.") && strings.HasSuffix(spec.Key.Identifier, ".Fire") && spec.DataType == domain.DataTypeUInt32 {
+		description = SynchronizationFireDescription
+	}
 	node := awserver.NewVariableNode(
 		s.server, id, awu.NewQualifiedName(s.businessNS, spec.BrowseName),
-		awu.NewLocalizedText(spec.BrowseName, ""), awu.NewLocalizedText("", ""), nil,
+		awu.NewLocalizedText(spec.BrowseName, ""), awu.NewLocalizedText(description, ""), nil,
 		[]awu.Reference{
 			awu.NewReference(awu.ReferenceTypeIDHasTypeDefinition, false, awu.NewExpandedNodeID(awu.VariableTypeIDBaseDataVariableType)),
 			awu.NewReference(awu.ReferenceTypeIDHasComponent, true, awu.NewExpandedNodeID(s.devicesID)),
@@ -126,6 +130,12 @@ func (s *UpstreamServer) addBusinessVariableLocked(spec domain.CatalogNode) (*bu
 	})
 	if spec.Writable {
 		node.SetWriteValueHandler(func(session *awserver.Session, req awu.WriteValue) (awu.DataValue, awu.StatusCode) {
+			if IsSynchronizationInput(spec.Key) && req.IndexRange != "" {
+				return awu.DataValue{}, awu.BadIndexRangeInvalid
+			}
+			if IsSynchronizationInput(spec.Key) && uint32(req.Value.StatusCode)&0xC0000000 != 0 {
+				return awu.DataValue{}, awu.BadInvalidArgument
+			}
 			if entry.retired.Load() {
 				return awu.NewDataValue(req.Value.Value, awu.BadOutOfService, time.Time{}, 0, time.Now(), 0), awu.BadOutOfService
 			}
@@ -459,7 +469,7 @@ func (s *UpstreamServer) addGroupManagementLocked(group domain.Group, members, p
 				_, err := s.backend.SetDefaultSource(group.ID, selected, current.Revision)
 				return statusFromBackend(domain.StatusGood, err)
 			}},
-		{name: "SelectedSourceId", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, writable: true,
+		{name: "SelectedSourceId", description: "Current Session's selected source. Legacy String write has no caller-supplied revision; use SelectSource for compare-and-set.", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankScalar, writable: true,
 			read: func(sid string) (any, awu.StatusCode) {
 				session, err := s.backend.Session(sid)
 				if err != nil {
@@ -487,7 +497,7 @@ func (s *UpstreamServer) addGroupManagementLocked(group domain.Group, members, p
 				_, err = s.backend.SelectSource(sid, group.ID, selected, route.Revision)
 				return statusFromBackend(domain.StatusGood, err)
 			}},
-		{name: "SelectionRevision", dataType: awu.DataTypeIDUInt64, valueRank: awu.ValueRankScalar,
+		{name: "SelectionRevision", description: "Current Session/group route revision. Pass as ExpectedRevision to SelectSource; not the lower TransmitStatus revision.", dataType: awu.DataTypeIDUInt64, valueRank: awu.ValueRankScalar,
 			read: func(sid string) (any, awu.StatusCode) {
 				session, err := s.backend.Session(sid)
 				if err != nil {
@@ -499,7 +509,7 @@ func (s *UpstreamServer) addGroupManagementLocked(group domain.Group, members, p
 				}
 				return route.Revision, awu.Good
 			}},
-		{name: "MemberSourceIds", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankOneDimension,
+		{name: "MemberSourceIds", description: "Configured group member IDs, including offline, disabled or unselectable members. Inspect Members/<source>/Selectable, ConnectionState and CompleteCoverage.", dataType: awu.DataTypeIDString, valueRank: awu.ValueRankOneDimension,
 			read: func(_ string) (any, awu.StatusCode) {
 				current := make([]string, 0, len(members))
 				for _, source := range s.backend.Sources() {
@@ -528,11 +538,30 @@ func (s *UpstreamServer) addGroupManagementLocked(group domain.Group, members, p
 		{name: "PendingCommandCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar,
 			read: func(_ string) (any, awu.StatusCode) { return uint32(s.backend.PendingCount(group.ID)), awu.Good }},
 	}
+	if backend, ok := s.backend.(interface{ CommandQueueCounts(string) (uint32, uint32) }); ok {
+		definitions = append(definitions,
+			managementVariable{name: "QueuedCommandCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar,
+				read: func(_ string) (any, awu.StatusCode) {
+					queued, _ := backend.CommandQueueCounts(group.ID)
+					return queued, awu.Good
+				}},
+			managementVariable{name: "ExecutingCommandCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar,
+				read: func(_ string) (any, awu.StatusCode) {
+					_, executing := backend.CommandQueueCounts(group.ID)
+					return executing, awu.Good
+				}},
+			managementVariable{name: "CommandQueueCapacityPerPort", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar,
+				read: func(_ string) (any, awu.StatusCode) { return uint32(domain.CommandQueueCapacity), awu.Good }},
+		)
+	}
 	definitions = append(definitions, s.redundancyVariables(group.ID)...)
 	for _, definition := range definitions {
 		if err := s.addManagementVariableLocked(objectID, "Groups/"+group.ID+"/"+definition.name, definition); err != nil {
 			return err
 		}
+	}
+	if err := s.addGroupSelectionMethodLocked(group.ID, objectID); err != nil {
+		return err
 	}
 	return s.addGroupCommandNodesLocked(group.ID, objectID)
 }
@@ -856,6 +885,7 @@ func stationRawValue(value *uint16) uint16 {
 
 type managementVariable struct {
 	name                    string
+	description             string
 	dataType                awu.NodeID
 	valueRank               int32
 	minimumSamplingInterval float64
@@ -887,7 +917,7 @@ func (s *UpstreamServer) addManagementVariableLocked(parent awu.NodeID, id strin
 		return nil
 	}
 	node := awserver.NewVariableNode(
-		s.server, nodeID, awu.NewQualifiedName(s.managementNS, definition.name), awu.NewLocalizedText(definition.name, ""), awu.NewLocalizedText("", ""), nil,
+		s.server, nodeID, awu.NewQualifiedName(s.managementNS, definition.name), awu.NewLocalizedText(definition.name, ""), awu.NewLocalizedText(definition.description, ""), nil,
 		[]awu.Reference{
 			awu.NewReference(awu.ReferenceTypeIDHasTypeDefinition, false, awu.NewExpandedNodeID(awu.VariableTypeIDBaseDataVariableType)),
 			awu.NewReference(awu.ReferenceTypeIDHasComponent, true, awu.NewExpandedNodeID(parent)),

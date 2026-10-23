@@ -3,6 +3,7 @@ package opc
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"rcd_manager/internal/domain"
@@ -16,10 +17,18 @@ const (
 	DefaultMonitorBatchSize = 500
 	// The current Rust lower caps an OPC Session timeout at 60 seconds and does
 	// not treat Publish traffic as Session activity. Probe well inside that cap.
-	DefaultSessionProbeInterval = 20 * time.Second
+	DefaultSessionProbeInterval    = 20 * time.Second
+	SynchronizationFireDescription = "UInt32：0=未知（仅接收）；1=正常；2=红色报警；3=红色报警闪；4=黄色报警；5=黄色报警闪；6=故障报警；7=故障报警闪；8=闭锁。故障细因不能由现有报文区分。发送只接受1..8。"
 )
 
 var ErrLowerUnavailable = errors.New("lower OPC source is unavailable")
+
+// Original inter-unit document names are forwarded as typed state inputs.
+// Read-only nodes are still rejected by the selected catalog's access check.
+// Retain recognition of old communication versions during rolling upgrades.
+func IsSynchronizationInput(key domain.NodeKey) bool {
+	return key.NamespaceURI == BusinessNamespaceURI && (strings.HasPrefix(key.Identifier, "DATA.") || key.Identifier == "TransmitSnapshot" || strings.HasPrefix(key.Identifier, "RcdSync."))
+}
 
 type ConnectionState string
 
@@ -105,6 +114,7 @@ func (NopLowerSink) OnCatalog(domain.SourceCatalog)                 {}
 func (NopLowerSink) OnSample(string, domain.NodeKey, domain.Sample) {}
 
 type LowerConfig struct {
+	ExpectedGatewayID    string
 	Source               domain.Source
 	Password             string
 	CertificateFile      string
@@ -125,6 +135,13 @@ type LowerClient interface {
 	Write(context.Context, domain.NodeKey, any) (domain.StatusCode, error)
 	Call(context.Context, domain.NodeKey, string) (string, domain.StatusCode, error)
 	Status() LowerStatus
+}
+
+// LegacyCommandClient fences subscription delivery while establishing the
+// pre-write ACK baseline. ready resets the coordinator's provisional ACKs;
+// false means its original reservation expired and no write may be sent.
+type LegacyCommandClient interface {
+	WriteLegacyCommandAtEpoch(context.Context, domain.NodeKey, any, uint64, func() bool) (domain.StatusCode, error)
 }
 
 // EpochPinnedLowerClient is implemented by supervisors that can bind a command

@@ -141,7 +141,7 @@ func TestConflictCallbackRechecksEpochGenerationAndClosingAfterWaiting(t *testin
 			runtime.running.Store(true)
 			defer runtime.running.Store(false)
 			runtime.mu.Lock()
-			runtime.generations["source-b"] = 1
+			runtime.connections.begin("source-b")
 			runtime.statuses["source-b"] = connectedStatus("source-b", 1<<32|1)
 			runtime.mu.Unlock()
 			conflict := connectedStatus("source-b", 1<<32|1)
@@ -163,7 +163,7 @@ func TestConflictCallbackRechecksEpochGenerationAndClosingAfterWaiting(t *testin
 			case "epoch":
 				runtime.statuses["source-b"] = connectedStatus("source-b", 1<<32|2)
 			case "generation":
-				runtime.generations["source-b"] = 2
+				runtime.connections.stop("source-b")
 				runtime.statuses["source-b"] = connectedStatus("source-b", 2<<32|1)
 			case "closing":
 				runtime.closing.Store(true)
@@ -178,7 +178,7 @@ func TestConflictCallbackRechecksEpochGenerationAndClosingAfterWaiting(t *testin
 			}
 			runtime.mu.RLock()
 			catalog, status := runtime.catalogs["source-b"], runtime.statuses["source-b"]
-			_, dirty := runtime.dirtyCatalogs["source-b"]
+			dirty := runtime.catalogPersistence.contains("source-b")
 			runtime.mu.RUnlock()
 			after, err := runtime.routes.Route("session", "line")
 			if catalog.QuarantineReason != "" || catalog.State == domain.CatalogConflict || dirty || status.Epoch != wantStatus.Epoch || status.Catalog != wantStatus.Catalog || err != nil || after != before {
@@ -291,12 +291,12 @@ func TestClosedRuntimeRejectsLateCatalogPreflightFailure(t *testing.T) {
 	runtime := seededRuntime(t)
 	entered, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	runtime.mu.Lock()
-	runtime.generations["source-b"] = 1
-	runtime.catalogValidator = func(domain.CatalogUnion, []domain.Group, []domain.Source) error {
+	runtime.connections.begin("source-b")
+	runtime.publication.configure(func(domain.CatalogUnion, []domain.Group, []domain.Source) error {
 		close(entered)
 		<-release
 		return errors.New("obsolete preflight rejection")
-	}
+	}, nil)
 	runtime.mu.Unlock()
 	runtime.running.Store(true)
 	defer runtime.running.Store(false)
@@ -308,7 +308,7 @@ func TestClosedRuntimeRejectsLateCatalogPreflightFailure(t *testing.T) {
 	runtime.mu.Lock()
 	runtime.closing.Store(true)
 	runtime.running.Store(false)
-	runtime.generations["source-b"]++
+	runtime.connections.stop("source-b")
 	runtime.mu.Unlock()
 	close(release)
 	select {
@@ -317,7 +317,7 @@ func TestClosedRuntimeRejectsLateCatalogPreflightFailure(t *testing.T) {
 		t.Fatal("late preflight callback did not return")
 	}
 	runtime.mu.RLock()
-	catalog, reconcileError := runtime.catalogs["source-b"], runtime.upstreamReconcileError
+	catalog, reconcileError := runtime.catalogs["source-b"], runtime.upstreamCatalogErrorLocked()
 	runtime.mu.RUnlock()
 	if catalog.QuarantineReason != "" || catalog.State == domain.CatalogConflict || reconcileError != "" {
 		t.Fatalf("late preflight failure mutated a closed runtime: reason=%q state=%q reconcile_error=%q", catalog.QuarantineReason, catalog.State, reconcileError)

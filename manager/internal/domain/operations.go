@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"encoding/json"
 	"fmt"
 	"path"
 	"strconv"
@@ -20,24 +21,25 @@ const (
 // OperationRequest is a bounded, library-independent lower operations request.
 // SourceID is intentionally absent: Runtime pins that physical target before I/O.
 type OperationRequest struct {
-	Action                  string  `json:"action"`
-	PortID                  string  `json:"port_id,omitempty"`
-	DeviceID                string  `json:"device_id,omitempty"`
-	ModuleType              string  `json:"module_type,omitempty"`
-	Mode                    string  `json:"mode,omitempty"`
-	LogLevel                string  `json:"log_level,omitempty"`
-	Enabled                 *bool   `json:"enabled,omitempty"`
-	ExpectedRevision        string  `json:"expected_revision,omitempty"`
-	ExpectedStationRevision string  `json:"expected_station_revision,omitempty"`
-	Name                    string  `json:"name,omitempty"`
-	BackupID                string  `json:"backup_id,omitempty"`
-	Content                 *string `json:"content,omitempty"`
-	Generation              string  `json:"generation,omitempty"`
-	Offset                  *int64  `json:"offset,omitempty"`
-	Limit                   int64   `json:"limit,omitempty"`
-	Query                   string  `json:"query,omitempty"`
-	Level                   string  `json:"level,omitempty"`
-	Tail                    bool    `json:"tail,omitempty"`
+	Action                  string          `json:"action"`
+	PortID                  string          `json:"port_id,omitempty"`
+	DeviceID                string          `json:"device_id,omitempty"`
+	ModuleType              string          `json:"module_type,omitempty"`
+	Mode                    string          `json:"mode,omitempty"`
+	LogLevel                string          `json:"log_level,omitempty"`
+	Enabled                 *bool           `json:"enabled,omitempty"`
+	ExpectedRevision        string          `json:"expected_revision,omitempty"`
+	ExpectedStationRevision string          `json:"expected_station_revision,omitempty"`
+	Name                    string          `json:"name,omitempty"`
+	BackupID                string          `json:"backup_id,omitempty"`
+	Content                 *string         `json:"content,omitempty"`
+	Edits                   json.RawMessage `json:"edits,omitempty"`
+	Generation              string          `json:"generation,omitempty"`
+	Offset                  *int64          `json:"offset,omitempty"`
+	Limit                   int64           `json:"limit,omitempty"`
+	Query                   string          `json:"query,omitempty"`
+	Level                   string          `json:"level,omitempty"`
+	Tail                    bool            `json:"tail,omitempty"`
 }
 
 func (r OperationRequest) Mutates() bool {
@@ -58,6 +60,8 @@ func (r OperationRequest) Feature() string {
 		return "logging_configuration"
 	case "list_configs", "read_config", "validate_config", "write_config":
 		return "configuration"
+	case "prepare_config":
+		return "configuration_forms"
 	case "list_logs", "read_log":
 		return "logs"
 	default:
@@ -119,7 +123,7 @@ func (r OperationRequest) Validate() error {
 		return invalid("log_level", "is only valid for set_logging_level")
 	}
 	switch r.Action {
-	case "read_config", "validate_config", "write_config", "read_log":
+	case "read_config", "validate_config", "write_config", "prepare_config", "read_log":
 		if !ValidOperationResourceName(r.Name) {
 			return invalid("name", "select a listed resource name, not a path")
 		}
@@ -127,7 +131,7 @@ func (r OperationRequest) Validate() error {
 	if r.BackupID != "" && !ValidOperationResourceName(r.BackupID) {
 		return invalid("backup_id", "invalid backup resource identifier")
 	}
-	if r.Action == "validate_config" || r.Action == "write_config" {
+	if r.Action == "validate_config" || r.Action == "write_config" || r.Action == "prepare_config" {
 		if r.Content == nil {
 			return invalid("content", "configuration text is required")
 		}
@@ -139,6 +143,9 @@ func (r OperationRequest) Validate() error {
 		}
 	}
 	if r.Action == "read_log" {
+		if len(r.Edits) > 0 {
+			return invalid("edits", "only supported for draft preparation")
+		}
 		if r.Offset != nil && *r.Offset < 0 {
 			return invalid("offset", "must not be negative")
 		}
@@ -155,6 +162,12 @@ func (r OperationRequest) Validate() error {
 		case "", "TRACE", "DEBUG", "INFO", "WARN", "ERROR":
 		default:
 			return invalid("level", "unsupported log level")
+		}
+	}
+	if len(r.Edits) > 0 {
+		var edits []json.RawMessage
+		if r.Action != "prepare_config" || len(r.Edits) > MaxOperationConfigBytes || json.Unmarshal(r.Edits, &edits) != nil || len(edits) > 4096 {
+			return invalid("edits", "expected a bounded configuration draft edit array")
 		}
 	}
 	return nil

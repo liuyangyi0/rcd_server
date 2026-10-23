@@ -235,12 +235,36 @@ impl DeviceConfig {
 //  CSV 解析入口
 // ============================================================
 
+// Older point tables use COM/BaudRate/.../Pre and KKS/Type/.../LH.
+// Accept those labels without rewriting data or weakening column order checks.
+fn csv_label_matches(actual: &str, expected: &str) -> bool {
+    let actual = actual.trim().replace('_', "").to_ascii_lowercase();
+    let expected = expected.replace('_', "").to_ascii_lowercase();
+    actual == expected || (expected == "kksprefix" && actual == "pre")
+}
+
 /// 运维保存前的严格校验。与启动解析器分开，避免改变已有采集行为；
 /// 不把非法布尔值、越界点、未知类型或重复 KKS 静默当成有效配置。
 pub fn validate_csv_content(content: &str) -> Result<(Config, Vec<Record>), String> {
+    validate_csv_content_inner(content, None)
+}
+
+/// 保存配置时保留点地址/位范围诊断，但不让可恢复的点表问题阻止配置更新。
+/// 文件结构、通信头部、类型及身份冲突仍严格校验；不修复或丢弃任何记录。
+pub fn validate_csv_content_with_point_warnings(
+    content: &str,
+    mut warning: impl FnMut(String),
+) -> Result<(Config, Vec<Record>), String> {
+    validate_csv_content_inner(content, Some(&mut warning))
+}
+
+fn validate_csv_content_inner(
+    content: &str,
+    mut warning: Option<&mut dyn FnMut(String)>,
+) -> Result<(Config, Vec<Record>), String> {
     let mut reader = ReaderBuilder::new()
         .has_headers(false)
-        .from_reader(content.as_bytes());
+        .from_reader(content.trim_start_matches('\u{feff}').as_bytes());
     let mut rows = reader.records();
     let fields = [
         "com",
@@ -257,7 +281,10 @@ pub fn validate_csv_content(content: &str) -> Result<(Config, Vec<Record>), Stri
             .next()
             .ok_or_else(|| format!("第 {} 行缺少配置字段 {field}", index + 1))?
             .map_err(|error| error.to_string())?;
-        if row.get(0).map(str::trim) != Some(*field) {
+        if !row
+            .get(0)
+            .is_some_and(|actual| csv_label_matches(actual, field))
+        {
             return Err(format!("第 {} 行应为配置字段 {field}", index + 1));
         }
         headers.push(row.get(1).unwrap_or_default().to_string());
@@ -269,10 +296,18 @@ pub fn validate_csv_content(content: &str) -> Result<(Config, Vec<Record>), Stri
     if headers[6].chars().any(char::is_control) {
         return Err("kks_prefix 不能包含控制字符".to_string());
     }
+    // FALSE is the deployed spelling of the runtime's existing false value.
+    // Do not case-fold TRUE: the old startup parser treats it as false, so
+    // accepting it as true here would silently change special-port semantics.
+    let is_special = if headers[2].trim().eq_ignore_ascii_case("false") {
+        false
+    } else {
+        parse_required(&headers, 2, "is_special").map_err(|e| e.to_string())?
+    };
     let config = Config {
         com,
         baud_rate: parse_required(&headers, 1, "baud_rate").map_err(|e| e.to_string())?,
-        is_special: parse_required(&headers, 2, "is_special").map_err(|e| e.to_string())?,
+        is_special,
         com_index: parse_required(&headers, 3, "com_index").map_err(|e| e.to_string())?,
         device_id: parse_required(&headers, 4, "device_id").map_err(|e| e.to_string())?,
         data_len: parse_required(&headers, 5, "data_len").map_err(|e| e.to_string())?,
@@ -285,7 +320,13 @@ pub fn validate_csv_content(content: &str) -> Result<(Config, Vec<Record>), Stri
         .next()
         .ok_or_else(|| "第 8 行缺少点表列头".to_string())?
         .map_err(|error| error.to_string())?;
-    if columns.iter().collect::<Vec<_>>() != RECORD_CSV_HEADER.split(',').collect::<Vec<_>>() {
+    let expected_columns: Vec<_> = RECORD_CSV_HEADER.split(',').collect();
+    if columns.len() != expected_columns.len()
+        || !columns
+            .iter()
+            .zip(expected_columns)
+            .all(|(actual, expected)| csv_label_matches(actual, expected))
+    {
         return Err(format!("第 8 行列头必须为 {RECORD_CSV_HEADER}"));
     }
     let mut records = Vec::new();
@@ -322,7 +363,11 @@ pub fn validate_csv_content(content: &str) -> Result<(Config, Vec<Record>), Stri
         // Keep the startup parser's existing warning behaviour unchanged.
         let max_status_bytes = usize::from(config.data_len) + 1;
         if let Some(reason) = record_bounds_error(&record, max_status_bytes) {
-            return Err(format!("第 {row_number} 行 {}: {reason}", record.kks));
+            let message = format!("第 {row_number} 行 {}: {reason}", record.kks);
+            match warning.as_mut() {
+                Some(report) => report(message),
+                None => return Err(message),
+            }
         }
         records.push(record);
     }
@@ -510,6 +555,159 @@ kks,type_,f_type,byte_index,bit_index,def,max,min,lh
              {RECORD_CSV_HEADER}\n\
              VALUE,uint,status,{byte_index},{bit_index},0,255,0,0\n"
         )
+    }
+
+    fn legacy_strict_fixture(data_len: u8, byte_index: u32, bit_index: &str) -> String {
+        let mut content = strict_fixture(data_len, byte_index, bit_index);
+        for (canonical, legacy) in [
+            ("com,", "COM,"),
+            ("baud_rate,", "BaudRate,"),
+            ("is_special,false,", "IsSpecial,FALSE,"),
+            ("com_index,", "ComIndex,"),
+            ("device_id,", "DeviceID,"),
+            ("data_len,", "DataLen,"),
+            ("kks_prefix,", "Pre,"),
+            (
+                RECORD_CSV_HEADER,
+                "KKS,Type,F_Type,byte_index,bit_index,Def,Max,Min,LH",
+            ),
+        ] {
+            content = content.replace(canonical, legacy);
+        }
+        content
+    }
+
+    #[test]
+    fn strict_csv_legacy_labels_and_false_match_runtime_values() {
+        let content = legacy_strict_fixture(8, 1, "0.7");
+        let (_directory, path) = write_tmp(&content);
+        let (running, running_records) = parse_csv(&path).unwrap();
+        let (validated, validated_records) = validate_csv_content(&content).unwrap();
+        assert_eq!(validated.com, running.com);
+        assert_eq!(validated.baud_rate, running.baud_rate);
+        assert_eq!(validated.is_special, running.is_special);
+        assert_eq!(validated.com_index, running.com_index);
+        assert_eq!(validated.device_id, running.device_id);
+        assert_eq!(validated.data_len, running.data_len);
+        assert_eq!(validated.kks_prefix, running.kks_prefix);
+        assert_eq!(validated_records[0].type_, running_records[0].type_);
+        assert_eq!(validated_records[0].kks, "PX_VALUE");
+        assert_eq!(
+            parsed_wire_values(&validated_records, &[0xaa, 0xbb]),
+            parsed_wire_values(&running_records, &[0xaa, 0xbb])
+        );
+        assert!(
+            content.contains("IsSpecial,FALSE"),
+            "validation must not rewrite the input"
+        );
+    }
+
+    #[test]
+    fn strict_csv_legacy_bom_crlf_and_label_spacing_are_accepted() {
+        let content = format!(
+            "\u{feff}{}",
+            legacy_strict_fixture(8, 1, "0.7")
+                .replace("COM,COM1", " CoM ,COM1")
+                .replace("BaudRate,", " BAUD_RATE ,")
+                .replace("KKS,Type,F_Type,", " KKS , Type , F_Type ,")
+                .replace('\n', "\r\n")
+        );
+        let (_, records) = validate_csv_content(&content).unwrap();
+        assert_eq!(records[0].kks, "PX_VALUE");
+    }
+
+    #[test]
+    fn strict_csv_legacy_keeps_header_order_and_column_validation() {
+        for content in [
+            legacy_strict_fixture(8, 1, "0.7").replacen("COM,COM1", "Unknown,COM1", 1),
+            legacy_strict_fixture(8, 1, "0.7").replace("BaudRate,9600", "DeviceID,9600"),
+            legacy_strict_fixture(8, 1, "0.7").replace("KKS,Type,F_Type", "Type,KKS,F_Type"),
+            legacy_strict_fixture(8, 1, "0.7").replace("KKS,Type,F_Type", "KKS,Unknown,F_Type"),
+        ] {
+            assert!(
+                validate_csv_content(&content).is_err(),
+                "accepted invalid legacy labels"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_csv_legacy_still_rejects_invalid_data_and_duplicates() {
+        let valid = legacy_strict_fixture(1, 1, "0.7");
+        for content in [
+            valid.replace("FALSE", "maybe"),
+            valid.replace("VALUE,uint", "VALUE,unknown"),
+            valid.replace("VALUE,uint,status,1", "VALUE,uint,status,3"),
+            valid.replace("status,1,0.7", "status,1,8"),
+            format!("{valid}VALUE,uint,status,1,0.7,0,255,0,0\n"),
+        ] {
+            assert!(
+                validate_csv_content(&content).is_err(),
+                "accepted invalid legacy data"
+            );
+        }
+    }
+
+    #[test]
+    fn point_warnings_keep_invalid_addresses_and_report_each_row_without_rewriting() {
+        for (byte, bits, expected) in [
+            (20, "0.15", "byte_index=20"),
+            (0, "0", "byte_index=0"),
+            (1, "8", "单字节位范围"),
+            (1, "9.2", "起点大于终点"),
+            (1, "0.32", "32 位上限"),
+            (2, "0.15", "需要访问第 3 字节"),
+        ] {
+            let content = legacy_strict_fixture(1, byte, bits);
+            let mut warnings = Vec::new();
+            let (_, records) = validate_csv_content_with_point_warnings(&content, |message| {
+                warnings.push(message)
+            })
+            .unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].byte_index, byte);
+            assert_eq!(records[0].kks, "PX_VALUE");
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("第 9 行 PX_VALUE"));
+            assert!(warnings[0].contains(expected), "{}", warnings[0]);
+            assert!(validate_csv_content(&content).is_err());
+        }
+        let content = format!(
+            "{}OTHER,uint,status,22,0,0,255,0,0\n",
+            legacy_strict_fixture(1, 20, "0")
+        );
+        let mut warnings = Vec::new();
+        let (_, records) =
+            validate_csv_content_with_point_warnings(&content, |message| warnings.push(message))
+                .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[1].contains("第 10 行 PX_OTHER"));
+    }
+
+    #[test]
+    fn point_warnings_do_not_relax_file_structure_types_or_duplicate_identities() {
+        let valid = legacy_strict_fixture(8, 1, "0");
+        for content in [
+            valid.replace("FALSE", "maybe"),
+            valid.replace("VALUE,uint", "VALUE,unknown"),
+            valid.replace("BaudRate,9600", "BaudRate,invalid"),
+            valid.replace("KKS,Type", "Unknown,Type"),
+            format!("{valid}VALUE,uint,status,20,0,0,255,0,0\n"),
+        ] {
+            assert!(validate_csv_content_with_point_warnings(&content, |_| {}).is_err());
+        }
+    }
+
+    #[test]
+    fn strict_csv_does_not_silently_enable_legacy_uppercase_true() {
+        let content = legacy_strict_fixture(8, 1, "0.7").replace("FALSE", "TRUE");
+        let (_directory, path) = write_tmp(&content);
+        assert!(!parse_csv(path).unwrap().0.is_special);
+        assert!(validate_csv_content(&content).is_err());
+        // Explicit canonical true remains supported, exactly as at startup.
+        let explicit = content.replace("TRUE", "true");
+        assert!(validate_csv_content(&explicit).unwrap().0.is_special);
     }
 
     fn parsed_wire_values(records: &[Record], status: &[u8]) -> crate::model::Value {

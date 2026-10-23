@@ -13,17 +13,25 @@ import (
 
 type calculationServiceStub struct {
 	fakeService
-	draft         calculation.Draft
-	page          PageRequest
-	savedExpected uint64
-	savedContent  string
-	importSource  string
-	importRevision uint64
-	activateErr   error
+	draft           calculation.Draft
+	page            PageRequest
+	savedExpected   uint64
+	savedContent    string
+	importSource    string
+	importRevision  uint64
+	activateErr     error
+	statusRevision  *uint64
+	restoreExpected uint64
+	restoreCalls    int
+	restoreErr      error
 }
 
 func (f *calculationServiceStub) GetCalculationStatus(context.Context) (CalculationStatus, error) {
-	return CalculationStatus{RoutingMode: "DefaultSources", ActiveRevision: 4, RuleCount: 6683}, nil
+	revision := uint64(4)
+	if f.statusRevision != nil {
+		revision = *f.statusRevision
+	}
+	return CalculationStatus{RoutingMode: "DefaultSources", ActiveRevision: revision, RuleCount: 6683}, nil
 }
 func (f *calculationServiceStub) ListCalculationResults(_ context.Context, request PageRequest) (CalculationResultPage, error) {
 	f.page = request
@@ -60,8 +68,10 @@ func (f *calculationServiceStub) DeactivateCalculation(context.Context, uint64) 
 func (f *calculationServiceStub) ListCalculationVersions(_ context.Context, request PageRequest) (CalculationVersionPage, error) {
 	return CalculationVersionPage{Items: []calculation.Version{}, Limit: request.Limit, Offset: request.Offset}, nil
 }
-func (f *calculationServiceStub) RestoreCalculationVersion(context.Context, int64, uint64) (calculation.Version, error) {
-	return calculation.Version{Revision: 5, State: "active"}, nil
+func (f *calculationServiceStub) RestoreCalculationVersion(_ context.Context, _ int64, expected uint64) (calculation.Version, error) {
+	f.restoreExpected = expected
+	f.restoreCalls++
+	return calculation.Version{Revision: 5, State: "active"}, f.restoreErr
 }
 
 func calculationHTTP(service *calculationServiceStub, method, path, body, revision string) *httptest.ResponseRecorder {
@@ -117,6 +127,56 @@ func TestCalculationHTTPParsesResultFilters(t *testing.T) {
 	want := PageRequest{Query: "KKS", Status: "bad", Kind: "Double", Limit: 25, Offset: 50}
 	if response.Code != http.StatusOK || service.page != want {
 		t.Fatalf("status=%d request=%#v want=%#v", response.Code, service.page, want)
+	}
+}
+
+func TestCalculationRestoreAcceptsObservedNoActiveRevision(t *testing.T) {
+	zero := uint64(0)
+	service := &calculationServiceStub{statusRevision: &zero}
+	status := calculationHTTP(service, http.MethodGet, "/api/v1/calculations/status", "", "")
+	if status.Code != http.StatusOK || status.Header().Get("ETag") != `"0"` {
+		t.Fatalf("status=%d etag=%q", status.Code, status.Header().Get("ETag"))
+	}
+	restored := calculationHTTP(service, http.MethodPost, "/api/v1/calculations/config/versions/3/restore", "", `"0"`)
+	if restored.Code != http.StatusOK || service.restoreCalls != 1 || service.restoreExpected != 0 || restored.Header().Get("ETag") != `"5"` {
+		t.Fatalf("restore status=%d calls=%d expected=%d body=%s", restored.Code, service.restoreCalls, service.restoreExpected, restored.Body.String())
+	}
+	service.restoreErr = &domain.RevisionConflictError{Expected: 0, Actual: 6}
+	conflict := calculationHTTP(service, http.MethodPost, "/api/v1/calculations/config/versions/3/restore", "", `"0"`)
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("stale no-active observation status=%d body=%s", conflict.Code, conflict.Body.String())
+	}
+}
+
+func TestCalculationRestoreRequiresExplicitPreconditionAndKeepsOtherWritesPositive(t *testing.T) {
+	for _, test := range []struct {
+		header string
+		status int
+	}{
+		{"", http.StatusPreconditionRequired},
+		{"0", http.StatusBadRequest},
+		{`W/"0"`, http.StatusBadRequest},
+		{`"00"`, http.StatusBadRequest},
+		{"*", http.StatusBadRequest},
+		{`"-1"`, http.StatusBadRequest},
+	} {
+		t.Run(test.header, func(t *testing.T) {
+			service := &calculationServiceStub{}
+			response := calculationHTTP(service, http.MethodPost, "/api/v1/calculations/config/versions/3/restore", "", test.header)
+			if response.Code != test.status || service.restoreCalls != 0 {
+				t.Fatalf("status=%d want=%d calls=%d", response.Code, test.status, service.restoreCalls)
+			}
+		})
+	}
+	for _, path := range []string{"activate", "deactivate", "import-lower"} {
+		response := calculationHTTP(&calculationServiceStub{}, http.MethodPost, "/api/v1/calculations/config/"+path, `{}`, `"0"`)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("%s unexpectedly accepts zero: %d", path, response.Code)
+		}
+	}
+	response := calculationHTTP(&calculationServiceStub{}, http.MethodPut, "/api/v1/calculations/config/draft", `{"content":""}`, `"0"`)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("save unexpectedly accepts zero: %d", response.Code)
 	}
 }
 

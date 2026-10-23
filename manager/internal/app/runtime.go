@@ -25,6 +25,7 @@ type LowerFactory func(opc.LowerConfig, opc.LowerSink) (opc.LowerClient, error)
 type CatalogPublisher func(domain.CatalogUnion, []domain.Group, []domain.Source) error
 
 type RuntimeOptions struct {
+	FleetConfigFile    string
 	OPCEndpoint        string
 	HTTPListen         string
 	DataDir            string
@@ -46,27 +47,6 @@ type RuntimeOptions struct {
 	ProcessAgentClient ProcessAgentClient
 }
 
-type lowerHandle struct {
-	client     opc.LowerClient
-	cancel     context.CancelFunc
-	generation uint64
-}
-
-type pendingCommandMeta struct {
-	generation       uint64
-	epoch            uint64
-	baselineSequence uint64
-	armed            bool
-	terminal         *pendingCommandTerminal
-	done             chan pendingCommandTerminal
-}
-
-type pendingCommandTerminal struct {
-	state   domain.CommandState
-	status  domain.StatusCode
-	message string
-}
-
 type sessionRefreshRequest struct {
 	sessionID string
 	groupID   string
@@ -75,93 +55,57 @@ type sessionRefreshRequest struct {
 // Runtime owns the mutable manager state. Configuration/catalog metadata is
 // persisted, while samples remain exclusively in the sharded in-memory cache.
 type Runtime struct {
-	repo    *store.Repository
-	routes  *domain.RouteTable
-	broker  *api.Broker
-	cache   *sampleCache
-	options RuntimeOptions
+	fleet    fleetSync
+	software softwareVersions
+	tracking *commandTrackingService
+	commands *commandExecutionService
+	repo     *store.Repository
+	routes   *domain.RouteTable
+	broker   *api.Broker
+	cache    *sampleCache
+	options  RuntimeOptions
 
-	configMu                     sync.RWMutex
-	redundancyPolicies           map[string]domain.RedundancyPolicy // guarded by configMu
-	redundancyStates             map[string]*redundancyState        // guarded by configMu
-	sourceOperations             map[string]bool                    // guarded by configMu; no hot-path I/O
-	sourceProcessOperations      map[string]string                  // durable maintenance fences, guarded by configMu
-	processExecuting             map[string]string                  // source -> executing request, guarded by configMu
-	lifecycleMu                  sync.Mutex
-	commandMu                    sync.Mutex
-	statusPersistMu              sync.Mutex
-	statusRetryMu                sync.Mutex
-	stationCacheMu               sync.Mutex
-	lowerLogMu                   sync.Mutex
-	mu                           sync.RWMutex
-	catalogs                     map[string]domain.SourceCatalog
-	index                        *catalogIndex
-	statuses                     map[string]opc.LowerStatus
-	lowers                       map[string]lowerHandle
-	generations                  map[string]uint64
-	dirtyCatalogs                map[string]domain.SourceCatalog
-	dirtyCommands                map[string]domain.PendingCommand
-	dirtyAudits                  map[string]domain.AuditEntry
-	dirtySourceEvents            []domain.SourceEvent
-	dirtyAlarmStatuses           map[string]opc.LowerStatus
-	stationVersions              map[string]domain.SourceStationVersions
-	stationVersionEpoch          map[string]uint64
-	stationRefreshPending        map[string]bool
-	stationRefreshDirty          map[string]bool
-	stationFeatureEpoch          map[string]uint64
-	stationFeatureSupported      map[string]bool
-	calculationPlan              *calculation.Plan
-	calculationVersion           calculation.Version
-	calculationPending           calculation.Version
-	calculationRunner            *calculation.Runner
-	calculationResults           map[string]calculation.Result
-	calculationRetired           map[string]calculation.Result
-	calculationRetiredPoints     map[string]indexedPoint
-	calculationDirty             map[string]struct{}
-	calculationStateSeen         map[string]string
-	calculationStateEventPending bool
-	calculationFull              bool
-	calculationRouteRevision     uint64
-	calculationLastEvaluationAt  time.Time
-	calculationLastDuration      time.Duration
-	calculationLastError         string
-	calculationEventAt           time.Time
-	calculationEventPending      bool
-	lowerLogs                    *lowerlogs.Store
-	quarantinedSources           map[string]string
-	pendingCommandMeta           map[string]pendingCommandMeta
-	ackSequences                 map[string]uint64
-	ackEpochs                    map[string]uint64
-	commandHistory               map[string]commandHistoryEntry
-	catalogPersistError          string
-	commandPersistError          string
-	auditPersistError            string
-	statusPersistError           string
-	stationPersistError          string
-	lowerLogPersistError         string
-	upstreamReconcileError       string
-	upstreamReconcileDirty       bool
-	conflictCount                int
-	selectionCount               uint64
-	lastSelectionAt              time.Time
-	groupLastSelectedAt          map[string]time.Time
-	lastLowerDataAt              time.Time
-	lastSampleEventAt            time.Time
-	sampleEventPending           bool
-	startedAt                    time.Time
-	runContext                   context.Context
-	runCancel                    context.CancelFunc
-	shutdownDone                 chan struct{}
-	refreshSession               func(sessionID, groupID string)
-	refreshQueue                 chan sessionRefreshRequest
-	statusPersistWake            chan struct{}
-	stationRefreshQueue          chan string
-	calculationWake              chan struct{}
-	catalogValidator             CatalogPublisher
-	catalogReconciler            CatalogPublisher
-	refreshCalculations          func([]string)
-	sessionViews                 func() map[string]api.SessionView
-	subscriptionCount            func() int
+	configMu             sync.RWMutex
+	redundancy           *redundancyService
+	maintenance          maintenanceService
+	release              managerReleaseState // guarded by configMu
+	releaseDispatches    atomic.Int64
+	lifecycleMu          sync.Mutex
+	mu                   sync.RWMutex
+	catalogs             map[string]domain.SourceCatalog
+	index                *catalogIndex
+	statuses             map[string]opc.LowerStatus
+	connections          sourceConnections
+	catalogPersistence   *catalogPersistence
+	publication          catalogPublication
+	statusHistory        statusHistory
+	managementAudit      managementAudit
+	stationSync          stationSync
+	stations             stationSnapshots
+	calculations         *calculationService
+	lowerLogs            *lowerlogs.Service
+	quarantinedSources   map[string]string
+	ackSequences         map[string]uint64
+	ackEpochs            map[string]uint64
+	commandHistory       map[string]commandHistoryEntry
+	commandResultHandler func(string, domain.NodeKey, domain.Sample)
+	conflictCount        int
+	selectionCount       uint64
+	lastSelectionAt      time.Time
+	groupLastSelectedAt  map[string]time.Time
+	lastLowerDataAt      time.Time
+	lastSampleEventAt    time.Time
+	sampleEventPending   bool
+	startedAt            time.Time
+	runContext           context.Context
+	runCancel            context.CancelFunc
+	shutdownDone         chan struct{}
+	refreshSession       func(sessionID, groupID string)
+	refreshQueue         chan sessionRefreshRequest
+	statusPersistWake    chan struct{}
+	refreshCalculations  func([]string)
+	sessionViews         func() map[string]api.SessionView
+	subscriptionCount    func() int
 
 	running atomic.Bool
 	ready   atomic.Bool
@@ -374,36 +318,54 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 			return nil, fmt.Errorf("open central lower log store: %w", err)
 		}
 	}
+	broker := api.NewBroker()
 	runtime := &Runtime{
-		repo: repo, routes: routes, broker: api.NewBroker(), cache: newSampleCache(), options: options,
+		repo: repo, routes: routes, broker: broker, cache: newSampleCache(), options: options,
 		catalogs: catalogs, index: index, statuses: make(map[string]opc.LowerStatus),
-		lowers: make(map[string]lowerHandle), generations: make(map[string]uint64),
-		dirtyCatalogs: dirtyCatalogs,
-		dirtyCommands: make(map[string]domain.PendingCommand), dirtyAudits: make(map[string]domain.AuditEntry),
-		dirtyAlarmStatuses: make(map[string]opc.LowerStatus),
-		stationVersions:    stationVersions, stationVersionEpoch: make(map[string]uint64),
-		stationRefreshPending: make(map[string]bool), stationRefreshDirty: make(map[string]bool),
-		stationFeatureEpoch: make(map[string]uint64), stationFeatureSupported: make(map[string]bool),
-		calculationPlan: calculationPlan, calculationVersion: calculationVersion, calculationPending: pendingVersion,
-		calculationResults: make(map[string]calculation.Result), calculationRetired: make(map[string]calculation.Result),
-		calculationRetiredPoints: make(map[string]indexedPoint),
-		calculationDirty:         make(map[string]struct{}), calculationFull: calculationPlan != nil,
-		calculationWake:     make(chan struct{}, 1),
-		lowerLogs:           centralLogs,
-		quarantinedSources:  quarantinedSources,
-		pendingCommandMeta:  make(map[string]pendingCommandMeta),
-		ackSequences:        make(map[string]uint64),
-		ackEpochs:           make(map[string]uint64),
-		refreshQueue:        make(chan sessionRefreshRequest, 256),
-		statusPersistWake:   make(chan struct{}, 1),
-		stationRefreshQueue: make(chan string, 64),
-		conflictCount:       conflicts, selectionCount: selectionCount, lastSelectionAt: lastSelectionAt,
+		catalogPersistence: newCatalogPersistence(dirtyCatalogs, repo.ReplaceSourceCatalog),
+		calculations:       newCalculationService(calculationPlan, calculationVersion, pendingVersion),
+		lowerLogs: lowerlogs.NewService(repo, centralLogs, func(source string, revision uint64) {
+			broker.Publish(api.Event{Type: "lower_logs_changed", SourceID: source, Revision: revision, Data: map[string]any{"source_id": source, "accepted_through": revision}})
+		}),
+		quarantinedSources: quarantinedSources,
+		commands:           newCommandExecutionService(routes),
+		ackSequences:       make(map[string]uint64),
+		ackEpochs:          make(map[string]uint64),
+		refreshQueue:       make(chan sessionRefreshRequest, 256),
+		statusPersistWake:  make(chan struct{}, 1),
+		conflictCount:      conflicts, selectionCount: selectionCount, lastSelectionAt: lastSelectionAt,
 		groupLastSelectedAt: groupLastSelectedAt, startedAt: now,
-		sourceProcessOperations: make(map[string]string), processExecuting: make(map[string]string),
 	}
-	if calculationPlan != nil {
-		runtime.calculationRunner = calculation.NewRunner(calculationPlan)
-		runtime.calculationRouteRevision = 1
+	for id, snapshot := range stationVersions {
+		runtime.stations.replace(id, snapshot, 0, false)
+	}
+	managerID, err := repo.ManagerInstanceID(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load manager identity: %w", err)
+	}
+	runtime.tracking = newCommandTrackingService(repo, managerID)
+	// A persisted queue is evidence, never permission to replay controls after
+	// restart. Consume the first page repeatedly because each update removes it
+	// from the Queued filter.
+	for {
+		queued, _, loadErr := repo.ListCommandsFiltered(ctx, store.CommandFilter{Status: string(domain.CommandQueued), Limit: 1000})
+		if loadErr != nil {
+			return nil, fmt.Errorf("load queued commands: %w", loadErr)
+		}
+		for _, command := range queued {
+			command.State, command.StatusCode = domain.CommandFailed, domain.StatusBadOutOfService
+			command.Error = "manager restarted before dispatch; queued command not replayed"
+			command.FinishedAt = now
+			if saveErr := repo.SaveCommand(ctx, command); saveErr != nil {
+				return nil, fmt.Errorf("retire queued command: %w", saveErr)
+			}
+		}
+		if len(queued) < 1000 {
+			break
+		}
+	}
+	if err := runtime.loadReleaseState(managerID); err != nil {
+		return nil, fmt.Errorf("restore manager release admission: %w", err)
 	}
 	if err := runtime.restoreProcessOperations(ctx); err != nil {
 		return nil, fmt.Errorf("restore process maintenance fences: %w", err)
@@ -415,8 +377,16 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 			return nil, fmt.Errorf("load pending commands: %w", loadErr)
 		}
 		for _, command := range pending {
+			detail, detailErr := repo.CommandDetail(ctx, command.ID)
+			if detailErr == nil {
+				runtime.tracking.audit.put(detail)
+			}
 			if restoreErr := routes.RestorePending(command); restoreErr != nil {
 				slog.Warn("ignore invalid persisted command", "command_id", command.ID, "error", restoreErr)
+				continue
+			}
+			if detailErr == nil {
+				runtime.commands.restoreTracked(detail, now, options.CommandPendingTTL)
 			}
 		}
 		if offset+len(pending) >= total || len(pending) == 0 {
@@ -424,9 +394,7 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 		}
 	}
 	for _, command := range routes.SweepExpired(now, options.CommandPendingTTL) {
-		if saveErr := repo.SaveCommand(ctx, command); saveErr != nil {
-			return nil, fmt.Errorf("persist expired restored command %s: %w", command.ID, saveErr)
-		}
+		runtime.tracking.audit.record(command)
 	}
 	for _, source := range sources {
 		lastError := ""
@@ -445,11 +413,7 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 	if err != nil {
 		return nil, fmt.Errorf("load redundancy policies: %w", err)
 	}
-	runtime.redundancyPolicies = make(map[string]domain.RedundancyPolicy)
-	runtime.redundancyStates = make(map[string]*redundancyState)
-	for _, policy := range policies {
-		runtime.redundancyPolicies[policy.GroupID] = policy
-	}
+	runtime.redundancy = newRedundancyService(policies)
 	for _, policy := range policies {
 		alarms, _, loadErr := repo.ListAlarms(ctx, store.AlarmFilter{State: string(domain.AlarmOpen), Query: policy.DifferenceKind(), Limit: 1000})
 		if loadErr != nil {
@@ -457,12 +421,7 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 		}
 		for _, alarm := range alarms {
 			if alarm.Kind == policy.DifferenceKind() && alarm.SourceID == "" {
-				s := runtime.redundancyStateLocked(policy.GroupID)
-				s.alarmKnown = true
-				s.alarmActive = true
-				s.alarmMessage = alarm.Message
-				s.view.DifferenceAlarmActive = true
-				s.view.ComparisonState = "Unknown"
+				runtime.redundancy.restoreAlarm(policy.GroupID, alarm.Message)
 			}
 		}
 	}
@@ -500,6 +459,8 @@ func (r *Runtime) Start(ctx context.Context) error {
 	r.wg.Add(1)
 	go r.commandSweeper()
 	r.wg.Add(1)
+	go r.commandTrackingWorker()
+	r.wg.Add(1)
 	go r.sessionRefreshWorker()
 	r.wg.Add(1)
 	go r.retentionSweeper()
@@ -511,9 +472,13 @@ func (r *Runtime) Start(ctx context.Context) error {
 	go r.calculationWorker()
 	r.wg.Add(1)
 	go r.redundancyWorker()
-	if r.calculationPlan != nil {
-		r.requestCalculationFull()
+	r.wg.Add(1)
+	go r.softwareVersionWorker()
+	if r.options.FleetConfigFile != "" {
+		r.wg.Add(1)
+		go r.fleetWorker()
 	}
+	r.requestCalculationFull()
 	return nil
 }
 
@@ -522,6 +487,8 @@ func (r *Runtime) Close() {
 }
 
 func (r *Runtime) CloseContext(ctx context.Context) error {
+	var cancelRun context.CancelFunc
+	var cancels []context.CancelFunc
 	r.lifecycleMu.Lock()
 	r.mu.Lock()
 	done := r.shutdownDone
@@ -530,20 +497,18 @@ func (r *Runtime) CloseContext(ctx context.Context) error {
 		r.running.Store(false)
 		r.closing.Store(true)
 		r.ready.Store(false)
-		if r.runCancel != nil {
-			r.runCancel()
-		}
-		for sourceID, handle := range r.lowers {
-			r.generations[sourceID]++
-			handle.cancel()
-			delete(r.lowers, sourceID)
-		}
+		cancelRun = r.runCancel
+		cancels = r.connections.stopAll()
 		done = make(chan struct{})
 		r.shutdownDone = done
 		startWaiter = true
 	}
 	r.mu.Unlock()
 	r.lifecycleMu.Unlock()
+	cancelLower(cancelRun)
+	for _, cancel := range cancels {
+		cancelLower(cancel)
+	}
 	if startWaiter {
 		go func() {
 			// Every path that can add a worker is serialized by configMu and
@@ -552,11 +517,12 @@ func (r *Runtime) CloseContext(ctx context.Context) error {
 			// configuration/DPAPI/factory operation is currently blocked.
 			r.configMu.Lock()
 			r.configMu.Unlock()
+			r.cancelDisconnectedQueued()
 			r.wg.Wait()
 			flushContext, flushCancel := context.WithTimeout(context.Background(), 2*time.Second)
 			r.retryDirtyCommands()
 			r.persistDirtyCatalogs(flushContext)
-			r.retryDirtyAudits(flushContext)
+			r.drainManagementAudits(flushContext)
 			r.retryDirtyStatuses(flushContext)
 			flushCancel()
 			r.broker.Close()
@@ -642,81 +608,6 @@ func (r *Runtime) retentionSweeper() {
 	}
 }
 
-func (r *Runtime) SetCatalogHandlers(validator, reconciler CatalogPublisher) error {
-	r.mu.Lock()
-	r.catalogValidator = validator
-	r.catalogReconciler = reconciler
-	union := cloneCatalogUnion(r.index.union)
-	r.mu.Unlock()
-	groups, sources := r.routes.Groups(), r.routes.Sources()
-	if validator != nil {
-		if err := validator(union, groups, sources); err != nil {
-			r.recordReconcileError(err)
-			return err
-		}
-	}
-	if reconciler != nil {
-		if err := reconciler(union, groups, sources); err != nil {
-			r.recordUpstreamReconcileResult(err)
-			return err
-		}
-	}
-	r.recordUpstreamReconcileResult(nil)
-	return nil
-}
-
-func (r *Runtime) reconcileUpstream() error {
-	r.mu.RLock()
-	handler := r.catalogReconciler
-	union := cloneCatalogUnion(r.index.union)
-	r.mu.RUnlock()
-	if handler == nil {
-		return nil
-	}
-	err := handler(union, r.routes.Groups(), r.routes.Sources())
-	r.recordUpstreamReconcileResult(err)
-	return err
-}
-
-func (r *Runtime) validateUpstream(index *catalogIndex, groups []domain.Group, sources []domain.Source) error {
-	r.mu.RLock()
-	validator := r.catalogValidator
-	r.mu.RUnlock()
-	if validator == nil {
-		return nil
-	}
-	union := domain.CatalogUnion{Groups: map[string]map[string]domain.CatalogNode{}, SourceStates: map[string]domain.CatalogState{}}
-	if index != nil {
-		union = cloneCatalogUnion(index.union)
-	}
-	return validator(union, groups, sources)
-}
-
-func (r *Runtime) recordReconcileError(err error) {
-	r.mu.Lock()
-	if err == nil {
-		if len(r.quarantinedSources) == 0 {
-			r.upstreamReconcileError = ""
-		}
-	} else {
-		r.upstreamReconcileError = err.Error()
-	}
-	r.mu.Unlock()
-}
-
-func (r *Runtime) recordUpstreamReconcileResult(err error) {
-	r.mu.Lock()
-	r.upstreamReconcileDirty = err != nil
-	if err == nil {
-		if len(r.quarantinedSources) == 0 {
-			r.upstreamReconcileError = ""
-		}
-	} else {
-		r.upstreamReconcileError = err.Error()
-	}
-	r.mu.Unlock()
-}
-
 func (r *Runtime) SetSessionViewHandler(handler func() map[string]api.SessionView) {
 	r.mu.Lock()
 	r.sessionViews = handler
@@ -769,140 +660,6 @@ func (r *Runtime) CatalogUnion() domain.CatalogUnion {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return cloneCatalogUnion(r.index.union)
-}
-
-func (r *Runtime) startLower(source domain.Source) error {
-	r.mu.Lock()
-	ctx := r.runContext
-	if ctx == nil || !r.running.Load() || ctx.Err() != nil {
-		r.mu.Unlock()
-		return nil
-	}
-	if old, exists := r.lowers[source.ID]; exists {
-		old.cancel()
-		delete(r.lowers, source.ID)
-	}
-	r.generations[source.ID]++
-	generation := r.generations[source.ID]
-	previousStatus := r.statuses[source.ID]
-	r.mu.Unlock()
-
-	_, password, err := r.repo.SourceCredential(ctx, source.ID)
-	if err != nil {
-		return err
-	}
-	proxy := lowerSinkProxy{runtime: r, sourceID: source.ID, generation: generation,
-		reconnectBase: previousStatus.ReconnectCount, lastDataAt: previousStatus.LastDataAt, lastProbeAt: previousStatus.LastProbeAt}
-	client, err := r.options.LowerFactory(opc.LowerConfig{
-		Source: source, Password: password, CertificateFile: r.options.CertificateFile,
-		PrivateKeyFile: r.options.PrivateKeyFile, PublishingInterval: r.options.PublishingInterval,
-		SamplingInterval: r.options.SamplingInterval, MonitorBatchSize: opc.DefaultMonitorBatchSize,
-		OperationTimeout: r.options.CommandTimeout,
-	}, proxy)
-	if err != nil {
-		return err
-	}
-	lowerCtx, cancel := context.WithCancel(ctx)
-	r.mu.Lock()
-	if !r.running.Load() || ctx.Err() != nil || r.generations[source.ID] != generation {
-		r.mu.Unlock()
-		cancel()
-		return nil
-	}
-	r.wg.Add(1)
-	r.lowers[source.ID] = lowerHandle{client: client, cancel: cancel, generation: generation}
-	r.mu.Unlock()
-	go func() {
-		defer r.wg.Done()
-		runErr := client.Run(lowerCtx)
-		if lowerCtx.Err() == nil {
-			if runErr == nil {
-				runErr = errors.New("lower OPC supervisor stopped unexpectedly")
-			}
-			slog.Error("lower OPC supervisor stopped", "source_id", source.ID, "error", runErr)
-			proxy.OnLowerStatus(opc.LowerStatus{SourceID: source.ID, Connection: opc.ConnectionDisconnected,
-				Session: opc.SessionInactive, Subscription: opc.SubscriptionInactive,
-				LastError: runErr.Error(), UpdatedAt: time.Now().UTC()})
-		}
-		r.mu.Lock()
-		if current, exists := r.lowers[source.ID]; exists && current.generation == generation {
-			delete(r.lowers, source.ID)
-		}
-		r.mu.Unlock()
-	}()
-	return nil
-}
-
-func (r *Runtime) recordLowerStartFailure(source domain.Source, err error) {
-	r.mu.RLock()
-	current := r.statuses[source.ID]
-	r.mu.RUnlock()
-	r.OnLowerStatus(opc.LowerStatus{SourceID: source.ID, Connection: opc.ConnectionDisconnected,
-		Session: opc.SessionInactive, Subscription: opc.SubscriptionInactive,
-		Epoch: current.Epoch, ReconnectCount: current.ReconnectCount,
-		LastDataAt: current.LastDataAt, LastProbeAt: current.LastProbeAt,
-		LastError: err.Error(), UpdatedAt: time.Now().UTC()})
-}
-
-func (r *Runtime) stopLower(sourceID string) {
-	r.mu.Lock()
-	r.generations[sourceID]++
-	if handle, ok := r.lowers[sourceID]; ok {
-		handle.cancel()
-		delete(r.lowers, sourceID)
-	}
-	previous, existed := r.statuses[sourceID]
-	status := previous
-	status.SourceID = sourceID
-	status.Connection = opc.ConnectionDisconnected
-	status.Session = opc.SessionInactive
-	status.Subscription = opc.SubscriptionInactive
-	status.UpdatedAt = time.Now().UTC()
-	r.statuses[sourceID] = status
-	r.mu.Unlock()
-	if existed && lowerStatusControlChanged(previous, status) {
-		r.persistLowerStatusTransition(previous, status, true)
-	}
-}
-
-type lowerSinkProxy struct {
-	runtime       *Runtime
-	sourceID      string
-	generation    uint64
-	reconnectBase uint64
-	lastDataAt    time.Time
-	lastProbeAt   time.Time
-}
-
-func (p lowerSinkProxy) OnLowerStatus(status opc.LowerStatus) {
-	status.SourceID = p.sourceID
-	status.Epoch = p.generation<<32 | status.Epoch&0xffffffff
-	status.ReconnectCount += p.reconnectBase
-	if status.LastDataAt.IsZero() {
-		status.LastDataAt = p.lastDataAt
-	}
-	if status.LastProbeAt.IsZero() {
-		status.LastProbeAt = p.lastProbeAt
-	}
-	p.runtime.onLowerStatus(status, p.generation)
-}
-
-func (p lowerSinkProxy) OnCatalog(catalog domain.SourceCatalog) {
-	p.runtime.onCatalog(p.sourceID, p.generation, catalog)
-}
-
-func (p lowerSinkProxy) OnSample(_ string, key domain.NodeKey, sample domain.Sample) {
-	sample.Epoch = p.generation<<32 | sample.Epoch&0xffffffff
-	p.runtime.onSample(p.sourceID, key, sample, p.generation)
-}
-
-func (p lowerSinkProxy) OnStationVersionRevision(_ string, _ string, _ uint64) {
-	p.runtime.mu.RLock()
-	current := p.runtime.generations[p.sourceID]
-	p.runtime.mu.RUnlock()
-	if current == p.generation {
-		p.runtime.queueStationVersionRefresh(p.sourceID)
-	}
 }
 
 func (r *Runtime) OnLowerStatus(status opc.LowerStatus) {
@@ -972,6 +729,9 @@ func (r *Runtime) onLowerStatus(status opc.LowerStatus, generation uint64) {
 	// Sessions that actually selected it; peers using another source in the
 	// same group must not absorb a full-group resample burst.
 	refreshSelectedSource = sampleStateChanged && !quarantined
+	if meaningfulChange {
+		r.cancelDisconnectedQueued()
+	}
 	if quarantined {
 		r.applyQuarantinedSourceLocked(status.SourceID)
 		refreshGroups = append(refreshGroups, r.groupsForSources(status.SourceID)...)
@@ -1024,9 +784,9 @@ func (r *Runtime) onCatalog(sourceID string, generation uint64, discovered domai
 	}
 	if generation != 0 {
 		r.mu.RLock()
-		current := r.generations[sourceID]
+		current := r.connections.current(sourceID, generation)
 		r.mu.RUnlock()
-		if !r.running.Load() || current != generation {
+		if !r.running.Load() || !current {
 			return
 		}
 	}
@@ -1055,13 +815,12 @@ func (r *Runtime) onCatalog(sourceID string, generation uint64, discovered domai
 	r.mu.RLock()
 	previous := r.catalogs[sourceID]
 	before := cloneCatalogMap(r.catalogs)
-	handler := r.catalogReconciler
 	r.mu.RUnlock()
 	merged := retainRemovedNodes(previous, discovered)
 	candidate := cloneCatalogMap(before)
 	candidate[sourceID] = merged
 	groups := r.routes.Groups()
-	index, states, conflicts, validateErr := buildCatalogIndexWithCalculations(candidate, r.calculationPlan, r.calculationRetiredPoints, groups)
+	index, states, conflicts, validateErr := r.buildCatalogWithCalculations(candidate, groups)
 	if validateErr != nil {
 		slog.Error("reject discovered catalog", "source_id", sourceID, "error", validateErr)
 		return
@@ -1081,7 +840,7 @@ func (r *Runtime) onCatalog(sourceID string, generation uint64, discovered domai
 	}
 	if err := r.validateUpstream(index, groups, sources); err != nil {
 		slog.Error("reject catalog before upstream publish", "source_id", sourceID, "error", err)
-		if r.isolateRejectedCatalog(sourceID, generation, discovered.DiscoveredAt, before, groups, sources, handler, err) {
+		if r.isolateRejectedCatalog(sourceID, generation, discovered.DiscoveredAt, before, groups, sources, err) {
 			refreshGroups = source.GroupIDs()
 		}
 		return
@@ -1100,7 +859,7 @@ func (r *Runtime) onCatalog(sourceID string, generation uint64, discovered domai
 	if domain.SourceTopologyFingerprint(previous.Topology) != domain.SourceTopologyFingerprint(merged.Topology) {
 		// A station at the same address in a new topology must not inherit the
 		// previous hardware's live health before a new status receipt arrives.
-		delete(r.stationVersionEpoch, sourceID)
+		r.stations.invalidateEpoch(sourceID)
 	}
 	r.catalogs = candidate
 	r.index = index
@@ -1142,19 +901,8 @@ func (r *Runtime) onCatalog(sourceID string, generation uint64, discovered domai
 		}
 	}
 	for _, catalog := range changed {
-		if err := r.repo.ReplaceSourceCatalog(context.Background(), catalog); err != nil {
+		if err := r.catalogPersistence.save(context.Background(), catalog); err != nil {
 			slog.Error("persist catalog", "source_id", catalog.SourceID, "error", err)
-			r.mu.Lock()
-			r.dirtyCatalogs[catalog.SourceID] = catalog
-			r.catalogPersistError = err.Error()
-			r.mu.Unlock()
-		} else {
-			r.mu.Lock()
-			delete(r.dirtyCatalogs, catalog.SourceID)
-			if len(r.dirtyCatalogs) == 0 {
-				r.catalogPersistError = ""
-			}
-			r.mu.Unlock()
 		}
 	}
 	if err := r.routes.ApplyConfiguration(groups, sources); err != nil {
@@ -1165,13 +913,8 @@ func (r *Runtime) onCatalog(sourceID string, generation uint64, discovered domai
 		changedSources = append(changedSources, change.current.SourceID)
 	}
 	refreshGroups = r.groupsForSources(changedSources...)
-	if handler != nil {
-		if err := handler(cloneCatalogUnion(index.union), groups, sources); err != nil {
-			slog.Error("reconcile upstream catalog", "error", err)
-			r.recordUpstreamReconcileResult(err)
-		} else {
-			r.recordUpstreamReconcileResult(nil)
-		}
+	if err := r.publishCatalog(index, groups, sources); err != nil {
+		slog.Error("reconcile upstream catalog", "error", err)
 	}
 	r.broker.Publish(api.Event{Type: "catalog.changed", Data: map[string]any{"source_id": sourceID}})
 	r.requestCalculationFull()
@@ -1188,7 +931,7 @@ func (r *Runtime) onSample(sourceID string, key domain.NodeKey, sample domain.Sa
 	ackPort := ""
 	ackSequence := uint64(0)
 	r.mu.Lock()
-	if generation != 0 && (!r.running.Load() || r.generations[sourceID] != generation) {
+	if generation != 0 && (!r.running.Load() || !r.connections.current(sourceID, generation)) {
 		r.mu.Unlock()
 		return
 	}
@@ -1261,7 +1004,7 @@ func (r *Runtime) flushPendingSampleEvent(now time.Time) {
 }
 
 func (r *Runtime) isolateRejectedCatalog(sourceID string, generation uint64, discoveredAt time.Time, before map[string]domain.SourceCatalog,
-	groups []domain.Group, sources []domain.Source, handler CatalogPublisher, validationErr error,
+	groups []domain.Group, sources []domain.Source, validationErr error,
 ) bool {
 	rejectedCatalogs := cloneCatalogMap(before)
 	rejected := rejectedCatalogs[sourceID]
@@ -1301,7 +1044,6 @@ func (r *Runtime) isolateRejectedCatalog(sourceID string, generation uint64, dis
 	r.catalogs = rejectedCatalogs
 	r.index = index
 	r.quarantinedSources[sourceID] = validationErr.Error()
-	r.upstreamReconcileError = validationErr.Error()
 	if !wasQuarantined {
 		r.conflictCount++
 	}
@@ -1319,26 +1061,11 @@ func (r *Runtime) isolateRejectedCatalog(sourceID string, generation uint64, dis
 	if !statusExisted || lowerStatusControlChanged(previousStatus, status) {
 		r.persistLowerStatusTransition(previousStatus, status, statusExisted)
 	}
-	if err := r.repo.ReplaceSourceCatalog(context.Background(), rejected); err != nil {
-		r.mu.Lock()
-		r.dirtyCatalogs[sourceID] = rejected
-		r.catalogPersistError = err.Error()
-		r.mu.Unlock()
-	} else {
-		r.mu.Lock()
-		delete(r.dirtyCatalogs, sourceID)
-		if len(r.dirtyCatalogs) == 0 {
-			r.catalogPersistError = ""
-		}
-		r.mu.Unlock()
+	if err := r.catalogPersistence.save(context.Background(), rejected); err != nil {
+		slog.Error("persist isolated catalog", "source_id", sourceID, "error", err)
 	}
-	if handler != nil {
-		if err := handler(cloneCatalogUnion(index.union), groups, sources); err != nil {
-			slog.Error("reconcile isolated catalog", "source_id", sourceID, "error", err)
-			r.recordUpstreamReconcileResult(err)
-		} else {
-			r.recordUpstreamReconcileResult(nil)
-		}
+	if err := r.publishCatalog(index, groups, sources); err != nil {
+		slog.Error("reconcile isolated catalog", "source_id", sourceID, "error", err)
 	}
 	r.broker.Publish(api.Event{Type: "catalog.changed", Data: map[string]any{"source_id": sourceID, "rejected": true}})
 	return true

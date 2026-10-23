@@ -36,4 +36,14 @@ describe('calculation API contract', () => {
     expect(JSON.parse(String(importInit.body))).toEqual({ source_id: 'lower-a', source_revision: 11 });
     expect(versions.items[0]).toMatchObject({ ruleCount: 6683, addedCount: 2, removedCount: 1, changedCount: 4 });
   });
+
+  it('sends explicit zero as the observed no-active-version restore precondition', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(json({ id: 3, revision: 9, state: 'active' }));
+    vi.stubGlobal('fetch', fetchMock);
+    await calculationApi.restore(3, 0);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/v1/calculations/config/versions/3/restore');
+    expect(init.headers).toMatchObject({ 'If-Match': '"0"' });
+    expect(init.method).toBe('POST');
+  });
 });

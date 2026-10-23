@@ -3,7 +3,11 @@ import { ApiError, request } from './client';
 import { queryKeys } from './queries';
 import type { ModuleType } from './types';
 
-export type OperationFeature = 'acquisition' | 'configuration' | 'logs' | 'station_versions' | 'calculation_mode' | 'logging_configuration';
+export type OperationFeature = 'acquisition' | 'configuration' | 'configuration_forms' | 'logs' | 'station_versions' | 'calculation_mode' | 'logging_configuration';
+
+export interface ConfigField { path: (string | number)[]; key: string; label: string; hint: string; kind: 'string' | 'integer' | 'boolean'; value: string | number | boolean; options: (string | number | boolean)[]; inherited: boolean; readonly: boolean }
+export interface ConfigForm { source_id: string; source_revision: number; content: string; fields: ConfigField[] }
+export interface ConfigEdit { path: (string | number)[]; value: string | number | boolean }
 export type LoggingLevel = 'error' | 'warn' | 'info' | 'debug' | 'trace';
 export interface OperationsTarget { id: string; revision: number }
 export interface OperationsCapabilities {
@@ -205,6 +209,7 @@ export const operationsApi = {
     return scopedResponse(id, operationRequest<ConfigDocument>(`${prefix(id)}/config?${params}`, { signal }), revision);
   },
   validate: (id: string, name: string, content: string) => operationRequest<ConfigValidation>(`${prefix(id)}/config/validate`, { method: 'POST', body: JSON.stringify({ name, content }) }),
+  prepare: (target: OperationsTarget, name: string, content: string, edits: ConfigEdit[] = [], signal?: AbortSignal) => scopedResponse(target.id, operationRequest<ConfigForm>(`${prefix(target.id)}/config/prepare`, { method: 'POST', signal, body: JSON.stringify({ source_revision: target.revision, name, content, edits }) }), target.revision),
   save: (target: OperationsTarget, revision: string, name: string, content: string) => operationRequest<ConfigDocument>(`${prefix(target.id)}/config`, {
     method: 'PUT', headers: { 'If-Match': JSON.stringify(revision) }, body: JSON.stringify({ source_revision: target.revision, name, content }),
   }),
@@ -236,8 +241,8 @@ export const operationKeys = {
 export function useOperationsCapabilities(target: OperationsTarget, enabled = true) {
   return useQuery({ ...queryOptions, queryKey: operationKeys.capabilities(target), queryFn: ({ signal }) => operationsApi.capabilities(target.id, signal, target.revision), enabled: enabled && Boolean(target.id) });
 }
-export function useAcquisitionStatus(target: OperationsTarget, poll = false) {
-  return useQuery({ ...queryOptions, queryKey: operationKeys.status(target), queryFn: ({ signal }) => operationsApi.status(target.id, signal, target.revision), refetchInterval: (query) => poll && !query.state.error ? 3_000 : false });
+export function useAcquisitionStatus(target: OperationsTarget, poll = false, enabled = true) {
+  return useQuery({ ...queryOptions, queryKey: operationKeys.status(target), enabled, queryFn: ({ signal }) => operationsApi.status(target.id, signal, target.revision), refetchInterval: (query) => poll && !query.state.error ? 3_000 : false });
 }
 export function useOperationConfigs(target: OperationsTarget) {
   return useQuery({ ...queryOptions, queryKey: operationKeys.configs(target), queryFn: ({ signal }) => operationsApi.configs(target.id, signal, target.revision) });

@@ -21,6 +21,7 @@ const (
 // Config contains process-level settings. Groups and lower OPC sources live in SQLite
 // so they can be changed without restarting the service.
 type Config struct {
+	FleetConfigFile string
 	DataDir                 string
 	DatabasePath            string
 	PKIDir                  string
@@ -76,6 +77,7 @@ func Load(args []string) (Config, error) {
 	applyEnv(&cfg)
 
 	fs := flag.NewFlagSet("rcd-manager", flag.ContinueOnError)
+	fs.StringVar(&cfg.FleetConfigFile,"fleet-config",cfg.FleetConfigFile,"path to machine inventory sync settings (separate from business configuration)")
 	fs.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "directory for database, logs and PKI")
 	fs.StringVar(&cfg.OPCListen, "opc-listen", cfg.OPCListen, "OPC UA listen address")
 	fs.StringVar(&cfg.OPCAdvertiseHost, "opc-advertise-host", cfg.OPCAdvertiseHost, "host advertised in OPC UA endpoint URLs")
@@ -104,6 +106,7 @@ func Load(args []string) (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if c.FleetConfigFile != "" && !filepath.IsAbs(c.FleetConfigFile) { return errors.New("fleet configuration path must be absolute") }
 	if strings.TrimSpace(c.DataDir) == "" {
 		return errors.New("data directory is required")
 	}
@@ -166,10 +169,12 @@ func (c Config) ServiceArguments() ([]string, error) {
 	if c.Development {
 		args = append(args, "--dev")
 	}
+	if c.FleetConfigFile != "" { args=append(args,"--fleet-config",c.FleetConfigFile) }
 	return args, nil
 }
 
 func applyEnv(cfg *Config) {
+	cfg.FleetConfigFile=os.Getenv("RCD_MANAGER_FLEET_CONFIG")
 	setString := func(name string, dst *string) {
 		if value, ok := os.LookupEnv(name); ok && strings.TrimSpace(value) != "" {
 			*dst = value

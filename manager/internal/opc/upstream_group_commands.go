@@ -13,6 +13,24 @@ import (
 // Group commands deliberately live in ns=3. The old ns=2 physical-port
 // interfaces remain unchanged, including their NodeIds and method arguments.
 func (s *UpstreamServer) addGroupCommandNodesLocked(groupID string, parent awu.NodeID) error {
+	if resultBackend, ok := s.backend.(interface {
+		ReadGroupCommandResult(string, string) domain.Sample
+	}); ok {
+		resultID := awu.NewNodeIDString(s.managementNS, "Groups/"+groupID+"/CommandResult")
+		if _, exists := s.management[resultID.String()]; !exists {
+			node := awserver.NewVariableNode(s.server, resultID, awu.NewQualifiedName(s.managementNS, "CommandResult"),
+				awu.NewLocalizedText("CommandResult", ""), awu.NewLocalizedText("Session-local outcome; Good means the report is valid, inspect state and status_code", ""), nil,
+				[]awu.Reference{awu.NewReference(awu.ReferenceTypeIDHasTypeDefinition, false, awu.NewExpandedNodeID(awu.VariableTypeIDBaseDataVariableType)), awu.NewReference(awu.ReferenceTypeIDHasComponent, true, awu.NewExpandedNodeID(parent))},
+				awu.NewDataValue("", awu.BadWaitingForInitialData, time.Time{}, 0, time.Now(), 0), awu.DataTypeIDString, awu.ValueRankScalar, nil, awu.AccessLevelsCurrentRead, upstreamMinimumSamplingIntervalMS, false, nil)
+			node.SetReadValueHandler(func(session *awserver.Session, _ awu.ReadValueID) awu.DataValue {
+				return sampleToDataValue(resultBackend.ReadGroupCommandResult(sessionID(session), groupID), domain.DataTypeString, awu.ValueRankScalar, time.Now())
+			})
+			if err := s.server.NamespaceManager().AddNode(node); err != nil {
+				return err
+			}
+			s.management[resultID.String()] = node
+		}
+	}
 	backend, supported := s.backend.(GroupCommandBackend)
 	sendID := awu.NewNodeIDString(s.managementNS, "Groups/"+groupID+"/Send")
 	if _, exists := s.management[sendID.String()]; !exists {

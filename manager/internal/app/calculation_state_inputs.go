@@ -12,31 +12,39 @@ import (
 )
 
 func stateTargetExists(target calculation.StateTarget, catalogs map[string]domain.SourceCatalog) bool {
+	return stateTargetProblem(target, catalogs) == ""
+}
+
+func stateTargetProblem(target calculation.StateTarget, catalogs map[string]domain.SourceCatalog) string {
 	catalog, ok := catalogs[target.SourceID]
 	if !ok || catalog.Topology == nil {
-		return false
+		return "来源尚无有效拓扑，请先连接下级完成发现: " + target.SourceID
 	}
 	for _, port := range catalog.Topology.Ports {
 		if port.PortID == target.PortID {
 			for _, device := range port.Devices {
 				if device.DeviceID == target.DeviceID {
-					return true
+					return ""
 				}
 			}
+			return "站点不存在: " + target.SourceID + " " + target.PortID + "/" + target.DeviceID
 		}
 	}
-	return false
+	return "串口不存在（使用串口完整ID，不是显示名称）: " + target.SourceID + " " + target.PortID
 }
 
 func validateStateTargets(inputs []calculation.StateInput, catalogs map[string]domain.SourceCatalog, groups []domain.Group, sources []domain.Source) error {
 	var problems []calculation.Problem
+	members := map[string]domain.Source{}
+	ids := make([]string, 0, len(sources))
+	for _, source := range sources {
+		members[source.ID] = source
+		ids = append(ids, source.ID)
+	}
+	sort.Strings(ids)
 	for _, input := range inputs {
 		bad := func(message string) {
 			problems = append(problems, calculation.Problem{Rule: input.Name, Field: "state_inputs", Message: input.Name + ": " + message})
-		}
-		members := map[string]domain.Source{}
-		for _, source := range sources {
-			members[source.ID] = source
 		}
 		if input.Mode == "group_default" {
 			found := false
@@ -64,8 +72,12 @@ func validateStateTargets(inputs []calculation.StateInput, catalogs map[string]d
 		}
 		for _, target := range input.Targets {
 			source, ok := members[target.SourceID]
-			if !ok || !stateTargetExists(target, catalogs) {
-				bad("来源或站点不存在，或尚无有效拓扑: " + target.SourceID + " " + target.PortID + "/" + target.DeviceID)
+			if !ok {
+				bad("来源ID不存在: " + target.SourceID + "；请使用来源ID而非名称或IP。当前来源ID: " + strings.Join(ids, ", "))
+				continue
+			}
+			if message := stateTargetProblem(target, catalogs); message != "" {
+				bad(message)
 				continue
 			}
 			if input.Mode == "group_default" && source.GroupForDevice(target.PortID, target.DeviceID) != input.GroupID {
@@ -121,15 +133,15 @@ func (r *Runtime) stateInputValue(input calculation.StateInput, groups []domain.
 		}
 	}
 	if !found {
-		return fail("来源已删除: " + selected)
+		return fail("来源ID不存在: " + selected + "；请在状态输入中选择已配置的来源")
 	}
 	if input.Mode == "group_default" && source.GroupForDevice(target.PortID, target.DeviceID) != input.GroupID {
 		return fail("目标站点已不属于指定组")
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if !stateTargetExists(target, r.catalogs) {
-		return fail("目标站点已删除或拓扑不可用")
+	if message := stateTargetProblem(target, r.catalogs); message != "" {
+		return fail(message)
 	}
 	if source.CatalogState == domain.CatalogConflict {
 		return fail("来源目录冲突")
@@ -148,45 +160,27 @@ func stateViewInput(view api.StateInputView) calculation.Input {
 // Check state transitions only, not observation heartbeats. Called after a new
 // snapshot and once per second so silence still expires to state 0.
 func (r *Runtime) refreshCalculationStateInputs(sourceID string) {
-	r.mu.RLock()
-	plan := r.calculationPlan
-	r.mu.RUnlock()
+	plan, _ := r.calculations.definition()
 	if plan == nil {
 		return
 	}
 	groups, sources := r.routes.Groups(), r.routes.Sources()
-	changed := false
+	var changed []string
 	for _, input := range plan.StateInputsForSource(sourceID) {
 		view := r.stateInputValue(input, groups, sources)
 		signature := fmt.Sprintf("%d/%d/%v/%s", view.Value, view.StatusCode, view.ResolvedTarget, view.Error)
-		r.mu.Lock()
-		if r.calculationPlan != plan {
-			r.mu.Unlock()
-			return
+		if r.calculations.stateChanged(plan, input.Name, signature) {
+			changed = append(changed, input.Name)
 		}
-		if r.calculationStateSeen == nil {
-			r.calculationStateSeen = map[string]string{}
-		}
-		if r.calculationStateSeen[input.Name] != signature {
-			r.calculationStateSeen[input.Name] = signature
-			if plan.HasBaseVariable(input.Name) {
-				r.calculationDirty[input.Name] = struct{}{}
-				changed = true
-			}
-			r.calculationStateEventPending = true
-		}
-		r.mu.Unlock()
 	}
-	if changed {
+	if len(changed) != 0 {
+		r.refreshCalculationNodes(changed)
 		r.wakeCalculationWorker()
 	}
 }
 
 func (r *Runtime) flushCalculationStateEvent() {
-	r.mu.Lock()
-	pending := r.calculationStateEventPending
-	r.calculationStateEventPending = false
-	r.mu.Unlock()
+	pending := r.calculations.takeStateEvent()
 	if pending {
 		r.broker.Publish(api.Event{Type: "calculation_state_inputs_changed"})
 	}
@@ -208,10 +202,8 @@ func (r *Runtime) ListCalculationStateInputs(ctx context.Context, request api.Pa
 		}
 		inputs = config.StateInputs
 	} else {
-		r.mu.RLock()
-		plan := r.calculationPlan
-		revision = r.calculationVersion.Revision
-		r.mu.RUnlock()
+		plan, active := r.calculations.definition()
+		revision = active.Revision
 		if plan != nil {
 			inputs = plan.StateInputs()
 			if request.Kind != "" {

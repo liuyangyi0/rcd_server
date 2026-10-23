@@ -58,7 +58,6 @@ export function useDeviceVersions(params: DeviceVersionParams) {
   return useQuery({
     queryKey: queryKeys.deviceVersions(params),
     queryFn: ({ signal }) => api.deviceVersions(params, signal),
-    placeholderData: (previous) => previous,
     refetchInterval: 30_000,
   });
 }

@@ -41,6 +41,25 @@ function drawer() {
 }
 
 describe('one Session context across group controls', () => {
+  it('does not close a newly opened switch dialog when an earlier closed switch finishes', async () => {
+    const { user, select } = setup();
+    let finish!: () => void;
+    const pending = new Promise<void>((resolve) => { finish = resolve; });
+    select.mockReturnValue(pending);
+    await user.selectOptions(screen.getByRole('combobox', { name: /^当前查看会话/ }), 'session-1');
+    await user.click(screen.getByRole('button', { name: '切源' }));
+    await user.click(screen.getByRole('checkbox', { name: '确认已核对目标下级状态' }));
+    await user.click(screen.getByRole('button', { name: '确认切换' }));
+    await waitFor(() => expect(select).toHaveBeenCalledOnce());
+    await user.click(screen.getByRole('button', { name: '关闭（请求继续执行）' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: /^当前查看会话/ }), 'session-2');
+    await user.click(screen.getByRole('button', { name: '切源' }));
+    expect(within(screen.getByRole('dialog')).getByText(/SCADA B/)).toBeInTheDocument();
+    await act(async () => { finish(); await pending; });
+    expect(within(screen.getByRole('dialog')).getByText(/SCADA B/)).toBeInTheDocument();
+    expect(select).toHaveBeenCalledOnce();
+  });
+
   it('opens the drawer and submits its switch for the second Session chosen at the top', async () => {
     const { user, select } = setup();
     await user.selectOptions(screen.getByRole('combobox', { name: /^当前查看会话/ }), 'session-2');

@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"rcd_manager/internal/domain"
 )
 
 const (
@@ -20,68 +22,13 @@ const (
 	maxLowerLogMessageBytes     = 16 << 10
 )
 
-type LowerLogEvent struct {
-	SourceID  string         `json:"source_id"`
-	BootID    string         `json:"boot_id"`
-	Sequence  uint64         `json:"sequence"`
-	Timestamp time.Time      `json:"timestamp"`
-	Level     string         `json:"level"`
-	Component string         `json:"component"`
-	PortID    string         `json:"port_id,omitempty"`
-	DeviceID  string         `json:"device_id,omitempty"`
-	Message   string         `json:"message"`
-	Fields    map[string]any `json:"fields,omitempty"`
-}
-
-type LowerLogBatch struct {
-	SourceID      string          `json:"source_id"`
-	BootID        string          `json:"boot_id"`
-	FirstSequence uint64          `json:"first_sequence"`
-	Events        []LowerLogEvent `json:"events"`
-}
-
-type LowerLogAck struct {
-	SourceID        string    `json:"source_id"`
-	BootID          string    `json:"boot_id"`
-	AcceptedThrough uint64    `json:"accepted_through"`
-	ReceivedAt      time.Time `json:"received_at"`
-}
-
-type LowerLogRequest struct {
-	SourceID string
-	Level    string
-	PortID   string
-	DeviceID string
-	Query    string
-	From     time.Time
-	To       time.Time
-	Limit    int
-	Offset   int
-}
-
-type LowerLogItem struct {
-	LowerLogEvent
-	ReceivedAt time.Time `json:"received_at"`
-}
-
-type LowerLogPage struct {
-	Items          []LowerLogItem `json:"items"`
-	Total          int            `json:"total"`
-	Limit          int            `json:"limit"`
-	Offset         int            `json:"offset"`
-	InvalidLines   int            `json:"invalid_lines,omitempty"`
-	LastReceivedAt time.Time      `json:"last_received_at,omitempty,omitzero"`
-	PushState      string         `json:"push_state"`
-}
-
-type LowerLogSequenceError struct {
-	Expected uint64
-	Actual   uint64
-}
-
-func (e *LowerLogSequenceError) Error() string {
-	return fmt.Sprintf("log sequence gap: expected %d, received %d", e.Expected, e.Actual)
-}
+type LowerLogEvent = domain.LowerLogEvent
+type LowerLogBatch = domain.LowerLogBatch
+type LowerLogAck = domain.LowerLogAck
+type LowerLogRequest = domain.LowerLogRequest
+type LowerLogItem = domain.LowerLogItem
+type LowerLogPage = domain.LowerLogPage
+type LowerLogSequenceError = domain.LowerLogSequenceError
 
 type LowerLogsService interface {
 	IngestLowerLogs(context.Context, LowerLogBatch) (LowerLogAck, error)
@@ -130,13 +77,18 @@ func (h *Handler) listLowerLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	request := LowerLogRequest{
-		SourceID: strings.TrimSpace(r.URL.Query().Get("source_id")),
-		Level:    strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("level"))),
-		PortID:   r.URL.Query().Get("port_id"), DeviceID: r.URL.Query().Get("device_id"),
+		CommandAttempts: r.URL.Query().Get("command_attempts"),
+		SourceID:        strings.TrimSpace(r.URL.Query().Get("source_id")),
+		Level:           strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("level"))),
+		PortID:          r.URL.Query().Get("port_id"), DeviceID: r.URL.Query().Get("device_id"),
 		Query: r.URL.Query().Get("q"), Limit: 100,
 	}
 	if request.SourceID == "" {
 		writeError(w, http.StatusBadRequest, "invalid_request", "source_id is required", nil)
+		return
+	}
+	if request.CommandAttempts != "" && request.CommandAttempts != "all" && request.CommandAttempts != "retried" && request.CommandAttempts != "three" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "command_attempts must be all, retried or three", nil)
 		return
 	}
 	if request.Level != "" && !validLowerLogLevel(request.Level) {

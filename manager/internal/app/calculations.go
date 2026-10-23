@@ -18,74 +18,26 @@ import (
 const calculationDebounce = 10 * time.Millisecond
 
 func (r *Runtime) CalculationMetadata() opc.CalculationMetadata {
-	r.mu.RLock()
+	status, identifiers := r.calculations.metadata()
 	value := opc.CalculationMetadata{
-		RoutingMode: "DefaultSources", ActiveRevision: r.calculationVersion.Revision,
-		DefaultRouteRevision: r.calculationRouteRevision, LastEvaluationAt: r.calculationLastEvaluationAt,
-		LastEvaluationDurationMS: float64(r.calculationLastDuration) / float64(time.Millisecond),
+		RoutingMode: status.RoutingMode, ActiveRevision: status.ActiveRevision,
+		ConfigHash: status.ConfigHash, RuleCount: uint32(status.RuleCount),
+		GoodCount: uint32(status.GoodCount), BadCount: uint32(status.BadCount),
+		DefaultRouteRevision: status.DefaultRouteRevision, LastEvaluationAt: status.LastEvaluationAt,
+		LastEvaluationDurationMS: status.LastEvaluationDurationMS, PendingRestart: status.PendingRestart,
 	}
-	if r.calculationPlan != nil {
-		value.ConfigHash = r.calculationPlan.Hash()
-		value.RuleCount = uint32(r.calculationPlan.RuleCount())
-		value.CalculationNodeIDs = make([]string, 0, r.calculationPlan.RuleCount())
-		for _, identifier := range r.calculationPlan.OutputNames() {
-			value.CalculationNodeIDs = append(value.CalculationNodeIDs, "ns=2;s="+identifier)
-		}
+	for _, id := range identifiers {
+		value.CalculationNodeIDs = append(value.CalculationNodeIDs, "ns=2;s="+id)
 	}
-	for _, result := range r.calculationResults {
-		if result.StatusCode.IsGood() {
-			value.GoodCount++
-		} else {
-			value.BadCount++
-		}
-	}
-	value.PendingRestart = r.calculationPending.Revision != 0
-	r.mu.RUnlock()
 	return value
 }
 
 func (r *Runtime) GetCalculationStatus(_ context.Context) (api.CalculationStatus, error) {
-	r.mu.RLock()
-	status := api.CalculationStatus{
-		RoutingMode:              "DefaultSources",
-		ActiveRevision:           r.calculationVersion.Revision,
-		RuleCount:                len(r.calculationResults),
-		DefaultRouteRevision:     r.calculationRouteRevision,
-		LastEvaluationAt:         r.calculationLastEvaluationAt,
-		LastEvaluationDurationMS: float64(r.calculationLastDuration) / float64(time.Millisecond),
-		LastError:                r.calculationLastError,
-	}
-	if r.calculationPlan != nil {
-		status.ConfigHash = r.calculationPlan.Hash()
-		status.RuleCount = r.calculationPlan.RuleCount()
-	}
-	for _, result := range r.calculationResults {
-		if result.StatusCode.IsGood() {
-			status.GoodCount++
-		} else {
-			status.BadCount++
-		}
-	}
-	pending := r.calculationPending
-	r.mu.RUnlock()
-	if pending.Revision != 0 {
-		status.PendingRestart = true
-		status.PendingRevision = pending.Revision
-		status.PendingHash = pending.Hash
-	}
-	return status, nil
+	return r.calculations.status(), nil
 }
 
 func (r *Runtime) ListCalculationResults(_ context.Context, request api.PageRequest) (api.CalculationResultPage, error) {
-	r.mu.RLock()
-	items := make([]calculation.Result, 0, len(r.calculationResults)+len(r.calculationRetired))
-	for _, result := range r.calculationResults {
-		items = append(items, result)
-	}
-	for _, result := range r.calculationRetired {
-		items = append(items, result)
-	}
-	r.mu.RUnlock()
+	items := r.calculations.resultList()
 	query := strings.ToLower(strings.TrimSpace(request.Query))
 	filtered := items[:0]
 	for _, result := range items {
@@ -106,9 +58,7 @@ func (r *Runtime) ListCalculationResults(_ context.Context, request api.PageRequ
 }
 
 func (r *Runtime) ListCalculationRules(_ context.Context, request api.PageRequest) (api.CalculationRulePage, error) {
-	r.mu.RLock()
-	plan := r.calculationPlan
-	r.mu.RUnlock()
+	plan, _ := r.calculations.definition()
 	if plan == nil {
 		return api.CalculationRulePage{Items: []calculation.RuleView{}, Limit: request.Limit, Offset: request.Offset}, nil
 	}
@@ -161,16 +111,24 @@ func (r *Runtime) SaveCalculationDraft(ctx context.Context, expected uint64, con
 }
 
 func (r *Runtime) ImportCalculationFromLower(ctx context.Context, sourceID string, sourceRevision uint64) (calculation.Draft, error) {
+	if sourceRevision == 0 {
+		return calculation.Draft{}, &domain.FieldError{Field: "source_revision", Message: "is required"}
+	}
+	// Check the requested revision in the same short transaction that captures
+	// the physical client, not in a separate source read before that capture.
+	result, err := r.ExecuteSourceOperation(ctx, sourceID, sourceRevision, domain.OperationRequest{Action: "read_config", Name: "calc.toml"})
+	if err != nil {
+		return calculation.Draft{}, err
+	}
+	// A read does not hold a mutation lease. If the source was edited while
+	// the OPC call was in flight, do not let that old response replace a draft
+	// associated with the now-current source definition.
 	source, err := r.source(sourceID)
 	if err != nil {
 		return calculation.Draft{}, err
 	}
 	if source.Revision != sourceRevision {
 		return calculation.Draft{}, &domain.RevisionConflictError{Expected: sourceRevision, Actual: source.Revision}
-	}
-	result, err := r.ExecuteSourceOperation(ctx, sourceID, 0, domain.OperationRequest{Action: "read_config", Name: "calc.toml"})
-	if err != nil {
-		return calculation.Draft{}, err
 	}
 	var response struct {
 		Content string `json:"content"`
@@ -212,7 +170,9 @@ func (r *Runtime) validateCalculationContent(content string) (api.CalculationVal
 		return api.CalculationValidation{}, err
 	}
 	err = validateStateTargets(config.StateInputs, catalogs, r.routes.Groups(), r.routes.Sources())
-	if err == nil { _, err = calculation.Compile(config, calculationInputs(rawIndex)) }
+	if err == nil {
+		_, err = calculation.Compile(config, calculationInputs(rawIndex))
+	}
 	if err != nil {
 		var invalid *calculation.ValidationError
 		if errors.As(err, &invalid) {
@@ -255,18 +215,17 @@ func (r *Runtime) ActivateCalculation(ctx context.Context, draftRevision uint64)
 func (r *Runtime) activateCalculationConfigLocked(ctx context.Context, config calculation.Config, reason string) (calculation.Version, error) {
 	r.mu.RLock()
 	catalogs := cloneCatalogMap(r.catalogs)
-	oldPlan := r.calculationPlan
+	old := r.calculations.snapshot()
+	oldPlan, oldResults, oldRetiredResults, oldRetiredPoints := old.plan, old.results, old.retired, old.retiredPoints
 	oldIndex := r.index
-	oldResults := cloneCalculationResults(r.calculationResults)
-	oldRetiredResults := cloneCalculationResults(r.calculationRetired)
-	oldRetiredPoints := cloneIndexedPoints(r.calculationRetiredPoints)
-	handler := r.catalogReconciler
 	r.mu.RUnlock()
 	rawIndex, _, _, err := validateCatalogs(filterLowerCalculations(catalogs))
 	if err != nil {
 		return calculation.Version{}, err
 	}
-	if err = validateStateTargets(config.StateInputs, catalogs, r.routes.Groups(), r.routes.Sources()); err != nil { return calculation.Version{}, err }
+	if err = validateStateTargets(config.StateInputs, catalogs, r.routes.Groups(), r.routes.Sources()); err != nil {
+		return calculation.Version{}, err
+	}
 	plan, err := calculation.Compile(config, calculationInputs(rawIndex))
 	if err != nil {
 		return calculation.Version{}, err
@@ -277,9 +236,7 @@ func (r *Runtime) activateCalculationConfigLocked(ctx context.Context, config ca
 		if persistErr != nil {
 			return calculation.Version{}, persistErr
 		}
-		r.mu.Lock()
-		r.calculationPending = version
-		r.mu.Unlock()
+		r.calculations.setPending(version)
 		_ = r.repo.PruneCalculationVersions(ctx, 50)
 		r.audit(ctx, "calculation.pending_restart", "global", version.Revision, map[string]any{"hash": version.Hash, "rules": version.RuleCount, "reason": reason})
 		r.broker.Publish(api.Event{Type: "calculation_config_changed", Revision: version.Revision})
@@ -352,33 +309,16 @@ func (r *Runtime) activateCalculationConfigLocked(ctx context.Context, config ca
 	}
 	r.mu.Lock()
 	r.catalogs, r.index, r.conflictCount = catalogs, index, conflicts
-	r.calculationPlan, r.calculationVersion = plan, version
-	r.calculationStateSeen = nil
-	r.calculationStateEventPending = true
-	r.calculationPending = calculation.Version{}
-	r.calculationRunner = calculation.NewRunner(plan)
-	r.calculationResults = make(map[string]calculation.Result, plan.RuleCount())
 	for id, value := range oldRetiredResults {
 		if _, active := newOutputs[id]; !active {
 			value.Value = zeroValue(value.DataType, -1)
 			retired[id] = value
 		}
 	}
-	r.calculationRetired = retired
-	r.calculationRetiredPoints = retiredPoints
-	r.calculationFull = true
-	r.calculationDirty = make(map[string]struct{})
-	if r.calculationRouteRevision == 0 {
-		r.calculationRouteRevision = 1
-	}
-	r.calculationLastError = ""
+	r.calculations.install(plan, version, retired, retiredPoints)
 	r.mu.Unlock()
-	if handler != nil {
-		if err = handler(cloneCatalogUnion(index.union), groups, sources); err != nil {
-			r.recordUpstreamReconcileResult(err)
-			return calculation.Version{}, err
-		}
-		r.recordUpstreamReconcileResult(nil)
+	if err = r.publishCatalog(index, groups, sources); err != nil {
+		return calculation.Version{}, err
 	}
 	_ = r.repo.PruneCalculationVersions(ctx, 50)
 	r.audit(ctx, "calculation.activated", "global", version.Revision, map[string]any{
@@ -393,10 +333,8 @@ func (r *Runtime) DeactivateCalculation(ctx context.Context, activeRevision uint
 	r.configMu.Lock()
 	defer r.configMu.Unlock()
 	r.mu.RLock()
-	version := r.calculationVersion
-	plan := r.calculationPlan
+	plan, version := r.calculations.definition()
 	catalogs := cloneCatalogMap(r.catalogs)
-	handler := r.catalogReconciler
 	r.mu.RUnlock()
 	if plan == nil || version.Revision == 0 {
 		return domain.ErrNotFound
@@ -409,6 +347,10 @@ func (r *Runtime) DeactivateCalculation(ctx context.Context, activeRevision uint
 		return err
 	}
 	for _, node := range plan.CatalogNodes() {
+		if _, state := plan.StateInput(node.Key.Identifier); state {
+			// State outputs belong to the manager, not to a lower local engine.
+			continue
+		}
 		legacy, exists := index.pointForNode(node.Key.Identifier)
 		if !exists || legacy.Node.Kind != "calculation" || legacy.Node.DataType != node.DataType {
 			return &domain.OperationError{Code: "conflict", Message: "下级尚未恢复 local 计算模式，不能停用中央计算"}
@@ -431,16 +373,10 @@ func (r *Runtime) DeactivateCalculation(ctx context.Context, activeRevision uint
 	}
 	r.mu.Lock()
 	r.index, r.conflictCount = index, conflicts
-	r.calculationPlan, r.calculationVersion, r.calculationRunner = nil, calculation.Version{}, nil
-	r.calculationPending = calculation.Version{}
-	r.calculationResults, r.calculationRetired = make(map[string]calculation.Result), make(map[string]calculation.Result)
-	r.calculationRetiredPoints = make(map[string]indexedPoint)
-	r.calculationDirty, r.calculationFull = make(map[string]struct{}), false
+	r.calculations.install(nil, calculation.Version{}, nil, nil)
 	r.mu.Unlock()
-	if handler != nil {
-		if err = handler(cloneCatalogUnion(index.union), groups, sources); err != nil {
-			return err
-		}
+	if err = r.publishCatalog(index, groups, sources); err != nil {
+		return err
 	}
 	r.audit(ctx, "calculation.deactivated", "global", activeRevision, map[string]any{"previous_hash": version.Hash})
 	r.broker.Publish(api.Event{Type: "calculation_config_changed", Revision: activeRevision})
@@ -461,9 +397,8 @@ func (r *Runtime) ListCalculationVersions(ctx context.Context, request api.PageR
 func (r *Runtime) RestoreCalculationVersion(ctx context.Context, id int64, activeRevision uint64) (calculation.Version, error) {
 	r.configMu.Lock()
 	defer r.configMu.Unlock()
-	r.mu.RLock()
-	current := r.calculationVersion.Revision
-	r.mu.RUnlock()
+	_, active := r.calculations.definition()
+	current := active.Revision
 	if current != activeRevision {
 		return calculation.Version{}, &domain.RevisionConflictError{Expected: activeRevision, Actual: current}
 	}
@@ -529,68 +464,41 @@ func countAddedOutputs(before, after *calculation.Plan) int {
 func cloneCalculationResults(input map[string]calculation.Result) map[string]calculation.Result {
 	result := make(map[string]calculation.Result, len(input))
 	for key, value := range input {
-		result[key] = value
+		result[key] = cloneCalculationResult(value)
 	}
 	return result
 }
 
-func (r *Runtime) requestCalculationFull() {
-	r.mu.Lock()
-	if r.calculationPlan != nil {
-		r.calculationFull = true
-	}
-	r.mu.Unlock()
-	r.wakeCalculationWorker()
+func cloneCalculationResult(value calculation.Result) calculation.Result {
+	value.CommunicationInputs = append([]string(nil), value.CommunicationInputs...)
+	return value
 }
 
-func (r *Runtime) calculationRouteChanged() {
-	r.mu.Lock()
-	if r.calculationPlan != nil {
-		r.calculationRouteRevision++
-		if r.calculationRouteRevision == 0 {
-			r.calculationRouteRevision = 1
-		}
-		r.calculationFull = true
-	}
-	r.mu.Unlock()
-	r.wakeCalculationWorker()
-}
+func (r *Runtime) requestCalculationFull() { r.calculations.invalidate(false) }
+
+func (r *Runtime) calculationRouteChanged() { r.calculations.invalidate(true) }
 
 func (r *Runtime) calculationInputChanged(sourceID, identifier string) {
 	groups := r.routes.Groups()
-	r.mu.Lock()
-	plan, index := r.calculationPlan, r.index
-	if plan == nil || index == nil || !plan.HasBaseVariable(identifier) {
-		r.mu.Unlock()
+	r.mu.RLock()
+	index := r.index
+	r.mu.RUnlock()
+	if index == nil {
 		return
 	}
 	groupID, exists := index.groupForNode(identifier)
 	if !exists {
-		r.mu.Unlock()
 		return
 	}
-	defaultSource := ""
 	for _, group := range groups {
-		if group.ID == groupID {
-			defaultSource = group.DefaultSourceID
-			break
+		if group.ID == groupID && group.DefaultSourceID == sourceID {
+			r.calculations.inputChanged(identifier)
+			return
 		}
 	}
-	if defaultSource != sourceID {
-		r.mu.Unlock()
-		return
-	}
-	r.calculationDirty[identifier] = struct{}{}
-	r.mu.Unlock()
-	r.wakeCalculationWorker()
 }
 
-func (r *Runtime) wakeCalculationWorker() {
-	select {
-	case r.calculationWake <- struct{}{}:
-	default:
-	}
-}
+func (r *Runtime) wakeCalculationWorker() { r.calculations.signal() }
 
 func (r *Runtime) calculationWorker() {
 	defer r.wg.Done()
@@ -610,7 +518,7 @@ func (r *Runtime) calculationWorker() {
 			r.refreshCalculationStateInputs("")
 			r.flushCalculationStateEvent()
 			r.flushCalculationEvent()
-		case <-r.calculationWake:
+		case <-r.calculations.wake:
 			timer := time.NewTimer(calculationDebounce)
 			select {
 			case <-ctx.Done():
@@ -626,53 +534,20 @@ func (r *Runtime) calculationWorker() {
 }
 
 func (r *Runtime) runCalculationBatch() {
-	r.configMu.RLock()
-	defer r.configMu.RUnlock()
-	r.mu.Lock()
-	plan, runner, index := r.calculationPlan, r.calculationRunner, r.index
-	version, routeRevision := r.calculationVersion, r.calculationRouteRevision
-	full := r.calculationFull
-	dirty := make([]string, 0, len(r.calculationDirty))
-	for name := range r.calculationDirty {
-		dirty = append(dirty, name)
-	}
-	r.calculationFull = false
-	r.calculationDirty = make(map[string]struct{})
-	r.mu.Unlock()
-	if plan == nil || runner == nil || index == nil || (!full && len(dirty) == 0) {
-		return
-	}
-	if full {
-		dirty = plan.BaseVariables()
-	}
-	inputs := r.calculationInputsAtIndex(plan, index, dirty)
-	started := time.Now()
-	var changed []calculation.Result
-	if full {
-		changed = runner.Reset(inputs, version.Revision, routeRevision)
-	} else {
-		changed = runner.Update(inputs, version.Revision, routeRevision)
-	}
-	duration, now := time.Since(started), time.Now().UTC()
-	r.mu.Lock()
-	if r.calculationPlan != plan || r.calculationVersion.Revision != version.Revision {
-		r.mu.Unlock()
-		return
-	}
-	for _, result := range runner.Results() {
-		r.calculationResults[result.NodeID] = result
-	}
-	r.calculationLastEvaluationAt, r.calculationLastDuration, r.calculationLastError = now, duration, ""
-	publish := len(changed) != 0 && now.Sub(r.calculationEventAt) >= time.Second
-	if len(changed) != 0 {
-		if publish {
-			r.calculationEventAt = now
-			r.calculationEventPending = false
-		} else {
-			r.calculationEventPending = true
+	// Route/source/catalog invalidation also refreshes directly published
+	// states, including configurations with no formulas at all.
+	r.refreshCalculationStateInputs("")
+	changed, publish, revision := r.calculations.evaluate(func(plan *calculation.Plan, dirty []string) (map[string]calculation.Input, bool) {
+		r.configMu.RLock()
+		defer r.configMu.RUnlock()
+		r.mu.RLock()
+		index := r.index
+		r.mu.RUnlock()
+		if index == nil {
+			return nil, false
 		}
-	}
-	r.mu.Unlock()
+		return r.calculationInputsAtIndex(plan, index, dirty), true
+	})
 	if len(changed) == 0 {
 		return
 	}
@@ -682,7 +557,7 @@ func (r *Runtime) runCalculationBatch() {
 	}
 	r.refreshCalculationNodes(identifiers)
 	if publish {
-		r.broker.Publish(api.Event{Type: "calculation_results_changed", Revision: version.Revision})
+		r.broker.Publish(api.Event{Type: "calculation_results_changed", Revision: revision})
 	}
 }
 
@@ -734,35 +609,20 @@ func (r *Runtime) refreshCalculationNodes(identifiers []string) {
 }
 
 func (r *Runtime) flushCalculationEvent() {
-	r.mu.Lock()
-	if !r.calculationEventPending || time.Since(r.calculationEventAt) < time.Second {
-		r.mu.Unlock()
-		return
+	if revision, pending := r.calculations.takeResultEvent(); pending {
+		r.broker.Publish(api.Event{Type: "calculation_results_changed", Revision: revision})
 	}
-	r.calculationEventPending = false
-	r.calculationEventAt = time.Now().UTC()
-	revision := r.calculationVersion.Revision
-	r.mu.Unlock()
-	r.broker.Publish(api.Event{Type: "calculation_results_changed", Revision: revision})
 }
 
 func (r *Runtime) calculationSample(identifier string) (domain.Sample, bool) {
-	r.mu.RLock()
-	result, exists := r.calculationResults[identifier]
-	if !exists {
-		result, exists = r.calculationRetired[identifier]
-	}
-	plan := r.calculationPlan
-	r.mu.RUnlock()
-	if exists {
-		return result.Sample(), true
-	}
+	plan, _ := r.calculations.definition()
 	if plan != nil {
-		if dataType, exists := plan.OutputDataType(identifier); exists {
-			return domain.Sample{Type: dataType, Value: zeroValue(dataType, -1), StatusCode: domain.StatusBadWaitingInitialData}, true
+		if input, exists := plan.StateInput(identifier); exists {
+			view := r.stateInputValue(input, r.routes.Groups(), r.routes.Sources())
+			return domain.Sample{Type: domain.DataTypeUInt32, Value: view.Value, StatusCode: view.StatusCode, SourceTimestamp: view.ObservedAt}, true
 		}
 	}
-	return domain.Sample{}, false
+	return r.calculations.sample(identifier)
 }
 
 var _ api.CalculationService = (*Runtime)(nil)

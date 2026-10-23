@@ -249,7 +249,7 @@ func (r *Repository) PruneOperationalHistory(ctx context.Context, cutoff time.Ti
 	}{
 		{`DELETE FROM source_events WHERE occurred_at < ? OR id NOT IN (SELECT id FROM source_events ORDER BY occurred_at DESC, id DESC LIMIT ?)`, []any{cutoffText, maxRows}},
 		{`DELETE FROM management_audit WHERE occurred_at < ? OR id NOT IN (SELECT id FROM management_audit ORDER BY occurred_at DESC, id DESC LIMIT ?)`, []any{cutoffText, maxRows}},
-		{`DELETE FROM command_audit WHERE state <> 'Waiting' AND (COALESCE(finished_at, started_at) < ? OR id NOT IN
+		{`DELETE FROM command_audit WHERE state NOT IN ('Waiting', 'Queued') AND (COALESCE(finished_at, started_at) < ? OR id NOT IN
 			(SELECT id FROM command_audit ORDER BY started_at DESC, id DESC LIMIT ?))`, []any{cutoffText, maxRows}},
 		{`DELETE FROM alarms WHERE state = 'Resolved' AND resolved_at < ?`, []any{cutoffText}},
 	}

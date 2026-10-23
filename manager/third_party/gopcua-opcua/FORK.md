@@ -11,7 +11,8 @@ Upstream module checksum:
 `h1:Qp40I5JmiiKXYIWmk7xECYNrXs5unohH24jKWnSRyIE=`.
 The imported files were checked against the downloaded v0.9.1 module ZIP;
 `UPSTREAM.sha256` records the original bytes of every retained upstream file.
-Only `client.go` and `client_sub.go` have local runtime modifications.
+Local runtime modifications are in `client.go`, `client_sub.go`,
+`subscription.go` and `uasc/secure_channel.go`.
 
 ## Scope of the source copy
 
@@ -71,6 +72,35 @@ owns an ephemeral loopback listener; it never borrows an existing OPC service.
    epoch/cancel token preventing late Dial success after Close. All connection
    and secure-channel I/O remains outside that mutex. The request timeout also
    bounds the UACP HEL/ACK phase, which otherwise only observes deadlines.
+8. A request cancelled while waiting for the channel-instance send lock does
+   not reserve a wire sequence number. Encoding/signing/cancellation failures
+   before any TCP write restore the unsent sequence reservation and remove only
+   that request's registered response handler. The same rule applies to the
+   response send path. A failed/short write or interruption after a logical
+   message's first chunk closes and poisons the transport: the following request
+   cannot continue an incomplete stream. This does not retry requests or weaken
+   peer sequence validation; in particular it must never resend control commands.
+9. Secure-channel renewal and wire admission use one cancellable send gate.
+   Selecting the active token and writing a logical message are atomic with
+   respect to renewal; response waits happen outside the gate. This replaces
+   the condition-variable/WaitGroup gap which allowed a sender to retain an old
+   token and duplicate the sequence after renewal, and raced Add against Wait.
+   A queued renewal for a replaced token is skipped. Close wakes queued senders
+   and closes a busy socket without waiting behind an unanswered OPN. A failed
+   Open/Renew result closes the transport, because a lost reply cannot establish
+   which sequence/token state is safe to continue. There is no automatic resend.
+10. A decoded response with `ServiceResult=BadTimeout` is a request-level error,
+    delivered to the original caller rather than the connection monitor. An
+    expired Publish may request the next notification on the same Session;
+    a Call still returns its timeout without resending. Transport failures,
+    secure-channel failures and a Publish `StatusChangeNotification` reporting
+    subscription expiry retain their existing error paths. An unsuccessful
+    channel Open/Renew still closes the transport.
+11. The Publish request timeout includes a margin of the larger of one keepalive
+    period and the configured request timeout, capped at the UA maximum with
+    overflow-safe arithmetic. For the revised 50 ms / 3000 keepalive settings
+    the request budget is 300 s, not exactly the 150 s keepalive deadline.
+    Sampling, publishing, subscription lifetime and serial timing are unchanged.
 
 No empty subscription, manual re-subscription, or client-side timer is used to
 wake Publish as a workaround.
@@ -103,6 +133,17 @@ OpenSecureChannel and verifies cancellation, no blocking transport lock, and no
 late connection publication. The peer uses fully initialized UA response
 headers and endpoint descriptions; it does not change the UA encoder.
 
+`uasc/secure_channel_send_test.go` uses a separate ephemeral loopback peer to
+check pre-send and mid-encode cancellation, cancelled concurrent send waiters,
+encoding-error handler cleanup, response cancellation, and an interrupted
+multi-chunk stream. The peer reads actual chunk headers and requires consecutive
+sequence numbers; no installed OPC service or hardware is used.
+`uasc/secure_channel_renewal_test.go` adds a strict OPN peer and covers stale-token
+renewals, an unanswered Publish during renewal, cancellable gate admission,
+Close interrupting OPN, and an unanswered initial/renewal OPN which must not be
+retried on the same transport. Duplicate-handler ownership and cancellation at
+sequence wrap are covered by the send tests.
+
 From the manager module, with explicit test endpoints and fixture control:
 
 ```sh
@@ -114,6 +155,26 @@ The live test covers native automatic Session/subscription recovery and an
 independent raw outstanding-Publish scenario against the deployed manager.
 The general manager suite also exercises its separate manual lower supervisor.
 
+The opt-in `TestTransportSequenceRealRustInterop` accepts only an isolated Rust
+binary via `RCD_SEQUENCE_INTEROP_BINARY`; it creates its own configuration,
+disabled nonexistent serial port, PKI and ephemeral OPC listener. Run it from
+the manager module with `-race -count=3`. It checks cancelled requests followed
+by successful reads and concurrent Read/readonly Call/Subscribe/actual Renew
+against both None and Basic256Sha256, with automatic reconnect disabled. It
+does not use a field endpoint or send hardware commands. See the dated
+[2026-10-11 evidence](../../docs/validation/opc-transport-audit-fixes-20261011.md).
+
 When changing the base version, compare against `UPSTREAM.sha256`, port the
 named patches deliberately, and run both the fork and real manager regressions
 before changing the `replace` target.
+
+The opt-in `TestIdlePublishRealRustInterop` uses the same isolated real Rust
+server with a constant monitored NamespaceArray and the field 50 ms / 3000
+keepalive settings. Both None and Basic256Sha256 must keep the original
+Session/channel for 330 s with reconnect disabled and concurrent read checks.
+Before patches 10–11 both failed at 151 s. `client_timeout_test.go` additionally
+forces repeated request-level `BadTimeout` ServiceFaults over the wire, proves
+that Call is not retried and that real channel faults still disconnect.
+`subscription_timeout_test.go` covers margin, overflow, and subscription-expiry
+notification delivery. Run the opt-in test with `-race -count=1 -timeout=8m`;
+short read tests cannot cover this idle-time failure.

@@ -68,6 +68,8 @@ func validateOperationResult(request domain.OperationRequest, result json.RawMes
 		return validateConfigDocument(request, object)
 	case "validate_config":
 		return validateConfigValidation(object)
+	case "prepare_config":
+		return validateConfigForm(object)
 	case "list_logs":
 		return validateLogList(object)
 	case "read_log":

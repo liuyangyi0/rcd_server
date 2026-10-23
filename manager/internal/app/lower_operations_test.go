@@ -15,11 +15,15 @@ import (
 
 type operationLowerStub struct {
 	fakeLowerClient
-	execute func(context.Context, domain.OperationRequest, uint64) (json.RawMessage, error)
-	calls   atomic.Int32
+	execute      func(context.Context, domain.OperationRequest, uint64) (json.RawMessage, error)
+	capabilities func(context.Context, uint64) (domain.OperationsCapabilities, error)
+	calls        atomic.Int32
 }
 
-func (*operationLowerStub) OperationsCapabilities(context.Context, uint64) (domain.OperationsCapabilities, error) {
+func (f *operationLowerStub) OperationsCapabilities(ctx context.Context, epoch uint64) (domain.OperationsCapabilities, error) {
+	if f.capabilities != nil {
+		return f.capabilities(ctx, epoch)
+	}
 	return domain.OperationsCapabilities{Supported: true, SchemaVersion: 1, Features: []string{"acquisition", "configuration", "logs", "logging_configuration"}}, nil
 }
 
@@ -73,7 +77,7 @@ func (f *operationLowerStub) ExecuteOperation(ctx context.Context, request domai
 func installOperationsLower(t *testing.T, r *Runtime, f *operationLowerStub) uint64 {
 	t.Helper()
 	r.mu.Lock()
-	r.lowers["source-a"] = lowerHandle{client: f, generation: 3}
+	installTestLower(r, "source-a", lowerHandle{client: f, generation: 3})
 	r.statuses["source-a"] = connectedStatus("source-a", 3<<32|7)
 	r.mu.Unlock()
 	source, err := r.source("source-a")
@@ -148,6 +152,53 @@ func TestOperationsRejectStaleSourceRevisionAndCommandPending(t *testing.T) {
 	_, err = r.ExecuteSourceOperation(context.Background(), "source-a", revision, request)
 	if !errors.Is(err, domain.ErrCommandPending) || f.calls.Load() != 0 {
 		t.Fatalf("physical ID bypassed normalized command lock: %v", err)
+	}
+}
+
+func TestOperationsRejectUnclaimedQueuedCommandsOnPhysicalPort(t *testing.T) {
+	r := seededRuntime(t)
+	f := &operationLowerStub{}
+	revision := installOperationsLower(t, r, f)
+	if err := r.openSession("operator"); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := r.routes.EnqueueWrite("operator", "line", "COM1", "COM1_Send", "010203")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, active := r.routes.PendingCommand("source-a", "COM1"); active {
+		t.Fatal("test must exercise the accepted-but-not-yet-executing window")
+	}
+	r.mu.Lock()
+	catalog := r.catalogs["source-a"]
+	catalog.Topology = &domain.SourceTopology{Ports: []domain.TopologyPort{{PortID: "/dev/COM1", SendNodeID: "COM1_Send"}}}
+	r.catalogs["source-a"] = catalog
+	r.mu.Unlock()
+	enabled := false
+	requests := []domain.OperationRequest{
+		{Action: "set_port_enabled", PortID: "/dev/COM1", Enabled: &enabled, ExpectedRevision: "1"},
+		{Action: "set_device_read_enabled", PortID: "/dev/COM1", DeviceID: "1", Enabled: &enabled, ExpectedRevision: "1"},
+		{Action: "set_device_module_type", PortID: "/dev/COM1", DeviceID: "1", ModuleType: domain.ModuleTypeDomestic, ExpectedRevision: "1", ExpectedStationRevision: "1"},
+		{Action: "query_device_version", PortID: "/dev/COM1", DeviceID: "1", ExpectedRevision: "1", ExpectedStationRevision: "1"},
+	}
+	for _, request := range requests {
+		if _, err := r.ExecuteSourceOperation(context.Background(), "source-a", revision, request); !errors.Is(err, domain.ErrCommandPending) {
+			t.Fatalf("%s bypassed queued command reservation: %v", request.Action, err)
+		}
+	}
+	if f.calls.Load() != 0 {
+		t.Fatalf("blocked maintenance reached the lower: %d calls", f.calls.Load())
+	}
+	other := portOperation()
+	other.PortID = "COM2"
+	if _, err := r.ExecuteSourceOperation(context.Background(), "source-a", revision, other); err != nil {
+		t.Fatalf("unrelated physical port should remain usable: %v", err)
+	}
+	if _, err := r.routes.CommitCommandFinish(queued.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ExecuteSourceOperation(context.Background(), "source-a", revision, requests[0]); err != nil {
+		t.Fatalf("completed queue did not release maintenance: %v", err)
 	}
 }
 

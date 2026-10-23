@@ -41,6 +41,35 @@ use sha2::{Digest, Sha256};
 
 #[tokio::main]
 async fn main() -> tokio::io::Result<()> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if matches!(
+        args.first().and_then(|v| v.to_str()),
+        Some("version" | "--version" | "-V")
+    ) {
+        let info = rcd_server::build_info::current();
+        match args.get(1).and_then(|v| v.to_str()) {
+            None if args.len() == 1 => println!(
+                "RCD Lower {} ({}, {})",
+                info.version, info.commit, info.built_at
+            ),
+            Some("--json") if args.len() == 2 => println!(
+                "{}",
+                serde_json::to_string(&info).map_err(io::Error::other)?
+            ),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "usage: rcd_server version [--json]",
+                ))
+            }
+        }
+        return Ok(());
+    }
+    if args.len() == 1 && matches!(args[0].to_str(), Some("--help" | "-h" | "help")) {
+        println!("rcd_server [--config-dir PATH] [--state-dir PATH] [--pki-dir PATH] [--log-dir PATH]\nrcd_server version [--json]");
+        return Ok(());
+    }
+    rcd_server::runtime_paths::initialize(rcd_server::runtime_paths::Overrides::parse(args)?)?;
     // 必须在初始化文件 logger 和打开串口之前加锁，避免第二个实例扰乱
     // rCURRENT 日志、抢占串口或短暂创建一套重复 worker。
     let _instance_lock = match InstanceLock::acquire() {
@@ -61,7 +90,7 @@ async fn main() -> tokio::io::Result<()> {
     info!(
         "[程序启动] pid={} version={} exe={:?}",
         std::process::id(),
-        env!("CARGO_PKG_VERSION"),
+        rcd_server::build_info::current().version,
         std::env::current_exe().ok(),
     );
 
@@ -171,8 +200,9 @@ async fn run_server() -> tokio::io::Result<()> {
     // the same validated CSV snapshot, including a persisted closed port.
     let serial_configs = load_and_group_csv_configs()?;
     let (log_dir, log_basename) = logging::startup_log_location()?;
-    let operations = Operations::new_with_shutdown(
+    let operations = Operations::new_with_directories(
         config::config_dir().map_err(|e| io::Error::other(e.to_string()))?,
+        rcd_server::runtime_paths::current()?.state,
         log_dir,
         log_basename,
         &serial_configs,
@@ -343,17 +373,25 @@ async fn shutdown_on_signal(
 /// 文件句柄关闭会自动释放锁。锁文件本身保留，不能删除，否则可能产生 inode 竞争。
 #[derive(Debug)]
 struct InstanceLock {
-    _file: File,
+    _files: Vec<File>,
 }
 
 impl InstanceLock {
     fn acquire() -> io::Result<Self> {
-        let exe = std::env::current_exe()?;
-        let lock_path = exe
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(".rcd_server.lock");
-        Self::acquire_at(&lock_path)
+        Self::acquire_paths(rcd_server::runtime_paths::current()?.lock_paths())
+    }
+
+    fn acquire_paths(paths: Vec<std::path::PathBuf>) -> io::Result<Self> {
+        let mut files = Vec::new();
+        let mut seen = HashSet::new();
+        for path in paths {
+            let canonical =
+                std::fs::canonicalize(path.parent().unwrap())?.join(path.file_name().unwrap());
+            if seen.insert(canonical.clone()) {
+                files.extend(Self::acquire_at(&canonical)?._files);
+            }
+        }
+        Ok(Self { _files: files })
     }
 
     fn acquire_at(path: &Path) -> io::Result<Self> {
@@ -377,7 +415,7 @@ impl InstanceLock {
         file.set_len(0)?;
         writeln!(file, "{}", std::process::id())?;
         file.flush()?;
-        Ok(Self { _file: file })
+        Ok(Self { _files: vec![file] })
     }
 }
 
@@ -716,6 +754,31 @@ mod startup_tests {
         assert_eq!(ports[1].baud_rate, 9600);
         assert!(ports[1].is_special);
         assert_eq!(ports[1].devices[0].config.device_id, 2);
+    }
+
+    #[test]
+    fn instance_lock_set_deduplicates_and_releases_partial_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_lock = dir.path().join("config.lock");
+        let legacy_lock = dir.path().join("legacy.lock");
+        let old = InstanceLock::acquire_at(&legacy_lock).unwrap();
+        assert!(InstanceLock::acquire_paths(vec![
+            config_lock.clone(),
+            config_lock.clone(),
+            legacy_lock.clone()
+        ])
+        .is_err());
+        // A failed upgrade/start attempt must not leave the config lock held.
+        drop(InstanceLock::acquire_at(&config_lock).unwrap());
+        drop(old);
+        let locks = InstanceLock::acquire_paths(vec![
+            config_lock.clone(),
+            config_lock.clone(),
+            legacy_lock,
+        ])
+        .unwrap();
+        assert_eq!(locks._files.len(), 2);
+        assert!(InstanceLock::acquire_at(&config_lock).is_err());
     }
 
     #[test]

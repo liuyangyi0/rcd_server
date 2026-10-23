@@ -198,7 +198,7 @@ func TestProcessMaintenanceAndAllPortCommandsExcludeEachOther(t *testing.T) {
 		r.OnSample("source-b", testKey("COM1_Send"), domain.Sample{Type: domain.DataTypeString, Value: "1", StatusCode: domain.StatusGood, Epoch: 1})
 	}
 	r.mu.Lock()
-	r.lowers["source-b"] = lowerHandle{client: client, generation: 1}
+	installTestLower(r, "source-b", lowerHandle{client: client, generation: 1})
 	r.statuses["source-b"] = connectedStatus("source-b", 1)
 	r.mu.Unlock()
 	primeWriteAck(r, "source-b", "COM1", 1)
@@ -315,7 +315,7 @@ func TestProcessManagerResolveBeforeOriginalPostFreezesExactFingerprint(t *testi
 		t.Fatalf("missing operation=%v", err)
 	}
 	op, err := r.ResolveSourceProcess(context.Background(), "source-a", "1", input)
-	if err != nil || !op.Terminal() || agent.actions.Load() != 0 || agent.resolves.Load() != 1 {
+	if err != nil || !op.Terminal() || agent.actions.Load() != 0 || agent.resolves.Load() != 0 {
 		t.Fatalf("manager resolve %+v %v", op, err)
 	}
 	if _, err := r.ExecuteSourceProcess(context.Background(), "source-a", "1", input); err != nil || agent.actions.Load() != 0 {
@@ -521,77 +521,55 @@ func TestProcessWorkerShutdownCancelsReconciliationWithoutActionRetry(t *testing
 }
 
 func TestProcessConcurrentResolveAndOriginalActionUseOneAdmission(t *testing.T) {
-	for _, resolveFirst := range []bool{false, true} {
-		t.Run(map[bool]string{true: "resolve_first", false: "action_first"}[resolveFirst], func(t *testing.T) {
-			r := seededRuntime(t)
-			entered, release := make(chan struct{}), make(chan struct{})
-			released := false
-			defer func() {
-				if !released {
-					close(release)
-				}
-			}()
-			block := func(ctx context.Context, _ domain.ProcessBinding, req domain.ProcessActionRequest) (domain.ProcessOperation, error) {
-				close(entered)
-				select {
-				case <-release:
-				case <-ctx.Done():
-				}
-				state := "accepted"
-				if resolveFirst {
-					state = "failed"
-				}
-				return processStubOperation(req, state), nil
+	t.Run("action_first", func(t *testing.T) {
+		r := seededRuntime(t)
+		entered, release := make(chan struct{}), make(chan struct{})
+		released := false
+		defer func() {
+			if !released {
+				close(release)
 			}
-			agent := &processAgentStub{}
-			if resolveFirst {
-				agent.resolveFn = block
-			} else {
-				agent.actionFn = block
-			}
-			r.options.ProcessAgentClient = agent
-			binding := bindProcessTest(t, r, "source-a")
-			input := processTestInput(binding, "same-id")
-			done := make(chan error, 1)
-			go func() {
-				var err error
-				if resolveFirst {
-					_, err = r.ResolveSourceProcess(context.Background(), "source-a", "1", input)
-				} else {
-					_, err = r.ExecuteSourceProcess(context.Background(), "source-a", "1", input)
-				}
-				done <- err
-			}()
+		}()
+		block := func(ctx context.Context, _ domain.ProcessBinding, req domain.ProcessActionRequest) (domain.ProcessOperation, error) {
+			close(entered)
 			select {
-			case <-entered:
-			case <-time.After(2 * time.Second):
-				t.Fatal("first admission did not reach agent")
+			case <-release:
+			case <-ctx.Done():
 			}
-			var op domain.ProcessOperation
-			var err error
-			if resolveFirst {
-				op, err = r.ExecuteSourceProcess(context.Background(), "source-a", "1", input)
-			} else {
-				op, err = r.ResolveSourceProcess(context.Background(), "source-a", "1", input)
+			return processStubOperation(req, "accepted"), nil
+		}
+		agent := &processAgentStub{actionFn: block}
+		r.options.ProcessAgentClient = agent
+		binding := bindProcessTest(t, r, "source-a")
+		input := processTestInput(binding, "same-id")
+		done := make(chan error, 1)
+		go func() {
+			_, err := r.ExecuteSourceProcess(context.Background(), "source-a", "1", input)
+			done <- err
+		}()
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("first admission did not reach agent")
+		}
+		op, err := r.ResolveSourceProcess(context.Background(), "source-a", "1", input)
+		if err != nil || op.State != "accepted" {
+			t.Fatalf("second admission %+v %v", op, err)
+		}
+		if agent.actions.Load() != 1 || agent.resolves.Load() != 0 {
+			t.Fatal("second endpoint dispatched a side effect")
+		}
+		close(release)
+		released = true
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
 			}
-			if err != nil || op.State != "accepted" {
-				t.Fatalf("second admission %+v %v", op, err)
-			}
-			if resolveFirst && agent.actions.Load() != 0 || !resolveFirst && agent.resolves.Load() != 0 {
-				t.Fatal("second endpoint dispatched a side effect")
-			}
-			close(release)
-			released = true
-			select {
-			case err := <-done:
-				if err != nil {
-					t.Fatal(err)
-				}
-			case <-time.After(2 * time.Second):
-				t.Fatal("first admission did not complete")
-			}
-		})
-	}
+		case <-time.After(2 * time.Second):
+			t.Fatal("first admission did not complete")
+		}
+	})
 }
 
 func TestProcessMaintenanceAlsoProtectsGroupDeleteImportAndDeviceRebinding(t *testing.T) {

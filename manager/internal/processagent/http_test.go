@@ -31,6 +31,16 @@ func agentHTTP(t *testing.T, s *Supervisor, method, path, instance string, body 
 
 func TestAgentHTTPInstanceScopeAndResourceBoundary(t *testing.T) {
 	s := newTestSupervisor(t, supervisorConfig(t, "graceful"))
+	for _, id := range []string{"", "another-lower"} {
+		if got := agentHTTP(t, s, "GET", "/api/v1/version", id, nil); got.Code != 404 {
+			t.Fatal("version target validation bypassed")
+		}
+	}
+	identity := agentHTTP(t, s, "GET", "/api/v1/version", s.cfg.InstanceID, nil)
+	var info map[string]any
+	if identity.Code != 200 || json.Unmarshal(identity.Body.Bytes(), &info) != nil || info["component"] != "agent" || info["release_id"] == nil {
+		t.Fatal(identity.Body.String())
+	}
 	if got := agentHTTP(t, s, "GET", "/healthz", "", nil); got.Code != 200 {
 		t.Fatal(got.Code, got.Body.String())
 	}

@@ -126,10 +126,11 @@ type SecureChannel struct {
 	activeInstance *channelInstance
 	instancesMu    sync.Mutex
 
-	// prevent sending msg when secure channel renewal occurs
-	reqLocker  *conditionLocker
-	rcvLocker  *conditionLocker
-	pendingReq sync.WaitGroup
+	// sendGate serializes selection of the active token and the complete wire
+	// write with token renewal. Ordinary sends release it before waiting for a
+	// response, so an outstanding Publish never prevents renewal.
+	sendGate  chan struct{}
+	rcvLocker *conditionLocker
 
 	// handles maps requestIDs to response channels
 	handlers   map[uint32]chan *MessageBody
@@ -174,6 +175,10 @@ type SecureChannel struct {
 	kind channelKind
 
 	closeOnce sync.Once
+
+	// An interrupted/failed write may leave an incomplete logical message on
+	// the wire. Once poisoned, no token instance may send on this transport.
+	failedWrite atomic.Bool
 }
 
 func NewSecureChannel(endpoint string, c *uacp.Conn, cfg *Config, errCh chan<- error) (*SecureChannel, error) {
@@ -225,7 +230,7 @@ func newSecureChannel(endpoint string, c *uacp.Conn, cfg *Config, kind channelKi
 		// secureChannelID: secureChannelID,
 		// sequenceNumber:  sequenceNumber,
 		// securityTokenID: securityTokenID,
-		reqLocker:    newConditionLocker(),
+		sendGate:     make(chan struct{}, 1),
 		rcvLocker:    newConditionLocker(),
 		errch:        errCh,
 		closing:      make(chan struct{}),
@@ -265,7 +270,14 @@ func (s *SecureChannel) dispatcher() {
 			return
 		default:
 			msg := s.Receive(ctx)
-			if msg.Err != nil {
+			// A decoded BadTimeout response ends only its service request.
+			// Publish must replenish its request on the SAME Session/channel;
+			// reporting this to the connection monitor races that normal path
+			// and tears down idle subscriptions. Do not suppress transport,
+			// chunk/decoder errors, or subscription StatusChangeNotifications.
+			requestTimeout := msg.Response() != nil && msg.Response().Header() != nil &&
+				msg.Response().Header().ServiceResult == ua.StatusBadTimeout
+			if msg.Err != nil && !requestTimeout {
 				select {
 				case <-s.closing:
 					return
@@ -574,7 +586,19 @@ func (s *SecureChannel) LocalEndpoint() string {
 }
 
 func (s *SecureChannel) Open(ctx context.Context) error {
-	return s.open(ctx, nil, ua.SecurityTokenRequestTypeIssue)
+	if err := s.lockSend(ctx); err != nil {
+		return err
+	}
+	defer s.unlockSend()
+	if err := s.checkSendAllowed(ctx); err != nil {
+		return err
+	}
+	if err := s.open(ctx, nil, ua.SecurityTokenRequestTypeIssue); err != nil {
+		s.failedWrite.Store(true)
+		_ = s.c.Close()
+		return err
+	}
+	return nil
 }
 
 func (s *SecureChannel) open(ctx context.Context, instance *channelInstance, requestType ua.SecurityTokenRequestType) error {
@@ -628,9 +652,8 @@ func (s *SecureChannel) open(ctx context.Context, instance *channelInstance, req
 	// s.openingInstance.securityTokenID = s.securityTokenID
 
 	if requestType == ua.SecurityTokenRequestTypeRenew {
-		// TODO: lock? sequenceNumber++?
-		// this seems racy. if another request goes out while the other open request is in flight then won't an error
-		// be raised on the server? can the sequenceNumber be as "global" as the request ID?
+		// sendGate excludes all other outbound messages until the new token is
+		// installed, so the copied sequence is the last one actually sent.
 		s.openingInstance.sequenceNumber = instance.sequenceNumber
 		s.openingInstance.secureChannelID = instance.secureChannelID
 	}
@@ -855,14 +878,38 @@ func (s *SecureChannel) scheduleRenewal(instance *channelInstance) {
 }
 
 func (s *SecureChannel) renew(instance *channelInstance) error {
-	// lock ensure no one else renews this at the same time
-	s.reqLocker.lock()
-	defer s.reqLocker.unlock()
-	s.pendingReq.Wait()
+	return s.renewWithContext(context.Background(), instance)
+}
+
+func (s *SecureChannel) renewWithContext(ctx context.Context, instance *channelInstance) error {
+	if err := s.lockSend(ctx); err != nil {
+		return err
+	}
+	defer s.unlockSend()
+	if err := s.checkSendAllowed(ctx); err != nil {
+		return err
+	}
+	active, err := s.getActiveChannelInstance()
+	if err != nil {
+		return err
+	}
+	if active != instance {
+		// Another queued/manual renewal already replaced this token. In
+		// particular, an old scheduled renewal must not restart its sequence.
+		return nil
+	}
 	instance.Lock()
 	defer instance.Unlock()
 
-	return s.open(context.Background(), instance, ua.SecurityTokenRequestTypeRenew)
+	if err := s.open(ctx, instance, ua.SecurityTokenRequestTypeRenew); err != nil {
+		// A complete OPN may already have consumed the next sequence and its
+		// response may have been lost. Never continue with the old token's
+		// counter or speculate that retrying OPN is harmless.
+		s.failedWrite.Store(true)
+		_ = s.c.Close()
+		return err
+	}
+	return nil
 }
 
 func (s *SecureChannel) scheduleExpiration(instance *channelInstance) {
@@ -913,16 +960,17 @@ func (s *SecureChannel) sendRequestWithTimeout(
 	timeout time.Duration,
 	h ResponseHandler) error {
 
-	s.pendingReq.Add(1)
 	respRequired := h != nil
 
 	ch, err := s.sendAsyncWithTimeout(ctx, req, reqID, instance, authToken, respRequired, timeout)
-	s.pendingReq.Done()
 	if err != nil {
 		return err
 	}
+	return s.waitResponse(ctx, reqID, ch, timeout, h)
+}
 
-	if !respRequired {
+func (s *SecureChannel) waitResponse(ctx context.Context, reqID uint32, ch <-chan *MessageBody, timeout time.Duration, h ResponseHandler) error {
+	if h == nil {
 		return nil
 	}
 
@@ -968,7 +1016,7 @@ func (s *SecureChannel) Renew(ctx context.Context) error {
 		return err
 	}
 
-	return s.renew(instance)
+	return s.renewWithContext(ctx, instance)
 }
 
 func (s *SecureChannel) SendRequest(ctx context.Context, req ua.Request, authToken *ua.NodeID, h ResponseHandler) error {
@@ -977,14 +1025,56 @@ func (s *SecureChannel) SendRequest(ctx context.Context, req ua.Request, authTok
 }
 
 func (s *SecureChannel) SendRequestWithTimeout(ctx context.Context, req ua.Request, authToken *ua.NodeID, timeout time.Duration, h ResponseHandler) error {
-	s.reqLocker.waitIfLock()
+	if err := s.lockSend(ctx); err != nil {
+		return err
+	}
 	active, err := s.getActiveChannelInstance()
 	if err != nil {
+		s.unlockSend()
 		return err
 	}
 
-	return s.sendRequestWithTimeout(ctx, req, s.nextRequestID(), active, authToken, timeout, h)
+	reqID := s.nextRequestID()
+	ch, err := s.sendAsyncWithTimeout(ctx, req, reqID, active, authToken, h != nil, timeout)
+	s.unlockSend()
+	if err != nil {
+		return err
+	}
+	return s.waitResponse(ctx, reqID, ch, timeout, h)
 }
+
+func (s *SecureChannel) lockSend(ctx context.Context) error {
+	// Bound lock admission even for Background callers. A timed-out caller
+	// never enters the send path after a renewal eventually releases the gate.
+	waitCtx := ctx
+	if s.cfg.RequestTimeout > 0 {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, s.cfg.RequestTimeout)
+		defer cancel()
+	}
+	select {
+	case <-waitCtx.Done():
+		return waitCtx.Err()
+	case <-s.closing:
+		return io.EOF
+	case <-s.disconnected:
+		return io.EOF
+	case s.sendGate <- struct{}{}:
+	}
+	select {
+	case <-s.closing:
+		s.unlockSend()
+		return io.EOF
+	default:
+	}
+	if err := waitCtx.Err(); err != nil {
+		s.unlockSend()
+		return err
+	}
+	return nil
+}
+
+func (s *SecureChannel) unlockSend() { <-s.sendGate }
 
 func (s *SecureChannel) sendAsyncWithTimeout(
 	ctx context.Context,
@@ -994,10 +1084,30 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 	authToken *ua.NodeID,
 	respRequired bool,
 	timeout time.Duration,
-) (<-chan *MessageBody, error) {
+) (response <-chan *MessageBody, err error) {
 
 	instance.Lock()
 	defer instance.Unlock()
+	if err := s.checkSendAllowed(ctx); err != nil {
+		return nil, err
+	}
+
+	sequenceBefore := instance.sequenceNumber
+	writeAttempted := false
+	registered := false
+	defer func() {
+		if err != nil {
+			// newRequestMessage reserves the first sequence before encoding.
+			// No bytes were offered to TCP: undo the reservation while the
+			// instance lock still prevents another sender from observing it.
+			if !writeAttempted {
+				instance.sequenceNumber = sequenceBefore
+			}
+			if registered {
+				s.popHandler(reqID)
+			}
+		}
+	}()
 
 	m, err := instance.newRequestMessage(req, reqID, authToken, timeout)
 	if err != nil {
@@ -1018,48 +1128,35 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 		}
 
 		s.handlers[reqID] = resp
+		registered = true
 		s.handlersMu.Unlock()
 	}
 
-	chunks, err := m.EncodeChunks(instance.maxBodySize)
+	_, writeAttempted, err = s.writeMessageChunks(ctx, instance, reqID, m, req, &timeout)
 	if err != nil {
 		return nil, err
-	}
-
-	for i, chunk := range chunks {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-		if i > 0 { // fix sequence number on subsequent chunks
-			number := instance.nextSequenceNumber()
-			binary.LittleEndian.PutUint32(chunk[16:], uint32(number))
-		}
-
-		chunk, err = instance.signAndEncrypt(m, chunk)
-		if err != nil {
-			return nil, err
-		}
-
-		// send the message
-		var n int
-		s.c.SetWriteDeadline(time.Now().Add(timeout))
-		if n, err = s.c.Write(chunk); err != nil {
-			return nil, err
-		}
-		s.c.SetWriteDeadline(time.Time{})
-
-		atomic.AddUint64(&instance.bytesSent, uint64(n))
-		atomic.AddUint32(&instance.messagesSent, 1)
-
-		debug.Printf("uasc %d/%d: send %T with %d bytes", s.c.ID(), reqID, req, len(chunk))
 	}
 
 	return resp, nil
 }
 
-func (s *SecureChannel) writeMessageChunks(ctx context.Context, instance *channelInstance, reqID uint32, m *Message, body any) (int, error) {
+func (s *SecureChannel) checkSendAllowed(ctx context.Context) error {
+	if s.failedWrite.Load() {
+		return io.EOF
+	}
+	return ctx.Err()
+}
+
+func (s *SecureChannel) writeMessageChunks(ctx context.Context, instance *channelInstance, reqID uint32, m *Message, body any, timeout *time.Duration) (bytesSent int, writeAttempted bool, err error) {
+	defer func() {
+		if err != nil && writeAttempted {
+			// TCP cannot withdraw bytes already written. Reusing this stream
+			// could splice the next request into an unfinished chunk sequence.
+			// Do not retry or roll back its sequence; force channel recovery.
+			s.failedWrite.Store(true)
+			_ = s.c.Close()
+		}
+	}()
 	// Large service payloads may exceed a single UASC message body. Encode the
 	// full logical message up front, then stream each chunk in sequence while the
 	// caller holds the channel-instance lock.
@@ -1071,15 +1168,15 @@ func (s *SecureChannel) writeMessageChunks(ctx context.Context, instance *channe
 	// cf. open62541 adjustCheckMessageLimitsSym, .NET MessageLimitsExceeded).
 	chunks, err := m.EncodeChunks(instance.maxBodySize)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
-	var bytesSent int
+	if timeout != nil {
+		defer func() { _ = s.c.SetWriteDeadline(time.Time{}) }()
+	}
 	for i, chunk := range chunks {
-		select {
-		case <-ctx.Done():
-			return bytesSent, ctx.Err()
-		default:
+		if err := s.checkSendAllowed(ctx); err != nil {
+			return bytesSent, writeAttempted, err
 		}
 
 		if i > 0 {
@@ -1095,27 +1192,36 @@ func (s *SecureChannel) writeMessageChunks(ctx context.Context, instance *channe
 		// security footer covers the whole encoded chunk.
 		chunk, err = instance.signAndEncrypt(m, chunk)
 		if err != nil {
-			return bytesSent, err
+			return bytesSent, writeAttempted, err
+		}
+		if err := s.checkSendAllowed(ctx); err != nil {
+			return bytesSent, writeAttempted, err
+		}
+		if timeout != nil {
+			if err := s.c.SetWriteDeadline(time.Now().Add(*timeout)); err != nil {
+				return bytesSent, writeAttempted, err
+			}
 		}
 
 		// UASC writes are expected to flush complete chunks. Treat short writes as
 		// a hard error instead of silently truncating the response stream.
+		writeAttempted = true
 		n, err := s.c.Write(chunk)
-		if err != nil {
-			return bytesSent, err
-		}
-		if len(chunk) != n {
-			return bytesSent, errors.Errorf("uasc: incomplete message %T sent len=%d sent=%d", body, len(chunk), n)
-		}
-
 		bytesSent += n
 		atomic.AddUint64(&instance.bytesSent, uint64(n))
+		if err != nil {
+			return bytesSent, true, err
+		}
+		if len(chunk) != n {
+			return bytesSent, true, errors.Errorf("uasc: incomplete message %T sent len=%d sent=%d", body, len(chunk), n)
+		}
+
 		atomic.AddUint32(&instance.messagesSent, 1)
 	}
 
 	debug.Printf("uasc %d/%d: send %T with %d bytes in %d chunks", s.c.ID(), reqID, body, bytesSent, len(chunks))
 
-	return bytesSent, nil
+	return bytesSent, writeAttempted, nil
 }
 
 func (s *SecureChannel) SendResponseWithContext(ctx context.Context, reqID uint32, resp ua.Response) error {
@@ -1127,6 +1233,10 @@ func (s *SecureChannel) SendMsgWithContext(ctx context.Context, instance *channe
 	if typeID == 0 {
 		return errors.Errorf("uasc: unknown service %T. Did you call register?", resp)
 	}
+	if err := s.lockSend(ctx); err != nil {
+		return err
+	}
+	defer s.unlockSend()
 
 	var err error
 	if instance == nil {
@@ -1139,9 +1249,16 @@ func (s *SecureChannel) SendMsgWithContext(ctx context.Context, instance *channe
 	// we need to get a lock on the sequence number so we are sure to send them in the correct order.
 	instance.Lock()
 	defer instance.Unlock()
+	if err := s.checkSendAllowed(ctx); err != nil {
+		return err
+	}
 
+	sequenceBefore := instance.sequenceNumber
 	m := instance.newMessage(resp, typeID, reqID)
-	if _, err := s.writeMessageChunks(ctx, instance, reqID, m, resp); err != nil {
+	if _, attempted, err := s.writeMessageChunks(ctx, instance, reqID, m, resp, nil); err != nil {
+		if !attempted {
+			instance.sequenceNumber = sequenceBefore
+		}
 		return err
 	}
 
@@ -1153,6 +1270,10 @@ func (s *SecureChannel) sendResponseWithContext(ctx context.Context, instance *c
 	if typeID == 0 {
 		return errors.Errorf("uasc: unknown service %T. Did you call register?", resp)
 	}
+	if err := s.lockSend(ctx); err != nil {
+		return err
+	}
+	defer s.unlockSend()
 
 	var err error
 	if instance == nil {
@@ -1163,9 +1284,16 @@ func (s *SecureChannel) sendResponseWithContext(ctx context.Context, instance *c
 	}
 	instance.Lock()
 	defer instance.Unlock()
+	if err := s.checkSendAllowed(ctx); err != nil {
+		return err
+	}
 
+	sequenceBefore := instance.sequenceNumber
 	m := instance.newMessage(resp, typeID, reqID)
-	if _, err := s.writeMessageChunks(ctx, instance, reqID, m, resp); err != nil {
+	if _, attempted, err := s.writeMessageChunks(ctx, instance, reqID, m, resp, nil); err != nil {
+		if !attempted {
+			instance.sequenceNumber = sequenceBefore
+		}
 		return err
 	}
 
@@ -1196,11 +1324,8 @@ func (s *SecureChannel) Close() (err error) {
 func (s *SecureChannel) close() error {
 	debug.Printf("uasc %d: Close()", s.c.ID())
 
-	defer func() {
-		close(s.closing)
-	}()
-
-	s.reqLocker.unlock()
+	close(s.closing)
+	defer s.c.Close()
 	s.rcvLocker.unlock()
 
 	select {
@@ -1209,7 +1334,19 @@ func (s *SecureChannel) close() error {
 	default:
 	}
 
-	err := s.SendRequest(context.Background(), &ua.CloseSecureChannelRequest{}, nil, nil)
+	// Close must not queue behind an OPN waiting for a response: closing the
+	// socket is what releases that wait. Send a courtesy CLO only if idle.
+	select {
+	case s.sendGate <- struct{}{}:
+		defer s.unlockSend()
+	default:
+		return io.EOF
+	}
+	active, err := s.getActiveChannelInstance()
+	if err != nil {
+		return io.EOF
+	}
+	err = s.sendRequestWithTimeout(context.Background(), &ua.CloseSecureChannelRequest{}, s.nextRequestID(), active, nil, s.cfg.RequestTimeout, nil)
 	if err != nil {
 		return err
 	}

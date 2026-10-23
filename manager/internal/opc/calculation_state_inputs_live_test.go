@@ -52,22 +52,22 @@ func TestLiveCalculationStateInputs(t *testing.T) {
 	}
 	setEnabled := func(enabled bool) error {
 		var source api.SourceView
-		if err := call("GET", "/sources/rcd92-58", nil, 0, &source); err != nil {
+		if err := call("GET", "/sources/rcd-58", nil, 0, &source); err != nil {
 			return err
 		}
-		return call("PUT", "/sources/rcd92-58", api.SourceMutation{GroupID: source.GroupID, GroupBindings: source.GroupBindings, Name: source.Name, Endpoint: source.Endpoint, SecurityPolicy: source.SecurityPolicy, SecurityMode: source.SecurityMode, Username: source.Username, Enabled: enabled}, source.Revision, nil)
+		return call("PUT", "/sources/rcd-58", api.SourceMutation{GroupID: source.GroupID, GroupBindings: source.GroupBindings, Name: source.Name, Endpoint: source.Endpoint, SecurityPolicy: source.SecurityPolicy, SecurityMode: source.SecurityMode, Username: source.Username, Enabled: enabled}, source.Revision, nil)
 	}
 	setDefault := func(source string) error {
 		var group struct {
 			Revision uint64 `json:"revision"`
 		}
-		if err := call("GET", "/groups/real-hardware", nil, 0, &group); err != nil {
+		if err := call("GET", "/groups/serial-acquisition", nil, 0, &group); err != nil {
 			return err
 		}
-		return call("PUT", "/groups/real-hardware/default-source", map[string]string{"source_id": source}, group.Revision, nil)
+		return call("PUT", "/groups/serial-acquisition/default-source", map[string]string{"source_id": source}, group.Revision, nil)
 	}
 	defer func() {
-		if err := setDefault("real-lower"); err != nil {
+		if err := setDefault("rcd-46"); err != nil {
 			t.Error(err)
 		}
 		if err := setEnabled(true); err != nil {
@@ -133,12 +133,12 @@ func TestLiveCalculationStateInputs(t *testing.T) {
 	}
 	waitValue(1, 1)
 	assertRead([]uint32{1, 2, 1, 1})
-	if err := setDefault("rcd92-58"); err != nil {
+	if err := setDefault("rcd-58"); err != nil {
 		t.Fatal(err)
 	}
 	waitValue(3, 2)
 	assertRead([]uint32{1, 2, 2, 1})
-	if err := setDefault("real-lower"); err != nil {
+	if err := setDefault("rcd-46"); err != nil {
 		t.Fatal(err)
 	}
 	waitValue(3, 1)

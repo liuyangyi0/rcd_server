@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"rcd_manager/internal/buildinfo"
 	"rcd_manager/internal/domain"
 )
 
@@ -21,6 +22,82 @@ import (
 // policy; the instance check is target validation, not authentication.
 func (s *Supervisor) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/lifecycle/actions", func(w http.ResponseWriter, r *http.Request) {
+		req, err := readAction(w, r)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if !req.Lifecycle || r.Header.Get("If-Match") != strconv.Quote(req.ExpectedRevision) {
+			writeError(w, maintenanceError("conflict", "安全操作必须携带 lifecycle 及精确 If-Match"))
+			return
+		}
+		value, err := s.SubmitLifecycle(req)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeOperation(w, value)
+	})
+	mux.HandleFunc("GET /api/v1/lifecycle/operations/{request_id}", func(w http.ResponseWriter, r *http.Request) {
+		value, ok := s.Operation(r.PathValue("request_id"))
+		if !ok {
+			writeError(w, maintenanceError("not_found", "操作尚未找到；不能据此认定未执行"))
+			return
+		}
+		writeJSON(w, http.StatusOK, value)
+	})
+	mux.HandleFunc("POST /api/v1/lifecycle/operations/{request_id}/resolve", func(w http.ResponseWriter, r *http.Request) {
+		req, err := readAction(w, r)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if !req.Lifecycle || req.RequestID != r.PathValue("request_id") || r.Header.Get("If-Match") != strconv.Quote(req.ExpectedRevision) {
+			writeError(w, maintenanceError("invalid_request", "操作目标或 If-Match 不一致"))
+			return
+		}
+		value, err := s.Resolve(req)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeOperation(w, value)
+	})
+	mux.HandleFunc("GET /api/v1/maintenance", func(w http.ResponseWriter, r *http.Request) {
+		value := s.Maintenance()
+		w.Header().Set("ETag", strconv.Quote(value.Revision))
+		writeJSON(w, http.StatusOK, value)
+	})
+	mux.HandleFunc("POST /api/v1/maintenance/actions", func(w http.ResponseWriter, r *http.Request) {
+		var req MaintenanceRequest
+		r.Body = http.MaxBytesReader(w, r.Body, 4096)
+		defer r.Body.Close()
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			writeError(w, maintenanceError("invalid_request", "需要有界维护 JSON 请求"))
+			return
+		}
+		if err := dec.Decode(new(any)); err != io.EOF {
+			writeError(w, maintenanceError("invalid_request", "只允许一个 JSON 对象"))
+			return
+		}
+		if header := r.Header.Get("If-Match"); header == "" || (header != req.ExpectedRevision && header != strconv.Quote(req.ExpectedRevision)) {
+			writeError(w, maintenanceError("conflict", "If-Match 必须与请求版本一致"))
+			return
+		}
+		value, err := s.MaintenanceAction(r.Context(), req)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		w.Header().Set("ETag", strconv.Quote(value.Revision))
+		writeJSON(w, http.StatusOK, value)
+	})
+	mux.HandleFunc("GET /api/v1/version", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, buildinfo.ForComponent("agent"))
+	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "instance_id": s.cfg.InstanceID})
 	})
@@ -37,6 +114,10 @@ func (s *Supervisor) Handler() http.Handler {
 		}
 		if header := r.Header.Get("If-Match"); header != "" && header != req.ExpectedRevision && header != strconv.Quote(req.ExpectedRevision) {
 			writeError(w, &domain.OperationError{Code: "conflict", Message: "请求体与 If-Match 版本不一致"})
+			return
+		}
+		if req.DeploymentID != "" && r.Header.Get("If-Match") == "" {
+			writeError(w, maintenanceError("conflict", "维护进程操作必须携带 If-Match"))
 			return
 		}
 		operation, err := s.Submit(req)
@@ -101,6 +182,24 @@ func (s *Supervisor) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if s.cfg.RemoteManagers != "" {
+			host, _, err := net.SplitHostPort(r.RemoteAddr)
+			ip := net.ParseIP(host)
+			allowed := err == nil && ip != nil && ip.IsLoopback()
+			for _, value := range strings.Split(s.cfg.RemoteManagers, ",") {
+				if ip != nil && ip.Equal(net.ParseIP(strings.TrimSpace(value))) {
+					allowed = true
+				}
+			}
+			if !allowed {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": "manager address is not allowed"})
+				return
+			}
+			if ip != nil && !ip.IsLoopback() && r.Method != http.MethodGet && r.Method != http.MethodHead && !strings.HasPrefix(r.URL.Path, "/api/v1/lifecycle/") {
+				writeError(w, maintenanceError("unsupported", "远程写入只允许安全生命周期接口；发布接口仅供本机使用"))
+				return
+			}
+		}
 		if r.URL.Path != "/healthz" && r.Header.Get(domain.ProcessInstanceHeader) != s.cfg.InstanceID {
 			writeError(w, &domain.OperationError{Code: "not_found", Message: "守护实例标识不匹配；未执行操作"})
 			return
@@ -120,7 +219,7 @@ func (s *Supervisor) Handler() http.Handler {
 
 func readAction(w http.ResponseWriter, r *http.Request) (domain.ProcessActionRequest, error) {
 	var value domain.ProcessActionRequest
-	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	defer r.Body.Close()
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()

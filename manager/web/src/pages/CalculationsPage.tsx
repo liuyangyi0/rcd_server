@@ -17,6 +17,7 @@ import { useSources } from '../api/queries';
 import type { CalculationDraft, CalculationValidation, ListParams, Source } from '../api/types';
 import type { CalculationEditorHandle } from '../features/calculations/CalculationEditor';
 import StateDependencies from '../features/calculations/StateDependencies';
+import { isValidStateInputName } from '../features/calculations/stateInputNames';
 import { InlineNotice } from '../components/InlineNotice';
 import { EmptyState, ErrorState, LoadingState } from '../components/PageState';
 import { PageHeader } from '../components/PageHeader';
@@ -28,6 +29,9 @@ const CalculationEditor = lazy(() => import('../features/calculations/Calculatio
 const StateInputsTab = lazy(() => import('../features/calculations/StateInputsTab'));
 // Keep unsaved text across route/tab navigation in this browser instance only.
 let pendingCalculationEdit: { draft: CalculationDraft; content: string } | undefined;
+function clearPendingCalculationEdit(expected: typeof pendingCalculationEdit) {
+  if (pendingCalculationEdit === expected) pendingCalculationEdit = undefined;
+}
 window.addEventListener('rcd-auth-cleared', () => { pendingCalculationEdit = undefined; });
 window.addEventListener('beforeunload', (event) => { if (pendingCalculationEdit) { event.preventDefault(); event.returnValue = ''; } });
 type Tab = 'results' | 'config' | 'versions' | 'lowers' | 'state-inputs';
@@ -58,7 +62,7 @@ export default function CalculationsPage() {
     {tab === 'results' ? <ResultsTab /> : null}
     {tab === 'config' ? <ConfigTab activeRevision={status.data?.activeRevision ?? 0} /> : null}
     {tab === 'state-inputs' ? <Suspense fallback={<LoadingState />}><StateInputsTab /></Suspense> : null}
-    {tab === 'versions' ? <VersionsTab activeRevision={status.data?.activeRevision ?? 0} /> : null}
+    {tab === 'versions' ? <VersionsTab activeRevision={status.isSuccess ? status.data.activeRevision : undefined} /> : null}
     {tab === 'lowers' ? <LowerModesTab centralHash={status.data?.configHash ?? ''} /> : null}
   </div>;
 }
@@ -123,6 +127,8 @@ function ConfigTab({ activeRevision }: { activeRevision: number }) {
   const sources = useSources();
   const mutation = useCalculationMutation();
   const editor = useRef<CalculationEditorHandle>(null);
+  const alive = useRef(true);
+  const editGeneration = useRef(0);
   const [editorGeneration, setEditorGeneration] = useState(0);
   const [replacement, setReplacement] = useState<string | undefined>(pendingCalculationEdit?.content);
   const [baseDraft, setBaseDraft] = useState<CalculationDraft | undefined>(pendingCalculationEdit?.draft);
@@ -136,6 +142,7 @@ function ConfigTab({ activeRevision }: { activeRevision: number }) {
   const content = replacement ?? draft?.content ?? '';
   const busy = mutation.isPending || localBusy;
   const remoteChanged = Boolean(baseDraft && draftQuery.data && baseDraft.revision !== draftQuery.data.revision);
+  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
   useEffect(() => {
     if (!dirty && !busy && draftQuery.data && draftQuery.data.revision !== baseDraft?.revision) {
       setBaseDraft(draftQuery.data); setReplacement(undefined); setValidation(undefined);
@@ -148,16 +155,23 @@ function ConfigTab({ activeRevision }: { activeRevision: number }) {
     return () => window.removeEventListener('beforeunload', warn);
   }, [dirty]);
   const currentContent = () => editor.current?.getValue() ?? content;
-  const rememberEdit = (value: string) => { if (draft) { setBaseDraft(draft); pendingCalculationEdit = { draft, content: value }; } };
+  const rememberEdit = (value: string) => { if (draft && alive.current) { editGeneration.current += 1; setBaseDraft(draft); pendingCalculationEdit = { draft, content: value }; } };
   const replaceEditor = (value: string) => { rememberEdit(value); setReplacement(value); setEditorGeneration((item) => item + 1); setDirty(true); setValidation(undefined); };
+  const acceptSavedDraft = (saved: CalculationDraft, expectedEdit: typeof pendingCalculationEdit, generation: number, feedback: string) => {
+    client.setQueryData<CalculationDraft>(calculationKeys.draft, (current) => current && current.revision > saved.revision ? current : saved);
+    clearPendingCalculationEdit(expectedEdit);
+    if (!alive.current || editGeneration.current !== generation) return;
+    setBaseDraft(saved); setReplacement(saved.content); setEditorGeneration((item) => item + 1); setDirty(false); setValidation(undefined); setMessage(feedback);
+  };
   const save = async () => {
     if (!draft) return;
     setError(undefined);
+    const expectedEdit = pendingCalculationEdit;
+    const generation = editGeneration.current;
     try {
       const saved = await mutation.mutateAsync({ action: 'save', revision: draft.revision, content: currentContent() }) as CalculationDraft;
-      client.setQueryData(calculationKeys.draft, saved);
-      setBaseDraft(saved); pendingCalculationEdit = undefined; setReplacement(saved.content); setEditorGeneration((item) => item + 1); setDirty(false); setValidation(undefined); setMessage('草稿已保存；请校验后再激活，活动版本尚未改变。');
-    } catch (reason) { setError(reason); }
+      acceptSavedDraft(saved, expectedEdit, generation, '草稿已保存；请校验后再激活，活动版本尚未改变。');
+    } catch (reason) { if (alive.current) setError(reason); }
   };
   const validate = async () => {
     setError(undefined);
@@ -174,10 +188,12 @@ function ConfigTab({ activeRevision }: { activeRevision: number }) {
     if (!draft || !source) return;
     if (!window.confirm('将用下级 calc.toml 整份替换管理端草稿（包括已有状态输入映射），不会自动激活。请先导出备份，确定继续？')) return;
     setError(undefined);
-    try { const saved = await mutation.mutateAsync({ action: 'import_lower', revision: draft.revision, sourceId: source.id, sourceRevision: source.revision }) as CalculationDraft; client.setQueryData(calculationKeys.draft, saved); setBaseDraft(saved); pendingCalculationEdit = undefined; setReplacement(saved.content); setEditorGeneration((item) => item + 1); setDirty(false); setValidation(undefined); setMessage(`已从 ${source.id} 导入 calc.toml 到草稿；请校验后再激活。`); } catch (reason) { setError(reason); }
+    const expectedEdit = pendingCalculationEdit;
+    const generation = editGeneration.current;
+    try { const saved = await mutation.mutateAsync({ action: 'import_lower', revision: draft.revision, sourceId: source.id, sourceRevision: source.revision }) as CalculationDraft; acceptSavedDraft(saved, expectedEdit, generation, `已从 ${source.id} 导入 calc.toml 到草稿；请校验后再激活。`); } catch (reason) { if (alive.current) setError(reason); }
   };
   return <section className="calculation-tab-panel calculation-config-panel">
-    {insertName && /^[A-Za-z_][A-Za-z0-9_]*$/.test(insertName) ? <p>先把光标放到 expression 的引号内，再点击：<button className="button button-secondary" disabled={busy} onClick={() => editor.current?.insertText(insertName)}>插入 {insertName}</button></p> : null}
+    {isValidStateInputName(insertName) ? <p>先把光标放到 expression 的引号内，再点击：<button className="button button-secondary" disabled={busy} onClick={() => editor.current?.insertText(insertName)}>插入 {insertName}</button></p> : null}
     {draftQuery.error ? <ErrorState error={draftQuery.error} onRetry={() => void draftQuery.refetch()} /> : null}
     {!draft ? <LoadingState label="正在载入计算草稿…" /> : <>
       <div className="calculation-config-toolbar">
@@ -185,7 +201,8 @@ function ConfigTab({ activeRevision }: { activeRevision: number }) {
           const file = event.target.files?.[0]; event.currentTarget.value = ''; if (!file) return;
           if (file.size > 4 * 1024 * 1024) { setError(new Error('文件超过 4 MiB')); return; }
           if (!window.confirm('将用文件整份替换编辑区内容，不是追加规则。原活动版本不变；请先导出备份，确定继续？')) return;
-          setLocalBusy(true); void file.text().then(replaceEditor).catch(setError).finally(() => setLocalBusy(false));
+          const generation = editGeneration.current;
+          setLocalBusy(true); void file.text().then((value) => { if (alive.current && editGeneration.current === generation) replaceEditor(value); }).catch((reason) => { if (alive.current) setError(reason); }).finally(() => { if (alive.current) setLocalBusy(false); });
         }} /></label>
         <label className="field inline-field"><span>从下级导入</span><select value={lowerSource} disabled={busy} onChange={(event) => setLowerSource(event.target.value)}><option value="">选择来源</option>{(sources.data ?? []).map((source) => <option key={source.id} value={source.id}>{source.name || source.id}</option>)}</select></label>
         <button className="button button-outline" type="button" disabled={!lowerSource || busy} onClick={() => void importLower()}><Download size={16} />读取下级</button>
@@ -196,8 +213,10 @@ function ConfigTab({ activeRevision }: { activeRevision: number }) {
       {remoteChanged ? <div className="top-error" role="alert">服务器草稿已变为 r{draftQuery.data?.revision}，当前仍按 r{draft.revision} 编辑，不会覆盖你的输入。请先导出文本，再载入新草稿合并。</div> : null}
       <button className="button button-small button-outline" type="button" disabled={busy} onClick={async () => {
         if (dirty && !window.confirm('丢弃当前未保存编辑并载入服务器草稿？建议先导出当前文本。')) return;
+        const expectedEdit = pendingCalculationEdit;
+        const generation = editGeneration.current;
         setLocalBusy(true);
-        try { const latest = await draftQuery.refetch(); if (latest.error) throw latest.error; if (latest.data) { setBaseDraft(latest.data); setReplacement(latest.data.content); pendingCalculationEdit = undefined; setEditorGeneration((value) => value + 1); setDirty(false); setValidation(undefined); setError(undefined); setMessage('已载入服务器草稿'); } } catch (reason) { setError(reason); } finally { setLocalBusy(false); }
+        try { const latest = await draftQuery.refetch(); if (latest.error) throw latest.error; if (latest.data) { acceptSavedDraft(latest.data, expectedEdit, generation, '已载入服务器草稿'); if (alive.current) setError(undefined); } } catch (reason) { if (alive.current) setError(reason); } finally { if (alive.current) setLocalBusy(false); }
       }}>重新载入服务器草稿</button>
       {message ? <div className="success-banner" role="status">{message}<button type="button" onClick={() => setMessage('')}>关闭</button></div> : null}
       {error ? <div className="top-error" role="alert">{apiErrorMessage(error)}</div> : null}
@@ -210,13 +229,24 @@ function ConfigTab({ activeRevision }: { activeRevision: number }) {
   </section>;
 }
 
-function VersionsTab({ activeRevision }: { activeRevision: number }) {
+function VersionsTab({ activeRevision }: { activeRevision?: number }) {
   const [page, setPage] = useState(1);
   const versions = useCalculationVersions({ page, pageSize: 50 });
   const mutation = useCalculationMutation();
-  const [confirmId, setConfirmId] = useState<number>();
+  const [restoreTarget, setRestoreTarget] = useState<{ id: number; revision: number }>();
   const [error, setError] = useState<unknown>();
-  return <section className="calculation-tab-panel"><section className="table-panel content-panel">{versions.error ? <ErrorState error={versions.error} onRetry={() => void versions.refetch()} /> : versions.isPending ? <LoadingState /> : !versions.data?.items.length ? <EmptyState title="暂无计算版本" /> : <><div className="table-scroll"><table className="data-table"><thead><tr><th>版本</th><th>状态</th><th>规则 / 差异</th><th>Hash</th><th>操作者</th><th>创建 / 激活时间</th><th>操作</th></tr></thead><tbody>{versions.data.items.map((item) => <tr key={item.id}><td><strong>revision {item.revision}</strong></td><td>{versionState(item.state)}</td><td>{formatNumber(item.ruleCount)}<span className="sub-cell">+{item.addedCount} / −{item.removedCount} / 改 {item.changedCount}</span></td><td><code>{shortHash(item.hash)}</code></td><td>{item.actor || 'manager'}</td><td>{formatDateTime(item.createdAt)}{item.activatedAt ? <span className="sub-cell">激活：{formatDateTime(item.activatedAt)}</span> : null}</td><td>{confirmId === item.id ? <span className="inline-confirm"><button className="button button-small button-primary" type="button" disabled={mutation.isPending || !activeRevision} onClick={() => void mutation.mutateAsync({ action: 'restore', id: item.id, revision: activeRevision }).then(() => setConfirmId(undefined)).catch(setError)}>确认复制并激活</button><button className="button button-small button-secondary" type="button" onClick={() => setConfirmId(undefined)}>取消</button></span> : <button className="button button-small button-outline" type="button" disabled={item.state === 'active' || !activeRevision} onClick={() => setConfirmId(item.id)}><RotateCcw size={14} />回滚为新版本</button>}</td></tr>)}</tbody></table></div><Pagination page={versions.data.page} pageSize={versions.data.pageSize} total={versions.data.total} onPageChange={setPage} /></>}</section>{error ? <div className="top-error" role="alert">{apiErrorMessage(error)}</div> : null}</section>;
+  const targetChanged = Boolean(restoreTarget && restoreTarget.revision !== activeRevision);
+  return <section className="calculation-tab-panel">
+    {activeRevision === undefined ? <p role="status">尚未确认当前活动版本，暂不能恢复历史版本。</p> : null}
+    {targetChanged ? <p className="top-error" role="alert">活动版本已变化，请取消本次确认，重新核对后再恢复。</p> : null}
+    <section className="table-panel content-panel">{versions.error ? <ErrorState error={versions.error} onRetry={() => void versions.refetch()} /> : versions.isPending ? <LoadingState /> : !versions.data?.items.length ? <EmptyState title="暂无计算版本" /> : <>
+      <div className="table-scroll"><table className="data-table"><thead><tr><th>版本</th><th>状态</th><th>规则 / 差异</th><th>Hash</th><th>操作者</th><th>创建 / 激活时间</th><th>操作</th></tr></thead><tbody>{versions.data.items.map((item) => <tr key={item.id}>
+        <td><strong>revision {item.revision}</strong></td><td>{versionState(item.state)}</td><td>{formatNumber(item.ruleCount)}<span className="sub-cell">+{item.addedCount} / −{item.removedCount} / 改 {item.changedCount}</span></td><td><code>{shortHash(item.hash)}</code></td><td>{item.actor || 'manager'}</td><td>{formatDateTime(item.createdAt)}{item.activatedAt ? <span className="sub-cell">激活：{formatDateTime(item.activatedAt)}</span> : null}</td>
+        <td>{restoreTarget?.id === item.id ? <span className="inline-confirm"><button className="button button-small button-primary" type="button" disabled={mutation.isPending || activeRevision === undefined || targetChanged} onClick={() => void mutation.mutateAsync({ action: 'restore', id: restoreTarget.id, revision: restoreTarget.revision }).then(() => setRestoreTarget(undefined)).catch(setError)}>确认复制并激活</button><button className="button button-small button-secondary" type="button" disabled={mutation.isPending} onClick={() => setRestoreTarget(undefined)}>取消</button></span> : <button className="button button-small button-outline" type="button" disabled={item.state === 'active' || activeRevision === undefined || mutation.isPending} onClick={() => { if (activeRevision !== undefined) { setError(undefined); setRestoreTarget({ id: item.id, revision: activeRevision }); } }}><RotateCcw size={14} />{activeRevision === 0 ? '复制并激活历史版本' : '回滚为新版本'}</button>}</td>
+      </tr>)}</tbody></table></div>
+      <Pagination page={versions.data.page} pageSize={versions.data.pageSize} total={versions.data.total} onPageChange={setPage} />
+    </>}</section>{error ? <div className="top-error" role="alert">{apiErrorMessage(error)}</div> : null}
+  </section>;
 }
 
 function LowerModesTab({ centralHash }: { centralHash: string }) {
@@ -237,6 +267,7 @@ function LowerModesTab({ centralHash }: { centralHash: string }) {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const saveMode = async (source: Source, config: ConfigDocument, mode: 'local' | 'manager') => {
     setPending((old) => ({ ...old, [source.id]: true }));
+    setMessages((old) => ({ ...old, [source.id]: '' }));
     setErrors((old) => ({ ...old, [source.id]: '' }));
     try {
       await operationsApi.calculationMode({ id: source.id, revision: source.revision }, config.revision, mode);

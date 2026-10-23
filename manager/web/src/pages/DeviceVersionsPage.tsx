@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useQueries, useQueryClient } from '@tanstack/react-query';
 import { CheckCircle2, Download, RefreshCw, Search, Settings2, XCircle } from 'lucide-react';
 import { useSearchParams } from 'react-router-dom';
-import { operationsApi, useDeviceVersionMutation, type AcquisitionSnapshot, type DeviceVersionMutationInput } from '../api/operations';
+import { useDeviceVersionMutation, type AcquisitionSnapshot, type DeviceVersionMutationInput } from '../api/operations';
 import { queryKeys, useDeviceVersions, useSources } from '../api/queries';
 import type { DeviceVersion, DeviceVersionParams, DeviceVersionSummary, ModuleType } from '../api/types';
 import { InlineNotice } from '../components/InlineNotice';
@@ -17,7 +17,6 @@ import { humanizeTechnicalMessage } from '../lib/labels';
 
 
 const SOURCE_CONCURRENCY = 3;
-const MAX_REVISION_ATTEMPTS = 3;
 
 type RowOperation = { state: 'running' | 'success' | 'warning' | 'error'; message: string };
 
@@ -86,29 +85,22 @@ export default function DeviceVersionsPage() {
       for (let index = 0; index < sourceRows.length; index += 1) {
         const row = sourceRows[index];
         updateRowOperation(row, { state: 'running', message: action === 'query' ? '正在读取版本…' : '正在保存类型…' });
-        let input: DeviceVersionMutationInput = action === 'query'
+        const input: DeviceVersionMutationInput = action === 'query'
           ? { action: 'query', target: { id: row.sourceId, revision: row.sourceRevision }, stationRevision, portId: row.portId, deviceId: row.deviceId, deferInvalidation: true }
           : { action: 'set_type', target: { id: row.sourceId, revision: row.sourceRevision }, stationRevision, portId: row.portId, deviceId: row.deviceId, moduleType: configuredType ?? 'unknown', deferInvalidation: true };
         try {
-          let result: AcquisitionSnapshot | undefined;
-          for (let attempt = 1; attempt <= MAX_REVISION_ATTEMPTS; attempt += 1) {
-            try {
-              result = await mutation.mutateAsync(input);
-              break;
-            } catch (error) {
-              // Only a confirmed revision rejection is safe to repeat. An
-              // automatic probe may advance this source-wide revision more
-              // than once; every retry must observe a strictly newer revision.
-              if (!(error instanceof ApiError) || error.status !== 409 || attempt === MAX_REVISION_ATTEMPTS) throw error;
-              const latest = await operationsApi.status(row.sourceId, undefined, row.sourceRevision);
-              if (!latest.station_revision || !stationRevisionAdvanced(stationRevision, latest.station_revision)) throw error;
-              stationRevision = latest.station_revision;
-              input = { ...input, stationRevision };
-            }
-          }
-          if (!result) throw new Error('设备版本操作没有返回结果');
+          // Keep the revision paired with the operator's confirmed target.
+          // A newer source-wide revision cannot prove that this station's
+          // configuration or physical identity stayed unchanged. Never rebase
+          // an old write intent automatically after a conflict.
+          const result = await mutation.mutateAsync(input);
           stationRevision = result.station_revision || stationRevision;
           const station = findStationVersion(result, row);
+          if (!station) {
+            updateRowOperation(row, { state: 'warning', message: '下级响应缺少目标站点，结果待确认；请刷新核对，不会自动重试' });
+            for (const skipped of sourceRows.slice(index + 1)) updateRowOperation(skipped, { state: 'warning', message: '同一来源前一项结果待确认，未继续提交' });
+            break;
+          }
           const versionState = station?.version_state?.toLowerCase() ?? '';
           const waiting = ['waiting', 'pending', 'querying'].some((state) => versionState.includes(state));
           const failed = ['fail', 'error', 'timeout'].some((state) => versionState.includes(state));
@@ -124,7 +116,7 @@ export default function DeviceVersionsPage() {
             updateRowOperation(row, { state: 'success', message: action === 'query' ? '版本查询完成' : '模块类型已保存' });
           }
         } catch (error) {
-          updateRowOperation(row, { state: 'error', message: apiErrorMessage(error) });
+          updateRowOperation(row, { state: 'error', message: error instanceof ApiError && error.status === 409 ? `操作冲突，请刷新并重新核对目标；未自动重试。${apiErrorMessage(error)}` : apiErrorMessage(error) });
           for (const skipped of sourceRows.slice(index + 1)) updateRowOperation(skipped, { state: 'error', message: '同一来源前一项失败，为避免沿用过期版本，未继续执行' });
           break;
         }
@@ -312,12 +304,6 @@ function togglePage(previous: Map<string, DeviceVersion>, rows: DeviceVersion[],
 
 function findStationVersion(snapshot: AcquisitionSnapshot, row: DeviceVersion) {
   return snapshot.ports.find((port) => port.port_id === row.portId)?.devices.find((device) => device.device_id === row.deviceId);
-}
-
-function stationRevisionAdvanced(previous: string, next: string): boolean {
-  const canonical = /^[1-9]\d*$/;
-  if (!canonical.test(previous) || !canonical.test(next)) return false;
-  return next.length > previous.length || (next.length === previous.length && next > previous);
 }
 
 export async function runWithConcurrency(jobs: Array<() => Promise<void>>, concurrency: number): Promise<void> {

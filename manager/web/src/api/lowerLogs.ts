@@ -4,6 +4,7 @@ import { request } from './client';
 export type LowerLogLevel = '' | 'TRACE' | 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
 
 export interface LowerLogParams {
+  commandAttempts?: 'all' | 'retried' | 'three';
   sourceId: string;
   level?: LowerLogLevel;
   portId?: string;
@@ -56,6 +57,7 @@ export async function listLowerLogs(params: LowerLogParams, signal?: AbortSignal
   if (params.portId) query.set('port_id', params.portId);
   if (params.deviceId) query.set('device_id', params.deviceId);
   if (params.query) query.set('q', params.query);
+  if (params.commandAttempts) query.set('command_attempts', params.commandAttempts);
   if (params.from) query.set('from', params.from);
   if (params.to) query.set('to', params.to);
   const raw = await request(`/lower-logs?${query}`, { signal }) as {

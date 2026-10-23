@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/semaphoreui/semaphore.git",
+  "tag": "v2.19.16",
+  "commit": "f8cefe62da4d40e536323e3dd936eb2e04e82b1a",
+  "custom_version": "v2.19.16-rcd.9",
+  "license": "MIT",
+  "status": "native customization; source and binary deployment records are recorded separately"
+}

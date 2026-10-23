@@ -14,7 +14,7 @@ import (
 	"rcd_manager/internal/domain"
 )
 
-// TestLiveManagerMethodReportsSerialFailure is an opt-in real-lower test. The
+// TestLiveManagerMethodReportsSerialFailure is an opt-in rcd-46 test. The
 // caller must make the selected physical port unavailable before running it;
 // the test itself never changes acquisition configuration or device files.
 func TestLiveManagerMethodReportsSerialFailure(t *testing.T) {
