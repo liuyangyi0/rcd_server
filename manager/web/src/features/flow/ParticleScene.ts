@@ -6,8 +6,8 @@ export const SCENE_WIDTH = 1680, SCENE_HEIGHT = 750;
 // the result bus runs along BUS_Y under the calculation label.
 const CARD_RIGHT = 297, SLOT_X = 486, SLOT_W = 132, SLOT_H = 30, NODE_X = 1092, NODE_W = 120, NODE_H = 30, EGRESS_X = 1446, BUS_X = 1256;
 const FRAME = { left: 410, top: 40, right: 1300, bottom: 726 }, CALC = { x: 846, y: 662, r: 24 }, BUS_Y = 714, RECENT_MS = 3200, OUTPUT_DELAY = .9;
-// One restrained palette: cyan data, ice-blue output; other colours only mark faults.
-const INK = { data: '#3fe3ff', out: '#86d6ff', frame: '#5fd8ee', amber: '#f5b951', red: '#f17479', off: '#6e828c', idle: '#4d6b78', stale: '#5d6d74', star: '#bfe9ff' };
+// Structure is neutral slate; the accent only appears where real data is moving.
+const INK = { data: '#59c7ff', out: '#8fb4ff', line: '#22324a', rule: '#3a4f68', amber: '#f0b45a', red: '#ff6f6f', off: '#56657a', idle: '#2c3b4f', stale: '#3a4656', text: '#e6edf5', muted: '#7d8ea3', plate: '#0a121c' };
 export const laneY = (index: number, count: number) => 48 + (index + 0.5) * (654 / Math.max(count, 1));
 const fract = (value: number) => value - Math.floor(value);
 const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value));
@@ -126,7 +126,6 @@ export class FlowScene {
     ctx.clearRect(0,0,frame.width,frame.height);
     ctx.drawImage(this.backdropFor(frame.width,frame.height),0,0);
     ctx.globalCompositeOperation='lighter';
-    this.ambient(ctx,state.live);
     this.frame(ctx,state.live);
     this.links(ctx,state.live);
     // Packets run under the slot and node plates, so they read as entering and leaving them.
@@ -230,80 +229,86 @@ export class FlowScene {
   private energise(ctx: CanvasRenderingContext2D, t: Track, color: string, level: number, weight: number) {
     const {u}=this.view;
     if(level<.01)return;
-    for(const [width,strength] of [[14,.05],[5,.12],[1.8,.55]])this.stroke(ctx,t,color,strength*level*weight,width*u);
-    ctx.lineDashOffset=-this.clock*90*u;this.stroke(ctx,t,'#ffffff',.5*level*weight,1.6*u,[2*u,16*u]);ctx.lineDashOffset=0;
+    for(const [width,strength] of [[10,.06],[4,.14],[1.4,.85]])this.stroke(ctx,t,color,strength*level*weight,width*u);
+    ctx.lineDashOffset=-this.clock*80*u;this.stroke(ctx,t,'#ffffff',.45*level*weight,1.3*u,[1.5*u,14*u]);ctx.lineDashOffset=0;
   }
 
   // The manager boundary: everything inside is the current OPC manager.
   private frame(ctx: CanvasRenderingContext2D, live: boolean) {
-    const {sx,sy,u}=this.view,x0=FRAME.left*sx,y0=FRAME.top*sy,x1=FRAME.right*sx,y1=FRAME.bottom*sy,cut=14*u,ink=live?INK.frame:INK.stale;
+    const {sx,sy,u}=this.view,x0=FRAME.left*sx,y0=FRAME.top*sy,x1=FRAME.right*sx,y1=FRAME.bottom*sy,cut=12*u,accent=live?INK.data:INK.stale;
     ctx.beginPath();ctx.moveTo(x0+cut,y0);ctx.lineTo(x1,y0);ctx.lineTo(x1,y1-cut);ctx.lineTo(x1-cut,y1);ctx.lineTo(x0,y1);ctx.lineTo(x0,y0+cut);ctx.closePath();
-    ctx.strokeStyle=ink;ctx.globalAlpha=.2;ctx.lineWidth=u;ctx.stroke();
-    const corner=(x: number,y: number,dx: number,dy: number)=>{ctx.beginPath();ctx.moveTo(x+dx*22*u,y);ctx.lineTo(x,y);ctx.lineTo(x,y+dy*22*u);ctx.globalAlpha=.75;ctx.lineWidth=2*u;ctx.stroke();};
-    corner(x1,y0,-1,1);corner(x0,y1,1,-1);
-    ctx.beginPath();ctx.moveTo(x0+cut,y0);ctx.lineTo(x0,y0+cut);ctx.moveTo(x1,y1-cut);ctx.lineTo(x1-cut,y1);ctx.globalAlpha=.75;ctx.lineWidth=2*u;ctx.stroke();
+    ctx.strokeStyle=INK.rule;ctx.globalAlpha=.6;ctx.lineWidth=u;ctx.stroke();
+    // Accent marks only on the two chamfered corners.
+    ctx.strokeStyle=accent;ctx.globalAlpha=.9;ctx.lineWidth=1.5*u;ctx.beginPath();
+    ctx.moveTo(x0,y0+cut+16*u);ctx.lineTo(x0,y0+cut);ctx.lineTo(x0+cut,y0);ctx.lineTo(x0+cut+16*u,y0);
+    ctx.moveTo(x1,y1-cut-16*u);ctx.lineTo(x1,y1-cut);ctx.lineTo(x1-cut,y1);ctx.lineTo(x1-cut-16*u,y1);ctx.stroke();
     // Decorative scan line sweeping the frame.
-    const scan=y0+fract(this.clock*.08)*(y1-y0),beam=ctx.createLinearGradient(0,scan-30*u,0,scan+2*u);
-    beam.addColorStop(0,withAlpha(ink,0));beam.addColorStop(1,withAlpha(ink,.07));
-    ctx.globalAlpha=live?1:.4;ctx.fillStyle=beam;ctx.fillRect(x0,scan-30*u,x1-x0,32*u);
+    const scan=y0+fract(this.clock*.06)*(y1-y0),beam=ctx.createLinearGradient(0,scan-70*u,0,scan);
+    beam.addColorStop(0,withAlpha(accent,0));beam.addColorStop(1,withAlpha(accent,.03));
+    const edge=ctx.createLinearGradient(x0,0,x1,0);edge.addColorStop(0,withAlpha(accent,0));edge.addColorStop(.5,withAlpha(accent,.16));edge.addColorStop(1,withAlpha(accent,0));
+    ctx.globalAlpha=1;ctx.fillStyle=beam;ctx.fillRect(x0,scan-70*u,x1-x0,70*u);ctx.fillStyle=edge;ctx.fillRect(x0,scan-.5*u,x1-x0,u);
   }
 
   private links(ctx: CanvasRenderingContext2D, live: boolean) {
     const {u}=this.view;
     // Every possible source → Session route, faint like an idle switch matrix.
-    for(const guide of this.guides)this.stroke(ctx,guide.track,live?INK.frame:INK.stale,.06*this.weight(guide.owner),u,[1.5*u,5*u]);
+    for(const guide of this.guides)this.stroke(ctx,guide.track,INK.line,.7*this.weight(guide.owner),.8*u,[1*u,5*u]);
     for(const slot of this.slots){
       const level=this.level(slot.key),weight=this.weight(slot.id);
       slot.wires.forEach((wire,index)=>{
-        const color=live?toneInk(wire.tone):INK.stale;
-        if(!live||wire.tone==='off'){this.stroke(ctx,wire.track,color,.45*weight,1.1*u,[2*u,7*u]);return;}
+        if(!live||wire.tone==='off'){this.stroke(ctx,wire.track,live?INK.off:INK.stale,.7*weight,u,[1.5*u,5*u]);return;}
         if(wire.tone==='down'){
           // A broken link: the red stub stops short of the cache.
           const stub=track(wire.track.pts.slice(0,Math.ceil(wire.track.pts.length*.55)));
-          this.stroke(ctx,stub,color,.6*weight,1.4*u,[5*u,5*u]);
-          if(index===slot.wires.length>>1){const [x,y]=stub.pts[stub.pts.length-1],s=4.5*u;ctx.globalAlpha=.95*weight;ctx.lineWidth=2*u;ctx.beginPath();ctx.moveTo(x-s,y-s);ctx.lineTo(x+s,y+s);ctx.moveTo(x+s,y-s);ctx.lineTo(x-s,y+s);ctx.stroke();}
+          this.stroke(ctx,stub,INK.red,.7*weight,1.2*u,[4*u,4*u]);
+          if(index===slot.wires.length>>1){const [x,y]=stub.pts[stub.pts.length-1],s=3.5*u;ctx.globalAlpha=weight;ctx.lineWidth=1.5*u;ctx.beginPath();ctx.moveTo(x-s,y-s);ctx.lineTo(x+s,y+s);ctx.moveTo(x+s,y-s);ctx.lineTo(x-s,y+s);ctx.stroke();}
           return;
         }
-        if(wire.tone==='warn'){this.stroke(ctx,wire.track,color,.55*weight,1.3*u,[5*u,5*u]);return;}
-        if(wire.tone==='idle'){this.stroke(ctx,wire.track,color,.45*weight,1.1*u);return;}
-        this.stroke(ctx,wire.track,color,(.2+(slot.selected?.2:0))*weight,1.3*u);
-        this.energise(ctx,wire.track,color,level,weight);
+        if(wire.tone==='warn'){this.stroke(ctx,wire.track,INK.amber,.6*weight,1.1*u,[4*u,4*u]);return;}
+        if(wire.tone==='idle'){this.stroke(ctx,wire.track,INK.idle,weight,u);return;}
+        this.stroke(ctx,wire.track,slot.selected?INK.rule:INK.line,weight,1.2*u);
+        this.energise(ctx,wire.track,INK.data,level,weight);
       });
     }
     for(const node of this.nodes){
-      const level=this.level(node.key),weight=this.weight(node.route),color=live&&node.attached?INK.out:live?INK.off:INK.stale;
-      if(!live||!node.attached){if(node.edge)this.stroke(ctx,node.edge,color,.4*weight,1.1*u,[2*u,7*u]);this.stroke(ctx,node.exit,color,.4*weight,1.1*u,[2*u,7*u]);continue;}
-      if(node.edge){this.stroke(ctx,node.edge,color,.32*weight,1.5*u);this.energise(ctx,node.edge,color,level,weight);}
-      this.stroke(ctx,node.exit,color,.3*weight,1.5*u);this.energise(ctx,node.exit,color,level,weight);
+      const level=this.level(node.key),weight=this.weight(node.route);
+      if(!live||!node.attached){const color=live?INK.off:INK.stale;if(node.edge)this.stroke(ctx,node.edge,color,.7*weight,u,[1.5*u,5*u]);this.stroke(ctx,node.exit,color,.7*weight,u,[1.5*u,5*u]);continue;}
+      if(node.edge){this.stroke(ctx,node.edge,INK.line,weight,1.3*u);this.energise(ctx,node.edge,INK.out,level,weight);}
+      this.stroke(ctx,node.exit,INK.line,weight,1.3*u);this.energise(ctx,node.exit,INK.out,level,weight);
     }
     if(this.calc){
-      const level=this.level('calc'),color=live?INK.data:INK.stale,feeder=this.slots.find((slot)=>slot.preferred),weight=this.weight(feeder?.id);
-      if(this.calc.feed){this.stroke(ctx,this.calc.feed,color,.28*weight,1.2*u,[4*u,4*u]);this.energise(ctx,this.calc.feed,color,level,weight);}
-      this.stroke(ctx,this.calc.bus,color,.22,1.2*u,[4*u,4*u]);this.energise(ctx,this.calc.bus,color,level*.6,1);
-      for(const [x,y] of this.calc.joins){ctx.globalAlpha=.6;ctx.fillStyle=color;ctx.beginPath();ctx.arc(x,y,2.6*u,0,Math.PI*2);ctx.fill();}
+      const level=this.level('calc'),feeder=this.slots.find((slot)=>slot.preferred),weight=this.weight(feeder?.id);
+      if(this.calc.feed){this.stroke(ctx,this.calc.feed,INK.line,weight,1.1*u,[3*u,3*u]);this.energise(ctx,this.calc.feed,INK.data,live?level:0,weight);}
+      this.stroke(ctx,this.calc.bus,INK.line,1,1.1*u,[3*u,3*u]);this.energise(ctx,this.calc.bus,INK.data,live?level*.6:0,1);
+      for(const [x,y] of this.calc.joins){ctx.globalAlpha=1;ctx.fillStyle=INK.rule;ctx.fillRect(x-2*u,y-2*u,4*u,4*u);}
     }
     // Card-side plug of every port wire.
-    for(const slot of this.slots)for(const wire of slot.wires){
-      const [x,y]=wire.track.pts[0],color=live?toneInk(wire.tone):INK.stale,size=(wire.tone==='ok'?10+10*this.level(slot.key):8)*u;
-      ctx.globalAlpha=(wire.tone==='ok'?.4+.5*this.level(slot.key):.35)*this.weight(slot.id);ctx.drawImage(this.glow(color),x-size/2,y-size/2,size,size);
-      ctx.fillStyle=color;ctx.fillRect(x-1.8*u,y-1.8*u,3.6*u,3.6*u);
+    for(const slot of this.slots){
+      const level=this.level(slot.key),weight=this.weight(slot.id);
+      for(const wire of slot.wires){
+        const [x,y]=wire.track.pts[0],color=live?toneInk(wire.tone):INK.stale;
+        if(wire.tone==='ok'&&level>.01){const size=12*u;ctx.globalAlpha=.6*level*weight;ctx.drawImage(this.glow(color),x-size/2,y-size/2,size,size);}
+        ctx.globalAlpha=weight;ctx.fillStyle=color;ctx.fillRect(x-1.5*u,y-1.5*u,3*u,3*u);
+      }
     }
   }
 
+  // Slot and node plates: neutral until data arrives, then the accent edge and left bar light up.
   private plate(ctx: CanvasRenderingContext2D, box: Box, color: string, level: number, flash: number, weight: number) {
-    const {u}=this.view,cut=6*u,{x,y,w,h}=box;
-    ctx.globalCompositeOperation='source-over';
-    ctx.beginPath();ctx.moveTo(x+cut,y);ctx.lineTo(x+w,y);ctx.lineTo(x+w,y+h-cut);ctx.lineTo(x+w-cut,y+h);ctx.lineTo(x,y+h);ctx.lineTo(x,y+cut);ctx.closePath();
-    ctx.globalAlpha=.92*Math.max(weight,.6);ctx.fillStyle='#061620';ctx.fill();
+    const {u}=this.view,cut=5*u,{x,y,w,h}=box;
+    const outline=()=>{ctx.beginPath();ctx.moveTo(x+cut,y);ctx.lineTo(x+w,y);ctx.lineTo(x+w,y+h-cut);ctx.lineTo(x+w-cut,y+h);ctx.lineTo(x,y+h);ctx.lineTo(x,y+cut);ctx.closePath();};
+    ctx.globalCompositeOperation='source-over';outline();
+    ctx.globalAlpha=.96*Math.max(weight,.7);ctx.fillStyle=INK.plate;ctx.fill();
+    ctx.globalAlpha=weight;ctx.strokeStyle=INK.rule;ctx.lineWidth=u;ctx.stroke();
     ctx.globalCompositeOperation='lighter';
-    ctx.globalAlpha=(.35+.4*level+.5*flash)*weight;ctx.strokeStyle=color;ctx.lineWidth=(1+flash)*u;ctx.stroke();
-    if(level+flash>.02){const halo=Math.max(w,h)*1.5;ctx.globalAlpha=(.12*level+.35*flash)*weight;ctx.drawImage(this.glow(color),x+w/2-halo/2,y+h/2-halo/2,halo,halo);}
-    ctx.globalAlpha=weight;ctx.fillStyle=color;ctx.fillRect(x,y+cut,2*u,h-cut);
+    if(level+flash>.01){outline();ctx.globalAlpha=Math.min(1,.55*level+.6*flash)*weight;ctx.strokeStyle=color;ctx.stroke();}
+    if(flash>.02){const halo=Math.max(w,h)*1.3;ctx.globalAlpha=.3*flash*weight;ctx.drawImage(this.glow(color),x+w/2-halo/2,y+h/2-halo/2,halo,halo);}
+    ctx.globalAlpha=weight;ctx.fillStyle=level>.01?color:INK.rule;ctx.fillRect(x,y+cut,1.5*u,h-cut*2);
   }
 
   private text(ctx: CanvasRenderingContext2D, value: string, x: number, y: number, color: string, alpha: number, size: number, max?: number, align: CanvasTextAlign='left') {
     const {u}=this.view;
-    ctx.globalCompositeOperation='source-over';ctx.font=`${Math.max(9,Math.round(size*u))}px ui-monospace, SFMono-Regular, Consolas, monospace`;ctx.textBaseline='middle';ctx.textAlign=align;
+    ctx.globalCompositeOperation='source-over';ctx.font=`500 ${Math.max(9,Math.round(size*u))}px ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace`;ctx.textBaseline='middle';ctx.textAlign=align;
     let label=value;
     if(max)while(label.length>1&&ctx.measureText(label).width>max)label=label.slice(0,-1);
     ctx.globalAlpha=alpha;ctx.fillStyle=color;ctx.fillText(label===value?value:`${label.slice(0,-1)}…`,x,y);
@@ -316,31 +321,34 @@ export class FlowScene {
       const level=this.level(slot.key),flash=this.flashes.get(slot.key)??0,weight=this.weight(slot.id),color=live?toneInk(slot.link):INK.stale,{x,y,w,h}=slot.box;
       this.plate(ctx,slot.box,color,level,flash,weight);
       const metered=slot.link==='ok'||slot.link==='warn';
-      this.text(ctx,slot.id,x+9*u,y+h/2,live?'#d6f3f8':INK.stale,weight,11,w-(metered?46:16)*u);
+      this.text(ctx,slot.id,x+10*u,y+h/2,live?INK.text:INK.stale,weight,11,w-(metered?46:16)*u);
       // Five-segment meter: lit while samples arrive; absent when the source cannot deliver.
-      if(metered)for(let i=0;i<5;i++){ctx.globalAlpha=(i<Math.round(level*5)?.85:.18)*weight;ctx.fillStyle=color;ctx.fillRect(x+w-(34-i*6)*u,y+h/2-4*u+(4-i)*.6*u,3.5*u,8*u-(4-i)*1.2*u);}
-      if(slot.preferred)this.text(ctx,'默认来源',x+2*u,y-7*u,color,.75*weight,9);
+      if(metered)for(let i=0;i<5;i++){ctx.globalAlpha=weight;ctx.fillStyle=i<Math.round(level*5)?color:INK.line;ctx.fillRect(x+w-(34-i*6)*u,y+h/2-4*u+(4-i)*.6*u,3*u,8*u-(4-i)*1.2*u);}
+      if(slot.preferred)this.text(ctx,'DEFAULT · 默认来源',x+1*u,y-8*u,live?INK.data:INK.stale,.85*weight,8.5);
     }
     for(const node of this.nodes){
       const level=this.level(node.key),flash=this.flashes.get(node.key)??0,weight=this.weight(node.route),color=live&&node.attached?INK.out:live?INK.off:INK.stale,{x,y,w,h}=node.box;
       this.plate(ctx,node.box,color,level,flash,weight);
-      this.text(ctx,node.label,x+9*u,y+h/2,live?'#d6f3f8':INK.stale,weight,11,w-16*u);
+      this.text(ctx,node.label,x+10*u,y+h/2,live?INK.text:INK.stale,weight,11,w-18*u);
       // Selected source shown on the node; an off-page selection gets a dashed stub.
       const route=node.route?`← ${node.route}${node.slot?'':' · 其他页'}`:'未选择来源';
-      this.text(ctx,route,x+2*u,y-7*u,node.route?color:INK.off,.75*weight,9);
-      if(node.route&&!node.slot)this.stroke(ctx,track([[x-60*u,y+h/2],[x,y+h/2]]),color,.5*weight,1.2*u,[3*u,4*u]);
+      this.text(ctx,route,x+1*u,y-8*u,INK.muted,.9*weight,8.5);
+      if(node.route&&!node.slot)this.stroke(ctx,track([[x-60*u,y+h/2],[x,y+h/2]]),INK.rule,weight,u,[3*u,4*u]);
     }
     if(this.calc){
-      const {center:[cx,cy],r,good,bad}=this.calc,level=this.level('calc'),flash=this.flashes.get('calc')??0,color=live?INK.data:INK.stale,total=Math.max(1,good+bad),start=-Math.PI/2;
-      ctx.globalCompositeOperation='source-over';ctx.globalAlpha=.92;ctx.fillStyle='#061620';ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.fill();
+      const {center:[cx,cy],r,good,bad}=this.calc,level=this.level('calc'),flash=this.flashes.get('calc')??0,color=live?INK.data:INK.stale,total=Math.max(1,good+bad),start=-Math.PI/2,split=start+Math.PI*2*good/total;
+      ctx.globalCompositeOperation='source-over';ctx.globalAlpha=.96;ctx.fillStyle=INK.plate;ctx.beginPath();ctx.arc(cx,cy,r+3*u,0,Math.PI*2);ctx.fill();
       ctx.globalCompositeOperation='lighter';
-      if(level+flash>.02){const halo=r*4;ctx.globalAlpha=.15*level+.4*flash;ctx.drawImage(this.glow(color),cx-halo/2,cy-halo/2,halo,halo);}
-      // Ring gauge of the real Good / other split.
-      ctx.lineWidth=3*u;ctx.globalAlpha=.18;ctx.strokeStyle=color;ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.stroke();
-      ctx.globalAlpha=.9;ctx.beginPath();ctx.arc(cx,cy,r,start,start+Math.PI*2*good/total);ctx.stroke();
-      if(bad){ctx.strokeStyle=live?INK.amber:INK.stale;ctx.beginPath();ctx.arc(cx,cy,r,start+Math.PI*2*good/total,start+Math.PI*2);ctx.stroke();}
-      ctx.strokeStyle=color;ctx.lineWidth=u;ctx.globalAlpha=.35+.4*level;ctx.setLineDash([2*u,4*u]);ctx.lineDashOffset=-this.clock*12*u;ctx.beginPath();ctx.arc(cx,cy,r*.68,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);ctx.lineDashOffset=0;
-      this.text(ctx,`${Math.round(good/total*100)}%`,cx,cy,live?'#d6f3f8':INK.stale,.9,10,undefined,'center');
+      if(flash>.02){const halo=r*4;ctx.globalAlpha=.35*flash;ctx.drawImage(this.glow(color),cx-halo/2,cy-halo/2,halo,halo);}
+      // Tick ring, then the real Good / other split as a gauge.
+      ctx.strokeStyle=INK.rule;ctx.lineWidth=u;ctx.globalAlpha=.9;ctx.beginPath();
+      for(let i=0;i<48;i++){const a=i/48*Math.PI*2,outer=r+(i%12?6:9)*u;ctx.moveTo(cx+Math.cos(a)*(r+4*u),cy+Math.sin(a)*(r+4*u));ctx.lineTo(cx+Math.cos(a)*outer,cy+Math.sin(a)*outer);}
+      ctx.stroke();
+      ctx.lineWidth=2.5*u;ctx.strokeStyle=INK.line;ctx.globalAlpha=1;ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.stroke();
+      ctx.strokeStyle=color;ctx.beginPath();ctx.arc(cx,cy,r,start,split);ctx.stroke();
+      if(bad){ctx.strokeStyle=live?INK.amber:INK.stale;ctx.beginPath();ctx.arc(cx,cy,r,split,start+Math.PI*2);ctx.stroke();}
+      ctx.strokeStyle=level>.01?color:INK.rule;ctx.lineWidth=.8*u;ctx.globalAlpha=.5+.4*level;ctx.setLineDash([1.5*u,3.5*u]);ctx.lineDashOffset=-this.clock*10*u;ctx.beginPath();ctx.arc(cx,cy,r*.66,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);ctx.lineDashOffset=0;
+      this.text(ctx,`${Math.round(good/total*100)}%`,cx,cy,live?INK.text:INK.stale,1,10.5,undefined,'center');
     }
   }
 
@@ -349,12 +357,12 @@ export class FlowScene {
     for(const packet of this.packets){
       const age=this.clock-packet.born;
       if(age<0||age>=packet.life)continue;
-      const head=age/packet.life*packet.track.total,fade=Math.min(1,age*10,(packet.life-age)*8)*(packet.owner?this.weight(packet.owner):1),scale=packet.lead?1.35:1,glow=this.glow(packet.color);
-      for(let k=11;k>=0;k--){
-        const [x,y]=along(packet.track,head-k*5*u),size=18*u*scale*(1-k/12*.75);
-        ctx.globalAlpha=fade*(1-k/12)**1.4*(k?.55:1);ctx.drawImage(glow,x-size/2,y-size/2,size,size);
+      const head=age/packet.life*packet.track.total,fade=Math.min(1,age*10,(packet.life-age)*8)*(packet.owner?this.weight(packet.owner):1),scale=packet.lead?1.3:1,glow=this.glow(packet.color);
+      for(let k=9;k>=0;k--){
+        const [x,y]=along(packet.track,head-k*4.5*u),size=13*u*scale*(1-k/10*.7);
+        ctx.globalAlpha=fade*(1-k/10)**1.5*(k?.5:.9);ctx.drawImage(glow,x-size/2,y-size/2,size,size);
       }
-      const [x,y]=along(packet.track,head),size=8*u*scale;
+      const [x,y]=along(packet.track,head),size=6.5*u*scale;
       ctx.globalAlpha=fade;ctx.drawImage(spark,x-size/2,y-size/2,size,size);
     }
   }
@@ -362,30 +370,20 @@ export class FlowScene {
   private ripples(ctx: CanvasRenderingContext2D) {
     const {u}=this.view;
     for(const spark of this.sparks){
-      const age=this.clock-spark.born,p=age/.7,drag=1-p*.5,x=spark.x+spark.vx*age*drag,y=spark.y+spark.vy*age*drag,size=(7-4*p)*u;
-      ctx.globalAlpha=(1-p)**1.5;ctx.strokeStyle=spark.color;ctx.lineWidth=1.3*u;
-      ctx.beginPath();ctx.moveTo(x-spark.vx*.05,y-spark.vy*.05);ctx.lineTo(x,y);ctx.stroke();
+      const age=this.clock-spark.born,p=age/.7,drag=1-p*.5,x=spark.x+spark.vx*age*drag,y=spark.y+spark.vy*age*drag,size=(5-3*p)*u;
+      ctx.globalAlpha=(1-p)**1.5*.8;ctx.strokeStyle=spark.color;ctx.lineWidth=u;
+      ctx.beginPath();ctx.moveTo(x-spark.vx*.04,y-spark.vy*.04);ctx.lineTo(x,y);ctx.stroke();
       ctx.drawImage(this.glow(spark.color),x-size/2,y-size/2,size,size);
     }
     for(const wave of this.waves){
       const p=(this.clock-wave.start)/1.2;
       if(p<0||p>=1)continue;
-      ctx.strokeStyle=wave.color;ctx.globalAlpha=(1-p)**2*.9;ctx.lineWidth=2*u*(1-p*.6);
-      ctx.beginPath();ctx.arc(wave.at[0],wave.at[1],(6+p*42)*u,0,Math.PI*2);ctx.stroke();
+      ctx.strokeStyle=wave.color;ctx.globalAlpha=(1-p)**2*.7;ctx.lineWidth=1.4*u*(1-p*.5);
+      ctx.beginPath();ctx.arc(wave.at[0],wave.at[1],(5+p*34)*u,0,Math.PI*2);ctx.stroke();
     }
   }
 
-  private ambient(ctx: CanvasRenderingContext2D, live: boolean) {
-    const mote=this.glow(live?INK.star:INK.stale),{u,sx,sy}=this.view;
-    for(let i=0;i<40;i++){
-      // Dust drifts upward so it is never read as left-to-right data flow.
-      const depth=hash(i*4.7),size=(3+depth*6)*u;
-      const x=hash(i*1.3)*SCENE_WIDTH+Math.sin(this.clock*.23+i)*16,y=(1-fract(hash(i*2.9)+this.clock*(5+depth*16)/SCENE_HEIGHT))*SCENE_HEIGHT;
-      ctx.globalAlpha=(.04+.1*(.5+.5*Math.sin(this.clock*(.6+depth)+i*2.3)))*(live?1:.5);
-      ctx.drawImage(mote,x*sx-size/2,y*sy-size/2,size,size);
-    }
-  }
-
+  // Static layer: dot grid and ruler ticks inside the manager frame.
   private backdropFor(width: number, height: number) {
     const key=`${width}x${height}`;
     if(this.backdrop&&this.backdropKey===key)return this.backdrop;
@@ -394,11 +392,11 @@ export class FlowScene {
     const g=canvas.getContext('2d');
     if(!g)return canvas;
     const {u,sx,sy}=this.view;
-    for(let i=0;i<220;i++){g.globalAlpha=.08+hash(i*7.7)*.35;g.fillStyle=INK.star;g.beginPath();g.arc(hash(i*3.7)*width,hash(i*9.1)*height,(.4+hash(i*5.3)*1.1)*u,0,Math.PI*2);g.fill();}
-    // Faint engineering grid inside the manager frame.
-    g.strokeStyle=INK.frame;g.lineWidth=u*.6;g.globalAlpha=.05;g.beginPath();
-    for(let x=FRAME.left+30;x<FRAME.right;x+=30){g.moveTo(x*sx,FRAME.top*sy);g.lineTo(x*sx,FRAME.bottom*sy);}
-    for(let y=FRAME.top+30;y<FRAME.bottom;y+=30){g.moveTo(FRAME.left*sx,y*sy);g.lineTo(FRAME.right*sx,y*sy);}
+    g.fillStyle=INK.rule;g.globalAlpha=.45;
+    for(let x=FRAME.left+30;x<FRAME.right;x+=30)for(let y=FRAME.top+30;y<FRAME.bottom;y+=30)g.fillRect(x*sx-.6*u,y*sy-.6*u,1.2*u,1.2*u);
+    g.strokeStyle=INK.rule;g.lineWidth=u;g.globalAlpha=.8;g.beginPath();
+    for(let x=FRAME.left+30;x<FRAME.right;x+=15){const long=(x-FRAME.left)%150===0;g.moveTo(x*sx,FRAME.top*sy);g.lineTo(x*sx,FRAME.top*sy+(long?7:3)*u);}
+    for(let y=FRAME.top+30;y<FRAME.bottom;y+=15){const long=(y-FRAME.top)%150===0;g.moveTo(FRAME.right*sx,y*sy);g.lineTo(FRAME.right*sx-(long?7:3)*u,y*sy);}
     g.stroke();
     return canvas;
   }

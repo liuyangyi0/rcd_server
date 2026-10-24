@@ -67,14 +67,14 @@ export default function FlowPage() {
     catch {setFullscreenError('浏览器未允许全屏，可使用 F11。');}
   }
   return <main className={`flow-page${!fresh ? ' flow-stale':''}${paused ? ' flow-paused':''}`}>
-    <header className="flow-header"><div className="flow-brand"><span className="flow-brand-mark" aria-hidden="true"><ActivityIcon size={22}/></span><h1>RCD 数据流监视</h1><span className="flow-readonly">只读展示</span></div><span className="flow-slogan">采集 / 路由 / 计算 / 发布</span><div className="flow-header-actions"><span className={`flow-monitor${fresh?' is-live':''}`} role="status"><i className="flow-live-dot" aria-hidden="true"/>{fresh?'监视连接正常':snapshot.isPending?'正在连接监视接口':'监视已断开 / 状态过期'}</span><button type="button" onClick={()=>setPaused((p)=>!p)} title={paused?'恢复视觉动画；不影响采集':'暂停视觉动画；数据继续更新'}>{paused?<Play size={14}/>:<Pause size={14}/>} {paused?'播放':'暂停动画'}</button><button type="button" onClick={()=>void fullscreen()} title="切换全屏"><Expand size={14}/>全屏</button><a href="#/">进入管理 ↗</a></div></header>
-    <section className="flow-toolbar" aria-label="监视范围"><span>下级连接 <b>{data ? `${data.sources.filter((s)=>s.connected).length}/${data.sources.length}`:'—'}</b></span><span>上级会话 <b>{data?.sessions.length ?? '—'}</b></span><span>现场异常 <b className={abnormal?'flow-amber':''}>{data?`${abnormal} 站`:'—'}</b></span><label>逻辑组 <select aria-label="查看逻辑组" value={group?.id ?? ''} onChange={(e)=>setGroupID(e.target.value)}>{data?.groups.length?data.groups.map((g)=><option key={g.id} value={g.id}>{g.name || g.id}</option>):<option value="">暂无逻辑组</option>}</select></label><span className="flow-endpoint">{data?.endpoint || '等待管理端状态'}</span><span>最后收到 {clock(data?.generated_at)}</span></section>
+    <header className="flow-header"><div className="flow-brand"><span className="flow-brand-mark" aria-hidden="true"><ActivityIcon size={18}/></span><div className="flow-brand-text"><h1>RCD 数据流监视</h1><small>DATA FLOW MONITOR</small></div><span className="flow-readonly">只读展示</span></div><span className="flow-slogan">采集<i/>路由<i/>计算<i/>发布</span><div className="flow-header-actions"><span className={`flow-monitor${fresh?' is-live':''}`} role="status"><i className="flow-live-dot" aria-hidden="true"/>{fresh?'监视连接正常':snapshot.isPending?'正在连接监视接口':'监视已断开 / 状态过期'}</span><button type="button" onClick={()=>setPaused((p)=>!p)} title={paused?'恢复视觉动画；不影响采集':'暂停视觉动画；数据继续更新'}>{paused?<Play size={14}/>:<Pause size={14}/>} {paused?'播放':'暂停动画'}</button><button type="button" onClick={()=>void fullscreen()} title="切换全屏"><Expand size={14}/>全屏</button><a href="#/">进入管理 ↗</a></div></header>
+    <section className="flow-toolbar" aria-label="监视范围"><span className="flow-kpi"><small>下级连接</small><b>{data ? `${data.sources.filter((s)=>s.connected).length}/${data.sources.length}`:'—'}</b></span><span className="flow-kpi"><small>上级会话</small><b>{data?.sessions.length ?? '—'}</b></span><span className="flow-kpi"><small>现场异常</small><b className={abnormal?'flow-amber':''}>{data?`${abnormal} 站`:'—'}</b></span><label className="flow-kpi"><small>逻辑组</small><select aria-label="查看逻辑组" value={group?.id ?? ''} onChange={(e)=>setGroupID(e.target.value)}>{data?.groups.length?data.groups.map((g)=><option key={g.id} value={g.id}>{g.name || g.id}</option>):<option value="">暂无逻辑组</option>}</select></label><span className="flow-kpi flow-endpoint"><small>管理端</small><span>{data?.endpoint || '等待管理端状态'}</span></span><span className="flow-kpi flow-received"><small>最后收到</small><b>{clock(data?.generated_at)}</b></span></section>
     {!fresh && data ? <div className="flow-offline" role="alert">正在展示最后收到的快照；数据流已停止，设备状态待重新确认。{snapshot.isError?' 正在自动重连…':''}</div>:null}
     {fullscreenError?<div className="flow-offline" role="status">{fullscreenError}</div>:null}
     <section ref={sceneRef} className="flow-scene" aria-label="采集、管理处理和客户端数据流拓扑">
       <FlowCanvas sources={sources} sessions={sessions} activity={activity} live={fresh} paused={paused} selected={selected} cacheActive={activeCount>0} group={group?.id} focus={hovered ?? selected} defaultSource={group?.default_source} anchors={anchors} maxPorts={maxPorts} calculation={data?{active:data.calculation.active,good:data.calculation.good,bad:data.calculation.bad,evaluated:data.calculation.last_evaluation_at}:undefined}/>
-      <span className="flow-scene-label flow-ingress-label">现场采集 <small>串口 / 站点</small></span><span className="flow-scene-label flow-egress-label">上级订阅数据流</span>
-      <div className="flow-frame-title"><b>当前 OPC 管理端</b><span>{data?.endpoint ?? ''}</span></div>
+      <div className="flow-col-head flow-col-sources"><small>SOURCES</small><b>现场采集</b><span>{allSources.length} 来源 · 串口 / 站点</span></div><div className="flow-col-head flow-col-clients"><small>CLIENTS</small><b>上级订阅</b><span>{allSessions.length} 会话</span></div>
+      <div className="flow-frame-title"><small>MANAGER</small><b>当前 OPC 管理端</b><span>{data?.endpoint ?? ''}</span></div>
       <div className="flow-stage flow-stage-cache"><span className="flow-section-index">01 / LATEST SAMPLES</span><h2>样本缓存</h2><p>{group?.name || '逻辑组'} · 默认来源 <strong>{group?.default_source || '未配置'}</strong></p></div>
       <div className="flow-stage flow-stage-route"><span className="flow-section-index">02 / ROUTING</span><h2>会话选源</h2><p>每个 Session 独立选择来源</p></div>
       <div className="flow-stage flow-stage-calc"><span className="flow-section-index">03 / CALCULATION</span><h2>中央计算</h2>{data?.calculation.active?<><p>{data.calculation.rules.toLocaleString()} 条规则 · {data.calculation.duration_ms.toFixed(2)} ms / 批</p><p><span className="flow-green">Good {data.calculation.good.toLocaleString()}</span> · <span className="flow-amber">其他 {data.calculation.bad.toLocaleString()}</span></p></>:<p>中央计算未激活</p>}<small>按默认来源计算 · 结果共享</small></div>
@@ -91,7 +91,7 @@ export default function FlowPage() {
       <StationPanel sources={allSources} focus={hovered ?? selected}/>
       <QueuePanel pending={data?.pending_commands} history={queueTrend}/>
     </section>
-    <footer className="flow-footer"><span><i/>数据更新　<span className="flow-amber">● 现场异常</span>　<span className="flow-muted">● 停用 / 未知</span></span><span>数据包依据收到的样本、生成的通知和计算求值；扫描线与网格为装饰</span><span>免登录只读 · 管理操作需登录</span></footer>
+    <footer className="flow-footer"><span className="flow-legend"><span><i className="is-data"/>数据更新</span><span><i className="is-warn"/>现场异常</span><span><i className="is-bad"/>OPC 断开</span><span><i className="is-off"/>停用 / 未知</span></span><span>数据包依据收到的样本、生成的通知和计算求值；扫描线与网格为装饰</span><span>免登录只读 · 管理操作需登录</span></footer>
     {picked?<SourceDetail key={picked.id} source={picked} fresh={fresh} onClose={closeDetail}/>:null}
   </main>;
 }
@@ -136,7 +136,7 @@ const EVENT_KIND: Record<FlowEvent['kind'],string> = { source:'来源', station:
 const STATION_GROUPS=[{label:'正常',color:STATION_COLORS[1],states:[1]},{label:'异常',color:STATION_COLORS[2],states:[2,3]},{label:'离线',color:STATION_COLORS[5],states:[5]},{label:'未知 / 停用',color:STATION_COLORS[0],states:[0,4]}];
 
 function EventsPanel({events}:{events:(FlowEvent & {id:number; at:string})[]}) {
-  return <section className="flow-panel flow-panel-events"><header><h2>实时事件</h2><small>自打开页面起 · 最近 {events.length} 条</small></header>
+  return <section className="flow-panel flow-panel-events"><header><small>EVENTS</small><h2>实时事件</h2><span>自打开页面起 · {events.length} 条</span></header>
     <div className="flow-event-list">{events.length?events.slice(0,6).map((e)=><p key={e.id} className={`is-${e.tone}`} title={e.text}><time>{clock(e.at)}</time><b>{EVENT_KIND[e.kind]}</b><span>{e.text}</span></p>):<p className="flow-event-empty"><i/>监视中 · 暂无新的连接、站点或选源变化</p>}</div>
   </section>;
 }
@@ -145,7 +145,7 @@ function EventsPanel({events}:{events:(FlowEvent & {id:number; at:string})[]}) {
 function ActivityPanel({samples,notes,active,total}:{samples:number[];notes:number[];active:number;total:number}) {
   const peak=Math.max(0,...samples), mean=Math.round(samples.reduce((sum,value)=>sum+value,0)/Math.max(1,samples.length)), notePeak=Math.max(1,...notes);
   const bars=samples.slice(-60), line=notes.slice(-60).map((v,i,list)=>`${(360-(list.length-1-i)*6-3).toFixed(1)},${(58-v/notePeak*48).toFixed(1)}`).join(' ');
-  return <section className="flow-panel flow-panel-activity"><header><h2>链路活动</h2><small>最近 60 次快照</small></header>
+  return <section className="flow-panel flow-panel-activity"><header><small>THROUGHPUT</small><h2>链路活动</h2><span>最近 60 次快照</span></header>
     <div className="flow-activity-stats"><span><b>{(samples[samples.length-1] ?? 0).toLocaleString()}</b>样本 / 快照</span><span><b>{(notes[notes.length-1] ?? 0).toLocaleString()}</b>通知 / 快照</span><span>峰值 {peak.toLocaleString()} · 均值 {mean.toLocaleString()}</span><span>活跃来源 {active}/{total}</span></div>
     <svg className="flow-activity-chart" viewBox="0 0 360 60" preserveAspectRatio="none" role="img" aria-label="最近60次快照的真实样本数和通知数"><path className="flow-chart-grid" d="M0 20.5H360M0 40.5H360"/>{bars.map((v,i)=><rect key={i} x={360-(bars.length-i)*6+1} y={58-v/Math.max(1,peak)*48} width="4" height={Math.max(1,v/Math.max(1,peak)*48)} className={i===bars.length-1?'is-last':undefined}/>)}{notes.length>1?<polyline points={line}/>:null}</svg>
   </section>;
@@ -156,7 +156,7 @@ function StationPanel({sources,focus}:{sources:FlowSource[];focus?:string}) {
   const source=sources.find((s)=>s.id===focus), list=source?[source]:sources;
   const devices=list.flatMap((s)=>s.ports.flatMap((port)=>port.devices.map((device)=>({port,device}))));
   const counts=STATION_GROUPS.map((group)=>devices.filter(({device})=>group.states.includes(device.state)).length), alerts=devices.filter(({device})=>stationAlert(device.state));
-  return <section className="flow-panel flow-panel-stations"><header><h2>{source?source.name || source.id:'站点概况'}</h2><small>{source?`${source.id} · ${source.ports.length} 串口 · 最近更新 ${clock(source.last_data_at)}`:`当前组 ${sources.filter((s)=>s.enabled && s.connected).length}/${sources.length} 来源在线`}</small></header>
+  return <section className="flow-panel flow-panel-stations"><header><small>STATIONS</small><h2>{source?source.name || source.id:'站点概况'}</h2><span>{source?`${source.id} · ${source.ports.length} 串口 · 最近更新 ${clock(source.last_data_at)}`:`当前组 ${sources.filter((s)=>s.enabled && s.connected).length}/${sources.length} 来源在线`}</span></header>
     <p className="flow-station-total"><b>{counts[0]}</b>/{devices.length} 站通信正常</p>
     <div className="flow-station-bar" aria-hidden="true">{STATION_GROUPS.map((group,i)=>counts[i]?<i key={group.label} style={{flexGrow:counts[i],background:group.color,color:group.color}}/>:null)}</div>
     <div className="flow-station-legend">{STATION_GROUPS.map((group,i)=><span key={group.label}><i style={{background:group.color}}/>{group.label} {counts[i]}</span>)}</div>
@@ -166,7 +166,7 @@ function StationPanel({sources,focus}:{sources:FlowSource[];focus?:string}) {
 
 function QueuePanel({pending,history}:{pending?:number;history:number[]}) {
   const peak=Math.max(0,...history);
-  return <section className="flow-panel flow-panel-queue"><header><h2>控制队列</h2><small>只读</small></header>
+  return <section className="flow-panel flow-panel-queue"><header><small>COMMANDS</small><h2>控制队列</h2><span>只读</span></header>
     <div className="flow-queue-head"><p className="flow-pending">{pending ?? '—'}<small>条待处理</small></p><Spark values={history.slice(-30)}/><small>峰值 {peak}</small></div>
     <ol className="flow-steps"><li>接收</li><li>排队</li><li>发送</li><li>ACK</li></ol>
     <small>只显示队列总数，不推断某条命令所处阶段或设备执行结果</small>

@@ -7,7 +7,7 @@ export interface FlowSnapshot { generated_at: string; instance: string; endpoint
 export interface FlowPoint { id: string; type: string; value: unknown; status: number; source_timestamp?: string; value_omitted: boolean }
 export interface FlowPointPage { items: FlowPoint[]; total: number; offset: number }
 export const STATION_LABELS = ['状态未知 / 已过期', '通信正常', '通信异常', '串口未打开', '已停用', '下级离线'];
-export const STATION_COLORS = ['#83949d', '#53e3bb', '#f5b951', '#f5b951', '#748591', '#f17479'];
+export const STATION_COLORS = ['#6b7a8c', '#3fd6a0', '#f0b45a', '#f0b45a', '#56657a', '#ff6f6f'];
 
 // Port rows shown on a source card and drawn as wires; the last row folds any remaining ports.
 export function portRows(ports: FlowPort[], max: number): { key: string; ports: FlowPort[] }[] {
