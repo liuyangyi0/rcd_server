@@ -28,19 +28,23 @@ export function sourceDelta(previous: FlowSource, current: FlowSource): number {
   catch { return 0; }
 }
 
-export interface Activity { sources: Record<string, number>; sessions: Record<string, number>; updates: number }
+// Timestamps mark the last snapshot with real updates; deltas hold that snapshot's counts.
+export interface Activity { sources: Record<string, number>; sessions: Record<string, number>; updates: number; sourceDeltas: Record<string, number>; sessionDeltas: Record<string, number> }
 export function advanceActivity(previous: FlowSnapshot | undefined, current: FlowSnapshot, activity: Activity, now: number): Activity {
-  const next: Activity = { sources: {}, sessions: {}, updates: 0 };
+  const next: Activity = { sources: {}, sessions: {}, updates: 0, sourceDeltas: {}, sessionDeltas: {} };
   if (!previous || previous.instance !== current.instance) return next;
   for (const source of current.sources) {
     const before = previous.sources.find((s) => s.id === source.id);
     const delta = before ? sourceDelta(before, source) : 0;
     if (sourceCanFlow(source)) next.sources[source.id] = delta > 0 ? now : activity.sources[source.id] ?? 0;
+    if (sourceCanFlow(source) && delta > 0) next.sourceDeltas[source.id] = delta;
     next.updates += delta;
   }
   for (const session of current.sessions) {
     const before = previous.sessions.find((s) => s.id === session.id);
-    if (session.attached) next.sessions[session.id] = before && notificationDelta(before, session) > 0 ? now : activity.sessions[session.id] ?? 0;
+    const delta = session.attached && before ? notificationDelta(before, session) : 0;
+    if (session.attached) next.sessions[session.id] = delta > 0 ? now : activity.sessions[session.id] ?? 0;
+    if (delta > 0) next.sessionDeltas[session.id] = delta;
   }
   return next;
 }
