@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { useQuery } from '@tanstack/react-query';
 import { Activity as ActivityIcon, ChevronLeft, ChevronRight, Expand, Pause, Play, X } from 'lucide-react';
 import FlowCanvas, { laneY } from '../features/flow/FlowCanvas';
-import { advanceActivity, portRows, publicRead, sourceCanFlow, STATION_COLORS, STATION_LABELS, visibleEvents, type Activity, type FlowPointPage, type FlowSession, type FlowSnapshot, type FlowSource } from '../features/flow/model';
+import { advanceActivity, portRows, publicRead, sourceCanFlow, STATION_COLORS, STATION_LABELS, visibleEvents, type Activity, type FlowEvent, type FlowPointPage, type FlowSession, type FlowSnapshot, type FlowSource } from '../features/flow/model';
 import { statusCodeHex, statusCodeLabel } from '../lib/labels';
 import './FlowPage.css';
 
@@ -14,9 +14,9 @@ const stationAlert = (state: number) => state===2 || state===3 || state===5;
 
 export default function FlowPage() {
   const [paused,setPaused]=useState(false), [groupID,setGroupID]=useState(''), [sourcePage,setSourcePage]=useState(0), [sessionPage,setSessionPage]=useState(0);
-  const [selected,setSelected]=useState<string>(), [hovered,setHovered]=useState<string>(), [events,setEvents]=useState<{id:number; at:string; text:string}[]>([]), [activity,setActivity]=useState(emptyActivity), [trend,setTrend]=useState<number[]>([0]);
+  const [selected,setSelected]=useState<string>(), [hovered,setHovered]=useState<string>(), [events,setEvents]=useState<(FlowEvent & {id:number; at:string})[]>([]), [activity,setActivity]=useState(emptyActivity), [trend,setTrend]=useState<number[]>([0]);
   const [now,setNow]=useState(performance.now()), [lastReceived,setLastReceived]=useState(0), [fullscreenError,setFullscreenError]=useState('');
-  const [history,setHistory]=useState<Record<string,number[]>>({}), [anchors,setAnchors]=useState<Record<string,[number,number]>>({}), [viewHeight,setViewHeight]=useState(()=>window.innerHeight);
+  const [history,setHistory]=useState<Record<string,number[]>>({}), [noteTrend,setNoteTrend]=useState<number[]>([0]), [queueTrend,setQueueTrend]=useState<number[]>([]), [anchors,setAnchors]=useState<Record<string,[number,number]>>({}), [viewHeight,setViewHeight]=useState(()=>window.innerHeight);
   const sceneRef=useRef<HTMLElement>(null);
   const previous=useRef<FlowSnapshot | undefined>(undefined);
   const activityRef=useRef(emptyActivity), eventSeq=useRef(0);
@@ -26,14 +26,16 @@ export default function FlowPage() {
     if (!snapshot.data) return;
     const data=snapshot.data, time=performance.now();
     const next=advanceActivity(previous.current,data,activityRef.current,time);
-    const additions=visibleEvents(previous.current,data).map((text)=>({id:++eventSeq.current,at:data.generated_at,text}));
-    if (previous.current?.instance!==data.instance) { setEvents([]);setTrend([0]);setHistory({}); }
+    const additions=visibleEvents(previous.current,data).map((event)=>({...event,id:++eventSeq.current,at:data.generated_at}));
+    if (previous.current?.instance!==data.instance) { setEvents([]);setTrend([0]);setNoteTrend([0]);setQueueTrend([]);setHistory({}); }
     if (additions.length) setEvents((old)=>[...additions,...old].slice(0,40));
     if (previous.current) {
       setTrend((old)=>[...old,next.updates].slice(-60));
+      setNoteTrend((old)=>[...old,Object.values(next.sessionDeltas).reduce((sum,value)=>sum+value,0)].slice(-60));
       // Per-card sparklines: the last 30 snapshots of real samples and notifications.
       setHistory((old)=>Object.fromEntries([...data.sources.map((s)=>[`s:${s.id}`,next.sourceDeltas[s.id]??0] as const),...data.sessions.map((c)=>[`c:${c.id}`,next.sessionDeltas[c.id]??0] as const)].map(([key,value])=>[key,[...(old[key]??[]),value].slice(-30)])));
     }
+    setQueueTrend((old)=>[...old,data.pending_commands].slice(-60));
     previous.current=data; activityRef.current=next;setActivity(next);
     setLastReceived(time-Math.max(0,Date.now()-snapshot.dataUpdatedAt));
   },[snapshot.data,snapshot.dataUpdatedAt]);
@@ -60,7 +62,6 @@ export default function FlowPage() {
   const devices=data?.sources.flatMap((s)=>s.ports.flatMap((p)=>p.devices)) ?? [];
   const abnormal=devices.filter((d)=>d.state===2 || d.state===3).length;
   const activeCount=data?.sources.filter((s)=>fresh && sourceCanFlow(s) && !!activity.sources[s.id] && now-activity.sources[s.id]<3200).length ?? 0;
-  const trendMax=Math.max(1,...trend), trendPoints=trend.map((n,i)=>`${i*360/59},${60-n/trendMax*52}`), trendX=(trend.length-1)*360/59, trendY=60-trend[trend.length-1]/trendMax*52;
   async function fullscreen() {
     try { if(document.fullscreenElement)await document.exitFullscreen();else await document.documentElement.requestFullscreen();setFullscreenError(''); }
     catch {setFullscreenError('浏览器未允许全屏，可使用 F11。');}
@@ -84,7 +85,12 @@ export default function FlowPage() {
       {data && !sessions.length?<div className={`flow-cache-output${activeCount>0?' is-active':''}`}><span className="flow-section-index">LATEST SAMPLE BUFFER</span><h2>最新样本缓存</h2><p>{activeCount>0?'正在收到采集更新':'等待数据变化'}</p><strong>上级会话 0</strong><small>尚未向客户端发送<br/>连接后按真实 Session 展开分流</small></div>:null}
       <div className="flow-scene-pagination flow-source-pagination"><button type="button" aria-label="上一页来源" disabled={sp===0} onClick={()=>setSourcePage(sp-1)}><ChevronLeft size={15}/></button><span>来源 {allSources.length} · {sp+1}/{sourcePages} 页</span><button type="button" aria-label="下一页来源" disabled={sp+1>=sourcePages} onClick={()=>setSourcePage(sp+1)}><ChevronRight size={15}/></button></div><div className="flow-scene-pagination flow-client-pagination"><button type="button" aria-label="上一页客户端" disabled={cp===0} onClick={()=>setSessionPage(cp-1)}><ChevronLeft size={15}/></button><span>会话 {allSessions.length} · {cp+1}/{sessionPages} 页</span><button type="button" aria-label="下一页客户端" disabled={cp+1>=sessionPages} onClick={()=>setSessionPage(cp+1)}><ChevronRight size={15}/></button></div>
     </section>
-    <section className="flow-dock"><section><h2>实时事件 <small>自打开页面起</small></h2><div className="flow-event-list">{events.length?events.slice(0,5).map((e)=><p key={e.id} title={e.text}><time>{clock(e.at)}</time>{e.text}</p>):<p className="flow-muted">暂无新的连接、站点或选源变化</p>}</div></section><section><h2>链路活动 <small>收到的采集样本 / 快照间隔</small></h2><span className="flow-trend-value" title="最近一次快照间隔收到的采集样本">{trend[trend.length-1].toLocaleString()}<small>样本</small></span><svg className="flow-trend" viewBox="0 0 360 65" role="img" aria-label="最近60次快照的真实样本更新量"><defs><linearGradient id="flow-trend-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#5ef2e0" stopOpacity=".32"/><stop offset="1" stopColor="#5ef2e0" stopOpacity="0"/></linearGradient></defs><path className="flow-trend-grid" d="M0 21.5H360M0 43.5H360"/><path d={`M 0,62 L ${trendPoints.join(' L ')} L ${trendX},62 Z`} fill="url(#flow-trend-fill)"/><path className="flow-trend-line" d={`M ${trendPoints.join(' L ')}`} fill="none" stroke="#71e7dc" strokeWidth="1.5"/>{activeCount>0?<circle className="flow-trend-ping" cx={trendX} cy={trendY} r="3"/>:null}<circle className="flow-trend-head" cx={trendX} cy={trendY} r="2.4"/></svg><small>{activeCount} 个来源近期有更新 · 粒子仅表示活动，不代表逐报文计数</small></section><section><h2>选中来源</h2>{picked?<><p className="flow-detail-name">{picked.name || picked.id}</p><p>{picked.id} · {picked.ports.length} 个串口</p><small>最近采集更新 {clock(picked.last_data_at)}</small><button type="button" className="flow-text-button" onClick={()=>setSelected(picked.id)}>查看站点和点位 →</button></>:<p className="flow-muted">点击左侧来源，查看站点状态与实际值</p>}</section><section><h2>控制队列 <small>只读</small></h2><p className="flow-pending">{data?.pending_commands ?? '—'} <small>条待处理命令</small></p><p>接收 → 排队 → 发送 → ACK</p><small>这里只显示队列总数，不推断设备执行结果</small></section></section>
+    <section className="flow-dock" aria-label="运行概况">
+      <EventsPanel events={events}/>
+      <ActivityPanel samples={trend} notes={noteTrend} active={activeCount} total={data?.sources.length ?? 0}/>
+      <StationPanel sources={allSources} focus={hovered ?? selected}/>
+      <QueuePanel pending={data?.pending_commands} history={queueTrend}/>
+    </section>
     <footer className="flow-footer"><span><i/>数据更新　<span className="flow-amber">● 现场异常</span>　<span className="flow-muted">● 停用 / 未知</span></span><span>数据包依据收到的样本、生成的通知和计算求值；扫描线与网格为装饰</span><span>免登录只读 · 管理操作需登录</span></footer>
     {picked?<SourceDetail key={picked.id} source={picked} fresh={fresh} onClose={closeDetail}/>:null}
   </main>;
@@ -124,6 +130,47 @@ function SessionCard({session,index,count,route,active,delta,history,onHover}:{s
     <span className="flow-client-route">采集来源 <strong>{route===undefined?'无路由':route || '未选择'}</strong></span>
     <span className="flow-card-status"><span><i/>{status}</span><b title="最近一次有更新的快照间隔生成的数据通知">{active?latestCount(delta,history):'—'}</b><Spark values={history}/></span>
   </article>;
+}
+
+const EVENT_KIND: Record<FlowEvent['kind'],string> = { source:'来源', station:'站点', route:'选源', session:'会话' };
+const STATION_GROUPS=[{label:'正常',color:STATION_COLORS[1],states:[1]},{label:'异常',color:STATION_COLORS[2],states:[2,3]},{label:'离线',color:STATION_COLORS[5],states:[5]},{label:'未知 / 停用',color:STATION_COLORS[0],states:[0,4]}];
+
+function EventsPanel({events}:{events:(FlowEvent & {id:number; at:string})[]}) {
+  return <section className="flow-panel flow-panel-events"><header><h2>实时事件</h2><small>自打开页面起 · 最近 {events.length} 条</small></header>
+    <div className="flow-event-list">{events.length?events.slice(0,6).map((e)=><p key={e.id} className={`is-${e.tone}`} title={e.text}><time>{clock(e.at)}</time><b>{EVENT_KIND[e.kind]}</b><span>{e.text}</span></p>):<p className="flow-event-empty"><i/>监视中 · 暂无新的连接、站点或选源变化</p>}</div>
+  </section>;
+}
+
+// Samples per snapshot as bars, generated notifications as a line, each scaled to its own peak.
+function ActivityPanel({samples,notes,active,total}:{samples:number[];notes:number[];active:number;total:number}) {
+  const peak=Math.max(0,...samples), mean=Math.round(samples.reduce((sum,value)=>sum+value,0)/Math.max(1,samples.length)), notePeak=Math.max(1,...notes);
+  const bars=samples.slice(-60), line=notes.slice(-60).map((v,i,list)=>`${(360-(list.length-1-i)*6-3).toFixed(1)},${(58-v/notePeak*48).toFixed(1)}`).join(' ');
+  return <section className="flow-panel flow-panel-activity"><header><h2>链路活动</h2><small>最近 60 次快照</small></header>
+    <div className="flow-activity-stats"><span><b>{(samples[samples.length-1] ?? 0).toLocaleString()}</b>样本 / 快照</span><span><b>{(notes[notes.length-1] ?? 0).toLocaleString()}</b>通知 / 快照</span><span>峰值 {peak.toLocaleString()} · 均值 {mean.toLocaleString()}</span><span>活跃来源 {active}/{total}</span></div>
+    <svg className="flow-activity-chart" viewBox="0 0 360 60" preserveAspectRatio="none" role="img" aria-label="最近60次快照的真实样本数和通知数"><path className="flow-chart-grid" d="M0 20.5H360M0 40.5H360"/>{bars.map((v,i)=><rect key={i} x={360-(bars.length-i)*6+1} y={58-v/Math.max(1,peak)*48} width="4" height={Math.max(1,v/Math.max(1,peak)*48)} className={i===bars.length-1?'is-last':undefined}/>)}{notes.length>1?<polyline points={line}/>:null}</svg>
+  </section>;
+}
+
+// Station health for the current group, or for the source under the pointer.
+function StationPanel({sources,focus}:{sources:FlowSource[];focus?:string}) {
+  const source=sources.find((s)=>s.id===focus), list=source?[source]:sources;
+  const devices=list.flatMap((s)=>s.ports.flatMap((port)=>port.devices.map((device)=>({port,device}))));
+  const counts=STATION_GROUPS.map((group)=>devices.filter(({device})=>group.states.includes(device.state)).length), alerts=devices.filter(({device})=>stationAlert(device.state));
+  return <section className="flow-panel flow-panel-stations"><header><h2>{source?source.name || source.id:'站点概况'}</h2><small>{source?`${source.id} · ${source.ports.length} 串口 · 最近更新 ${clock(source.last_data_at)}`:`当前组 ${sources.filter((s)=>s.enabled && s.connected).length}/${sources.length} 来源在线`}</small></header>
+    <p className="flow-station-total"><b>{counts[0]}</b>/{devices.length} 站通信正常</p>
+    <div className="flow-station-bar" aria-hidden="true">{STATION_GROUPS.map((group,i)=>counts[i]?<i key={group.label} style={{flexGrow:counts[i],background:group.color,color:group.color}}/>:null)}</div>
+    <div className="flow-station-legend">{STATION_GROUPS.map((group,i)=><span key={group.label}><i style={{background:group.color}}/>{group.label} {counts[i]}</span>)}</div>
+    {source?<p className="flow-station-alerts">{alerts.length?alerts.slice(0,2).map(({port,device})=>`${shortPort(port.id)} / 站${device.id} ${STATION_LABELS[device.state]}`).join(' · '):'无异常站点'}</p>:<p className="flow-station-alerts">悬停来源卡查看单个来源 · 点击查看站点和点位</p>}
+  </section>;
+}
+
+function QueuePanel({pending,history}:{pending?:number;history:number[]}) {
+  const peak=Math.max(0,...history);
+  return <section className="flow-panel flow-panel-queue"><header><h2>控制队列</h2><small>只读</small></header>
+    <div className="flow-queue-head"><p className="flow-pending">{pending ?? '—'}<small>条待处理</small></p><Spark values={history.slice(-30)}/><small>峰值 {peak}</small></div>
+    <ol className="flow-steps"><li>接收</li><li>排队</li><li>发送</li><li>ACK</li></ol>
+    <small>只显示队列总数，不推断某条命令所处阶段或设备执行结果</small>
+  </section>;
 }
 
 function SourceDetail({source,fresh,onClose}:{source:FlowSource;fresh:boolean;onClose:()=>void}) {

@@ -55,26 +55,28 @@ export function advanceActivity(previous: FlowSnapshot | undefined, current: Flo
   return next;
 }
 
-export function visibleEvents(previous: FlowSnapshot | undefined, current: FlowSnapshot): string[] {
+// kind groups events for the event list; tone says whether the change is a recovery, a fault or neutral.
+export interface FlowEvent { kind: 'source' | 'station' | 'route' | 'session'; tone: 'good' | 'bad' | 'info'; text: string }
+export function visibleEvents(previous: FlowSnapshot | undefined, current: FlowSnapshot): FlowEvent[] {
   if (!previous || previous.instance !== current.instance) return [];
-  const events: string[] = [];
+  const events: FlowEvent[] = [];
   for (const source of current.sources) {
     const before = previous.sources.find((s) => s.id === source.id);
-    if (!before) { events.push(`${source.name || source.id} 已加入`); continue; }
-    if (before.connected !== source.connected) events.push(`${source.name || source.id}：OPC ${source.connected ? '连接恢复' : '连接断开'}`);
+    if (!before) { events.push({ kind: 'source', tone: 'info', text: `${source.name || source.id} 已加入` }); continue; }
+    if (before.connected !== source.connected) events.push({ kind: 'source', tone: source.connected ? 'good' : 'bad', text: `${source.name || source.id}：OPC ${source.connected ? '连接恢复' : '连接断开'}` });
     const oldDevices = new Map(before.ports.flatMap((p) => p.devices.map((d) => [`${p.id}\0${d.id}`, d.state] as const)));
     for (const port of source.ports) for (const device of port.devices) {
       const old = oldDevices.get(`${port.id}\0${device.id}`);
-      if (old !== undefined && old !== device.state) events.push(`${source.id} / ${port.name || port.id} / 站${device.id}：${STATION_LABELS[device.state] ?? '未知'}`);
+      if (old !== undefined && old !== device.state) events.push({ kind: 'station', tone: device.state === 1 ? 'good' : [2, 3, 5].includes(device.state) ? 'bad' : 'info', text: `${source.id} / ${port.name || port.id} / 站${device.id}：${STATION_LABELS[device.state] ?? '未知'}` });
       if (events.length >= 30) return events;
     }
   }
   for (const session of current.sessions) {
     const before = previous.sessions.find((s) => s.id === session.id);
-    if (!before) { events.push(`客户端 ${session.name || session.id.slice(0, 6)} 已接入`); continue; }
-    for (const [group, source] of Object.entries(session.routes)) if (before.routes[group] !== source) events.push(`${session.name || session.id.slice(0, 6)}：${group} 选源 → ${source || '未选择'}`);
+    if (!before) { events.push({ kind: 'session', tone: 'good', text: `客户端 ${session.name || session.id.slice(0, 6)} 已接入` }); continue; }
+    for (const [group, source] of Object.entries(session.routes)) if (before.routes[group] !== source) events.push({ kind: 'route', tone: 'info', text: `${session.name || session.id.slice(0, 6)}：${group} 选源 → ${source || '未选择'}` });
   }
-  for (const session of previous.sessions) if (!current.sessions.some((s) => s.id === session.id)) events.push(`客户端 ${session.name || session.id.slice(0, 6)} 会话已结束`);
+  for (const session of previous.sessions) if (!current.sessions.some((s) => s.id === session.id)) events.push({ kind: 'session', tone: 'info', text: `客户端 ${session.name || session.id.slice(0, 6)} 会话已结束` });
   return events.slice(0, 30);
 }
 
