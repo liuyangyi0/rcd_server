@@ -25,6 +25,8 @@ describe('real flow activity',()=>{
   it('reports actual station and routing changes without replaying fabricated events',()=>{
     const old=flowFixture(),next=structuredClone(old);next.sources[0].ports[0].devices[0].state=2;next.sessions[0].routes['serial-acquisition']='rcd-58';
     expect(visibleEvents(undefined,next)).toEqual([]);
-    const events=visibleEvents(old,next);expect(events).toHaveLength(2);expect(events[0]).toContain('通信异常');expect(events[1]).toContain('rcd-58');
+    const events=visibleEvents(old,next);expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({kind:'station',tone:'bad'});expect(events[0].text).toContain('通信异常');
+    expect(events[1]).toMatchObject({kind:'route',tone:'info'});expect(events[1].text).toContain('rcd-58');
   });
 });

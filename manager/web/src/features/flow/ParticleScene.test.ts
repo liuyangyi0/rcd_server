@@ -34,6 +34,22 @@ describe('flow particle scene',()=>{
     expect(flying({...base,activity:{sources:{},sessions:{},updates:0,sourceDeltas:{},sessionDeltas:{}},live:true,cacheActive:false})).toBe(0);
     expect(flying({...base,activity:{...recent,sources:{'rcd-46':-3000},sessions:{'public-alias':-3000}},live:true,cacheActive:false})).toBe(0);
   });
+  it('pulses the calculation only when its evaluation time changes',()=>{
+    const data=flowFixture(),scene=new FlowScene(),idle={sources:{},sessions:{},updates:0,sourceDeltas:{},sessionDeltas:{}},calculation={active:true,good:9,bad:1,evaluated:'10:00:00'};
+    const state: SceneState={sources:data.sources,sessions:[],activity:idle,live:true,paused:false,group:'serial-acquisition',defaultSource:'rcd-46',calculation};
+    scene.draw(recorder().ctx,state,{...frame,motion:true,dt:.05});scene.draw(recorder().ctx,{...state},{...frame,motion:true,dt:.05});
+    expect(scene.inFlight).toBe(0);
+    scene.draw(recorder().ctx,{...state,calculation:{...calculation,evaluated:'10:00:01'}},{...frame,motion:true,dt:.05});
+    expect(scene.inFlight).toBeGreaterThan(0);
+  });
+  it('drops packets on a link that has just broken',()=>{
+    const data=flowFixture(),scene=new FlowScene(),state: SceneState={sources:data.sources,sessions:[],activity:recent,live:true,paused:false,group:'serial-acquisition'};
+    scene.draw(recorder().ctx,state,{...frame,motion:true,dt:.05});
+    expect(scene.inFlight).toBeGreaterThan(0);
+    const down=structuredClone(data);down.sources[0].connected=false;
+    scene.draw(recorder().ctx,{...state,sources:down.sources},{...frame,motion:true,dt:.05});
+    expect(scene.inFlight).toBe(0);
+  });
   it('sizes bursts by the logarithm of real updates',()=>{
     expect(burstSize(0)).toBe(0);
     expect(burstSize(1)).toBeLessThan(burstSize(100));
