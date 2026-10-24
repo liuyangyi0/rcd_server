@@ -2,10 +2,12 @@ import { portRows, sourceCanFlow, type Activity, type FlowPort, type FlowSession
 
 export const SCENE_WIDTH = 1680, SCENE_HEIGHT = 750;
 // Scene units. Cards and stage labels in FlowPage.css are placed with the same percentages:
-// source cards end at CARD_RIGHT, the manager frame spans FRAME, client cards start after EGRESS_X;
+// source cards end at CARD_RIGHT, the manager frame spans FRAME, client cards start just after EGRESS_X;
 // the result bus runs along BUS_Y under the calculation label.
-const CARD_RIGHT = 297, SLOT_X = 486, SLOT_W = 132, SLOT_H = 30, NODE_X = 1092, NODE_W = 120, NODE_H = 30, EGRESS_X = 1446, BUS_X = 1256;
-const FRAME = { left: 410, top: 40, right: 1300, bottom: 726 }, CALC = { x: 846, y: 662, r: 24 }, BUS_Y = 714, RECENT_MS = 3200, OUTPUT_DELAY = .9;
+const CARD_RIGHT = 319, SLOT_X = 548, SLOT_W = 120, SLOT_H = 28, NODE_X = 1012, NODE_W = 120, NODE_H = 28, EGRESS_X = 1403, BUS_X = 1156;
+const FRAME = { left: 500, top: 150, right: 1180, bottom: 650 }, CALC = { x: 840, y: 575, r: 22 }, BUS_Y = 622, RECENT_MS = 3200, OUTPUT_DELAY = .9;
+// Slots and nodes stack compactly inside the frame; wires fan in from the cards and out to the clients.
+const stackY = (index: number, count: number) => 375 + (index - (count - 1) / 2) * Math.min(80, 320 / Math.max(count - 1, 1));
 // Structure is neutral slate; the accent only appears where real data is moving.
 const INK = { data: '#59c7ff', out: '#8fb4ff', line: '#22324a', rule: '#3a4f68', amber: '#f0b45a', red: '#ff6f6f', off: '#56657a', idle: '#2c3b4f', stale: '#3a4656', text: '#e6edf5', muted: '#7d8ea3', plate: '#0a121c' };
 export const laneY = (index: number, count: number) => 48 + (index + 0.5) * (654 / Math.max(count, 1));
@@ -68,21 +70,21 @@ const toneInk=(tone: Tone,out=false)=>tone==='ok'?out?INK.out:INK.data:tone==='w
 function layout(state: SceneState, view: View) {
   const {sx,sy,u}=view,X=(x: number)=>x*sx,Y=(y: number)=>y*sy,n=Math.max(state.sources.length,1),m=Math.max(state.sessions.length,1);
   const slots=state.sources.map((source,index): Slot=>{
-    const y=laneY(index,n),box={x:X(SLOT_X),y:Y(y)-SLOT_H*sy/2,w:SLOT_W*sx,h:SLOT_H*sy};
+    const y=stackY(index,n),card=laneY(index,n),box={x:X(SLOT_X),y:Y(y)-SLOT_H*sy/2,w:SLOT_W*sx,h:SLOT_H*sy};
     const link: Tone=!source.enabled?'off':!source.connected?'down':source.catalog_state==='CatalogConflict'?'warn':'ok';
     const rows=portRows(source.ports,state.maxPorts??5),count=Math.max(rows.length,1);
     const wires=(rows.length?rows:[{key:'',ports:[]}]).map((row,k): Wire=>{
-      const anchor=state.anchors?.[`${source.id}::${row.key}`]??[CARD_RIGHT,y+(k-(count-1)/2)*15];
+      const anchor=state.anchors?.[`${source.id}::${row.key}`]??[CARD_RIGHT,card+(k-(count-1)/2)*15];
       const a: Point=[X(anchor[0])+5*u,Y(anchor[1])],d: Point=[box.x,box.y+box.h/2+(k-(count-1)/2)*Math.min(4*sy,box.h/(count+1))];
       return {track:track(curve(a,d)),tone:link!=='ok'?link:portTone(row.ports)};
     });
     return {key:`in:${source.id}`,id:source.id,box,wires,link,ready:state.live&&sourceCanFlow(source),stamp:state.activity.sources[source.id],delta:state.activity.sourceDeltas[source.id]??0,running:false,selected:state.selected===source.id,preferred:source.id===state.defaultSource};
   });
   const nodes=state.sessions.map((session,index): Node=>{
-    const y=laneY(index,m),box={x:X(NODE_X),y:Y(y)-NODE_H*sy/2,w:NODE_W*sx,h:NODE_H*sy},route=state.group?session.routes[state.group]||undefined:undefined,slot=slots.find((item)=>item.id===route);
-    const enter: Point=[box.x,Y(y)],leave: Point=[box.x+box.w,Y(y)],client: Point=[X(EGRESS_X),Y(y)];
+    const y=stackY(index,m),box={x:X(NODE_X),y:Y(y)-NODE_H*sy/2,w:NODE_W*sx,h:NODE_H*sy},route=state.group?session.routes[state.group]||undefined:undefined,slot=slots.find((item)=>item.id===route);
+    const enter: Point=[box.x,Y(y)],leave: Point=[box.x+box.w,Y(y)],exitPoints=curve(leave,[X(EGRESS_X),Y(laneY(index,m))]);
     const edgePoints=slot?curve([slot.box.x+slot.box.w,slot.box.y+slot.box.h/2],enter):undefined;
-    return {key:`out:${session.id}`,label:session.name||`客户端 ${session.id.slice(0,6)}`,box,route,slot,edge:edgePoints&&track(edgePoints),path:track([...(edgePoints??[enter]),leave,client]),exit:track([leave,client]),
+    return {key:`out:${session.id}`,label:session.name||`客户端 ${session.id.slice(0,6)}`,box,route,slot,edge:edgePoints&&track(edgePoints),path:track([...(edgePoints??[enter]),...exitPoints]),exit:track(exitPoints),
       attached:session.attached,ready:state.live&&session.attached,stamp:state.activity.sessions[session.id],delta:state.activity.sessionDeltas[session.id]??0,running:false};
   });
   let calc: Calc|undefined;
