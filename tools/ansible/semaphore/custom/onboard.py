@@ -10,6 +10,8 @@ import http.cookiejar
 import json
 import urllib.request
 
+# Values are SSH accounts and persistent Agent instance IDs, not OPC source IDs.
+# OPC sources use rcd-30/rcd-58/rcd-46; do not rename an existing Agent identity.
 HOSTS = {'30': ('RCD93', 'rcd93-30'), '58': ('lenovo', 'rcd92-58'), '46': ('lenovo', 'real-lower')}
 
 

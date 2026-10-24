@@ -16,6 +16,7 @@ import uuid
 
 SOURCES = {'30': 'rcd-30', '58': 'rcd-58', '46': 'rcd-46'}
 # Agent instance identities do not change when manager source IDs are migrated.
+# Persistent physical Agent identities, intentionally distinct from OPC source IDs.
 AGENT_INSTANCES = {'30': 'rcd93-30', '58': 'rcd92-58', '46': 'real-lower'}
 
 

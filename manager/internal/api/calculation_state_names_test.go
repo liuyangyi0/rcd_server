@@ -22,7 +22,7 @@ func TestCalculationDraftDigitLeadingStateInputNames(t *testing.T) {
 		{"9CYE.STATE", http.StatusUnprocessableEntity},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			input := calculation.StateInput{Name: tc.name, Mode: "fixed", Targets: []calculation.StateTarget{{SourceID: "rcd92-58", PortID: "/dev/ttyWCH0", DeviceID: "11"}}}
+			input := calculation.StateInput{Name: tc.name, Mode: "fixed", Targets: []calculation.StateTarget{{SourceID: "rcd-58", PortID: "/dev/ttyWCH0", DeviceID: "11"}}}
 			body, err := json.Marshal(map[string]any{
 				"content":      "[[rules]]\nkks_calc=\"ALARM\"\ndata_type=\"UInt32\"\nexpression=\"1\"\n",
 				"state_inputs": []calculation.StateInput{input},

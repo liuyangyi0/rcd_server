@@ -7,7 +7,7 @@ import { api } from '../api/client';
 import type { Source } from '../api/types';
 import SourcesPage from './SourcesPage';
 
-const source: Source = { id: 'real-lower', name: 'RCD 46 (192.168.10.46)', groupId: 'real-hardware', endpoint: 'opc.tcp://192.168.10.46:4841',
+const source: Source = { id: 'rcd-46', name: 'RCD 46 (192.168.10.46)', groupId: 'serial-acquisition', endpoint: 'opc.tcp://192.168.10.46:4841',
   securityPolicy: 'None', securityMode: 'None', hasPassword: false, enabled: true, connectionState: 'Connected', sessionState: 'Active', subscriptionState: 'Active',
   catalogState: 'Ready', reconnectCount: 0, monitoredCount: 1, goodPoints: 1, badPoints: 0, totalPoints: 1, revision: 2 };
 let client: QueryClient;
@@ -25,7 +25,7 @@ it('shows the machine display name and stable ID together and supports name sear
   const user = userEvent.setup();
   await user.type(screen.getByPlaceholderText('搜索名称、Source ID、Endpoint 或分组'), 'RCD 46');
   expect(screen.getByText(source.name)).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: '编辑 real-lower' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '编辑 rcd-46' })).toBeInTheDocument();
 });
 it('falls back to the stable ID when no display name is configured', async () => {
   setup({ ...source, name: '' });

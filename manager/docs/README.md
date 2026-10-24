@@ -28,6 +28,8 @@
 
 ## 测试与历史验收
 
+- [GitHub发布前敏感信息与命名审查（2026-10-24）](../../docs/development/repository-publication-review-20261024.md)
+- [46通信程序版本补登（2026-10-24，0.2.0，未替换或重启程序）](validation/communication-version-registration-20261024.md)
 - [图文帮助完整打包及三台平台部署（2026-10-23，0.6.19-help，10主题/19图片实测通过）](validation/help-center-deployment-20261023.md)
 - [状态输入同名OPC输出（三台平台部署，2026-10-23，0.6.18-state-output）](validation/state-output-deployment-20261023.md)
 - [真实截图图文帮助中心（2026-10-23，隔离阶段；后续已部署）](validation/help-center-20261023.md)
@@ -35,7 +37,7 @@
 - [配置页流程整理与点表非阻断提示（2026-10-23，隔离验证，后续已部署）](validation/configuration-workflow-and-point-warnings-20261023.md)
 - [旧CSV格式兼容三台采集平台发布（2026-10-23，0.6.15-csv，仅采集程序）](validation/csv-legacy-deployment-20261023.md)
 - [旧CSV格式兼容与严格保存校验（2026-10-23，隔离验证，后续已发布）](validation/csv-legacy-validation-fix-20261023.md)
-- [命令队列、发送间隔与全链路多agent复查（2026-10-23，4项修复；Rust已发布、Go未发布）](validation/command-chain-adversarial-review-20261023.md)
+- [命令队列、发送间隔与全链路多agent复查（2026-10-23，4项修复；后续均已发布）](validation/command-chain-adversarial-review-20261023.md)
 - [命令链路及发送间隔三台平台发布（2026-10-22，0.6.14-command，短时验收）](validation/command-chain-deployment-20261022.md)
 - [网页命令间隔及命令全链路复查（2026-10-22，隔离验证，未部署）](validation/command-chain-and-interval-20261022.md)
 - [管理端第二轮审查与控制命令间隔（2026-10-22，隔离验证，未部署）](validation/manager-review-and-command-interval-20261022.md)

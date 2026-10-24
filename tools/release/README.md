@@ -10,6 +10,8 @@
 
 46现场路径不迁移：程序`/opt/rcd/bin/rcd_communicate`，用户级服务`rcd-communicate.service`（运行用户`lenovo`），运行数据`/var/lib/rcd/communicate/sync46`，配置目录`.../config`、PKI`.../pki`、状态`.../state`，日志`/var/log/rcd/communicate/sync46`，OPC端口4842。profile必须绑定这些独立路径，`databases=[]`、`config_dirs=["/var/lib/rcd/communicate/sync46/config"]`；发布只替换二进制，不迁移或覆盖配置/点表。30/58没有安装它时，巡检显示未安装，不借发布创建服务。
 
+旧通信程序已有原始发布产物、源码校验清单及基线清单，但缺少平台版本登记时，可由维护人员使用`register_legacy_identity.py`补登。工具要求显式主机、当前PID及原始证据的固定SHA，校验全部源码和运行/安装/原始映像，仅原子新增只读版本档案；不替换程序、不执行程序、不创建成功部署记录或可恢复软件包。历史构建时间缺失时留空，不用登记时间冒充。此工具须使用Python 3.9以上，46执行路径为`/opt/semaphore/venv/bin/python3`；默认只核验，`--apply`才登记。补登后通过平台普通只读检查更新快照，不直接改平台数据库。46的`0.2.0`补登记录见[验收说明](../../manager/docs/validation/communication-version-registration-20261024.md)。
+
 ## 额外软件的标准包
 
 平台先注册软件种类，再通过包页面上传新版本，不支持包内安装脚本、任意路径或shell。额外软件的版本取公开构建清单和实际映像SHA，不执行第三方`version`命令。

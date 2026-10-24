@@ -20,6 +20,7 @@ import time
 from deployment import durable_json, require_no_unfinished_release, target_lock
 from release import Release, atomic_copy, sha
 
+# Values pin SSH accounts and physical Agent identities, not renamed OPC sources.
 HOSTS = {'192.168.10.30': ('RCD93','rcd93-30'), '192.168.10.58': ('lenovo','rcd92-58'),
          '192.168.10.46': ('lenovo','real-lower')}
 

@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import urllib.request
 
+# Second values are stable Agent instance IDs, not the OPC rcd-30/46/58 source IDs.
 TARGETS = {'30': ('RCD93', 'rcd93-30'), '46': ('lenovo', 'real-lower'), '58': ('lenovo', 'rcd92-58')}
 COMPONENTS = {'lower': 'rcd_server', 'agent': 'RcdAgent', 'manager': 'RcdManager'}
 RELEASE = 'rcd-standard-paths-20260928'
