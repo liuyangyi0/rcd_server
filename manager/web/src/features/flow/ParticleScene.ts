@@ -1,23 +1,27 @@
-import { sourceCanFlow, type Activity, type FlowSession, type FlowSource } from './model';
+import { FLOW_HUES, sourceCanFlow, type Activity, type FlowSession, type FlowSource } from './model';
 
 export const SCENE_WIDTH = 1680, SCENE_HEIGHT = 750;
-// DOM cards are placed in percentages of this 1680×750 scene. Geometry stays in
-// scene units and is mapped per axis; sprites and strokes are drawn in device
-// pixels so particles stay round when the scene is stretched.
-const CX = -480, CY = 375, INNER = 1200, OUTER = 1535, SPAN = .34;
-const INGRESS_X = 304, EGRESS_X = 1448, RECENT_MS = 3200, STREAK_HEAD = 88;
-const INK = { data: '#5ef2e0', out: '#8dffc8', hub: '#9df5d8', dust: '#7fd9d0', amber: '#f5b951', red: '#f17479', off: '#6e828c', conflict: '#e0b164', stale: '#62747b' };
+// DOM cards are placed in percentages of this scene. The hub sits between the
+// card columns above the processing row (.flow-processing in FlowPage.css).
+const HUB_X = 876, HUB_Y = 288, HUB_R = 86, INGRESS_X = 306, EGRESS_X = 1446, RECENT_MS = 3200;
+const SPIRAL = .2, TRAIL = 14, OUTPUT_DELAY = 1;
+const INK = { hub: '#7ff3ff', out: '#c4f1ff', amber: '#f5b951', red: '#f17479', off: '#6e828c', stale: '#5d6d74', star: '#bfe9ff' };
 export const laneY = (index: number, count: number) => 48 + (index + 0.5) * (654 / Math.max(count, 1));
-const arcX = (y: number, r: number) => CX + Math.sqrt(r*r-(y-CY)**2);
 const fract = (value: number) => value - Math.floor(value);
+const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value));
 // Deterministic noise: paused and reduced-motion frames must be pixel-stable.
 const hash = (seed: number) => fract(Math.sin(seed * 127.1 + 311.7) * 43758.5453);
-const withAlpha = (hex: string, alpha: number) => hex + Math.round(Math.max(0, Math.min(1, alpha)) * 255).toString(16).padStart(2, '0');
+const withAlpha = (hex: string, alpha: number) => hex + Math.round(clamp(alpha, 0, 1) * 255).toString(16).padStart(2, '0');
+// Packets per snapshot follow the logarithm of real updates, so 10 and 10 000 samples both stay readable.
+export const burstSize = (delta: number) => delta > 0 ? Math.min(18, 3 + Math.round(5 * Math.log10(1 + delta))) : 0;
 type Point = [number,number];
-export interface SceneState { sources: FlowSource[]; sessions: FlowSession[]; activity: Activity; live: boolean; paused: boolean; selected?: string; cacheActive?: boolean }
+export interface SceneState { sources: FlowSource[]; sessions: FlowSession[]; activity: Activity; live: boolean; paused: boolean; selected?: string; cacheActive?: boolean; group?: string; hues?: Record<string, string> }
 export interface SceneFrame { width: number; height: number; dt: number; motion: boolean; now: number }
-interface Lane { a: Point; b: Point; c: Point; d: Point; color: string; healthy: boolean; seed: number }
-interface Flow { key: string; out: boolean; lanes: Lane[]; colors: string[]; anchor: Point; port: Point; half: number; color: string; ready: boolean; always: boolean; stamp?: number; running: boolean; selected: boolean; label?: string }
+interface View { sx: number; sy: number; u: number; hx: number; hy: number; hr: number }
+interface Channel { key: string; out: boolean; color: string; link: 'ok' | 'down' | 'off'; a: Point; b: Point; c: Point; d: Point; angle: number; ready: boolean; stamp?: number; delta: number; running: boolean; selected: boolean }
+interface Packet { key: string; born: number; life: number; spread: number; lead: boolean }
+interface Wave { start: number; color: string; at?: Point }
+interface Spark { x: number; y: number; vx: number; vy: number; born: number; color: string }
 
 function bezier(a: Point,b: Point,c: Point,d: Point,t: number): Point {
   const u=1-t;
@@ -27,80 +31,74 @@ function tangent(a: Point,b: Point,c: Point,d: Point,t: number): Point {
   const u=1-t;
   return [3*u*u*(b[0]-a[0])+6*u*t*(c[0]-b[0])+3*t*t*(d[0]-c[0]),3*u*u*(b[1]-a[1])+6*u*t*(c[1]-b[1])+3*t*t*(d[1]-c[1])];
 }
-
 function sheet(width: number, height: number) {
   const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;
   return canvas;
 }
 function glowSprite(color: string) {
   const sprite=sheet(64,64),g=sprite.getContext('2d');
-  if(g){const glow=g.createRadialGradient(32,32,0,32,32,32);glow.addColorStop(0,'#ffffff');glow.addColorStop(.12,withAlpha(color,1));glow.addColorStop(.35,withAlpha(color,.32));glow.addColorStop(1,withAlpha(color,0));g.fillStyle=glow;g.fillRect(0,0,64,64);}
-  return sprite;
-}
-// Comet with a white-hot head at STREAK_HEAD and a tail fading to the left.
-function streakSprite(color: string) {
-  const sprite=sheet(96,16),g=sprite.getContext('2d');
-  if(g){
-    const body=g.createLinearGradient(0,0,96,0);body.addColorStop(0,withAlpha(color,0));body.addColorStop(.62,withAlpha(color,.45));body.addColorStop(.9,'#ffffff');body.addColorStop(.94,'#ffffff');body.addColorStop(1,withAlpha(color,0));
-    g.fillStyle=body;g.fillRect(0,0,96,16);
-    const profile=g.createLinearGradient(0,0,0,16);profile.addColorStop(0,'#0000');profile.addColorStop(.3,'#0003');profile.addColorStop(.5,'#000');profile.addColorStop(.7,'#0003');profile.addColorStop(1,'#0000');
-    g.globalCompositeOperation='destination-in';g.fillStyle=profile;g.fillRect(0,0,96,16);
-  }
+  if(g){const glow=g.createRadialGradient(32,32,0,32,32,32);glow.addColorStop(0,'#ffffff');glow.addColorStop(.14,withAlpha(color,1));glow.addColorStop(.38,withAlpha(color,.3));glow.addColorStop(1,withAlpha(color,0));g.fillStyle=glow;g.fillRect(0,0,64,64);}
   return sprite;
 }
 
-// Lane geometry and readiness only change with the snapshot or page; recency is
-// re-evaluated per frame from the activity timestamps.
-function layout(state: SceneState): Flow[] {
-  const flows: Flow[]=[],sessions=state.sessions;
+// Channels run from each source card into the hub rim and from the rim to each
+// Session card. Geometry is in device pixels and rebuilt with the snapshot or size.
+function layout(state: SceneState, view: View): Channel[] {
+  const channels: Channel[]=[],hues=state.hues??{},{sx,sy,hx,hy,hr}=view;
+  const rim=(angle: number): Point=>[hx+Math.cos(angle)*hr,hy+Math.sin(angle)*hr];
   state.sources.forEach((source,index)=>{
-    const y=laneY(index,state.sources.length),x=arcX(y,INNER),half=Math.min(78,274/Math.max(state.sources.length,1));
-    const color=!source.enabled?INK.off:!source.connected?INK.red:source.catalog_state==='CatalogConflict'?INK.conflict:INK.data;
-    const devices=source.ports.flatMap((p)=>p.devices).slice(0,12),lanes: Lane[]=[];
-    for(let lane=0;lane<34;lane++){
-      const spread=(lane/33*2-1)*half,device=devices.length?devices[lane%devices.length]:undefined;
-      lanes.push({a:[INGRESS_X,y+spread],b:[INGRESS_X+140,y+spread*1.15],c:[x-210,y+spread*.22],d:[x,y],color:device&&(device.state===2||device.state===3)?INK.amber:color,healthy:!device||device.state===1,seed:lane*7.31+index*97.3});
-    }
-    flows.push({key:`in:${source.id}`,out:false,lanes,colors:[...new Set(lanes.map((lane)=>lane.color))],anchor:[x,y],port:[INGRESS_X,y],half,color,ready:state.live&&sourceCanFlow(source),always:false,stamp:state.activity.sources[source.id],running:false,selected:state.selected===source.id,label:source.id});
+    const a: Point=[INGRESS_X*sx,laneY(index,state.sources.length)*sy],angle=Math.PI-clamp(Math.atan2(a[1]-hy,hx-a[0]),-1.05,1.05),d=rim(angle),reach=Math.hypot(d[0]-a[0],d[1]-a[1]);
+    channels.push({key:`in:${source.id}`,out:false,color:source.catalog_state==='CatalogConflict'?INK.amber:hues[source.id]??FLOW_HUES[index%FLOW_HUES.length],link:!source.enabled?'off':!source.connected?'down':'ok',
+      a,b:[a[0]+reach*.42,a[1]],c:[d[0]+Math.cos(angle)*reach*.3,d[1]+Math.sin(angle)*reach*.3],d,angle,
+      ready:state.live&&sourceCanFlow(source),stamp:state.activity.sources[source.id],delta:state.activity.sourceDeltas[source.id]??0,running:false,selected:state.selected===source.id});
   });
-  const outputs: {key: string; y: number; attached: boolean; stamp?: number}[]=sessions.length
-    ?sessions.map((session,index)=>({key:`out:${session.id}`,y:laneY(index,sessions.length),attached:session.attached,stamp:state.activity.sessions[session.id]}))
-    :[{key:'out:cache',y:CY,attached:true}];
-  outputs.forEach((output,index)=>{
-    const x=arcX(output.y,OUTER),half=sessions.length?Math.min(74,262/sessions.length):150,color=output.attached?INK.out:INK.off,lanes: Lane[]=[];
-    for(let lane=0;lane<38;lane++){
-      const spread=(lane/37*2-1)*half;
-      lanes.push({a:[x,output.y+spread*.05],b:[x+150,output.y+spread*.15],c:[EGRESS_X-180,output.y+spread],d:[EGRESS_X,output.y+spread],color,healthy:true,seed:4000+lane*5.17+index*131.9});
-    }
-    flows.push({key:output.key,out:true,lanes,colors:[color],anchor:[x,output.y],port:[EGRESS_X,output.y],half,color,ready:state.live&&output.attached&&(sessions.length>0||!!state.cacheActive),always:!sessions.length,stamp:output.stamp,running:false,selected:false});
+  const sessions=state.sessions,latest=Math.max(0,...Object.values(state.activity.sources));
+  const outputs: {key: string; y: number; attached: boolean; color: string; stamp?: number; delta: number}[]=sessions.length
+    ?sessions.map((session,index)=>({key:`out:${session.id}`,y:laneY(index,sessions.length),attached:session.attached,color:hues[session.routes[state.group??'']??'']??INK.out,stamp:state.activity.sessions[session.id],delta:state.activity.sessionDeltas[session.id]??0}))
+    // Without Sessions the hub feeds only the latest-sample cache.
+    :[{key:'out:cache',y:375,attached:true,color:INK.hub,stamp:latest||undefined,delta:state.activity.updates}];
+  outputs.forEach((output)=>{
+    const d: Point=[EGRESS_X*sx,output.y*sy],angle=clamp(Math.atan2(d[1]-hy,d[0]-hx),-1.05,1.05),a=rim(angle),reach=Math.hypot(d[0]-a[0],d[1]-a[1]);
+    channels.push({key:output.key,out:true,color:output.attached?output.color:INK.off,link:output.attached?'ok':'off',
+      a,b:[a[0]+Math.cos(angle)*reach*.3,a[1]+Math.sin(angle)*reach*.3],c:[d[0]-reach*.42,d[1]],d,angle,
+      ready:state.live&&output.attached&&(sessions.length>0||!!state.cacheActive),stamp:output.stamp,delta:output.delta,running:false,selected:false});
   });
-  return flows;
+  return channels;
 }
 
-// The arc band, ticks, scan line and drifting dust are decoration. Particles,
-// arrival ripples and the band's energy follow only the real activity counters;
-// a stale monitor turns the whole scene grey and stops every data effect.
+// Data packets are launched only when a snapshot shows new samples or Session
+// notifications; their number follows that count. Rings, orbits, the floor grid
+// and the drifting dust are decoration. A stale monitor greys out and clears packets.
 export class FlowScene {
-  private clock=0; private spin=0; private energy=0; private sx=1; private sy=1; private u=1;
-  private flows: Flow[]=[]; private shown?: SceneState;
-  private levels=new Map<string,number>(); private stamps=new Map<string,number>(); private pulses: {key: string; start: number}[]=[];
-  private glows=new Map<string,HTMLCanvasElement>(); private streaks=new Map<string,HTMLCanvasElement>();
-  private backdrop?: HTMLCanvasElement; private backdropKey='';
+  private clock=0; private spin=0; private energy=0; private charge=0; private seq=0;
+  private view: View={sx:1,sy:1,u:1,hx:0,hy:0,hr:1};
+  private channels: Channel[]=[]; private byKey=new Map<string,Channel>(); private shown?: SceneState; private shownSize='';
+  private levels=new Map<string,number>(); private stamps=new Map<string,number>();
+  private packets: Packet[]=[]; private waves: Wave[]=[]; private sparks: Spark[]=[];
+  private glows=new Map<string,HTMLCanvasElement>(); private backdrop?: HTMLCanvasElement; private backdropKey='';
+
+  // Packets launched or still travelling.
+  get inFlight() { return this.packets.length; }
 
   draw(ctx: CanvasRenderingContext2D, state: SceneState, frame: SceneFrame) {
-    this.sx=frame.width/SCENE_WIDTH;this.sy=frame.height/SCENE_HEIGHT;this.u=Math.sqrt(this.sx*this.sy);
-    if(state!==this.shown){this.flows=layout(state);this.shown=state;}
+    const size=`${frame.width}x${frame.height}`;
+    if(state!==this.shown||size!==this.shownSize){
+      const sx=frame.width/SCENE_WIDTH,sy=frame.height/SCENE_HEIGHT;
+      this.view={sx,sy,u:Math.sqrt(sx*sy),hx:HUB_X*sx,hy:HUB_Y*sy,hr:HUB_R*Math.min(sx,sy)};
+      this.channels=layout(state,this.view);this.byKey=new Map(this.channels.map((channel): [string,Channel]=>[channel.key,channel]));this.shown=state;this.shownSize=size;
+    }
     this.advance(state,frame);
     ctx.setTransform(1,0,0,1,0,0);ctx.globalCompositeOperation='source-over';ctx.globalAlpha=1;
     ctx.clearRect(0,0,frame.width,frame.height);
     ctx.drawImage(this.backdropFor(frame.width,frame.height),0,0);
     ctx.globalCompositeOperation='lighter';
     this.ambient(ctx,state.live);
+    for(const channel of this.channels)this.channel(ctx,channel,state.live);
     this.hub(ctx,state.live);
-    for(const flow of this.flows)this.lanes(ctx,flow,state.live);
-    for(const flow of this.flows)this.particles(ctx,flow);
+    this.flight(ctx);
     this.ripples(ctx);
-    for(const flow of this.flows)this.nodes(ctx,flow,state.live);
+    this.debris(ctx);
+    for(const channel of this.channels)this.ports(ctx,channel,state.live);
     ctx.setTransform(1,0,0,1,0,0);ctx.globalCompositeOperation='source-over';ctx.globalAlpha=1;
   }
 
@@ -108,173 +106,192 @@ export class FlowScene {
     // Fades run only while animating; paused or reduced-motion frames show the current state at once.
     const ease=(rate: number)=>motion&&state.live?1-Math.exp(-dt*rate):1,keys=new Set<string>();
     let total=0;
-    this.clock+=dt;this.spin+=dt*(.4+.9*this.energy);
-    for(const flow of this.flows){
-      flow.running=flow.ready&&(flow.always||(!!flow.stamp&&now-flow.stamp<RECENT_MS));
-      const old=this.levels.get(flow.key)??0,level=old+(Number(flow.running)-old)*ease(3.5),seen=this.stamps.get(flow.key);
-      this.levels.set(flow.key,level);total+=level;keys.add(flow.key);
-      if(flow.stamp===undefined)continue;
-      this.stamps.set(flow.key,flow.stamp);
-      if(motion&&flow.running&&flow.stamp>(seen??0))this.pulses.push({key:flow.key,start:this.clock});
+    this.clock+=dt;this.spin+=dt*(.35+.9*this.energy);this.charge*=Math.exp(-dt*1.4);
+    for(const channel of this.channels){
+      channel.running=channel.ready&&!!channel.stamp&&now-channel.stamp<RECENT_MS;
+      const old=this.levels.get(channel.key)??0,level=old+(Number(channel.running)-old)*ease(3),seen=this.stamps.get(channel.key);
+      this.levels.set(channel.key,level);total+=level;keys.add(channel.key);
+      if(channel.stamp===undefined)continue;
+      this.stamps.set(channel.key,channel.stamp);
+      if(motion&&channel.running&&channel.stamp>(seen??0))this.launch(channel);
     }
     for(const map of [this.levels,this.stamps])for(const key of map.keys())if(!keys.has(key))map.delete(key);
-    const target=state.live?Math.min(1,total/Math.max(1,this.flows.length)*1.3+(state.cacheActive?.2:0)):0;
-    this.energy+=(target-this.energy)*ease(1.2);
-    this.pulses=state.live?this.pulses.filter((pulse)=>this.clock-pulse.start<1.5).slice(-48):[];
+    this.energy+=((state.live?Math.min(1,total/Math.max(1,this.channels.length)*1.4):0)-this.energy)*ease(1.2);
+    if(!state.live){this.packets=[];this.waves=[];this.sparks=[];this.charge=0;return;}
+    if(!motion)return;
+    // Arrivals brighten the core; the first packet of each burst sends a shockwave.
+    const flying: Packet[]=[];
+    for(const packet of this.packets){
+      const channel=this.byKey.get(packet.key);
+      if(!channel)continue;
+      if(this.clock-packet.born<packet.life){flying.push(packet);continue;}
+      if(!channel.out)this.charge=Math.min(1,this.charge+.05);
+      if(packet.lead)this.waves.push({start:this.clock,color:channel.color,at:channel.out?channel.d:undefined});
+      if(!channel.out||packet.lead)this.burst(channel.out?channel.d:[this.view.hx,this.view.hy],channel.color,channel.out?7:2,channel.out?0:this.view.hr*.3);
+    }
+    this.packets=flying;
+    this.waves=this.waves.filter((wave)=>this.clock-wave.start<1.2).slice(-32);
+    this.sparks=this.sparks.filter((spark)=>this.clock-spark.born<.7).slice(-240);
+  }
+
+  private launch(channel: Channel) {
+    const count=burstSize(channel.delta)||3;
+    // Spread the burst over the next snapshot interval; outputs leave once inputs have reached the hub.
+    for(let i=0;i<count;i++){
+      const seed=++this.seq;
+      this.packets.push({key:channel.key,born:this.clock+(i+hash(seed)*.8)/count*.95+(channel.out?OUTPUT_DELAY:0),life:(channel.out?1.7:1.9)*(.88+hash(seed*1.7)*.24),spread:hash(seed*2.3)*2-1,lead:i===0});
+    }
+    if(this.packets.length>900)this.packets.splice(0,this.packets.length-900);
+  }
+
+  // Sparks thrown off where data lands: the core for inputs, the client port for outputs.
+  private burst([x,y]: Point, color: string, count: number, offset: number) {
+    const {u}=this.view;
+    for(let i=0;i<count;i++){
+      const seed=++this.seq,angle=hash(seed*3.1)*Math.PI*2,speed=(70+hash(seed*4.7)*120)*u;
+      this.sparks.push({x:x+Math.cos(angle)*offset,y:y+Math.sin(angle)*offset,vx:Math.cos(angle)*speed,vy:Math.sin(angle)*speed,born:this.clock,color});
+    }
+  }
+
+  // Path: channel then an inward spiral for inputs; outward spiral then channel for outputs.
+  private at(channel: Channel, p: number, spread: number): Point {
+    const {hx,hy,hr,u}=this.view;
+    if(!channel.out&&p>1-SPIRAL){const s=(p-1+SPIRAL)/SPIRAL,angle=channel.angle+1.8*s,r=hr*(1-.84*s);return [hx+Math.cos(angle)*r,hy+Math.sin(angle)*r];}
+    if(channel.out&&p<SPIRAL){const s=p/SPIRAL,angle=channel.angle-1.8*(1-s),r=hr*(.16+.84*s);return [hx+Math.cos(angle)*r,hy+Math.sin(angle)*r];}
+    const t=channel.out?(p-SPIRAL)/(1-SPIRAL):p/(1-SPIRAL),[x,y]=bezier(channel.a,channel.b,channel.c,channel.d,t),[tx,ty]=tangent(channel.a,channel.b,channel.c,channel.d,t);
+    const norm=Math.hypot(tx,ty)||1,offset=spread*6*u*Math.sin(Math.PI*t);
+    return [x-ty/norm*offset,y+tx/norm*offset];
+  }
+
+  private channel(ctx: CanvasRenderingContext2D, channel: Channel, live: boolean) {
+    const {u}=this.view,level=this.levels.get(channel.key)??0;
+    const path=(until=1)=>{
+      ctx.beginPath();ctx.moveTo(...channel.a);
+      if(until>=1){ctx.bezierCurveTo(...channel.b,...channel.c,...channel.d);return;}
+      for(let i=1;i<=24;i++)ctx.lineTo(...bezier(channel.a,channel.b,channel.c,channel.d,until*i/24));
+    };
+    if(!live||channel.link==='off'){
+      path();ctx.setLineDash([2*u,7*u]);ctx.strokeStyle=live?INK.off:INK.stale;ctx.globalAlpha=.5;ctx.lineWidth=1.2*u;ctx.stroke();ctx.setLineDash([]);
+      return;
+    }
+    if(channel.link==='down'){
+      // A broken link: the red stub stops well short of the hub.
+      path(.42);ctx.setLineDash([6*u,6*u]);ctx.strokeStyle=INK.red;ctx.globalAlpha=.6;ctx.lineWidth=1.6*u;ctx.stroke();ctx.setLineDash([]);
+      const [x,y]=bezier(channel.a,channel.b,channel.c,channel.d,.46),s=5*u;
+      ctx.globalAlpha=.95;ctx.lineWidth=2*u;ctx.beginPath();ctx.moveTo(x-s,y-s);ctx.lineTo(x+s,y+s);ctx.moveTo(x+s,y-s);ctx.lineTo(x-s,y+s);ctx.stroke();
+      return;
+    }
+    ctx.strokeStyle=channel.color;
+    path();ctx.globalAlpha=.16+(channel.selected?.2:0);ctx.lineWidth=(channel.selected?2.2:1.5)*u;ctx.stroke();
+    if(level<.01)return;
+    for(const [width,strength] of [[24,.05],[10,.1],[2.8,.55]]){path();ctx.globalAlpha=strength*level;ctx.lineWidth=width*u;ctx.stroke();}
+    // Current markers run toward the clients only while real updates arrive.
+    path();ctx.setLineDash([2*u,18*u]);ctx.lineDashOffset=-this.clock*95*u;ctx.strokeStyle='#ffffff';ctx.globalAlpha=.6*level;ctx.lineWidth=2*u;ctx.stroke();ctx.setLineDash([]);ctx.lineDashOffset=0;
   }
 
   private hub(ctx: CanvasRenderingContext2D, live: boolean) {
-    const {u,sx,sy}=this,e=this.energy,ink=live?INK.hub:INK.stale,dim=live?1:.45,cx=this.X(CX),cy=this.Y(CY);
-    const polar=(a: number,r: number): Point=>[this.X(CX+Math.cos(a)*r),this.Y(CY+Math.sin(a)*r)];
-    // Rails glow brighter and the band spins faster while real updates arrive.
+    const {u,hx,hy,hr:R}=this.view,e=this.energy,c=this.charge,ink=live?INK.hub:INK.stale,dim=live?1:.4,glow=this.glow(ink);
+    const ring=(r: number,width: number,alpha: number,from=0,to=Math.PI*2)=>{ctx.globalAlpha=alpha*dim;ctx.lineWidth=width*u;ctx.beginPath();ctx.arc(hx,hy,r,from,to);ctx.stroke();};
+    const halo=ctx.createRadialGradient(hx,hy,0,hx,hy,R*3.4);
+    halo.addColorStop(0,withAlpha(ink,(.16+.14*e+.3*c)*dim));halo.addColorStop(.4,withAlpha(ink,.05*dim));halo.addColorStop(1,withAlpha(ink,0));
+    ctx.globalAlpha=1;ctx.fillStyle=halo;ctx.fillRect(hx-R*3.4,hy-R*3.4,R*6.8,R*6.8);
+    // Anamorphic flare widens with each arrival.
+    const flareR=R*(3+2.5*c);
+    ctx.save();ctx.translate(hx,hy);ctx.scale(1,.045);
+    const flare=ctx.createRadialGradient(0,0,0,0,0,flareR);
+    flare.addColorStop(0,withAlpha('#ffffff',(.3+.55*c)*dim));flare.addColorStop(.3,withAlpha(ink,(.16+.3*c)*dim));flare.addColorStop(1,withAlpha(ink,0));
+    ctx.fillStyle=flare;ctx.beginPath();ctx.arc(0,0,flareR,0,Math.PI*2);ctx.fill();ctx.restore();
     ctx.strokeStyle=ink;
-    for(const r of [INNER,OUTER])for(const [width,strength] of [[16,.04],[6,.1],[1.8,.6]]){
-      ctx.globalAlpha=strength*(.5+.5*e)*dim;ctx.lineWidth=width*u;
-      ctx.beginPath();ctx.ellipse(cx,cy,r*sx,r*sy,0,-SPAN,SPAN);ctx.stroke();
+    ring(R,1.6,.75);
+    ctx.beginPath();
+    for(let n=0;n<72;n++){const a=n/72*Math.PI*2+this.spin*.25,r2=R*(n%6?1.1:1.17);ctx.moveTo(hx+Math.cos(a)*R*1.05,hy+Math.sin(a)*R*1.05);ctx.lineTo(hx+Math.cos(a)*r2,hy+Math.sin(a)*r2);}
+    ctx.globalAlpha=.45*dim;ctx.lineWidth=1.2*u;ctx.stroke();
+    for(let k=0;k<3;k++){const a=-this.spin*.5+k*Math.PI*2/3;ring(R*1.34,3,.55+.3*e,a,a+1.25);ring(R*1.34,1,.35,a+1.45,a+1.75);}
+    ctx.setLineDash([1.2*u,7*u]);ctx.lineDashOffset=-this.spin*10*u;ring(R*1.64,1.6,.5);ctx.setLineDash([]);ctx.lineDashOffset=0;
+    for(let k=0;k<4;k++){const a=this.spin*.12+k*Math.PI/2;ring(R*1.98,1.4,.45,a-.16,a+.16);}
+    ring(R*1.98,.8,.12);
+    // Three tilted orbits give the core depth.
+    for(let k=0;k<3;k++){
+      const t=this.spin*(1.1+k*.25)+k*2.1,s=12*u;
+      ctx.save();ctx.translate(hx,hy);ctx.rotate(k*Math.PI/3+this.spin*.06);
+      ctx.globalAlpha=.24*dim;ctx.lineWidth=u;ctx.beginPath();ctx.ellipse(0,0,R*1.18,R*.34,0,0,Math.PI*2);ctx.stroke();
+      ctx.globalAlpha=(.55+.4*Math.sin(t))*dim;ctx.drawImage(glow,Math.cos(t)*R*1.18-s/2,Math.sin(t)*R*.34-s/2,s,s);
+      ctx.restore();
     }
-    for(const [r,dir,speed] of [[INNER+11,1,.023],[OUTER-11,-1,-.017]])for(const major of [false,true]){
-      ctx.beginPath();
-      for(let n=0;n<180;n++){
-        if((n%6===0)!==major)continue;
-        const a=fract(n/180+this.spin*speed/.7)*.7-.35;
-        ctx.moveTo(...polar(a,r));ctx.lineTo(...polar(a,r+dir*(major?15:7)));
-      }
-      ctx.globalAlpha=(major?.75:.28)*(.6+.4*e)*dim;ctx.lineWidth=(major?2.2:1)*u;ctx.stroke();
-    }
-    // Radial data columns with bright packets travelling through them.
-    const strengths=[.06,.14,.3,.7];
-    for(let bucket=0;bucket<4;bucket++){
-      ctx.beginPath();
-      for(let column=0;column<5;column++){
-        const r=INNER+48+column*53,drift=this.spin*(column%2?.009:-.012)/.69;
-        for(let row=0;row<62;row++){
-          const wave=fract(row/31-this.spin*.3+column*.37),size=(row*17+column*7)%27;
-          if((wave<.06?3:wave<.16?2:size%5===0?1:0)!==bucket)continue;
-          const a=fract(row/62+drift)*.69-.345;
-          ctx.moveTo(...polar(a,r));ctx.lineTo(...polar(a,r+10+size));
-        }
-      }
-      ctx.globalAlpha=strengths[bucket]*(bucket>1?.3+.7*e:1)*dim;ctx.strokeStyle=live?bucket>1?'#e2fff6':'#b5ffe7':INK.stale;ctx.lineWidth=1.5*u;ctx.stroke();
-    }
-    ctx.save();
-    ctx.beginPath();ctx.ellipse(cx,cy,OUTER*sx,OUTER*sy,0,-SPAN,SPAN);ctx.ellipse(cx,cy,INNER*sx,INNER*sy,0,SPAN,-SPAN,true);ctx.closePath();ctx.clip();
-    const scan=this.Y(CY+Math.sin(this.spin*.5)*330),reach=48*sy,beam=ctx.createLinearGradient(0,scan-reach,0,scan+reach);
-    beam.addColorStop(0,withAlpha(ink,0));beam.addColorStop(.5,withAlpha(ink,.14));beam.addColorStop(1,withAlpha(ink,0));
-    ctx.globalAlpha=(.5+.5*e)*dim;ctx.fillStyle=beam;ctx.fillRect(this.X(620),scan-reach,480*sx,reach*2);
-    ctx.globalAlpha=(.25+.35*e)*dim;ctx.fillStyle=ink;ctx.fillRect(this.X(620),scan-.5*u,480*sx,u);
-    ctx.restore();
-    if(live){
-      const glow=this.glow(ink);
-      for(const [r,dir] of [[INNER,1],[OUTER,-1]])for(let k=0;k<2;k++){
-        const head=(fract(this.spin*.14*dir+k*.5+(dir>0?0:.25))-.5)*2*SPAN;
-        for(let i=0;i<12;i++){
-          const [x,y]=polar(head-dir*i*.0045,r),size=(22-i*1.2)*u;
-          ctx.globalAlpha=(1-i/12)**1.6*(.25+.75*e);ctx.drawImage(glow,x-size/2,y-size/2,size,size);
-        }
-      }
-    }
-    // Sparks crossing the band scale with the share of flows that are really running.
-    const sparks=28*e,streak=this.streak(ink);
-    for(let i=0;i<Math.ceil(sparks);i++){
-      const a=(hash(i*3.17)-.5)*.56,p=fract(this.clock*(.4+hash(i*5.3)*.35)+hash(i*1.91)),[x,y]=polar(a,INNER+8+p*(OUTER-INNER-16));
-      const angle=Math.atan2(Math.sin(a)*sy,Math.cos(a)*sx),cos=Math.cos(angle)*.55*u,sin=Math.sin(angle)*.55*u;
-      ctx.globalAlpha=Math.sin(p*Math.PI)*Math.min(1,sparks-i)*.85;
-      ctx.setTransform(cos,sin,-sin,cos,x,y);ctx.drawImage(streak,-STREAK_HEAD,-8);
-    }
-    ctx.setTransform(1,0,0,1,0,0);
+    const coreR=R*(.52+.16*c+.04*Math.sin(this.spin*2.2)),core=ctx.createRadialGradient(hx,hy,0,hx,hy,coreR);
+    core.addColorStop(0,withAlpha('#ffffff',.95*dim));core.addColorStop(.22,withAlpha(ink,.85*dim));core.addColorStop(.6,withAlpha(ink,.22*dim));core.addColorStop(1,withAlpha(ink,0));
+    ctx.globalAlpha=1;ctx.fillStyle=core;ctx.beginPath();ctx.arc(hx,hy,coreR,0,Math.PI*2);ctx.fill();
+    // Radar sweep inside the rim and rings breathing out of the core.
+    const sweep=this.spin*1.6;ctx.fillStyle=ink;
+    for(let i=0;i<14;i++){const a=sweep-i*.05;ctx.globalAlpha=.16*(1-i/14)*dim;ctx.beginPath();ctx.moveTo(hx,hy);ctx.arc(hx,hy,R*.97,a-.05,a);ctx.closePath();ctx.fill();}
+    ctx.strokeStyle='#ffffff';
+    for(let k=0;k<2;k++){const p=fract(this.spin*.6+k*.5);ring(R*(.22+.6*p),1.2,(1-p)*(.35+.4*c));}
   }
 
-  private lanes(ctx: CanvasRenderingContext2D, flow: Flow, live: boolean) {
-    const level=this.levels.get(flow.key)??0,u=this.u;
-    const trace=(lane: Lane)=>{ctx.moveTo(this.X(lane.a[0]),this.Y(lane.a[1]));ctx.bezierCurveTo(this.X(lane.b[0]),this.Y(lane.b[1]),this.X(lane.c[0]),this.Y(lane.c[1]),this.X(lane.d[0]),this.Y(lane.d[1]));};
-    for(const color of flow.colors){
-      ctx.beginPath();for(const lane of flow.lanes)if(lane.color===color)trace(lane);
-      ctx.globalAlpha=live?.05+.1*level+(flow.selected?.08:0):.035;ctx.strokeStyle=live?color:INK.stale;ctx.lineWidth=(flow.selected?1:.7)*u;ctx.stroke();
-    }
-    if(level<.01)return;
-    // A soft beam along the bundle centre keeps active routes readable from a distance.
-    ctx.strokeStyle=flow.color;
-    for(const [width,strength] of [[26,.03],[8,.06]]){
-      ctx.beginPath();trace(flow.lanes[flow.lanes.length>>1]);ctx.globalAlpha=strength*level;ctx.lineWidth=width*u;ctx.stroke();
+  private flight(ctx: CanvasRenderingContext2D) {
+    const {u}=this.view,spark=this.glow('#ffffff');
+    for(const packet of this.packets){
+      const channel=this.byKey.get(packet.key),p=(this.clock-packet.born)/packet.life;
+      if(!channel||p<0||p>=1)continue;
+      const glow=this.glow(channel.color),fade=Math.min(1,p*12,(1-p)*10),scale=packet.lead?1.45:1;
+      for(let k=TRAIL-1;k>=0;k--){
+        const q=p-k*.009;
+        if(q<0)continue;
+        const [x,y]=this.at(channel,q,packet.spread),size=22*u*scale*(1-k/TRAIL*.78);
+        ctx.globalAlpha=fade*(1-k/TRAIL)**1.4*(k?.55:1);ctx.drawImage(glow,x-size/2,y-size/2,size,size);
+      }
+      const [x,y]=this.at(channel,p,packet.spread),size=9*u*scale;
+      ctx.globalAlpha=fade;ctx.drawImage(spark,x-size/2,y-size/2,size,size);
     }
   }
 
-  private particles(ctx: CanvasRenderingContext2D, flow: Flow) {
-    const level=this.levels.get(flow.key)??0,u=this.u;
-    if(level<.01)return;
-    for(const lane of flow.lanes){
-      if(!lane.healthy)continue;
-      const streak=this.streak(lane.color),speed=(flow.out?.32:.22)+hash(lane.seed)*.1;
-      for(let n=0;n<2;n++){
-        // Inputs accelerate into the hub; outputs leave fast and settle at the client.
-        const phase=fract(this.clock*speed+hash(lane.seed+n*17.17)),big=hash(lane.seed*3.3+n)>.9;
-        const t=flow.out?1-(1-phase)**1.7:phase**1.45,pace=flow.out?1.7*(1-phase)**.7:1.45*phase**.45;
-        const [x,y]=bezier(lane.a,lane.b,lane.c,lane.d,t),[tx,ty]=tangent(lane.a,lane.b,lane.c,lane.d,t);
-        const norm=Math.hypot(tx,ty)||1,wobble=Math.sin(phase*9+lane.seed)*2.4*(flow.out?t:1-t);
-        const px=this.X(x-ty/norm*wobble),py=this.Y(y+tx/norm*wobble),angle=Math.atan2(ty*this.sy,tx*this.sx);
-        const along=(.25+.45*pace)*(big?1.3:.85)*u,across=(big?1.1:.7)*u,cos=Math.cos(angle),sin=Math.sin(angle);
-        ctx.globalAlpha=Math.min(1,phase*10,(1-phase)*12)*level*(big?1:.72);
-        ctx.setTransform(cos*along,sin*along,-sin*across,cos*across,px,py);ctx.drawImage(streak,-STREAK_HEAD,-8);
-        if(!big)continue;
-        const size=18*u;
-        ctx.setTransform(1,0,0,1,0,0);ctx.drawImage(this.glow(lane.color),px-size/2,py-size/2,size,size);
-      }
+  private debris(ctx: CanvasRenderingContext2D) {
+    const {u}=this.view;
+    for(const spark of this.sparks){
+      const age=this.clock-spark.born,p=age/.7,drag=1-p*.5,x=spark.x+spark.vx*age*drag,y=spark.y+spark.vy*age*drag,size=(7-4*p)*u;
+      ctx.globalAlpha=(1-p)**1.5;ctx.strokeStyle=spark.color;ctx.lineWidth=1.4*u;
+      ctx.beginPath();ctx.moveTo(x-spark.vx*.05,y-spark.vy*.05);ctx.lineTo(x,y);ctx.stroke();
+      ctx.drawImage(this.glow(spark.color),x-size/2,y-size/2,size,size);
     }
-    ctx.setTransform(1,0,0,1,0,0);
   }
 
-  // One ripple per snapshot whose sample or notification counter advanced.
   private ripples(ctx: CanvasRenderingContext2D) {
-    const u=this.u;
-    for(const pulse of this.pulses){
-      const flow=this.flows.find((item)=>item.key===pulse.key);
-      if(!flow)continue;
-      const [x,y]=flow.out?flow.port:flow.anchor,age=(this.clock-pulse.start)/1.5,px=this.X(x),py=this.Y(y);
-      ctx.strokeStyle=flow.color;
-      for(const lag of [0,.18]){
-        const p=age-lag;
-        if(p<=0||p>=1)continue;
-        ctx.globalAlpha=(1-p)**2*.8;ctx.lineWidth=(2.4*(1-p)+.5)*u;
-        ctx.beginPath();ctx.arc(px,py,(6+p*64)*u,0,Math.PI*2);ctx.stroke();
-      }
-      if(age<.3){const size=(70-age*120)*u;ctx.globalAlpha=1-age/.3;ctx.drawImage(this.glow(flow.color),px-size/2,py-size/2,size,size);}
+    const {u,hx,hy,hr}=this.view;
+    for(const wave of this.waves){
+      const p=(this.clock-wave.start)/1.2;
+      if(p<0||p>=1)continue;
+      const [x,y]=wave.at??[hx,hy],r=wave.at?(6+p*46)*u:hr*(.5+p*2.2);
+      ctx.strokeStyle=wave.color;ctx.globalAlpha=(1-p)**2*.9;ctx.lineWidth=(wave.at?2:3.2)*u*(1-p*.6);
+      ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.stroke();
     }
   }
 
-  private nodes(ctx: CanvasRenderingContext2D, flow: Flow, live: boolean) {
-    const level=this.levels.get(flow.key)??0,u=this.u,color=live?flow.color:INK.stale,glow=this.glow(color);
-    const x=this.X(flow.anchor[0]),y=this.Y(flow.anchor[1]),px=this.X(flow.port[0]),py=this.Y(flow.port[1]),top=this.Y(flow.port[1]-flow.half),bottom=this.Y(flow.port[1]+flow.half),tick=(flow.out?-5:5)*u;
-    ctx.globalCompositeOperation='lighter';ctx.strokeStyle=color;
-    // Port bracket where lanes leave a source card or reach a client card.
-    ctx.globalAlpha=.2+.35*level;ctx.lineWidth=u;
-    ctx.beginPath();ctx.moveTo(px+tick,top);ctx.lineTo(px,top);ctx.lineTo(px,bottom);ctx.lineTo(px+tick,bottom);ctx.stroke();
-    if(level>.01){const halo=34*u;ctx.globalAlpha=.55*level;ctx.drawImage(glow,px-halo/2,py-halo/2,halo,halo);}
-    const size=(flow.out?26:40)*u*(.7+.3*level);
-    ctx.globalAlpha=.3+.6*level;ctx.drawImage(glow,x-size/2,y-size/2,size,size);
-    ctx.globalAlpha=.85;ctx.lineWidth=1.8*u;ctx.beginPath();ctx.arc(x,y,(flow.out?5:8)*u,0,Math.PI*2);ctx.stroke();
-    if(!flow.out){ctx.globalAlpha=.22;ctx.lineWidth=4*u;ctx.beginPath();ctx.arc(x,y,13*u,0,Math.PI*2);ctx.stroke();}
-    if(flow.selected){
-      ctx.globalAlpha=.9;ctx.lineWidth=1.2*u;ctx.setLineDash([5*u,4*u]);ctx.lineDashOffset=-this.spin*14*u;
-      ctx.beginPath();ctx.arc(x,y,21*u,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);ctx.lineDashOffset=0;
+  private ports(ctx: CanvasRenderingContext2D, channel: Channel, live: boolean) {
+    const {u}=this.view,level=this.levels.get(channel.key)??0,color=!live?INK.stale:channel.link==='down'?INK.red:channel.link==='off'?INK.off:channel.color,glow=this.glow(color);
+    const [px,py]=channel.out?channel.d:channel.a,[ex,ey]=channel.out?channel.a:channel.d;
+    let size=(22+16*level)*u;
+    ctx.globalAlpha=.35+.55*level;ctx.drawImage(glow,px-size/2,py-size/2,size,size);
+    ctx.strokeStyle=color;ctx.globalAlpha=.85;ctx.lineWidth=1.5*u;ctx.beginPath();ctx.arc(px,py,4.5*u,0,Math.PI*2);ctx.stroke();
+    if(channel.selected){
+      ctx.lineWidth=1.2*u;ctx.setLineDash([4*u,4*u]);ctx.lineDashOffset=-this.spin*12*u;
+      ctx.beginPath();ctx.arc(px,py,12*u,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);ctx.lineDashOffset=0;
     }
-    if(!flow.label)return;
-    const text=flow.label.slice(0,13);
-    ctx.globalCompositeOperation='source-over';ctx.font=`${Math.round(11*u)}px ui-monospace, SFMono-Regular, Consolas, monospace`;ctx.textBaseline='middle';
-    const width=ctx.measureText(text).width+16*u,height=22*u,left=x-22*u-width,labelTop=y-height/2;
-    ctx.globalAlpha=.9;ctx.fillStyle='#061217';ctx.fillRect(left,labelTop,width,height);
-    ctx.globalAlpha=.45;ctx.lineWidth=u;ctx.strokeRect(left,labelTop,width,height);
-    ctx.globalAlpha=1;ctx.fillStyle=color;ctx.fillRect(left,labelTop,2*u,height);
-    ctx.fillStyle='#d3ede3';ctx.fillText(text,left+9*u,y);
+    if(channel.link!=='down'){size=(12+12*level)*u;ctx.globalAlpha=.3+.6*level;ctx.drawImage(glow,ex-size/2,ey-size/2,size,size);}
+    // Real samples or notifications counted in the last snapshot.
+    if(level<.05||!channel.delta)return;
+    ctx.globalCompositeOperation='source-over';ctx.font=`600 ${Math.round(12*u)}px ui-monospace, SFMono-Regular, Consolas, monospace`;ctx.textBaseline='bottom';ctx.textAlign=channel.out?'right':'left';
+    ctx.globalAlpha=level;ctx.fillStyle=color;ctx.fillText(`+${channel.delta.toLocaleString()}`,px+(channel.out?-12:12)*u,py-8*u);
+    ctx.globalCompositeOperation='lighter';
   }
 
   private ambient(ctx: CanvasRenderingContext2D, live: boolean) {
-    const mote=this.glow(live?INK.dust:INK.stale);
-    for(let i=0;i<64;i++){
+    const mote=this.glow(live?INK.star:INK.stale),{u,sx,sy}=this.view;
+    for(let i=0;i<48;i++){
       // Dust drifts upward so it is never read as left-to-right data flow.
-      const depth=hash(i*4.7),size=(3+depth*7)*this.u;
+      const depth=hash(i*4.7),size=(3+depth*7)*u;
       const x=hash(i*1.3)*SCENE_WIDTH+Math.sin(this.clock*.23+i)*16,y=(1-fract(hash(i*2.9)+this.clock*(5+depth*16)/SCENE_HEIGHT))*SCENE_HEIGHT;
-      ctx.globalAlpha=(.05+.13*(.5+.5*Math.sin(this.clock*(.6+depth)+i*2.3)))*(live?1:.5);
-      ctx.drawImage(mote,this.X(x)-size/2,this.Y(y)-size/2,size,size);
+      ctx.globalAlpha=(.04+.12*(.5+.5*Math.sin(this.clock*(.6+depth)+i*2.3)))*(live?1:.5);
+      ctx.drawImage(mote,x*sx-size/2,y*sy-size/2,size,size);
     }
   }
 
@@ -285,13 +302,22 @@ export class FlowScene {
     canvas.width=width;canvas.height=height;this.backdrop=canvas;this.backdropKey=key;
     const g=canvas.getContext('2d');
     if(!g)return canvas;
-    const cx=this.X(CX),cy=this.Y(CY),halo=g.createRadialGradient(this.X(880),cy,0,this.X(880),cy,560*this.u);
-    halo.addColorStop(0,'#1f514a40');halo.addColorStop(1,'#1f514a00');g.fillStyle=halo;g.fillRect(0,0,width,height);
-    const band=g.createLinearGradient(this.X(650),0,this.X(1080),0);
-    band.addColorStop(0,'#0b171ce6');band.addColorStop(.2,'#162629e6');band.addColorStop(.58,'#0c141ae6');band.addColorStop(.9,'#172a2ae6');band.addColorStop(1,'#102522e6');
-    g.beginPath();g.ellipse(cx,cy,OUTER*this.sx,OUTER*this.sy,0,-SPAN,SPAN);g.ellipse(cx,cy,INNER*this.sx,INNER*this.sy,0,SPAN,-SPAN,true);g.closePath();g.fillStyle=band;g.fill();
-    g.strokeStyle='#77a5a2';g.lineWidth=this.u;g.globalAlpha=.22;
-    for(const r of [INNER-12,INNER+8,INNER+31,OUTER-38,OUTER-17,OUTER+7]){g.beginPath();g.ellipse(cx,cy,r*this.sx,r*this.sy,0,-SPAN,SPAN);g.stroke();}
+    const {u,hx,hy,hr}=this.view;
+    for(let i=0;i<260;i++){g.globalAlpha=.1+hash(i*7.7)*.4;g.fillStyle=INK.star;g.beginPath();g.arc(hash(i*3.7)*width,hash(i*9.1)*height,(.4+hash(i*5.3)*1.1)*u,0,Math.PI*2);g.fill();}
+    // Static perspective floor under the hub, faded towards the horizon and the sides.
+    const horizon=hy+hr*2.4,floor=sheet(width,height),f=floor.getContext('2d');
+    if(f){
+      f.strokeStyle=INK.hub;f.lineWidth=u;f.globalAlpha=.16;f.beginPath();
+      for(let k=-24;k<=24;k++){f.moveTo(hx+k*width*.004,horizon);f.lineTo(hx+k*width*.06,height);}
+      for(let i=1;i<=12;i++){const y=horizon+(height-horizon)*(i/12)**1.8;f.moveTo(0,y);f.lineTo(width,y);}
+      f.stroke();
+      f.globalCompositeOperation='destination-in';f.globalAlpha=1;
+      const down=f.createLinearGradient(0,horizon,0,height);down.addColorStop(0,'#0000');down.addColorStop(.5,'#000c');down.addColorStop(1,'#000');f.fillStyle=down;f.fillRect(0,horizon,width,height-horizon);
+      const across=f.createLinearGradient(0,0,width,0);across.addColorStop(0,'#0000');across.addColorStop(.5,'#000');across.addColorStop(1,'#0000');f.fillStyle=across;f.fillRect(0,0,width,height);
+      g.globalAlpha=1;g.drawImage(floor,0,0);
+    }
+    const line=g.createLinearGradient(0,0,width,0);line.addColorStop(0,withAlpha(INK.hub,0));line.addColorStop(.5,withAlpha(INK.hub,.35));line.addColorStop(1,withAlpha(INK.hub,0));
+    g.globalAlpha=1;g.fillStyle=line;g.fillRect(0,horizon-.5*u,width,u);
     return canvas;
   }
 
@@ -300,11 +326,4 @@ export class FlowScene {
     if(!sprite){sprite=glowSprite(color);this.glows.set(color,sprite);}
     return sprite;
   }
-  private streak(color: string): HTMLCanvasElement {
-    let sprite=this.streaks.get(color);
-    if(!sprite){sprite=streakSprite(color);this.streaks.set(color,sprite);}
-    return sprite;
-  }
-  private X(x: number) { return x*this.sx; }
-  private Y(y: number) { return y*this.sy; }
 }

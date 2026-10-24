@@ -8,6 +8,11 @@ export interface FlowPoint { id: string; type: string; value: unknown; status: n
 export interface FlowPointPage { items: FlowPoint[]; total: number; offset: number }
 export const STATION_LABELS = ['状态未知 / 已过期', '通信正常', '通信异常', '串口未打开', '已停用', '下级离线'];
 export const STATION_COLORS = ['#83949d', '#53e3bb', '#f5b951', '#f5b951', '#748591', '#f17479'];
+// Each physical source keeps one hue for its card, channel and the Sessions that select it.
+export const FLOW_HUES = ['#33e6ff', '#b388ff', '#4dffa6', '#ff6bd6', '#5d8bff', '#c6ff5c'];
+export function sourceHues(sources: FlowSource[]): Record<string, string> {
+  return Object.fromEntries(sources.map((source, index) => [source.id, FLOW_HUES[index % FLOW_HUES.length]]));
+}
 
 export function sourceCanFlow(source: FlowSource) {
   return source.enabled && source.connected && source.subscribed && source.catalog_state !== 'CatalogConflict';
@@ -28,19 +33,23 @@ export function sourceDelta(previous: FlowSource, current: FlowSource): number {
   catch { return 0; }
 }
 
-export interface Activity { sources: Record<string, number>; sessions: Record<string, number>; updates: number }
+// Timestamps mark the last snapshot with real updates; deltas hold that snapshot's counts.
+export interface Activity { sources: Record<string, number>; sessions: Record<string, number>; updates: number; sourceDeltas: Record<string, number>; sessionDeltas: Record<string, number> }
 export function advanceActivity(previous: FlowSnapshot | undefined, current: FlowSnapshot, activity: Activity, now: number): Activity {
-  const next: Activity = { sources: {}, sessions: {}, updates: 0 };
+  const next: Activity = { sources: {}, sessions: {}, updates: 0, sourceDeltas: {}, sessionDeltas: {} };
   if (!previous || previous.instance !== current.instance) return next;
   for (const source of current.sources) {
     const before = previous.sources.find((s) => s.id === source.id);
     const delta = before ? sourceDelta(before, source) : 0;
     if (sourceCanFlow(source)) next.sources[source.id] = delta > 0 ? now : activity.sources[source.id] ?? 0;
+    if (sourceCanFlow(source) && delta > 0) next.sourceDeltas[source.id] = delta;
     next.updates += delta;
   }
   for (const session of current.sessions) {
     const before = previous.sessions.find((s) => s.id === session.id);
-    if (session.attached) next.sessions[session.id] = before && notificationDelta(before, session) > 0 ? now : activity.sessions[session.id] ?? 0;
+    const delta = session.attached && before ? notificationDelta(before, session) : 0;
+    if (session.attached) next.sessions[session.id] = delta > 0 ? now : activity.sessions[session.id] ?? 0;
+    if (delta > 0) next.sessionDeltas[session.id] = delta;
   }
   return next;
 }
