@@ -5,14 +5,15 @@ export const SCENE_WIDTH = 1680, SCENE_HEIGHT = 750;
 // source cards end at CARD_RIGHT, the manager frame spans FRAME, client cards start just after EGRESS_X;
 // the result bus runs along BUS_Y under the calculation label.
 const CARD_RIGHT = 319, SLOT_X = 548, SLOT_W = 120, SLOT_H = 28, NODE_X = 1012, NODE_W = 120, NODE_H = 28, EGRESS_X = 1403, BUS_X = 1156;
-const FRAME = { left: 500, top: 150, right: 1180, bottom: 650 }, CALC = { x: 840, y: 575, r: 22 }, BUS_Y = 622, RECENT_MS = 3200, OUTPUT_DELAY = .9;
+const FRAME = { left: 500, top: 150, right: 1180, bottom: 650 }, CALC = { x: 840, y: 575, r: 22 }, BUS_Y = 622, RECENT_MS = 3200, OUTPUT_DELAY = .9, BOOT_S = 2.2;
 // Slots and nodes stack compactly inside the frame; wires fan in from the cards and out to the clients.
 const stackY = (index: number, count: number) => 375 + (index - (count - 1) / 2) * Math.min(80, 320 / Math.max(count - 1, 1));
 // Structure is neutral slate; the accent only appears where real data is moving.
-const INK = { data: '#59c7ff', out: '#8fb4ff', line: '#22324a', rule: '#3a4f68', amber: '#f0b45a', red: '#ff6f6f', off: '#56657a', idle: '#2c3b4f', stale: '#3a4656', text: '#e6edf5', muted: '#7d8ea3', plate: '#0a121c' };
+const INK = { data: '#59c7ff', out: '#8fb4ff', ok: '#3fd6a0', line: '#22324a', rule: '#3a4f68', amber: '#f0b45a', red: '#ff6f6f', off: '#56657a', idle: '#2c3b4f', stale: '#3a4656', text: '#e6edf5', muted: '#7d8ea3', plate: '#0a121c' };
 export const laneY = (index: number, count: number) => 48 + (index + 0.5) * (654 / Math.max(count, 1));
 const fract = (value: number) => value - Math.floor(value);
 const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value));
+const easeOut = (value: number) => 1 - (1 - clamp(value, 0, 1)) ** 3;
 // Deterministic noise: paused and reduced-motion frames must be pixel-stable.
 const hash = (seed: number) => fract(Math.sin(seed * 127.1 + 311.7) * 43758.5453);
 const withAlpha = (hex: string, alpha: number) => hex + Math.round(clamp(alpha, 0, 1) * 255).toString(16).padStart(2, '0');
@@ -27,7 +28,8 @@ export interface SceneFrame { width: number; height: number; dt: number; motion:
 interface View { sx: number; sy: number; u: number }
 interface Box { x: number; y: number; w: number; h: number }
 interface Track { pts: Point[]; acc: number[]; total: number }
-interface Wire { track: Track; tone: Tone }
+// alerts counts the port's stations in an abnormal or offline state.
+interface Wire { key: string; track: Track; tone: Tone; alerts: number }
 interface Slot { key: string; id: string; box: Box; wires: Wire[]; link: Tone; ready: boolean; stamp?: number; delta: number; running: boolean; selected: boolean; preferred: boolean }
 interface Node { key: string; label: string; box: Box; route?: string; slot?: Slot; edge?: Track; path: Track; exit: Track; attached: boolean; ready: boolean; stamp?: number; delta: number; running: boolean }
 interface Calc { center: Point; r: number; good: number; bad: number; feed?: Track; bus: Track; joins: Point[] }
@@ -35,6 +37,9 @@ interface Calc { center: Point; r: number; good: number; bad: number; feed?: Tra
 interface Packet { track: Track; key: string; owner?: string; born: number; life: number; lead: boolean; color: string; land: 'slot' | 'client' | 'calc' | 'none'; via: number; passed: boolean }
 interface Wave { start: number; color: string; at: Point }
 interface Spark { x: number; y: number; vx: number; vy: number; born: number; color: string }
+// A real state change between snapshots: a station turning abnormal or recovering, an OPC link breaking or joining.
+interface Shift { key: string; kind: 'warn' | 'recover' | 'break' | 'join'; start: number; landed?: boolean }
+const SHIFT_S = { warn: 1.6, recover: 1.2, break: .8, join: 1 };
 
 function bezier(a: Point,b: Point,c: Point,d: Point,t: number): Point {
   const u=1-t;
@@ -52,6 +57,14 @@ function along(t: Track, distance: number): Point {
   while(high-low>1){const mid=(low+high)>>1;if(t.acc[mid]<=s)low=mid;else high=mid;}
   const span=t.acc[high]-t.acc[low]||1,k=(s-t.acc[low])/span,a=t.pts[low],b=t.pts[high];
   return [a[0]+(b[0]-a[0])*k,a[1]+(b[1]-a[1])*k];
+}
+// The leading part of a track, used while links are drawn in or retract.
+function partial(t: Track, portion: number): Track {
+  if(portion>=1)return t;
+  const end=t.total*Math.max(0,portion),pts: Point[]=[];
+  for(let i=0;i<t.pts.length&&t.acc[i]<end;i++)pts.push(t.pts[i]);
+  pts.push(along(t,end));
+  return track(pts.length>1?pts:[t.pts[0],t.pts[0]]);
 }
 function sheet(width: number, height: number) {
   const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;
@@ -76,7 +89,7 @@ function layout(state: SceneState, view: View) {
     const wires=(rows.length?rows:[{key:'',ports:[]}]).map((row,k): Wire=>{
       const anchor=state.anchors?.[`${source.id}::${row.key}`]??[CARD_RIGHT,card+(k-(count-1)/2)*15];
       const a: Point=[X(anchor[0])+5*u,Y(anchor[1])],d: Point=[box.x,box.y+box.h/2+(k-(count-1)/2)*Math.min(4*sy,box.h/(count+1))];
-      return {track:track(curve(a,d)),tone:link!=='ok'?link:portTone(row.ports)};
+      return {key:`${source.id}::${row.key}`,track:track(curve(a,d)),tone:link!=='ok'?link:portTone(row.ports),alerts:row.ports.reduce((total,port)=>total+port.devices.filter((d)=>d.state===2||d.state===3||d.state===5).length,0)};
     });
     return {key:`in:${source.id}`,id:source.id,box,wires,link,ready:state.live&&sourceCanFlow(source),stamp:state.activity.sources[source.id],delta:state.activity.sourceDeltas[source.id]??0,running:false,selected:state.selected===source.id,preferred:source.id===state.defaultSource};
   });
@@ -102,14 +115,15 @@ function layout(state: SceneState, view: View) {
 // Packets are launched only when a snapshot shows new samples, Session notifications
 // or a new calculation evaluation; their number follows that count. The snapshot has no
 // per-port counters, so a source's packets are shared over its ports with a normal station.
-// The frame scan line, matrix guides and drifting dust are decoration. A stale monitor
-// greys out and clears every packet.
+// Alarm and link effects follow real changes between snapshots. The opening sequence,
+// frame scan line and matrix guides are decoration. A stale monitor greys out and
+// clears every packet and effect.
 export class FlowScene {
-  private clock=0; private seq=0; private focus?: string; private evaluated?: string; private calcAt=-1e9;
+  private clock=0; private seq=0; private focus?: string; private evaluated?: string; private calcAt=-1e9; private bootClock=0; private booted=false; private reveal=1;
   private view: View={sx:1,sy:1,u:1};
   private slots: Slot[]=[]; private nodes: Node[]=[]; private calc?: Calc; private guides: {owner: string; track: Track}[]=[]; private shown?: SceneState; private shownSize='';
-  private levels=new Map<string,number>(); private stamps=new Map<string,number>(); private flashes=new Map<string,number>();
-  private packets: Packet[]=[]; private waves: Wave[]=[]; private sparks: Spark[]=[];
+  private levels=new Map<string,number>(); private stamps=new Map<string,number>(); private flashes=new Map<string,number>(); private memory=new Map<string,string>();
+  private packets: Packet[]=[]; private waves: Wave[]=[]; private sparks: Spark[]=[]; private shifts: Shift[]=[];
   private glows=new Map<string,HTMLCanvasElement>(); private backdrop?: HTMLCanvasElement; private backdropKey='';
 
   // Packets launched or still travelling.
@@ -122,11 +136,12 @@ export class FlowScene {
       this.view={sx,sy,u:Math.sqrt(sx*sy)};
       ({slots:this.slots,nodes:this.nodes,calc:this.calc,guides:this.guides}=layout(state,this.view));
       this.shown=state;this.shownSize=size;this.focus=state.focus;
+      this.notice(state.live&&frame.motion);
     }
     this.advance(state,frame);
     ctx.setTransform(1,0,0,1,0,0);ctx.globalCompositeOperation='source-over';ctx.globalAlpha=1;
     ctx.clearRect(0,0,frame.width,frame.height);
-    ctx.drawImage(this.backdropFor(frame.width,frame.height),0,0);
+    ctx.globalAlpha=this.phase(0,.3);ctx.drawImage(this.backdropFor(frame.width,frame.height),0,0);
     ctx.globalCompositeOperation='lighter';
     this.frame(ctx,state.live);
     this.links(ctx,state.live);
@@ -140,11 +155,42 @@ export class FlowScene {
   // Hovering a source or Session keeps its route bright and dims the rest.
   private weight(id?: string) { return !this.focus||id===this.focus?1:.25; }
   private level(key: string) { return this.levels.get(key)??0; }
+  // Opening sequence progress between two points of the reveal, eased.
+  private phase(from: number, to: number) { return easeOut((this.reveal-from)/(to-from)); }
+  private shift(key: string) { return this.shifts.find((item)=>item.key===key); }
+
+  // Compare link and station states with the previous snapshot and start the matching effect.
+  private notice(active: boolean) {
+    const seen=new Set<string>();
+    const mark=(key: string,value: string,kind: (old: string)=>Shift['kind']|undefined,at?: Point,count=0)=>{
+      seen.add(key);
+      const old=this.memory.get(key);this.memory.set(key,value);
+      const change=active&&old!==undefined&&old!==value?kind(old):undefined;
+      if(!change)return;
+      this.shifts.push({key,kind:change,start:this.clock});
+      // Packets already travelling on a link that just broke would cross the break, so they are dropped.
+      if(change==='break')this.packets=this.packets.filter((packet)=>packet.key!==key);
+      const color=change==='warn'?INK.amber:change==='break'?INK.red:change==='recover'?INK.ok:INK.data;
+      if(at){this.waves.push({start:this.clock,color,at});if(count)this.burst(at,color,count);}
+    };
+    for(const slot of this.slots){
+      const stub=slot.wires[slot.wires.length>>1];
+      mark(slot.key,slot.link,(old)=>slot.link==='down'&&old!=='down'?'break':old==='down'&&slot.link==='ok'?'join':undefined,stub&&along(stub.track,stub.track.total*.55),slot.link==='down'?8:0);
+      for(const wire of slot.wires)mark(wire.key,String(wire.alerts),(old)=>wire.alerts>Number(old)?'warn':wire.alerts<Number(old)?'recover':undefined,wire.track.pts[0]);
+    }
+    for(const key of this.memory.keys())if(!seen.has(key))this.memory.delete(key);
+  }
 
   private advance(state: SceneState, {dt,motion,now}: SceneFrame) {
     // Fades run only while animating; paused or reduced-motion frames show the current state at once.
     const ease=(rate: number)=>motion&&state.live?1-Math.exp(-dt*rate):1,keys=new Set<string>(['calc']);
     this.clock+=dt;
+    // The opening sequence plays once; a still frame skips straight to the finished scene.
+    if(!motion)this.booted=true;
+    // It starts with the first snapshot that has something to show.
+    if(this.slots.length||this.nodes.length)this.bootClock+=dt;
+    this.reveal=this.booted?1:clamp(this.bootClock/BOOT_S,0,1);
+    if(this.reveal>=1)this.booted=true;
     for(const [key,value] of this.flashes)this.flashes.set(key,value*Math.exp(-dt*3.5));
     const step=(flow: Slot|Node,launch: ()=>void)=>{
       flow.running=flow.ready&&!!flow.stamp&&now-flow.stamp<RECENT_MS;
@@ -163,7 +209,7 @@ export class FlowScene {
     const calcLevel=this.level('calc');
     this.levels.set('calc',calcLevel+(Number(state.live&&!!this.calc&&now-this.calcAt<RECENT_MS)-calcLevel)*ease(3));
     for(const map of [this.levels,this.stamps])for(const key of map.keys())if(!keys.has(key))map.delete(key);
-    if(!state.live){this.packets=[];this.waves=[];this.sparks=[];return;}
+    if(!state.live){this.packets=[];this.waves=[];this.sparks=[];this.shifts=[];return;}
     if(!motion)return;
     const flying: Packet[]=[],spawned: Packet[]=[];
     for(const packet of this.packets){
@@ -176,9 +222,12 @@ export class FlowScene {
       if(packet.land==='calc'){this.flash('calc',1);if(this.calc)spawned.push({track:this.calc.bus,key:'calc',born:this.clock,life:this.calc.bus.total/(380*this.view.u),lead:true,color:INK.data,land:'none',via:0,passed:false});}
       if(packet.land==='client'&&packet.lead){this.waves.push({start:this.clock,color:packet.color,at:end});this.burst(end,packet.color,7);}
     }
+    // A rejoined link flashes its cache slot as the light reaches it.
+    for(const shift of this.shifts)if(shift.kind==='join'&&!shift.landed&&this.clock-shift.start>=SHIFT_S.join*.85){shift.landed=true;this.flash(shift.key,1);}
     this.packets=flying.concat(spawned);
     this.waves=this.waves.filter((wave)=>this.clock-wave.start<1.2).slice(-32);
     this.sparks=this.sparks.filter((spark)=>this.clock-spark.born<.7).slice(-240);
+    this.shifts=this.shifts.filter((shift)=>this.clock-shift.start<SHIFT_S[shift.kind]).slice(-40);
   }
 
   private flash(key: string, amount: number) { this.flashes.set(key,Math.min(1,(this.flashes.get(key)??0)+amount)); }
@@ -227,66 +276,91 @@ export class FlowScene {
     if(dash)ctx.setLineDash([]);
   }
 
-  // A live link glows and carries current markers toward the clients.
+  // A soft light segment ending at distance head, used for light-pipe waves and alarm pulses.
+  private comet(ctx: CanvasRenderingContext2D, t: Track, head: number, span: number, color: string, alpha: number, width: number) {
+    ctx.strokeStyle=color;ctx.lineWidth=width;
+    for(let k=0;k<8;k++){
+      const from=head-span*(k+1)/8,to=head-span*k/8;
+      if(to<=0||from>=t.total)continue;
+      ctx.globalAlpha=alpha*(1-k/8)**1.5;ctx.beginPath();ctx.moveTo(...along(t,from));ctx.lineTo(...along(t,to));ctx.stroke();
+    }
+  }
+
+  // A live link glows like a light pipe, with waves running toward the clients.
   private energise(ctx: CanvasRenderingContext2D, t: Track, color: string, level: number, weight: number) {
     const {u}=this.view;
-    if(level<.01)return;
+    if(level<.01||t.total<1)return;
     for(const [width,strength] of [[10,.06],[4,.14],[1.4,.85]])this.stroke(ctx,t,color,strength*level*weight,width*u);
-    ctx.lineDashOffset=-this.clock*80*u;this.stroke(ctx,t,'#ffffff',.45*level*weight,1.3*u,[1.5*u,14*u]);ctx.lineDashOffset=0;
+    const span=Math.min(80*u,t.total*.5),gap=Math.max(t.total/2,240*u);
+    for(let head=fract(this.clock*260*u/gap)*gap;head<t.total+span;head+=gap)this.comet(ctx,t,head,span,'#ffffff',.6*level*weight,2*u);
   }
 
   // The manager boundary: everything inside is the current OPC manager.
   private frame(ctx: CanvasRenderingContext2D, live: boolean) {
-    const {sx,sy,u}=this.view,x0=FRAME.left*sx,y0=FRAME.top*sy,x1=FRAME.right*sx,y1=FRAME.bottom*sy,cut=12*u,accent=live?INK.data:INK.stale;
+    const {sx,sy,u}=this.view,x0=FRAME.left*sx,y0=FRAME.top*sy,x1=FRAME.right*sx,y1=FRAME.bottom*sy,cut=12*u,accent=live?INK.data:INK.stale,drawn=this.phase(0,.35);
+    const perimeter=2*(x1-x0+y1-y0);
     ctx.beginPath();ctx.moveTo(x0+cut,y0);ctx.lineTo(x1,y0);ctx.lineTo(x1,y1-cut);ctx.lineTo(x1-cut,y1);ctx.lineTo(x0,y1);ctx.lineTo(x0,y0+cut);ctx.closePath();
-    ctx.strokeStyle=INK.rule;ctx.globalAlpha=.6;ctx.lineWidth=u;ctx.stroke();
+    // The outline draws itself in during the opening sequence.
+    if(drawn<1)ctx.setLineDash([perimeter*drawn,perimeter]);
+    ctx.strokeStyle=INK.rule;ctx.globalAlpha=.6;ctx.lineWidth=u;ctx.stroke();ctx.setLineDash([]);
     // Accent marks only on the two chamfered corners.
-    ctx.strokeStyle=accent;ctx.globalAlpha=.9;ctx.lineWidth=1.5*u;ctx.beginPath();
+    ctx.strokeStyle=accent;ctx.globalAlpha=.9*drawn;ctx.lineWidth=1.5*u;ctx.beginPath();
     ctx.moveTo(x0,y0+cut+16*u);ctx.lineTo(x0,y0+cut);ctx.lineTo(x0+cut,y0);ctx.lineTo(x0+cut+16*u,y0);
     ctx.moveTo(x1,y1-cut-16*u);ctx.lineTo(x1,y1-cut);ctx.lineTo(x1-cut,y1);ctx.lineTo(x1-cut-16*u,y1);ctx.stroke();
     // Decorative scan line sweeping the frame.
     const scan=y0+fract(this.clock*.06)*(y1-y0),beam=ctx.createLinearGradient(0,scan-70*u,0,scan);
     beam.addColorStop(0,withAlpha(accent,0));beam.addColorStop(1,withAlpha(accent,.03));
     const edge=ctx.createLinearGradient(x0,0,x1,0);edge.addColorStop(0,withAlpha(accent,0));edge.addColorStop(.5,withAlpha(accent,.16));edge.addColorStop(1,withAlpha(accent,0));
-    ctx.globalAlpha=1;ctx.fillStyle=beam;ctx.fillRect(x0,scan-70*u,x1-x0,70*u);ctx.fillStyle=edge;ctx.fillRect(x0,scan-.5*u,x1-x0,u);
+    ctx.globalAlpha=drawn;ctx.fillStyle=beam;ctx.fillRect(x0,scan-70*u,x1-x0,70*u);ctx.fillStyle=edge;ctx.fillRect(x0,scan-.5*u,x1-x0,u);
   }
 
   private links(ctx: CanvasRenderingContext2D, live: boolean) {
-    const {u}=this.view;
+    const {u}=this.view,wired=this.phase(.25,.65),routed=this.phase(.5,.85),sent=this.phase(.65,1);
     // Every possible source → Session route, faint like an idle switch matrix.
-    for(const guide of this.guides)this.stroke(ctx,guide.track,INK.line,.7*this.weight(guide.owner),.8*u,[1*u,5*u]);
+    for(const guide of this.guides)this.stroke(ctx,guide.track,INK.line,.7*this.weight(guide.owner)*routed,.8*u,[1*u,5*u]);
     for(const slot of this.slots){
-      const level=this.level(slot.key),weight=this.weight(slot.id);
+      const level=this.level(slot.key),weight=this.weight(slot.id),link=this.shift(slot.key);
       slot.wires.forEach((wire,index)=>{
-        if(!live||wire.tone==='off'){this.stroke(ctx,wire.track,live?INK.off:INK.stale,.7*weight,u,[1.5*u,5*u]);return;}
+        const t=partial(wire.track,wired),alarm=this.shift(wire.key);
+        if(!live||wire.tone==='off'){this.stroke(ctx,t,live?INK.off:INK.stale,.7*weight,u,[1.5*u,5*u]);return;}
         if(wire.tone==='down'){
-          // A broken link: the red stub stops short of the cache.
-          const stub=track(wire.track.pts.slice(0,Math.ceil(wire.track.pts.length*.55)));
+          // A broken link: the red stub stops short of the cache; on a fresh break the wire retracts to it.
+          const p=link?.kind==='break'?(this.clock-link.start)/SHIFT_S.break:1;
+          if(p<1)this.energise(ctx,partial(wire.track,1-.45*easeOut(p)),INK.red,1-p,weight);
+          const stub=partial(wire.track,.55*wired);
           this.stroke(ctx,stub,INK.red,.7*weight,1.2*u,[4*u,4*u]);
-          if(index===slot.wires.length>>1){const [x,y]=stub.pts[stub.pts.length-1],s=3.5*u;ctx.globalAlpha=weight;ctx.lineWidth=1.5*u;ctx.beginPath();ctx.moveTo(x-s,y-s);ctx.lineTo(x+s,y+s);ctx.moveTo(x+s,y-s);ctx.lineTo(x-s,y+s);ctx.stroke();}
+          if(index===slot.wires.length>>1&&wired>=1){const [x,y]=stub.pts[stub.pts.length-1],s=3.5*u;ctx.globalAlpha=weight;ctx.lineWidth=1.5*u;ctx.beginPath();ctx.moveTo(x-s,y-s);ctx.lineTo(x+s,y+s);ctx.moveTo(x+s,y-s);ctx.lineTo(x-s,y+s);ctx.stroke();}
           return;
         }
-        if(wire.tone==='warn'){this.stroke(ctx,wire.track,INK.amber,.6*weight,1.1*u,[4*u,4*u]);return;}
-        if(wire.tone==='idle'){this.stroke(ctx,wire.track,INK.idle,weight,u);return;}
-        this.stroke(ctx,wire.track,slot.selected?INK.rule:INK.line,weight,1.2*u);
-        this.energise(ctx,wire.track,INK.data,level,weight);
+        if(wire.tone==='warn')this.stroke(ctx,t,INK.amber,.6*weight,1.1*u,[4*u,4*u]);
+        else if(wire.tone==='idle')this.stroke(ctx,t,INK.idle,weight,u);
+        else{this.stroke(ctx,t,slot.selected?INK.rule:INK.line,weight,1.2*u);this.energise(ctx,t,INK.data,level,weight);}
+        // A reconnected link lights up again from the card to the cache.
+        if(link?.kind==='join'&&wire.tone==='ok'){const p=easeOut((this.clock-link.start)/SHIFT_S.join),lit=partial(wire.track,p);this.energise(ctx,lit,INK.data,1,weight);this.comet(ctx,wire.track,lit.total,60*u,'#ffffff',weight,2.4*u);}
+        // A station turning abnormal (or recovering) sends an alarm pulse down its port wire.
+        if(alarm){
+          const p=(this.clock-alarm.start)/SHIFT_S[alarm.kind],color=alarm.kind==='warn'?INK.amber:INK.ok,fade=(1-p)**1.5;
+          for(const [width,strength] of [[14,.2],[5,.35],[2,.9]])this.stroke(ctx,wire.track,color,strength*fade*weight,width*u);
+          this.comet(ctx,wire.track,easeOut(p*1.4)*wire.track.total,110*u,'#ffffff',fade*weight,3*u);
+        }
       });
     }
     for(const node of this.nodes){
-      const level=this.level(node.key),weight=this.weight(node.route);
-      if(!live||!node.attached){const color=live?INK.off:INK.stale;if(node.edge)this.stroke(ctx,node.edge,color,.7*weight,u,[1.5*u,5*u]);this.stroke(ctx,node.exit,color,.7*weight,u,[1.5*u,5*u]);continue;}
-      if(node.edge){this.stroke(ctx,node.edge,INK.line,weight,1.3*u);this.energise(ctx,node.edge,INK.out,level,weight);}
-      this.stroke(ctx,node.exit,INK.line,weight,1.3*u);this.energise(ctx,node.exit,INK.out,level,weight);
+      const level=this.level(node.key),weight=this.weight(node.route),edge=node.edge&&partial(node.edge,routed),exit=partial(node.exit,sent);
+      if(!live||!node.attached){const color=live?INK.off:INK.stale;if(edge)this.stroke(ctx,edge,color,.7*weight,u,[1.5*u,5*u]);this.stroke(ctx,exit,color,.7*weight,u,[1.5*u,5*u]);continue;}
+      if(edge){this.stroke(ctx,edge,INK.line,weight,1.3*u);this.energise(ctx,edge,INK.out,level,weight);}
+      this.stroke(ctx,exit,INK.line,weight,1.3*u);this.energise(ctx,exit,INK.out,level,weight);
     }
     if(this.calc){
-      const level=this.level('calc'),feeder=this.slots.find((slot)=>slot.preferred),weight=this.weight(feeder?.id);
-      if(this.calc.feed){this.stroke(ctx,this.calc.feed,INK.line,weight,1.1*u,[3*u,3*u]);this.energise(ctx,this.calc.feed,INK.data,live?level:0,weight);}
-      this.stroke(ctx,this.calc.bus,INK.line,1,1.1*u,[3*u,3*u]);this.energise(ctx,this.calc.bus,INK.data,live?level*.6:0,1);
-      for(const [x,y] of this.calc.joins){ctx.globalAlpha=1;ctx.fillStyle=INK.rule;ctx.fillRect(x-2*u,y-2*u,4*u,4*u);}
+      const level=this.level('calc'),feeder=this.slots.find((slot)=>slot.preferred),weight=this.weight(feeder?.id),feed=this.calc.feed&&partial(this.calc.feed,sent),bus=partial(this.calc.bus,sent);
+      if(feed){this.stroke(ctx,feed,INK.line,weight,1.1*u,[3*u,3*u]);this.energise(ctx,feed,INK.data,live?level:0,weight);}
+      this.stroke(ctx,bus,INK.line,1,1.1*u,[3*u,3*u]);this.energise(ctx,bus,INK.data,live?level*.6:0,1);
+      for(const [x,y] of this.calc.joins){ctx.globalAlpha=sent;ctx.fillStyle=INK.rule;ctx.fillRect(x-2*u,y-2*u,4*u,4*u);}
     }
     // Card-side plug of every port wire.
+    const plugged=this.phase(.2,.4);
     for(const slot of this.slots){
-      const level=this.level(slot.key),weight=this.weight(slot.id);
+      const level=this.level(slot.key),weight=this.weight(slot.id)*plugged;
       for(const wire of slot.wires){
         const [x,y]=wire.track.pts[0],color=live?toneInk(wire.tone):INK.stale;
         if(wire.tone==='ok'&&level>.01){const size=12*u;ctx.globalAlpha=.6*level*weight;ctx.drawImage(this.glow(color),x-size/2,y-size/2,size,size);}
@@ -295,7 +369,8 @@ export class FlowScene {
     }
   }
 
-  // Slot and node plates: neutral until data arrives, then the accent edge and left bar light up.
+  // Slot and node plates: neutral until data arrives, then the accent edge and left bar light up;
+  // each landing burst sweeps a write line across the plate.
   private plate(ctx: CanvasRenderingContext2D, box: Box, color: string, level: number, flash: number, weight: number) {
     const {u}=this.view,cut=5*u,{x,y,w,h}=box;
     const outline=()=>{ctx.beginPath();ctx.moveTo(x+cut,y);ctx.lineTo(x+w,y);ctx.lineTo(x+w,y+h-cut);ctx.lineTo(x+w-cut,y+h);ctx.lineTo(x,y+h);ctx.lineTo(x,y+cut);ctx.closePath();};
@@ -304,7 +379,14 @@ export class FlowScene {
     ctx.globalAlpha=weight;ctx.strokeStyle=INK.rule;ctx.lineWidth=u;ctx.stroke();
     ctx.globalCompositeOperation='lighter';
     if(level+flash>.01){outline();ctx.globalAlpha=Math.min(1,.55*level+.6*flash)*weight;ctx.strokeStyle=color;ctx.stroke();}
-    if(flash>.02){const halo=Math.max(w,h)*1.3;ctx.globalAlpha=.3*flash*weight;ctx.drawImage(this.glow(color),x+w/2-halo/2,y+h/2-halo/2,halo,halo);}
+    if(flash>.02){
+      const halo=Math.max(w,h)*1.3,sweep=x+w*(1-flash);
+      ctx.globalAlpha=.3*flash*weight;ctx.drawImage(this.glow(color),x+w/2-halo/2,y+h/2-halo/2,halo,halo);
+      ctx.save();outline();ctx.clip();
+      const bar=ctx.createLinearGradient(sweep-24*u,0,sweep,0);bar.addColorStop(0,withAlpha(color,0));bar.addColorStop(1,withAlpha(color,.5));
+      ctx.globalAlpha=flash*weight;ctx.fillStyle=bar;ctx.fillRect(sweep-24*u,y,24*u,h);ctx.fillStyle='#ffffff';ctx.fillRect(sweep-u,y,1.5*u,h);
+      ctx.restore();
+    }
     ctx.globalAlpha=weight;ctx.fillStyle=level>.01?color:INK.rule;ctx.fillRect(x,y+cut,1.5*u,h-cut*2);
   }
 
@@ -319,47 +401,54 @@ export class FlowScene {
 
   private boxes(ctx: CanvasRenderingContext2D, live: boolean) {
     const {u}=this.view;
-    for(const slot of this.slots){
-      const level=this.level(slot.key),flash=this.flashes.get(slot.key)??0,weight=this.weight(slot.id),color=live?toneInk(slot.link):INK.stale,{x,y,w,h}=slot.box;
+    this.slots.forEach((slot,index)=>{
+      const shown=this.phase(.15+index*.05,.45+index*.05),level=this.level(slot.key),flash=this.flashes.get(slot.key)??0,weight=this.weight(slot.id)*shown,color=live?toneInk(slot.link):INK.stale,{x,y,w,h}=slot.box;
+      if(shown<=0)return;
       this.plate(ctx,slot.box,color,level,flash,weight);
       const metered=slot.link==='ok'||slot.link==='warn';
       this.text(ctx,slot.id,x+10*u,y+h/2,live?INK.text:INK.stale,weight,11,w-(metered?46:16)*u);
       // Five-segment meter: lit while samples arrive; absent when the source cannot deliver.
       if(metered)for(let i=0;i<5;i++){ctx.globalAlpha=weight;ctx.fillStyle=i<Math.round(level*5)?color:INK.line;ctx.fillRect(x+w-(34-i*6)*u,y+h/2-4*u+(4-i)*.6*u,3*u,8*u-(4-i)*1.2*u);}
       if(slot.preferred)this.text(ctx,'DEFAULT · 默认来源',x+1*u,y-8*u,live?INK.data:INK.stale,.85*weight,8.5);
-    }
-    for(const node of this.nodes){
-      const level=this.level(node.key),flash=this.flashes.get(node.key)??0,weight=this.weight(node.route),color=live&&node.attached?INK.out:live?INK.off:INK.stale,{x,y,w,h}=node.box;
+    });
+    this.nodes.forEach((node,index)=>{
+      const shown=this.phase(.45+index*.05,.75+index*.05),level=this.level(node.key),flash=this.flashes.get(node.key)??0,weight=this.weight(node.route)*shown,color=live&&node.attached?INK.out:live?INK.off:INK.stale,{x,y,w,h}=node.box;
+      if(shown<=0)return;
       this.plate(ctx,node.box,color,level,flash,weight);
       this.text(ctx,node.label,x+10*u,y+h/2,live?INK.text:INK.stale,weight,11,w-18*u);
+      // Forwarding cue: a pointer slides in from the selected source as each burst passes the node.
+      if(flash>.02){const px=x-4*u-12*u*flash,cy=y+h/2;ctx.globalAlpha=flash*weight;ctx.fillStyle=color;ctx.beginPath();ctx.moveTo(px+6*u,cy);ctx.lineTo(px,cy-4*u);ctx.lineTo(px,cy+4*u);ctx.closePath();ctx.fill();}
       // Selected source shown on the node; an off-page selection gets a dashed stub.
       const route=node.route?`← ${node.route}${node.slot?'':' · 其他页'}`:'未选择来源';
-      this.text(ctx,route,x+1*u,y-8*u,INK.muted,.9*weight,8.5);
+      this.text(ctx,route,x+1*u,y-8*u,flash>.05?color:INK.muted,.9*weight,8.5);
       if(node.route&&!node.slot)this.stroke(ctx,track([[x-60*u,y+h/2],[x,y+h/2]]),INK.rule,weight,u,[3*u,4*u]);
-    }
+    });
     if(this.calc){
-      const {center:[cx,cy],r,good,bad}=this.calc,level=this.level('calc'),flash=this.flashes.get('calc')??0,color=live?INK.data:INK.stale,total=Math.max(1,good+bad),start=-Math.PI/2,split=start+Math.PI*2*good/total;
-      ctx.globalCompositeOperation='source-over';ctx.globalAlpha=.96;ctx.fillStyle=INK.plate;ctx.beginPath();ctx.arc(cx,cy,r+3*u,0,Math.PI*2);ctx.fill();
+      const shown=this.phase(.6,1);
+      if(shown<=0)return;
+      const {center:[cx,cy],r,good,bad}=this.calc,level=this.level('calc'),flash=this.flashes.get('calc')??0,color=live?INK.data:INK.stale,total=Math.max(1,good+bad),start=-Math.PI/2,split=start+Math.PI*2*good/total*shown;
+      ctx.globalCompositeOperation='source-over';ctx.globalAlpha=.96*shown;ctx.fillStyle=INK.plate;ctx.beginPath();ctx.arc(cx,cy,r+3*u,0,Math.PI*2);ctx.fill();
       ctx.globalCompositeOperation='lighter';
       if(flash>.02){const halo=r*4;ctx.globalAlpha=.35*flash;ctx.drawImage(this.glow(color),cx-halo/2,cy-halo/2,halo,halo);}
-      // Tick ring, then the real Good / other split as a gauge.
-      ctx.strokeStyle=INK.rule;ctx.lineWidth=u;ctx.globalAlpha=.9;ctx.beginPath();
-      for(let i=0;i<48;i++){const a=i/48*Math.PI*2,outer=r+(i%12?6:9)*u;ctx.moveTo(cx+Math.cos(a)*(r+4*u),cy+Math.sin(a)*(r+4*u));ctx.lineTo(cx+Math.cos(a)*outer,cy+Math.sin(a)*outer);}
+      // Tick ring (turning briefly on each evaluation), then the real Good / other split as a gauge.
+      const turn=flash*.6;
+      ctx.strokeStyle=INK.rule;ctx.lineWidth=u;ctx.globalAlpha=.9*shown;ctx.beginPath();
+      for(let i=0;i<48;i++){const a=i/48*Math.PI*2+turn,outer=r+(i%12?6:9)*u;ctx.moveTo(cx+Math.cos(a)*(r+4*u),cy+Math.sin(a)*(r+4*u));ctx.lineTo(cx+Math.cos(a)*outer,cy+Math.sin(a)*outer);}
       ctx.stroke();
-      ctx.lineWidth=2.5*u;ctx.strokeStyle=INK.line;ctx.globalAlpha=1;ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.stroke();
+      ctx.lineWidth=2.5*u;ctx.strokeStyle=INK.line;ctx.globalAlpha=shown;ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.stroke();
       ctx.strokeStyle=color;ctx.beginPath();ctx.arc(cx,cy,r,start,split);ctx.stroke();
-      if(bad){ctx.strokeStyle=live?INK.amber:INK.stale;ctx.beginPath();ctx.arc(cx,cy,r,split,start+Math.PI*2);ctx.stroke();}
-      ctx.strokeStyle=level>.01?color:INK.rule;ctx.lineWidth=.8*u;ctx.globalAlpha=.5+.4*level;ctx.setLineDash([1.5*u,3.5*u]);ctx.lineDashOffset=-this.clock*10*u;ctx.beginPath();ctx.arc(cx,cy,r*.66,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);ctx.lineDashOffset=0;
-      this.text(ctx,`${Math.round(good/total*100)}%`,cx,cy,live?INK.text:INK.stale,1,10.5,undefined,'center');
+      if(bad){ctx.strokeStyle=live?INK.amber:INK.stale;ctx.beginPath();ctx.arc(cx,cy,r,split,start+Math.PI*2*shown);ctx.stroke();}
+      ctx.strokeStyle=level>.01?color:INK.rule;ctx.lineWidth=.8*u;ctx.globalAlpha=(.5+.4*level)*shown;ctx.setLineDash([1.5*u,3.5*u]);ctx.lineDashOffset=-this.clock*10*u;ctx.beginPath();ctx.arc(cx,cy,r*.66,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);ctx.lineDashOffset=0;
+      this.text(ctx,`${Math.round(good/total*100*shown)}%`,cx,cy,live?INK.text:INK.stale,shown,10.5,undefined,'center');
     }
   }
 
   private flight(ctx: CanvasRenderingContext2D) {
-    const {u}=this.view,spark=this.glow('#ffffff');
+    const {u}=this.view,spark=this.glow('#ffffff'),shown=this.phase(.6,1);
     for(const packet of this.packets){
       const age=this.clock-packet.born;
       if(age<0||age>=packet.life)continue;
-      const head=age/packet.life*packet.track.total,fade=Math.min(1,age*10,(packet.life-age)*8)*(packet.owner?this.weight(packet.owner):1),scale=packet.lead?1.3:1,glow=this.glow(packet.color);
+      const head=age/packet.life*packet.track.total,fade=Math.min(1,age*10,(packet.life-age)*8)*(packet.owner?this.weight(packet.owner):1)*shown,scale=packet.lead?1.3:1,glow=this.glow(packet.color);
       for(let k=9;k>=0;k--){
         const [x,y]=along(packet.track,head-k*4.5*u),size=13*u*scale*(1-k/10*.7);
         ctx.globalAlpha=fade*(1-k/10)**1.5*(k?.5:.9);ctx.drawImage(glow,x-size/2,y-size/2,size,size);
