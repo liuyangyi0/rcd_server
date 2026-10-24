@@ -1,0 +1,25 @@
+---
+# Copy to a PRIVATE inventory host_vars/<alias>.yml on the 46 controller.
+# These are placeholders, not live deployment values. One component per run.
+rcd_release:
+  host: 192.0.2.30
+  component: lower
+  # Existing private release profile on TARGET; contains runtime paths and complete
+  # backup inventory. Ansible never copies business configuration over the target.
+  profile: /private/rcd/lower-profile.json
+  tool_dir: /private/rcd/tools/release-20260928
+  controller_artifact: /private/rcd/builds/lower-release-1
+  manifest_sha256: REPLACE_WITH_SHA256_OF_ORIGINAL_BUILD_MANIFEST
+  incoming_dir: /private/rcd/incoming/lower-release-1
+  # Must be within release_dir from the profile; immutable once staged.
+  artifact_dir: /private/rcd/releases/lower-release-1
+  mode: maintenance  # lower + supported agent only; manager/legacy lower: explicit manual
+  operation_id: upgrade-30-lower-001
+  deployment_id: upgrade-30-lower-001
+# Supply CURRENT authorization separately for each mutating run, not permanently
+# here. Example private window.yml: rcd_confirm_targets: ['192.0.2.30/lower'],
+# rcd_no_active_commands: true, rcd_initiator: operator-name.
+# Recovery uses a new operation_id but the SAME original deployment_id.
+# Manual rollback: artifact_dir is the precise backup-* path, mode=manual.
+# If recovering an unknown manual operation, set recover_operation_id to its ID.
+# rcd_restore_backup_data defaults false; true requires separate data-loss approval.

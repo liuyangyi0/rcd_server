@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "server": {
+    "repository": "https://github.com/mendersoftware/mender-server.git",
+    "tag": "v4.1.4",
+    "commit": "89f60e8f1d9f2923e66f45d3bc8d21deb5fed475"
+  },
+  "client_series": "6.0",
+  "deployment_kind": "isolated-evaluation",
+  "image_lock_required": true
+}

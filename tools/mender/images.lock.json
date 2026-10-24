@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "server_tag": "v4.1.4",
+  "resolved_at": "2026-10-08",
+  "source": "https://hub.docker.com/v2/repositories/",
+  "images": {
+    "docker.io/mendersoftware/deployments:v4.1.4": "sha256:a330dbce77b974b15d94eb11cf562a95447278e6c2a0092e603bcc47c4271c4f",
+    "docker.io/mendersoftware/deviceauth:v4.1.4": "sha256:786f3880e968f7ed67435726d44438349510eab69f73fdfa54e463e44c92ea09",
+    "docker.io/mendersoftware/deviceconfig:v4.1.4": "sha256:163ed13cbe3aa36345bfe8b4f046c9f3d0e5356602113bfe0d53160cd7865e94",
+    "docker.io/mendersoftware/deviceconnect:v4.1.4": "sha256:7100fc7c6bf36c097fbd4618f2ad54c509280230cd75d3ac464b2e55ad77e36a",
+    "docker.io/mendersoftware/gui:v4.1.4": "sha256:3446af9a31326f458a045b0ab8b28a59079cc9f313e0c40552039de3207ba629",
+    "docker.io/mendersoftware/inventory:v4.1.4": "sha256:6e60869f09548e4f4a16e894016f9ebcdd9c819941d680fa2773f76c37d73c15",
+    "docker.io/mendersoftware/iot-manager:v4.1.4": "sha256:2993311e4d9062e9c1c9565c8dc28736aec2f9b38a13198badc9bfd5a1996481",
+    "docker.io/mendersoftware/useradm:v4.1.4": "sha256:43a295f0e7ae022060b2f0d4a4ed0c357c5698e4147d5296a4b2f4313d341541",
+    "docker.io/mendersoftware/workflows:v4.1.4": "sha256:fcc521d806c433331c9de2ca5b42b68ae8f89ca395ab3701cce5a7ea4eaa1b56",
+    "docker.io/mendersoftware/create-artifact-worker:v4.1.4": "sha256:d9eb989353ffff76545c310b7d0f89626b7d1567f6f7ac7d97e7142e81867edb",
+    "mongo:8.0": "sha256:d0d926f94df099bff534b7ee5b5986458131a22489dfff8664509af0c1e2ca9c",
+    "nats:2.14-alpine": "sha256:4063edae0717ba5f7501bfde75f97fd9b57f5b93597b92c70b6a6fbbf6a6fbbf6a74e06",
+    "traefik:v3.7.1": "sha256:6b9cbca6fac42ab0075f5437d8dc1685cfd188626d8d515839ea94f8b6271c42",
+    "chrislusf/seaweedfs:4.31": "sha256:e14ad400e28c811fe8426dc08abf248ec722b9f017713290a9b84a54557f45c2"
+  }
+}

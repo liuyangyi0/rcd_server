@@ -1,0 +1,9 @@
+---
+- name: Verify the running image and software readiness without controlling devices
+  hosts: rcd_nodes
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  roles:
+    - role: release
+      rcd_action: verify-running

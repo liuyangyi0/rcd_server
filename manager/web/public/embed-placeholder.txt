@@ -1,0 +1,1 @@
+Run `npm run build` before packaging the production manager executable.

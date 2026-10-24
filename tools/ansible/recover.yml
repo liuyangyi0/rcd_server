@@ -1,0 +1,14 @@
+---
+- name: Inspect or explicitly continue one durable lower deployment
+  hosts: rcd_nodes
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  pre_tasks:
+    - name: Require an explicit recovery action without a mutating default
+      ansible.builtin.assert:
+        that:
+          - rcd_recovery_action | default('') in ['inspect-deployment', 'resume-deployment', 'finish-deployment', 'rollback-deployment', 'resume-rollback', 'finish-rollback']
+  roles:
+    - role: release
+      rcd_action: "{{ rcd_recovery_action }}"

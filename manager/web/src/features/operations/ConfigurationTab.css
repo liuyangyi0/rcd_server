@@ -1,0 +1,16 @@
+.config-workflow { display: grid; gap: 8px; margin-bottom: 14px; }
+.config-workflow ol { list-style: none; display: flex; flex-wrap: wrap; gap: 8px 20px; padding: 0; margin: 0; color: var(--muted); font-size: 12px; }
+.config-workflow li + li::before { content: '→'; margin-right: 20px; color: #8993a1; }
+.config-workflow p { margin: 0; font-size: 13px; }
+.config-primary-actions { position: sticky; top: 48px; z-index: 2; display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--border); background: #f7f8fa; }
+.config-primary-actions > div:first-child { display: grid; gap: 5px; min-width: 0; font-size: 13px; }
+.config-primary-actions small { color: var(--muted); font-size: 12px; }
+.config-primary-actions .operations-editor-actions { flex-shrink: 0; margin: 0; }
+.config-secondary-tools, .config-version-tools, .config-raw-editor { margin-top: 14px; border: 1px solid var(--border); padding: 12px 14px; background: #fff; }
+.config-secondary-tools > summary, .config-version-tools > summary, .config-raw-editor > summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+.config-version-tools .operations-file-meta { margin-top: 14px; }
+.operations-validation.is-warning { border-color: #e0c99c; background: #fffaf0; }
+.operations-validation details { margin-top: 9px; }
+.operations-validation summary { cursor: pointer; }
+@media (max-width: 800px) { .config-primary-actions { align-items: flex-start; flex-direction: column; } .config-primary-actions .operations-editor-actions { flex-wrap: wrap; flex-shrink: 1; width: 100%; } }
+@media (max-width: 540px) { .config-primary-actions { position: static; } .config-workflow ol { gap: 8px 12px; } .config-workflow li + li::before { margin-right: 12px; } }

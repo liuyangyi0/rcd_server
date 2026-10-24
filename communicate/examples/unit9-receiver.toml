@@ -1,0 +1,50 @@
+# 安全示例：全部停用，不绑定现场串口，不占用现有 OPC 端口。
+# 角色 unit9-receiver：接收 unit1-to9-v1，本方数据编码 unit9-to1-v1。
+schema_version = 1
+instance_id = "unit9-receiver"
+points_file = "unit9-receiver.csv"
+
+[opc]
+bind_ip = "127.0.0.1"
+advertised_host = "127.0.0.1"
+port = 14842
+allow_anonymous_none = true
+allow_anonymous_secure = true
+trust_client_certificates = true
+
+[[ports]]
+id = "sync"
+device = "/dev/rcd-communicate-unassigned"
+enabled = false
+# 波特率和校验来自旧程序示例，现场使用前须核对。
+baud_rate = 115200
+data_bits = 8
+parity = "even"
+stop_bits = 2
+first_byte_timeout_ms = 500
+frame_timeout_ms = 1500
+write_timeout_ms = 1000
+late_frame_guard_ms = 100
+reconnect_min_ms = 1000
+reconnect_max_ms = 30000
+max_frame_bytes = 4096
+max_payload_bytes = 4096
+
+[ports.synchronization]
+# 开启后仍须通过 SetTransmitSnapshot 提供本方新鲜、完整载荷。
+transmit_enabled = false
+transmit_protocol = "unit9-to1-v1"
+send_interval_ms = 5000
+# 两端错开；这不是查询超时，也不是 ACK 等待。
+initial_delay_ms = 2500
+idle_gap_ms = 50
+receive_timeout_ms = 15000
+snapshot_max_age_ms = 15000
+input_refresh_interval_ms = 5000
+
+[[ports.tasks]]
+id = "rx1"
+enabled = false
+protocol = "unit1-to9-v1"
+# 保留旧配置兼容字段，同步模式忽略此查询调度间隔。
+interval_ms = 5000

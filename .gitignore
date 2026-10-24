@@ -1,0 +1,61 @@
+/target
+/.claude/
+
+# IDE / local agent state
+/.idea/
+/tools/.idea/
+/tmpclaude-*-cwd
+/nul
+
+# Runtime credentials and site-specific deployment data
+/pki/
+/rcd/
+
+# Never publish local credentials, private keys or runtime databases.
+# Public example environment files remain eligible for explicit review.
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+id_ecdsa
+id_dsa
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Generated binaries and build output
+/musl_output/
+/tools/build/
+/tools/output/
+/tools/fuzz-device/build/
+/tools/fuzz-device/output/
+/tools/serial/probe
+/tools/serial/*.jsonl
+/tools/serial/*.err
+/tools/nesting-check/target-build-check/
+
+# Local vendor driver/tester bundles (large third-party binaries)
+/docs/Linux_COM_2025-09-30/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Local releases, evidence and recoverable archives; see artifacts/README.md
+/artifacts/*
+!/artifacts/README.md

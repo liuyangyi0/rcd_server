@@ -1,0 +1,9 @@
+---
+- name: Deploy explicitly selected RCD components one host at a time
+  hosts: rcd_nodes
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  roles:
+    - role: release
+      rcd_action: deploy

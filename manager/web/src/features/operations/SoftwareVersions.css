@@ -1,0 +1,8 @@
+.software-versions { grid-column: 1 / -1; min-width: 0; }
+.software-versions .settings-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 12px; }
+.software-versions .settings-actions h2 { margin: 0; }
+.software-versions .data-table { min-width: 860px; }
+.software-versions .data-table td { max-width: 300px; white-space: normal; overflow-wrap: anywhere; }
+.software-versions details dl { max-width: 300px; }
+.software-versions details dd { margin-left: 0; white-space: normal; }
+.software-versions input { max-width: 100%; }

@@ -1,0 +1,151 @@
+---
+- name: Validate explicit host names and release inputs before writing anything
+  ansible.builtin.assert:
+    that:
+      - ansible_limit | default('') | length > 0
+      - (ansible_limit | default('')).split(',') | difference(groups['rcd_nodes']) | length == 0
+      - rcd_release is defined
+      - rcd_release.host == ansible_host
+      - rcd_release.component in ['lower', 'manager', 'agent']
+      - rcd_release.profile is match('^/[^\r\n]+$')
+      - rcd_release.tool_dir is match('^/[^\r\n]+$')
+      - rcd_action in ['preflight', 'history', 'stage', 'verify-running', 'inspect-deployment', 'deploy', 'rollback', 'resume-deployment', 'finish-deployment', 'rollback-deployment', 'resume-rollback', 'finish-rollback']
+    fail_msg: Use --limit with comma-separated inventory host names (no groups or wildcards), and a private explicit rcd_release mapping.
+
+- name: Require authorization for mutation (also in check mode)
+  ansible.builtin.assert:
+    that:
+      - rcd_confirm_targets is defined
+      - (rcd_release.host ~ '/' ~ rcd_release.component) in rcd_confirm_targets
+      - rcd_no_active_commands | default(false) is sameas true
+      - rcd_release.operation_id | default('') is match('^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$')
+      - rcd_initiator | default('') | length > 0
+      - rcd_release.mode | default('maintenance') in ['manual', 'maintenance']
+    fail_msg: Confirm exact targets, current command pause, initiator and a unique operation ID. Never retry an unknown result as a new deployment.
+  when: rcd_action not in ['preflight', 'history', 'stage', 'verify-running', 'inspect-deployment']
+
+- name: Require a pinned build for staging
+  ansible.builtin.assert:
+    that:
+      - rcd_release.controller_artifact is match('^/[^\r\n]+$')
+      - rcd_release.incoming_dir is match('^/[^\r\n]+$')
+      - rcd_release.manifest_sha256 is match('^[0-9a-f]{64}$')
+  when: rcd_action == 'stage'
+
+- name: Require a specific artifact or backup
+  ansible.builtin.assert:
+    that:
+      - rcd_release.artifact_dir | default('') is match('^/[^\r\n]+$')
+  when: rcd_action in ['stage', 'deploy', 'verify-running', 'rollback']
+
+- name: Show the exact scope before execution
+  ansible.builtin.debug:
+    msg:
+      host: "{{ rcd_release.host }}"
+      component: "{{ rcd_release.component }}"
+      action: "{{ rcd_action }}"
+      profile: "{{ rcd_release.profile }}"
+      artifact_or_backup: "{{ rcd_release.artifact_dir | default('not used') }}"
+      operation_id: "{{ rcd_release.operation_id | default('read-only') }}"
+      deployment_id: "{{ rcd_release.deployment_id | default('not used') }}"
+      mode: "{{ rcd_release.mode | default('maintenance') }}"
+      restore_backup_data: "{{ rcd_restore_backup_data | default(false) }}"
+      check_mode: "{{ ansible_check_mode }}"
+      note: Check mode is a plan only. No upload, version execution, service check or deployment is performed.
+
+- name: Address the tool bundle by its content so parallel jobs cannot replace code
+  ansible.builtin.set_fact:
+    rcd_effective_tool_dir: >-
+      {{ rcd_release.tool_dir ~ '/' ~
+         ((lookup('ansible.builtin.file', playbook_dir ~ '/../release/orchestration.py') ~
+           lookup('ansible.builtin.file', playbook_dir ~ '/../release/release.py') ~
+           lookup('ansible.builtin.file', playbook_dir ~ '/../release/application_profile.py') ~
+           lookup('ansible.builtin.file', playbook_dir ~ '/../release/deployment.py') ~
+           lookup('ansible.builtin.file', playbook_dir ~ '/../release/release_probe.py') ~
+           lookup('ansible.builtin.file', playbook_dir ~ '/../release/recovery.py') ~
+           lookup('ansible.builtin.file', playbook_dir ~ '/../release/resume.py') ~
+           lookup('ansible.builtin.file', playbook_dir ~ '/../release/rollback_deployment.py')) | hash('sha256')) }}
+
+- name: Prepare isolated tool files and execute only outside check mode
+  when: not ansible_check_mode
+  block:
+    - name: Create the explicitly named tool directory
+      ansible.builtin.file:
+        path: "{{ rcd_effective_tool_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Copy release adapters (no config, PKI, database or source tree)
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../release/{{ item }}"
+        dest: "{{ rcd_effective_tool_dir }}/{{ item }}"
+        mode: '0600'
+      loop:
+        - orchestration.py
+        - release.py
+        - application_profile.py
+        - deployment.py
+        - release_probe.py
+        - recovery.py
+        - resume.py
+        - rollback_deployment.py
+
+    - name: Stage only the two allowed build files
+      when: rcd_action == 'stage'
+      block:
+        - name: Resolve staging paths against the target profile before uploading a binary
+          ansible.builtin.command:
+            argv:
+              - "{{ rcd_python | default('/usr/bin/python3') }}"
+              - "{{ rcd_effective_tool_dir }}/orchestration.py"
+              - validate-staging
+              - --profile
+              - "{{ rcd_release.profile }}"
+              - --host
+              - "{{ rcd_release.host }}"
+              - --component
+              - "{{ rcd_release.component }}"
+              - --incoming
+              - "{{ rcd_release.incoming_dir }}"
+              - --artifact
+              - "{{ rcd_release.artifact_dir }}"
+            expand_argument_vars: false
+          changed_when: false
+        - name: Create explicit incoming directory
+          ansible.builtin.file:
+            path: "{{ rcd_release.incoming_dir }}"
+            state: directory
+            mode: '0700'
+        - name: Transfer binary and original build manifest
+          ansible.builtin.copy:
+            src: "{{ rcd_release.controller_artifact }}/{{ item }}"
+            dest: "{{ rcd_release.incoming_dir }}/{{ item }}"
+            mode: '0600'
+          loop: [binary, manifest.json]
+
+    - name: Construct arguments without invoking a shell
+      ansible.builtin.set_fact:
+        rcd_command_argv: >-
+          {{ [rcd_python | default('/usr/bin/python3'), rcd_effective_tool_dir ~ '/orchestration.py', rcd_action,
+              '--profile', rcd_release.profile, '--host', rcd_release.host, '--component', rcd_release.component]
+             + (['--artifact', rcd_release.artifact_dir] if rcd_action in ['stage', 'deploy', 'verify-running', 'rollback'] else [])
+             + (['--incoming', rcd_release.incoming_dir, '--manifest-sha256', rcd_release.manifest_sha256] if rcd_action == 'stage' else [])
+             + (['--deployment-id', rcd_release.deployment_id] if rcd_release.deployment_id is defined else [])
+             + (['--operation-id', rcd_release.operation_id, '--mode', rcd_release.mode | default('maintenance'),
+                 '--initiator', rcd_initiator, '--confirm-live-target', rcd_release.host ~ '/' ~ rcd_release.component,
+                 '--confirm-no-active-commands'] if rcd_action not in ['preflight', 'history', 'stage', 'verify-running', 'inspect-deployment'] else [])
+             + (['--recover-operation-id', rcd_release.recover_operation_id] if rcd_release.recover_operation_id is defined else [])
+             + (['--confirm-restore-backup-data'] if rcd_action == 'rollback' and rcd_restore_backup_data | default(false) is sameas true else []) }}
+
+    - name: Call the release tool once (no retry and no automatic rollback)
+      ansible.builtin.command:
+        argv: "{{ rcd_command_argv }}"
+        expand_argument_vars: false
+      register: rcd_result
+      changed_when: rcd_result.rc == 0 and ((rcd_result.stdout_lines | last | from_json).changed | default(false))
+
+    - name: Show software acceptance or durable recovery record
+      ansible.builtin.debug:
+        # Keep the recovery_backup line emitted before replacement visible in
+        # the normal Semaphore log, not only in Ansible's registered variable.
+        msg: "{{ rcd_result.stdout_lines | map('from_json') | list }}"

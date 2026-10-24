@@ -1,0 +1,27 @@
+[Unit]
+Description=Semaphore UI for RCD automation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=semaphore
+Group=semaphore
+WorkingDirectory=/var/lib/semaphore
+Environment=HOME=/var/lib/semaphore
+Environment=PATH=/opt/semaphore/venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=LANG=C.UTF-8
+Environment=ANSIBLE_HOST_KEY_CHECKING=True
+ExecStart=/opt/semaphore/bin/semaphore server --config /etc/semaphore/config.json
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/semaphore /var/cache/semaphore
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

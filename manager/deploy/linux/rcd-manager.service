@@ -1,0 +1,23 @@
+[Unit]
+Description=RCD OPC Manager
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/RcdManager/manager.env
+ExecStart=%h/.local/bin/RcdManager run \
+    --data-dir=${RCD_MANAGER_DATA_DIR} \
+    --opc-listen=${RCD_MANAGER_OPC_LISTEN} \
+    --opc-advertise-host=${RCD_MANAGER_OPC_ADVERTISE_HOST} \
+    --http-listen=${RCD_MANAGER_HTTP_LISTEN} \
+    --lower-publishing-interval=${RCD_MANAGER_LOWER_PUBLISHING_INTERVAL} \
+    --lower-sampling-interval=${RCD_MANAGER_LOWER_SAMPLING_INTERVAL}
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=45s
+
+[Install]
+WantedBy=default.target

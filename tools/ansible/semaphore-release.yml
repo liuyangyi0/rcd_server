@@ -1,0 +1,56 @@
+---
+- name: RCD explicit single-target web release workflow
+  hosts: rcd_nodes
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  become: true
+  vars:
+    rcd_catalog: "{{ lookup('ansible.builtin.file', '/opt/semaphore/catalog/releases.json') | from_json }}"
+  tasks:
+    - name: Assign a unique operation number for this explicit web request
+      ansible.builtin.set_fact:
+        rcd_generated_operation_id: "{{ lookup('ansible.builtin.pipe', '/opt/semaphore/venv/bin/python -c \"import uuid; print(uuid.uuid4().hex)\"') }}"
+    - name: Resolve survey values against installed target and artifact catalog
+      ansible.builtin.set_fact:
+        rcd_web: >-
+          {{ {'component': component | default('lower'), 'release_id': release_id | default(''),
+              'execution': execution | default('preview'), 'mode': mode | default('manual'),
+              'command_pause': command_pause | default('not_confirmed'),
+              'operation_id': operation_id | default(rcd_generated_operation_id), 'initiator': initiator | default('Semaphore admin'),
+              'backup_ref': backup_ref | default(''), 'restore_data': restore_data | default('keep'),
+              'recover_operation_id': recover_operation_id | default(''),
+              'deployment_id': deployment_id | default(''), 'recovery_action': recovery_action | default('')}
+             | rcd_semaphore_release(rcd_catalog, ansible_host, rcd_workflow) }}
+    - name: Bind business release arguments (not arbitrary user-supplied paths)
+      ansible.builtin.set_fact:
+        rcd_release: "{{ rcd_web.release }}"
+        rcd_initiator: "{{ rcd_web.initiator }}"
+        rcd_no_active_commands: "{{ rcd_web.no_active_commands }}"
+        rcd_confirm_targets: "{{ rcd_web.confirm_targets }}"
+        rcd_restore_backup_data: "{{ rcd_web.restore_data }}"
+    - name: Show selected target and preview semantics
+      ansible.builtin.debug:
+        msg:
+          target: "{{ ansible_host }}/{{ rcd_release.component }}"
+          requested_action: "{{ rcd_web.action }}"
+          preview_only: "{{ rcd_web.preview }}"
+          note: 预览只执行软件预检，不停止服务、不部署、不恢复数据。执行部署需暂停全部控制命令。
+    - name: Preview performs only software preflight
+      ansible.builtin.include_role:
+        name: release
+      vars:
+        rcd_action: preflight
+      when: rcd_web.preview
+    - name: Stage pinned package before an explicitly confirmed deployment
+      ansible.builtin.include_role:
+        name: release
+      vars:
+        rcd_action: stage
+      when: not rcd_web.preview and rcd_web.action == 'deploy'
+    - name: Run selected workflow once without automatic retry
+      ansible.builtin.include_role:
+        name: release
+      vars:
+        rcd_action: "{{ rcd_web.action }}"
+      when: not rcd_web.preview

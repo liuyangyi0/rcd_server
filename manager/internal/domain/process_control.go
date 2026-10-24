@@ -1,0 +1,307 @@
+package domain
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+
+	"rcd_manager/internal/buildinfo"
+)
+
+const (
+	ProcessInstanceHeader   = "X-RCD-Instance-ID"
+	MaxProcessLogBytes      = 64 << 10
+	MaxProcessResponseBytes = 1 << 20
+)
+
+// ProcessBinding is management configuration, independent of the OPC endpoint
+// and its connection epoch. Revision zero denotes an unconfigured binding.
+type ProcessBinding struct {
+	RegistryDeviceID string    `json:"registry_device_id,omitempty"`
+	SourceID         string    `json:"source_id"`
+	SourceRevision   uint64    `json:"source_revision"`
+	AgentURL         string    `json:"agent_url"`
+	InstanceID       string    `json:"instance_id"`
+	Revision         uint64    `json:"revision"`
+	UpdatedAt        time.Time `json:"updated_at,omitempty,omitzero"`
+}
+
+func (b ProcessBinding) Configured() bool { return b.AgentURL != "" && b.InstanceID != "" }
+
+func (b ProcessBinding) Validate() error {
+	if b.AgentURL == "" && b.InstanceID == "" {
+		return nil
+	}
+	if !ValidOperationRevision(b.InstanceID) {
+		return &FieldError{Field: "instance_id", Message: "a stable process-agent instance identifier is required"}
+	}
+	u, err := url.Parse(b.AgentURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil ||
+		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawPath != "" || (u.Path != "" && u.Path != "/") || len(b.AgentURL) > 2048 {
+		return &FieldError{Field: "agent_url", Message: "must be an absolute HTTP(S) agent URL without credentials, query, or path"}
+	}
+	return nil
+}
+
+type ProcessSnapshot struct {
+	LifecycleSupported          bool                  `json:"lifecycle_supported,omitempty"`
+	ConfigurationGuardSupported bool                  `json:"configuration_guard_supported,omitempty"`
+	GatewayInstanceID           string                `json:"gateway_instance_id,omitempty"`
+	ManualStopped               bool                  `json:"manual_stopped,omitempty"`
+	Lifecycle                   *ProcessLifecycleView `json:"lifecycle,omitempty"`
+	SchemaVersion               int                   `json:"schema_version,omitempty"`
+	InstanceID                  string                `json:"instance_id"`
+	Revision                    string                `json:"revision"`
+	State                       string                `json:"state"`
+	DesiredState                string                `json:"desired_state"`
+	PID                         int                   `json:"pid,omitempty"`
+	StartedAt                   *time.Time            `json:"started_at,omitempty"`
+	UptimeSeconds               int64                 `json:"uptime_seconds,omitempty"`
+	ExitCode                    *int                  `json:"exit_code,omitempty"`
+	LastError                   string                `json:"last_error,omitempty"`
+	PendingRequestID            string                `json:"pending_request_id,omitempty"`
+	Executable                  string                `json:"executable,omitempty"`
+	WorkDir                     string                `json:"work_dir,omitempty"`
+	RestartPolicy               string                `json:"restart_policy,omitempty"`
+	RestartCount                uint64                `json:"restart_count,omitempty"`
+	LastExitAt                  *time.Time            `json:"last_exit_at,omitempty"`
+	LastStopForced              bool                  `json:"last_stop_forced,omitempty"`
+	MaintenanceDeploymentID     string                `json:"maintenance_deployment_id,omitempty"`
+	MaintenancePhase            string                `json:"maintenance_phase,omitempty"`
+	// Nil means an older agent did not report this capability, not disabled.
+	MaintenanceEnabled *bool                 `json:"maintenance_enabled,omitempty"`
+	AgentIdentity      *ProcessAgentIdentity `json:"agent_identity,omitempty"`
+}
+
+// Self-reported identity of the running supervisor, not the child or the
+// executable currently on disk. Missing means a legacy agent did not report it.
+type ProcessAgentIdentity struct {
+	Build      buildinfo.Info `json:"build"`
+	BootID     string         `json:"boot_id"`
+	StartedAt  time.Time      `json:"started_at"`
+	ReportedAt time.Time      `json:"reported_at"`
+}
+
+func (i ProcessAgentIdentity) Validate() error {
+	if i.Build.SchemaVersion != 1 || i.Build.Component != "agent" || !ValidOperationRevision(i.BootID) || i.StartedAt.IsZero() || i.ReportedAt.IsZero() {
+		return invalidProcessResponse("守护代理运行身份无效")
+	}
+	for _, value := range []string{i.Build.Version, i.Build.Commit, i.Build.BuiltAt, i.Build.ReleaseID, i.Build.SourceSHA256, i.Build.Target} {
+		if value == "" || len(value) > 256 || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+			return invalidProcessResponse("守护代理构建字段无效或超限")
+		}
+	}
+	return nil
+}
+
+type ProcessActionRequest struct {
+	// Canonical JSON preserves request comparability and immutable retry identity.
+	// It is generated by the manager, never an executable/path payload.
+	ConfigurationGuard string `json:"configuration_guard,omitempty"`
+	Lifecycle          bool   `json:"lifecycle,omitempty"`
+	ManagerInstanceID  string `json:"manager_instance_id,omitempty"`
+	Actor              string `json:"actor,omitempty"`
+	GatewayInstanceID  string `json:"gateway_instance_id,omitempty"`
+	RequestID          string `json:"request_id"`
+	InstanceID         string `json:"instance_id"`
+	Action             string `json:"action"`
+	ExpectedRevision   string `json:"expected_revision"`
+	DeploymentID       string `json:"deployment_id,omitempty"`
+	FencingToken       string `json:"fencing_token,omitempty"`
+}
+
+func (r ProcessActionRequest) Validate() error {
+	if r.ConfigurationGuard != "" {
+		if !r.Lifecycle || r.Action != "restart" {
+			return &FieldError{Field: "configuration_guard", Message: "requires a safe restart"}
+		}
+		if _, err := ParseConfigurationGuard(r.ConfigurationGuard); err != nil {
+			return err
+		}
+	}
+	if r.Lifecycle {
+		if !ValidOperationRevision(r.ManagerInstanceID) || !ValidOperationRevision(r.GatewayInstanceID) || strings.TrimSpace(r.Actor) == "" || len(r.Actor) > 128 || strings.IndexFunc(r.Actor, unicode.IsControl) >= 0 || r.DeploymentID != "" || r.FencingToken != "" {
+			return &FieldError{Field: "lifecycle", Message: "safe lifecycle requires a pinned manager, gateway and actor; maintenance tokens are internal"}
+		}
+	} else if r.ManagerInstanceID != "" || r.Actor != "" || r.GatewayInstanceID != "" {
+		return &FieldError{Field: "lifecycle", Message: "lifecycle identity requires the safe lifecycle protocol"}
+	}
+	if !ValidOperationRevision(r.RequestID) || r.RequestID == "." || r.RequestID == ".." || !ValidOperationRevision(r.InstanceID) {
+		return &FieldError{Field: "request_id", Message: "request_id and instance_id must be stable nonempty identifiers"}
+	}
+	if r.Action != "start" && r.Action != "stop" && r.Action != "restart" {
+		return &FieldError{Field: "action", Message: "must be start, stop, or restart"}
+	}
+	if !ValidOperationRevision(r.ExpectedRevision) {
+		return &FieldError{Field: "revision", Message: "an exact process-agent revision is required"}
+	}
+	if r.DeploymentID != "" || r.FencingToken != "" {
+		token, err := strconv.ParseUint(r.FencingToken, 10, 64)
+		if !ValidOperationRevision(r.DeploymentID) || err != nil || token == 0 || strconv.FormatUint(token, 10) != r.FencingToken {
+			return &FieldError{Field: "fencing_token", Message: "maintenance requires an exact deployment ID and positive decimal token"}
+		}
+	}
+	return nil
+}
+
+func ParseConfigurationGuard(raw string) (map[string]string, error) {
+	invalid := &FieldError{Field: "configuration_guard", Message: "requires bounded canonical file revisions"}
+	if len(raw) > 48<<10 {
+		return nil, invalid
+	}
+	var expected map[string]string
+	if json.Unmarshal([]byte(raw), &expected) != nil || len(expected) == 0 || len(expected) > 256 {
+		return nil, invalid
+	}
+	canonical, err := json.Marshal(expected)
+	if err != nil || string(canonical) != raw {
+		return nil, invalid
+	}
+	for name, hash := range expected {
+		if !ValidOperationResourceName(name) || (name != "config.toml" && name != "calc.toml" && !(strings.HasPrefix(name, "rcd") && strings.HasSuffix(name, ".csv"))) || len(hash) != 64 {
+			return nil, invalid
+		}
+		if _, err := hex.DecodeString(hash); err != nil {
+			return nil, invalid
+		}
+	}
+	return expected, nil
+}
+
+// ProcessLifecycleView describes the shared physical operation, including work
+// started by another manager. It is not an additional process execution queue.
+type ProcessLifecycleView struct {
+	RequestID         string `json:"request_id"`
+	ManagerInstanceID string `json:"manager_instance_id"`
+	Actor             string `json:"actor"`
+	Action            string `json:"action"`
+	Phase             string `json:"phase"`
+	State             string `json:"state"`
+	Error             string `json:"error,omitempty"`
+}
+
+// Source identity fields are filled by the manager, never trusted from agents.
+// Only succeeded/failed are terminal. Unknown keeps the maintenance fence until
+// reconciliation obtains an authoritative terminal operation for this ID.
+type ProcessOperation struct {
+	SourceID        string           `json:"source_id,omitempty"`
+	SourceRevision  uint64           `json:"source_revision,omitempty"`
+	BindingRevision uint64           `json:"binding_revision,omitempty"`
+	RequestID       string           `json:"request_id"`
+	InstanceID      string           `json:"instance_id"`
+	Action          string           `json:"action"`
+	State           string           `json:"state"`
+	CreatedAt       time.Time        `json:"created_at"`
+	UpdatedAt       time.Time        `json:"updated_at"`
+	ErrorCode       string           `json:"error_code,omitempty"`
+	Error           string           `json:"error,omitempty"`
+	Forced          bool             `json:"forced,omitempty"`
+	Snapshot        *ProcessSnapshot `json:"snapshot,omitempty"`
+}
+
+func (o ProcessOperation) Terminal() bool { return o.State == "succeeded" || o.State == "failed" }
+
+type ProcessLog struct {
+	InstanceID string `json:"instance_id"`
+	Text       string `json:"text"`
+	Truncated  bool   `json:"truncated"`
+	SizeBytes  int64  `json:"size_bytes"`
+}
+
+func (s ProcessSnapshot) Validate(instanceID string) error {
+	if s.LifecycleSupported && !ValidOperationRevision(s.GatewayInstanceID) {
+		return invalidProcessResponse("安全生命周期缺少固定下级身份")
+	}
+	if v := s.Lifecycle; v != nil {
+		if !ValidOperationRevision(v.RequestID) || !ValidOperationRevision(v.ManagerInstanceID) || !ValidOperationRevision(v.Phase) || strings.TrimSpace(v.Actor) == "" || len(v.Actor) > 128 || len(v.Error) > 16384 || (v.Action != "start" && v.Action != "stop" && v.Action != "restart") {
+			return invalidProcessResponse("安全生命周期状态无效")
+		}
+		switch v.State {
+		case "accepted", "running", "succeeded", "failed", "unknown":
+		default:
+			return invalidProcessResponse("安全生命周期结果无效")
+		}
+	}
+	if s.AgentIdentity != nil {
+		if err := s.AgentIdentity.Validate(); err != nil {
+			return err
+		}
+	}
+	if s.InstanceID != instanceID || !ValidOperationRevision(s.Revision) || (s.SchemaVersion != 0 && s.SchemaVersion != 1) {
+		return invalidProcessResponse("进程代理身份或版本不匹配")
+	}
+	switch s.State {
+	case "stopped", "starting", "running", "stopping", "failed", "unknown":
+	default:
+		return invalidProcessResponse("进程状态无效")
+	}
+	if (s.DesiredState != "running" && s.DesiredState != "stopped") || s.PID < 0 || s.UptimeSeconds < 0 ||
+		(s.State == "running" && s.PID <= 1) || (s.PendingRequestID != "" && !ValidOperationRevision(s.PendingRequestID)) ||
+		len(s.LastError) > 16384 || len(s.Executable) > 4096 || len(s.WorkDir) > 4096 {
+		return invalidProcessResponse("进程状态字段无效或超限")
+	}
+	if s.RestartPolicy != "" && s.RestartPolicy != "never" && s.RestartPolicy != "on-failure" {
+		return invalidProcessResponse("进程重启策略无效")
+	}
+	if s.MaintenanceDeploymentID != "" || s.MaintenancePhase != "" {
+		if !ValidOperationRevision(s.MaintenanceDeploymentID) || !ValidOperationRevision(s.MaintenancePhase) ||
+			(s.MaintenanceEnabled != nil && !*s.MaintenanceEnabled) {
+			return invalidProcessResponse("维护状态字段不完整或矛盾")
+		}
+	}
+	return nil
+}
+
+func (o ProcessOperation) Validate(request ProcessActionRequest) error {
+	if o.RequestID != request.RequestID || o.InstanceID != request.InstanceID || o.Action != request.Action ||
+		o.CreatedAt.IsZero() || o.UpdatedAt.IsZero() || o.UpdatedAt.Before(o.CreatedAt) || len(o.Error) > 16384 || len(o.ErrorCode) > 128 {
+		return invalidProcessResponse("进程作业身份或字段无效")
+	}
+	switch o.State {
+	case "accepted", "running", "succeeded", "failed", "unknown":
+	default:
+		return invalidProcessResponse("进程作业状态无效")
+	}
+	if o.Snapshot != nil {
+		if err := o.Snapshot.Validate(request.InstanceID); err != nil {
+			return err
+		}
+	}
+	if o.State == "succeeded" {
+		want := "running"
+		if request.Action == "stop" {
+			want = "stopped"
+		}
+		if o.Snapshot == nil || o.Snapshot.State != want || o.Snapshot.DesiredState != want {
+			return invalidProcessResponse("成功作业缺少已确认的目标进程状态")
+		}
+	}
+	return nil
+}
+
+func NormalizeProcessAgentURL(value string) string {
+	return strings.TrimRight(strings.TrimSpace(value), "/")
+}
+
+func invalidProcessResponse(message string) error {
+	return &OperationError{Code: "invalid_response", Message: message}
+}
+
+// SourcePendingCount covers every physical port, independent of logical group
+// or originating Session. Runtime serializes command/process admission around
+// this snapshot with configMu so neither direction can pass the other's fence.
+func (t *RouteTable) SourcePendingCount(sourceID string) int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	count := 0
+	for _, command := range t.pendingByKey {
+		if command.SourceID == sourceID {
+			count++
+		}
+	}
+	return count
+}

@@ -1,0 +1,9 @@
+---
+- name: Explicitly restore one selected backup through the existing release tool
+  hosts: rcd_nodes
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  roles:
+    - role: release
+      rcd_action: rollback

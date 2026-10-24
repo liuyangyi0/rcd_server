@@ -1,0 +1,27 @@
+[Unit]
+Description=RCD lower process agent (%i)
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/RcdManager/agents/%i.env
+ExecStart=%h/.local/bin/RcdManager agent run \
+    --instance-id=%i \
+    --executable=${RCD_LOWER_EXECUTABLE} \
+    --work-dir=${RCD_LOWER_WORK_DIR} \
+    --data-dir=${RCD_AGENT_DATA_DIR} \
+    --http-listen=${RCD_AGENT_HTTP_LISTEN} \
+    --ready-address=${RCD_LOWER_READY_ADDRESS} \
+    --auto-start=${RCD_AGENT_AUTO_START} \
+    --restart-policy=${RCD_AGENT_RESTART_POLICY} \
+    --stop-timeout=${RCD_AGENT_STOP_TIMEOUT} \
+    --start-timeout=${RCD_AGENT_START_TIMEOUT}
+Restart=on-failure
+RestartSec=3s
+KillSignal=SIGTERM
+KillMode=control-group
+# Covers the default 15s lower grace + 5s kill wait + 5s HTTP shutdown.
+# Increase this if RCD_AGENT_STOP_TIMEOUT is increased.
+TimeoutStopSec=40s
+
+[Install]
+WantedBy=default.target

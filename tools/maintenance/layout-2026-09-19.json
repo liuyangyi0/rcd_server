@@ -1,0 +1,122 @@
+[
+  {
+    "from": "manager/docs/使用说明.md",
+    "to": "manager/docs/guides/使用说明.md"
+  },
+  {
+    "from": "manager/docs/功能说明.md",
+    "to": "manager/docs/guides/功能说明.md"
+  },
+  {
+    "from": "manager/docs/device-groups.md",
+    "to": "manager/docs/guides/device-groups.md"
+  },
+  {
+    "from": "manager/docs/lower-operations.md",
+    "to": "manager/docs/guides/lower-operations.md"
+  },
+  {
+    "from": "manager/docs/lower-process-management.md",
+    "to": "manager/docs/guides/lower-process-management.md"
+  },
+  {
+    "from": "manager/docs/central-lower-logs.md",
+    "to": "manager/docs/guides/central-lower-logs.md"
+  },
+  {
+    "from": "manager/docs/calculation-state-inputs.md",
+    "to": "manager/docs/guides/calculation-state-inputs.md"
+  },
+  {
+    "from": "manager/docs/web-login-and-usability.md",
+    "to": "manager/docs/guides/web-login-and-usability.md"
+  },
+  {
+    "from": "manager/docs/windows-deployment.md",
+    "to": "manager/docs/deployment/windows-deployment.md"
+  },
+  {
+    "from": "manager/docs/linux-autostart.md",
+    "to": "manager/docs/deployment/linux-autostart.md"
+  },
+  {
+    "from": "manager/docs/architecture.md",
+    "to": "manager/docs/reference/architecture.md"
+  },
+  {
+    "from": "manager/docs/rest-api.md",
+    "to": "manager/docs/reference/rest-api.md"
+  },
+  {
+    "from": "manager/docs/security.md",
+    "to": "manager/docs/reference/security.md"
+  },
+  {
+    "from": "manager/docs/validation.md",
+    "to": "manager/docs/validation/validation.md"
+  },
+  {
+    "from": "manager/docs/device-groups-validation.md",
+    "to": "manager/docs/validation/device-groups-validation.md"
+  },
+  {
+    "from": "manager/docs/process-control-validation.md",
+    "to": "manager/docs/validation/process-control-validation.md"
+  },
+  {
+    "from": "manager/docs/station-communication-validation.md",
+    "to": "manager/docs/validation/station-communication-validation.md"
+  },
+  {
+    "from": "manager/docs/calculation-state-inputs-validation.md",
+    "to": "manager/docs/validation/calculation-state-inputs-validation.md"
+  },
+  {
+    "from": "manager/docs/web-login-validation.md",
+    "to": "manager/docs/validation/web-login-validation.md"
+  },
+  {
+    "from": "USER_MANUAL.md",
+    "to": "docs/lower/standalone-guide.md"
+  },
+  {
+    "from": "REFACTORING.md",
+    "to": "docs/archive/pre-modularization/REFACTORING.md"
+  },
+  {
+    "from": "src_backup",
+    "to": "docs/archive/pre-modularization/src_backup"
+  },
+  {
+    "from": "jisuan.txt",
+    "to": "docs/archive/calculation-reference/jisuan.txt"
+  },
+  {
+    "from": "manager/web/设备版本管理说明.md",
+    "to": "manager/docs/guides/设备版本管理说明.md"
+  },
+  {
+    "from": "manager/tools/remote-soak-run.sh",
+    "to": "manager/tools/archive/soak-review5/remote-soak-run.sh"
+  },
+  {
+    "from": "manager/tools/remote-soak-monitor.sh",
+    "to": "manager/tools/archive/soak-review5/remote-soak-monitor.sh"
+  },
+  {
+    "from": "manager/tools/remote-route-switch.py",
+    "to": "manager/tools/archive/soak-review5/remote-route-switch.py"
+  },
+  {
+    "from": "manager/output",
+    "to": "artifacts/archive/2026-09-19/manager-output"
+  },
+  {
+    "from": "manager/dist",
+    "to": "artifacts/archive/2026-09-19/manager-dist"
+  },
+  {
+    "from": "manager/tmp",
+    "to": "artifacts/archive/2026-09-19/manager-tmp"
+  }
+]

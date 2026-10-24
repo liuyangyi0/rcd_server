@@ -1,0 +1,110 @@
+---
+- name: Bind an immutable native service operation without a software package
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Validate server-selected service operation
+      ansible.builtin.assert:
+        that:
+          - rcd_platform_control is defined
+          - rcd_platform_control.commands_paused is sameas true
+          - rcd_platform_control.hosts | length == 1
+          - rcd_platform_control.hosts | difference(groups['rcd_nodes']) | length == 0
+          - (rcd_platform_control.component == 'manager' and rcd_platform_control.action in ['start', 'stop', 'restart']) or (rcd_platform_control.component == 'agent' and rcd_platform_control.action == 'recover') or (rcd_platform_control.application is mapping and rcd_platform_control.application.component == rcd_platform_control.component and rcd_platform_control.action in ['start', 'stop', 'restart'])
+    - name: Record not-started evidence
+      ansible.builtin.copy:
+        dest: "{{ rcd_platform_control.report_directory }}/{{ item.device_id }}.json"
+        mode: '0600'
+        content: "{{ {'schema_version': 1, 'operation_id': rcd_platform_control.operation_id, 'task_id': rcd_platform_control.task_id, 'device_id': item.device_id, 'host_alias': item.host_alias, 'state': 'not_started', 'error': '', 'stages': [], 'acceptance': {}} | to_json }}"
+      loop: "{{ rcd_platform_control.targets }}"
+    - name: Select the fixed target
+      ansible.builtin.add_host:
+        name: "{{ item.host_alias }}"
+        groups: rcd_control_selected
+        rcd_selected_device: "{{ item }}"
+      loop: "{{ rcd_platform_control.targets }}"
+
+- name: Execute one protected service operation
+  hosts: rcd_control_selected
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+  become: true
+  vars:
+    rcd_tools: "{{ rcd_platform_workspace | default('/var/lib/rcd-release-platform') }}/{{ rcd_platform_control.operation_id }}/tools"
+    rcd_adapter_files: [application_profile.py, service_control.py, platform_release.py, release_probe.py, component_deployment.py, orchestration.py, release.py, deployment.py, recovery.py, resume.py, rollback_deployment.py]
+  tasks:
+    - name: Resolve only the administrator profile or registered application fixed profile
+      ansible.builtin.set_fact:
+        rcd_effective_profile: "{{ (rcd_release_profiles | default({})).get(rcd_platform_control.component, '/etc/rcd/release-platform/' ~ rcd_platform_control.component ~ '.json' if rcd_platform_control.application is mapping else '') }}"
+    - name: Verify target and fixed profile
+      ansible.builtin.assert:
+        that:
+          - ansible_host == rcd_selected_device.address
+          - rcd_platform_control.operation_id is match('^[a-f0-9]{64}$')
+          - rcd_selected_device.expected_binary_sha256 is match('^[a-f0-9]{64}$')
+          - rcd_effective_profile is match('^/[^\r\n]+$')
+    - name: Prepare task tools
+      ansible.builtin.file:
+        path: "{{ rcd_tools }}"
+        state: directory
+        mode: '0700'
+    - name: Copy controlled source, never browser-supplied commands
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../release/{{ item }}"
+        dest: "{{ rcd_tools }}/{{ item }}"
+        mode: '0600'
+      loop: "{{ rcd_adapter_files }}"
+    - name: Locate the fixed report directory from administrator profile
+      ansible.builtin.slurp:
+        src: "{{ rcd_effective_profile }}"
+      register: rcd_control_profile
+      no_log: true
+    - name: Execute once and retrieve evidence even on SSH failure
+      block:
+        - name: Mark uncertain execution before sending the action
+          ansible.builtin.copy:
+            dest: "{{ rcd_platform_control.report_directory }}/{{ rcd_selected_device.device_id }}.json"
+            mode: '0600'
+            content: "{{ {'schema_version': 1, 'operation_id': rcd_platform_control.operation_id, 'task_id': rcd_platform_control.task_id, 'device_id': rcd_selected_device.device_id, 'host_alias': inventory_hostname, 'state': 'unknown', 'error': '等待原服务控制事务结果；不会重投', 'stages': [], 'acceptance': {}} | to_json }}"
+          delegate_to: localhost
+          become: false
+        - name: Run fixed safe lifecycle adapter
+          ansible.builtin.command:
+            argv:
+              - "{{ rcd_python | default('/usr/bin/python3') }}"
+              - "{{ rcd_tools }}/service_control.py"
+              - --profile
+              - "{{ rcd_effective_profile }}"
+              - --host
+              - "{{ ansible_host }}"
+              - --component
+              - "{{ rcd_platform_control.component }}"
+              - --action
+              - "{{ rcd_platform_control.action }}"
+              - --operation-id
+              - "{{ rcd_platform_control.operation_id }}"
+              - --task-id
+              - "{{ rcd_platform_control.task_id | string }}"
+              - --device-id
+              - "{{ rcd_selected_device.device_id }}"
+              - --host-alias
+              - "{{ inventory_hostname }}"
+              - --expected-sha256
+              - "{{ rcd_selected_device.expected_binary_sha256 }}"
+              - --initiator
+              - "{{ rcd_platform_control.actor }}"
+              - --commands-paused
+              - --project-id
+              - "{{ rcd_platform_control.project_id | string }}"
+              - --definition-sha256
+              - "{{ (rcd_platform_control.application | default({}, true)).definition_sha256 | default('') }}"
+            expand_argument_vars: false
+          changed_when: true
+      always:
+        - name: Fetch the original service result without replay
+          ansible.builtin.fetch:
+            src: "{{ (rcd_control_profile.content | b64decode | from_json).release_dir }}/platform-reports/{{ rcd_platform_control.operation_id }}.json"
+            dest: "{{ rcd_platform_control.report_directory }}/{{ rcd_selected_device.device_id }}.json"
+            flat: true

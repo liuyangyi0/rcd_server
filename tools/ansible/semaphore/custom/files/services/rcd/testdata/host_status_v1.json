@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-10-20T08:00:00Z",
+  "available": true,
+  "error": "",
+  "sample_interval_seconds": 0.2,
+  "uptime_seconds": 1234.5,
+  "cpu": {
+    "available": true,
+    "error": "",
+    "utilization_percent": 50.0,
+    "logical_count": 2
+  },
+  "memory": {
+    "available": true,
+    "error": "",
+    "total_bytes": 1024000,
+    "available_bytes": 409600,
+    "used_bytes": 614400,
+    "used_percent": 60.0
+  },
+  "disks": [
+    {
+      "path": "/",
+      "mount_point": "/",
+      "filesystem": "ext4",
+      "available": true,
+      "error": "",
+      "total_bytes": 4096000,
+      "available_bytes": 1433600,
+      "used_bytes": 2457600,
+      "used_percent": 60.0
+    },
+    {
+      "path": "/var/lib/rcd",
+      "mount_point": "/var/lib/rcd",
+      "filesystem": "ext4",
+      "available": true,
+      "error": "",
+      "total_bytes": 4096000,
+      "available_bytes": 1433600,
+      "used_bytes": 2457600,
+      "used_percent": 60.0
+    }
+  ],
+  "network": [
+    {
+      "name": "eth0",
+      "operstate": "up",
+      "link_up": true,
+      "ipv4_addresses": ["192.0.2.46/24", "198.51.100.46/32"],
+      "addresses_error": "",
+      "available": true,
+      "error": "",
+      "rx_bytes": 1100,
+      "tx_bytes": 2200,
+      "rx_bytes_per_second": 500.0,
+      "tx_bytes_per_second": 1000.0
+    }
+  ]
+}

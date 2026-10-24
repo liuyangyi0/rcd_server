@@ -1,0 +1,13 @@
+.process-maintenance-notice {
+  margin-block: 12px;
+  min-width: 0;
+}
+
+.process-maintenance-notice .inline-notice > div,
+.process-maintenance-notice .operations-file-meta > div {
+  min-width: 0;
+}
+
+.process-maintenance-notice dd {
+  overflow-wrap: anywhere;
+}

@@ -1,0 +1,17 @@
+[
+  {"from":"tools/serial_parity_analyze.py","to":"tools/serial/serial_parity_analyze.py"},
+  {"from":"tools/serial_parity_matrix.py","to":"tools/serial/serial_parity_matrix.py"},
+  {"from":"tools/serial_parity_probe.c","to":"tools/serial/serial_parity_probe.c"},
+  {"from":"tools/serial_parity_report.py","to":"tools/serial/serial_parity_report.py"},
+  {"from":"tools/serial_parity_run.py","to":"tools/serial/serial_parity_run.py"},
+  {"from":"tools/test_serial_parity_matrix.py","to":"tools/serial/test_serial_parity_matrix.py"},
+  {"from":"tools/serial_opc_observe.py","to":"tools/opc/serial_opc_observe.py"},
+  {"from":"tools/opc_client_test.py","to":"tools/opc/opc_client_test.py"},
+  {"from":"tools/opc_e2e_serial_test.py","to":"tools/opc/opc_e2e_serial_test.py"},
+  {"from":"tools/fuzz_device.py","to":"tools/fuzz-device/fuzz_device.py"},
+  {"from":"tools/build_kylin.bat","to":"tools/fuzz-device/build_kylin.bat"},
+  {"from":"tools/build_windows.bat","to":"tools/fuzz-device/build_windows.bat"},
+  {"from":"tools/Dockerfile.build","to":"tools/fuzz-device/Dockerfile.build"},
+  {"from":"artifacts/transfer/layout-20260919.tar.gz","to":"artifacts/transfer/2026-09-19-layout/layout-20260919.tar.gz"},
+  {"from":"artifacts/transfer/instruction-audit-20260920.tar.gz","to":"artifacts/transfer/2026-09-20-instruction-audit/instruction-audit-20260920.tar.gz"}
+]
