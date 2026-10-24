@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"rcd_manager/internal/calculation"
@@ -26,11 +27,14 @@ type Options struct {
 }
 
 type Handler struct {
-	auth    *WebAuth
-	service Service
-	logger  *slog.Logger
-	now     func() time.Time
-	mux     *http.ServeMux
+	auth         *WebAuth
+	service      Service
+	logger       *slog.Logger
+	now          func() time.Time
+	mux          *http.ServeMux
+	flowMu       sync.Mutex
+	flowJSON     []byte
+	flowCachedAt time.Time
 }
 
 func New(service Service, options Options) http.Handler {
@@ -51,6 +55,8 @@ func New(service Service, options Options) http.Handler {
 }
 
 func (h *Handler) routes() {
+	h.mux.HandleFunc("GET /api/v1/public/flow", h.publicFlow)
+	h.mux.HandleFunc("GET /api/v1/public/flow/points", h.publicFlowPoints)
 	h.mux.HandleFunc("GET /api/v1/overview", h.getOverview)
 	h.mux.HandleFunc("GET /api/v1/groups", h.listGroups)
 	h.mux.HandleFunc("POST /api/v1/groups", h.createGroup)
@@ -89,7 +95,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /api/v1/management-audit", h.listManagementAudit)
 	h.mux.HandleFunc("GET /api/v1/system", h.systemInfo)
 	h.mux.HandleFunc("GET /api/v1/software-versions", h.softwareVersions)
-	h.mux.HandleFunc("GET /api/v1/fleet",h.fleetStatus)
+	h.mux.HandleFunc("GET /api/v1/fleet", h.fleetStatus)
 	h.mux.HandleFunc("GET /api/v1/configuration", h.exportConfiguration)
 	h.mux.HandleFunc("POST /api/v1/configuration/import", h.importConfiguration)
 	h.mux.HandleFunc("GET /api/v1/diagnostics", h.diagnosticBundle)

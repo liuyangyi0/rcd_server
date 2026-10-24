@@ -9,6 +9,7 @@ import { AuthAccount } from './AuthGate';
 const NAV_SECTIONS = [
   { label: '运行', items: [
     { to: '/', label: '运行总览', icon: Gauge, end: true },
+    { to: '/flow', label: '数据流监视', icon: Gauge },
     { to: '/groups', label: '分组与选源', icon: Boxes },
     { to: '/sources', label: '下级 OPC', icon: ServerCog },
   ] },

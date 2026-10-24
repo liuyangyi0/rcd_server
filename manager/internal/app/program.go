@@ -109,7 +109,21 @@ func RunProgram(ctx context.Context, cfg config.Config) error {
 		for _, session := range upstream.Sessions() {
 			id := fmt.Sprint(session.SessionID)
 			views[id] = api.SessionView{Session: domain.Session{LastSeenAt: session.LastAccess}, ClientName: session.SessionName,
-				ClientApplicationURI: session.ClientApplicationURI, RemoteAddress: session.RemoteAddress}
+				ClientApplicationURI: session.ClientApplicationURI, RemoteAddress: session.RemoteAddress, Attached: session.SecureChannelID != 0}
+		}
+		for _, sub := range upstream.SubscriptionDiagnostics() {
+			id := fmt.Sprint(sub.SessionID)
+			view, exists := views[id]
+			if !exists {
+				continue
+			}
+			if view.Notifications == nil {
+				view.Notifications = make(map[string]uint32)
+			}
+			view.Subscriptions++
+			view.MonitoredItems += sub.MonitoredItemCount
+			view.Notifications[fmt.Sprint(sub.SubscriptionID)] = sub.DataChangeNotificationsCount
+			views[id] = view
 		}
 		return views
 	})

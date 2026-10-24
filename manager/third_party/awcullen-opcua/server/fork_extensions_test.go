@@ -214,7 +214,7 @@ func TestSubscriptionDiagnosticsSnapshotConcurrentAddDelete(t *testing.T) {
 					return
 				}
 				subscription.SetPublishingMode(j%2 == 0)
-				_ = subscription.diagnosticsSnapshot()
+				_ = subscription.DiagnosticsSnapshot()
 				srv.subscriptionManager.Delete(subscription)
 				subscription.Delete()
 			}

@@ -94,6 +94,7 @@ type Runtime struct {
 	lastSelectionAt      time.Time
 	groupLastSelectedAt  map[string]time.Time
 	lastLowerDataAt      time.Time
+	flowSamples          map[string]uint64 // guarded by mu; accepted samples only
 	lastSampleEventAt    time.Time
 	sampleEventPending   bool
 	startedAt            time.Time
@@ -969,6 +970,10 @@ func (r *Runtime) onSample(sourceID string, key domain.NodeKey, sample domain.Sa
 		return
 	}
 	r.lastLowerDataAt = now
+	if r.flowSamples == nil {
+		r.flowSamples = make(map[string]uint64)
+	}
+	r.flowSamples[sourceID]++
 	status := currentStatus
 	status.LastDataAt = now
 	r.statuses[sourceID] = status

@@ -63,6 +63,10 @@ not silently move to a different server implementation.
   writes. Deterministic transport-failure and concurrent reactivation regressions
   live in `server/publish_reconnect_test.go`.
 
+`Subscription.DiagnosticsSnapshot()` exposes the existing locked diagnostics
+copy to the manager's read-only visualization. Notification counts describe
+generated notifications, not remote receipt or hardware acknowledgement.
+
 The focused regression suites are `server/fork_extensions_test.go` and
 `server/publish_reconnect_test.go`. When
 upgrading the base version, port these named APIs and tests first, then run both

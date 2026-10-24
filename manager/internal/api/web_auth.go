@@ -199,7 +199,7 @@ func (a *WebAuth) serve(w http.ResponseWriter, r *http.Request, next http.Handle
 	w.Header().Set("Cache-Control", "no-store")
 	path := r.URL.Path
 	// Machine log ingestion and liveness probes are intentionally not browser login endpoints.
-	if (r.Method == "POST" && path == "/api/v1/lower-ingest/logs") || ((r.Method == "GET" || r.Method == "HEAD") && (path == "/healthz" || path == "/readyz")) {
+	if isPublicFlowRead(r) || (r.Method == "POST" && path == "/api/v1/lower-ingest/logs") || ((r.Method == "GET" || r.Method == "HEAD") && (path == "/healthz" || path == "/readyz")) {
 		next.ServeHTTP(w, r)
 		return
 	}

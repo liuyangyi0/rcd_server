@@ -490,6 +490,14 @@ func (s *UpstreamServer) SubscriptionCount() int {
 	return s.server.SubscriptionManager().Len()
 }
 
+func (s *UpstreamServer) SubscriptionDiagnostics() []awu.SubscriptionDiagnosticsDataType {
+	result := make([]awu.SubscriptionDiagnosticsDataType, 0)
+	for _, sub := range s.server.SubscriptionManager().Subscriptions() {
+		result = append(result, sub.DiagnosticsSnapshot())
+	}
+	return result
+}
+
 func (s *UpstreamServer) handleSessionEvent(event awserver.SessionEvent) {
 	sessionID := fmt.Sprint(event.Session.SessionID)
 	switch event.Kind {

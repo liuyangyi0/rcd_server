@@ -66,5 +66,5 @@ export function AuthGate({ children }: { children: ReactNode }) {
       {error ? <p role="alert" className="text-warning">{error}</p> : null}
       <button className="button button-primary" type="submit" disabled={busy}>{busy ? '正在提交…' : changeMode ? '保存密码' : '登录'}</button>
       {changing && !session.password_change_required ? <button className="button button-secondary" type="button" disabled={busy} onClick={() => { setChanging(false); setPassword(''); setNewPassword(''); setConfirm(''); setError(''); }}>取消</button> : null}
-    </form>}</section></main>;
+    </form>}<a href="#/flow" className="button button-secondary" style={{marginTop:16}}>免登录查看数据流监视 →</a></section></main>;
 }

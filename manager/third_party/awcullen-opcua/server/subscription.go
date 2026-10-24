@@ -419,6 +419,12 @@ func (s *Subscription) stopPublishingLocked() {
 	s.cancelPublishing = nil
 }
 
+// DiagnosticsSnapshot is a read-only copy of subscription activity. Counts mean
+// generated notifications (including retained messages), not peer receipt.
+func (s *Subscription) DiagnosticsSnapshot() ua.SubscriptionDiagnosticsDataType {
+	return s.diagnosticsSnapshot()
+}
+
 // diagnosticsSnapshot returns a coherent view without exposing Subscription
 // fields while publishing, modification, or deletion mutates them.
 func (s *Subscription) diagnosticsSnapshot() ua.SubscriptionDiagnosticsDataType {

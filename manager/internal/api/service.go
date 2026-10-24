@@ -65,9 +65,13 @@ type SourceView struct {
 
 type SessionView struct {
 	domain.Session
-	ClientName           string `json:"client_name,omitempty"`
-	ClientApplicationURI string `json:"client_application_uri,omitempty"`
-	RemoteAddress        string `json:"remote_address,omitempty"`
+	Attached             bool              `json:"attached"`
+	Subscriptions        int               `json:"subscriptions"`
+	MonitoredItems       uint32            `json:"monitored_items"`
+	Notifications        map[string]uint32 `json:"notifications,omitempty"`
+	ClientName           string            `json:"client_name,omitempty"`
+	ClientApplicationURI string            `json:"client_application_uri,omitempty"`
+	RemoteAddress        string            `json:"remote_address,omitempty"`
 }
 
 type PointView struct {

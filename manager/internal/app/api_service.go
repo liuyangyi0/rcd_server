@@ -283,6 +283,7 @@ func (r *Runtime) DeleteGroup(ctx context.Context, id string, revision uint64) e
 	r.conflictCount = candidateConflictCount
 	for _, source := range removedSources {
 		delete(r.statuses, source.ID)
+		delete(r.flowSamples, source.ID)
 		r.stations.remove(source.ID)
 		r.stationSync.remove(source.ID)
 		r.catalogPersistence.discard(source.ID)
@@ -522,9 +523,13 @@ func (r *Runtime) CreateSource(ctx context.Context, mutation api.SourceMutation)
 }
 
 func (r *Runtime) UpdateSource(ctx context.Context, id string, revision uint64, mutation api.SourceMutation) (api.SourceView, error) {
-	if row,_,err:=r.repo.FleetBinding(ctx,id);err==nil&&row.Machine!=nil{
-		if mutation.Endpoint!=row.Machine.OPCEndpoint||mutation.Name!=row.Machine.Name{return api.SourceView{},&domain.OperationError{Code:"conflict",Message:"来源名称与地址由发布平台统一台账管理；业务配置仍可在此修改"}}
-	}else if err!=nil&&!errors.Is(err,domain.ErrNotFound){return api.SourceView{},err}
+	if row, _, err := r.repo.FleetBinding(ctx, id); err == nil && row.Machine != nil {
+		if mutation.Endpoint != row.Machine.OPCEndpoint || mutation.Name != row.Machine.Name {
+			return api.SourceView{}, &domain.OperationError{Code: "conflict", Message: "来源名称与地址由发布平台统一台账管理；业务配置仍可在此修改"}
+		}
+	} else if err != nil && !errors.Is(err, domain.ErrNotFound) {
+		return api.SourceView{}, err
+	}
 	if mutation.ID == "" {
 		mutation.ID = id
 	}
@@ -766,6 +771,7 @@ func (r *Runtime) DeleteSource(ctx context.Context, id string, revision uint64) 
 	r.index = candidateIndex
 	r.conflictCount = candidateConflictCount
 	delete(r.statuses, id)
+	delete(r.flowSamples, id)
 	r.stations.remove(id)
 	r.stationSync.remove(id)
 	r.catalogPersistence.discard(id)

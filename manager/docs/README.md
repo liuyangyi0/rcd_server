@@ -6,6 +6,7 @@
 - [全部软件关系与使用说明](../../docs/整体软件使用说明.md)
 - [使用说明](guides/使用说明.md) · [功能说明](guides/功能说明.md)
 - [网页登录、密码恢复与分页](guides/web-login-and-usability.md)
+- [免登录数据流监视：旋转环带、粒子与真实状态](guides/数据流监视.md)
 - [设备拓扑、分组、选源及通信状态](guides/device-groups.md)
 - [自动切源与来源数据差异告警](guides/redundancy.md)
 - [下级配置、串口和站点操作](guides/lower-operations.md)
@@ -28,6 +29,7 @@
 
 ## 测试与历史验收
 
+- [数据流监视（2026-10-24，46隔离测试与实际动效，未替换现场程序）](validation/public-flow-20261024.md)
 - [GitHub发布前敏感信息与命名审查（2026-10-24）](../../docs/development/repository-publication-review-20261024.md)
 - [46通信程序版本补登（2026-10-24，0.2.0，未替换或重启程序）](validation/communication-version-registration-20261024.md)
 - [图文帮助完整打包及三台平台部署（2026-10-23，0.6.19-help，10主题/19图片实测通过）](validation/help-center-deployment-20261023.md)

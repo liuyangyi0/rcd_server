@@ -15,11 +15,13 @@ const LowerLogsPage = lazy(() => import('./pages/LowerLogsPage'));
 const OperationsPage = lazy(() => import('./pages/OperationsPage'));
 const SettingsPage = lazy(() => import('./pages/SettingsPage'));
 const HelpPage = lazy(() => import('./pages/HelpPage'));
+const FlowPage = lazy(() => import('./pages/FlowPage'));
 
 export default function App() {
   return (
-    <AuthGate><Routes>
-      <Route element={<AppShell />}>
+    <Routes>
+      <Route path="flow" element={<Suspense fallback={<LoadingState />}><FlowPage /></Suspense>} />
+      <Route element={<AuthGate><AppShell /></AuthGate>}>
         <Route index element={<Suspense fallback={<LoadingState />}><OverviewPage /></Suspense>} />
         <Route path="groups" element={<Suspense fallback={<LoadingState />}><GroupsPage /></Suspense>} />
         <Route path="sources" element={<Suspense fallback={<LoadingState />}><SourcesPage /></Suspense>} />
@@ -33,6 +35,6 @@ export default function App() {
         <Route path="help" element={<Suspense fallback={<LoadingState />}><HelpPage /></Suspense>} />
         <Route path="*" element={<Navigate replace to="/" />} />
       </Route>
-    </Routes></AuthGate>
+    </Routes>
   );
 }
