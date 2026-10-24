@@ -21,7 +21,7 @@ afterAll(()=>{HTMLCanvasElement.prototype.getContext=original;});
 describe('flow particle scene',()=>{
   it('repeats a still frame exactly while paused',()=>{
     const data=flowFixture(),scene=new FlowScene(),first=recorder(),second=recorder();
-    const state: SceneState={sources:data.sources,sessions:data.sessions,activity:recent,live:true,paused:true,cacheActive:true,group:'serial-acquisition',hues:{'rcd-46':'#33e6ff'}};
+    const state: SceneState={sources:data.sources,sessions:data.sessions,activity:recent,live:true,paused:true,cacheActive:true,group:'serial-acquisition',focus:'rcd-46'};
     scene.draw(first.ctx,state,frame);scene.draw(second.ctx,state,{...frame,now:2400});
     expect(first.calls.length).toBeGreaterThan(100);
     expect(second.calls).toEqual(first.calls);

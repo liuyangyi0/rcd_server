@@ -8,11 +8,6 @@ export interface FlowPoint { id: string; type: string; value: unknown; status: n
 export interface FlowPointPage { items: FlowPoint[]; total: number; offset: number }
 export const STATION_LABELS = ['状态未知 / 已过期', '通信正常', '通信异常', '串口未打开', '已停用', '下级离线'];
 export const STATION_COLORS = ['#83949d', '#53e3bb', '#f5b951', '#f5b951', '#748591', '#f17479'];
-// Each physical source keeps one hue for its card, channel and the Sessions that select it.
-export const FLOW_HUES = ['#33e6ff', '#b388ff', '#4dffa6', '#ff6bd6', '#5d8bff', '#c6ff5c'];
-export function sourceHues(sources: FlowSource[]): Record<string, string> {
-  return Object.fromEntries(sources.map((source, index) => [source.id, FLOW_HUES[index % FLOW_HUES.length]]));
-}
 
 export function sourceCanFlow(source: FlowSource) {
   return source.enabled && source.connected && source.subscribed && source.catalog_state !== 'CatalogConflict';
