@@ -78,6 +78,18 @@ export function useEventStream(): StreamState {
       schedule();
     };
 
+    // Sample and result events arrive about once a second. Cancelling a slower read for each
+    // one would mean it never completes, so an in-flight read is kept; if one was running, the
+    // view is read once more after it settles so the newest change is not lost.
+    const refreshKeepingReads = (queryKey: readonly unknown[]) => {
+      const busy = queryClient.isFetching({ queryKey }) > 0;
+      void queryClient.invalidateQueries({ queryKey, refetchType: 'active' }, { cancelRefetch: false }).then(() => {
+        if (busy && !disposed) return queryClient.invalidateQueries({ queryKey, refetchType: 'active' }, { cancelRefetch: false });
+      }).catch(() => {
+        // Query errors remain visible to their page.
+      });
+    };
+
     const invalidate = (event: MessageEvent<string>) => {
       let envelope: EventEnvelope = { type: event.type || 'message' };
       try {
@@ -113,7 +125,11 @@ export function useEventStream(): StreamState {
         void queryClient.invalidateQueries({ queryKey: ['fleet'], refetchType: 'active' }, { cancelRefetch: false });
         return;
       }
-      if (eventInvalidatesOverview(type)) void queryClient.invalidateQueries({ queryKey: queryKeys.overview, refetchType: 'active' });
+      const frequent = type === 'source.sample';
+      if (eventInvalidatesOverview(type)) {
+        if (frequent) refreshKeepingReads(queryKeys.overview);
+        else void queryClient.invalidateQueries({ queryKey: queryKeys.overview, refetchType: 'active' });
+      }
       if (type === 'source.status' || type.includes('catalog')) {
         void queryClient.invalidateQueries({ queryKey: queryKeys.allSources });
         void queryClient.invalidateQueries({ queryKey: queryKeys.groups });
@@ -144,8 +160,8 @@ export function useEventStream(): StreamState {
 	  } else if (type === 'calculation_results_changed') {
 		// Results are server-paged. Invalidate only active result/status views;
 		// never copy thousands of values into a global event payload or store.
-		void queryClient.invalidateQueries({ queryKey: ['calculations', 'status'], refetchType: 'active' });
-		void queryClient.invalidateQueries({ queryKey: ['calculations', 'results'], refetchType: 'active' });
+		refreshKeepingReads(['calculations', 'status']);
+		refreshKeepingReads(['calculations', 'results']);
 	  }
       if (type.includes('catalog')) {
         void queryClient.invalidateQueries({ queryKey: envelope.sourceId ? queryKeys.sourceTopology(envelope.sourceId) : queryKeys.allTopologies });
@@ -157,7 +173,8 @@ export function useEventStream(): StreamState {
       // even when no further sample arrives after a disconnect. Session close
       // also invalidates its cached point view instead of waiting for samples.
       if (eventInvalidatesPoints(type)) {
-        void queryClient.invalidateQueries({ queryKey: queryKeys.allPoints, refetchType: 'active' });
+        if (frequent) refreshKeepingReads(queryKeys.allPoints);
+        else void queryClient.invalidateQueries({ queryKey: queryKeys.allPoints, refetchType: 'active' });
       }
       if (type.includes('group') || type.includes('selection')) {
         void queryClient.invalidateQueries({ queryKey: queryKeys.groups });

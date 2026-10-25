@@ -14,7 +14,8 @@ const comparisonLabels: Record<string, string> = { Disabled: '未开启', Unknow
 export function RedundancyDialog(props: Props) {
   const query = useQuery({ queryKey: redundancyKey(props.group.id), queryFn: () => getRedundancy(props.group.id), refetchInterval: 3000 });
   return <Modal open title={`${props.group.name || props.group.id} · 自动切源与差异告警`} width="large" onClose={props.onClose}>
-    {query.error ? <ErrorState error={query.error} onRetry={() => void query.refetch()} /> : query.data ? <RedundancyEditor {...props} view={query.data} /> : <LoadingState />}
+    {/* A failed background refresh keeps the editor mounted, so an unsaved draft is not lost. */}
+    {query.data ? <>{query.error ? <ErrorState error={query.error} title="状态刷新失败，下方为上次读取的策略与状态" onRetry={() => void query.refetch()} /> : null}<RedundancyEditor {...props} view={query.data} /></> : query.error ? <ErrorState error={query.error} onRetry={() => void query.refetch()} /> : <LoadingState />}
   </Modal>;
 }
 

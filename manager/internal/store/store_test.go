@@ -364,3 +364,19 @@ func TestPruneOperationalHistoryRetainsOpenAndWaitingRecords(t *testing.T) {
 		t.Fatalf("old resolved alarms retained: %#v", alarms)
 	}
 }
+
+func TestSearchTreatsWildcardCharactersLiterally(t *testing.T) {
+	ctx := context.Background()
+	r := openTestRepository(t)
+	for _, message := range []string{"point A_B1 bad", "point AXB1 bad", "load 100% reached", "load 1005 reached"} {
+		if _, err := r.AppendSourceEvent(ctx, domain.SourceEvent{SourceID: "source-a", Kind: "quality", Message: message}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for query, want := range map[string]string{"A_B1": "point A_B1 bad", "100%": "load 100% reached"} {
+		events, total, err := r.ListSourceEvents(ctx, SourceEventFilter{Query: query, Limit: 10})
+		if err != nil || total != 1 || len(events) != 1 || events[0].Message != want {
+			t.Fatalf("query %q: events=%#v total=%d err=%v", query, events, total, err)
+		}
+	}
+}

@@ -5,10 +5,10 @@ import { Activity as ActivityIcon, ChevronLeft, ChevronRight, Expand, Pause, Pla
 import FlowCanvas, { laneY } from '../features/flow/FlowCanvas';
 import { TRACE_CELLS } from '../features/flow/MatrixScene';
 import { advanceActivity, portRows, publicRead, sourceCanFlow, STATION_COLORS, STATION_LABELS, traceFrame, visibleEvents, type Activity, type FlowEvent, type FlowPointPage, type FlowSession, type FlowSnapshot, type FlowSource, type TraceFrame } from '../features/flow/model';
-import { clock, EVENT_KIND, latestValue, MotionContext, shortPort, Spark, STATION_GROUPS, stationAlert, Ticker } from '../features/flow/ui';
+import { clock, EVENT_KIND, latestValue, MotionContext, shortPort, Spark, STATION_GROUPS, stationAlert, Ticker, usePulse } from '../features/flow/ui';
 import { statusCodeHex, statusCodeLabel } from '../lib/labels';
-import FlowMatrix from './FlowMatrix';
 import './FlowPage.css';
+import FlowMatrix from './FlowMatrix';
 
 const emptyActivity: Activity = { sources:{}, sessions:{}, updates:0, sourceDeltas:{}, sessionDeltas:{} };
 const uaStatusLabel = (status: number) => statusCodeLabel(statusCodeHex(status));
@@ -24,7 +24,7 @@ export default function FlowPage() {
   const [now,setNow]=useState(performance.now()), [lastReceived,setLastReceived]=useState(0), [fullscreenError,setFullscreenError]=useState('');
   const [history,setHistory]=useState<Record<string,number[]>>({}), [noteTrend,setNoteTrend]=useState<number[]>([0]), [queueTrend,setQueueTrend]=useState<number[]>([]), [anchors,setAnchors]=useState<Record<string,[number,number]>>({}), [viewHeight,setViewHeight]=useState(()=>window.innerHeight);
   const sceneRef=useRef<HTMLElement>(null), [beat,setBeat]=useState(0), [frames,setFrames]=useState<TraceFrame[]>([]);
-  const [params,setParams]=useSearchParams(), [view,setView]=useState<FlowView>(()=>{const asked=params.get('view');return isView(asked)?asked:storedView() ?? 'pipeline';});
+  const [params,setParams]=useSearchParams(), [chosen,setChosen]=useState<FlowView>(()=>storedView() ?? 'pipeline'), asked=params.get('view'), view=isView(asked)?asked:chosen;
   // Without matchMedia (non-browser hosts) the motion preference is unknown, so numbers stay still.
   const [reduced,setReduced]=useState(()=>typeof window.matchMedia!=='function' || window.matchMedia('(prefers-reduced-motion: reduce)').matches);
   const previous=useRef<FlowSnapshot | undefined>(undefined);
@@ -34,6 +34,9 @@ export default function FlowPage() {
   useEffect(()=>{
     if (!snapshot.data) return;
     const data=snapshot.data, time=performance.now();
+    setLastReceived(time-Math.max(0,Date.now()-snapshot.dataUpdatedAt));
+    // The server caches its snapshot for a second, so a poll can return the one already shown; it carries no new counts.
+    if (previous.current?.instance===data.instance && previous.current.generated_at===data.generated_at) return;
     const next=advanceActivity(previous.current,data,activityRef.current,time);
     const additions=visibleEvents(previous.current,data).map((event)=>({...event,id:++eventSeq.current,at:data.generated_at}));
     if (previous.current?.instance!==data.instance) { setEvents([]);setTrend([0]);setNoteTrend([0]);setQueueTrend([]);setHistory({});setFrames([]); }
@@ -47,7 +50,6 @@ export default function FlowPage() {
     }
     setQueueTrend((old)=>[...old,data.pending_commands].slice(-60));
     previous.current=data; activityRef.current=next;setActivity(next);setBeat((value)=>value+1);
-    setLastReceived(time-Math.max(0,Date.now()-snapshot.dataUpdatedAt));
   },[snapshot.data,snapshot.dataUpdatedAt]);
   useEffect(()=>{const id=window.setInterval(()=>setNow(performance.now()),1000);return ()=>window.clearInterval(id);},[]);
   useEffect(()=>{setSourcePage(0);setSessionPage(0);},[groupID]);
@@ -78,7 +80,7 @@ export default function FlowPage() {
     catch {setFullscreenError('浏览器未允许全屏，可使用 F11。');}
   }
   function switchView(next: FlowView) {
-    setView(next);
+    setChosen(next);
     try { window.localStorage.setItem(VIEW_KEY,next); } catch { /* the choice is only kept for this visit */ }
     if (params.has('view')) setParams((old)=>{const updated=new URLSearchParams(old);updated.set('view',next);return updated;},{replace:true});
   }
@@ -120,7 +122,8 @@ function SourceCard({source,index,count,active,selected,delta,history,maxPorts,o
   const tone=!source.enabled?'off':!source.connected?'down':source.catalog_state==='CatalogConflict'?'warn':active?'live':'idle';
   const status=!source.enabled?'来源停用':!source.connected?'OPC 未连接':source.catalog_state==='CatalogConflict'?'已连接 · 目录冲突':active?'正在收到更新':source.subscribed?'已连接 · 等待数据变化':'已连接 · 订阅未就绪';
   const stations=source.ports.reduce((total,port)=>total+port.devices.length,0);
-  return <button type="button" className={`flow-source is-${tone}${selected?' is-selected':''}`} style={{top:`${laneY(index,count)/750*100}%`,animationDelay:`${index*90}ms`}} onClick={onSelect} onMouseEnter={()=>onHover(source.id)} onMouseLeave={()=>onHover(undefined)} onFocus={()=>onHover(source.id)} onBlur={()=>onHover(undefined)} title="展开串口、站点和只读点位">
+  const pulsing=usePulse(`${tone==='live' || tone==='idle'?'ok':tone}|${source.ports.map((port)=>port.devices.filter((device)=>stationAlert(device.state)).length).join(',')}`);
+  return <button type="button" className={`flow-source is-${tone}${selected?' is-selected':''}${pulsing?' is-pulsing':''}`} style={{top:`${laneY(index,count)/750*100}%`,animationDelay:`${index*90}ms`}} onClick={onSelect} onMouseEnter={()=>onHover(source.id)} onMouseLeave={()=>onHover(undefined)} onFocus={()=>onHover(source.id)} onBlur={()=>onHover(undefined)} title="展开串口、站点和只读点位">
     <span className="flow-card-head"><span className="flow-source-heading">{source.name || source.id}</span><span className="flow-card-tag">{source.ports.length} 串口 · {stations}{source.truncated?'+':''} 站</span></span>
     <span className="flow-card-meta">{source.id} · {source.address.replace('opc.tcp://','')}</span>
     <span className="flow-card-status"><span><i/>{status}</span><b title="最近一次有更新的快照间隔收到的采集样本">{active && latestValue(delta,history)?<Ticker value={latestValue(delta,history) ?? 0} prefix="+"/>:'—'}</b><Spark values={history}/></span>

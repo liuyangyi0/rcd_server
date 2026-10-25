@@ -478,8 +478,8 @@ func (r *Runtime) requestCalculationFull() { r.calculations.invalidate(false) }
 
 func (r *Runtime) calculationRouteChanged() { r.calculations.invalidate(true) }
 
+// Runs for every accepted lower sample, so it looks up only the sample's own group.
 func (r *Runtime) calculationInputChanged(sourceID, identifier string) {
-	groups := r.routes.Groups()
 	r.mu.RLock()
 	index := r.index
 	r.mu.RUnlock()
@@ -490,11 +490,8 @@ func (r *Runtime) calculationInputChanged(sourceID, identifier string) {
 	if !exists {
 		return
 	}
-	for _, group := range groups {
-		if group.ID == groupID && group.DefaultSourceID == sourceID {
-			r.calculations.inputChanged(identifier)
-			return
-		}
+	if defaultSource, exists := r.routes.DefaultSource(groupID); exists && defaultSource == sourceID {
+		r.calculations.inputChanged(identifier)
 	}
 }
 

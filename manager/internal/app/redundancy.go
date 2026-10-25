@@ -62,6 +62,20 @@ func (r *Runtime) Redundancy(_ context.Context, id string) (domain.RedundancyVie
 	}
 	return v, nil
 }
+
+// redundancyDiagnostics serves the OPC group diagnostics variables, read by every subscribed
+// Session each second. It takes neither configMu, which configuration writes hold across
+// SQLite and audit I/O, nor the per-Session route copy that only the HTTP view needs.
+func (r *Runtime) redundancyDiagnostics(id string) (domain.RedundancyView, error) {
+	if !r.routes.HasGroup(id) {
+		return domain.RedundancyView{}, domain.ErrNotFound
+	}
+	v := r.redundancy.diagnostics(id)
+	if v.Policy.CompareEnabled && v.EvaluatedAt.IsZero() {
+		v.ComparisonState = "Unknown"
+	}
+	return v, nil
+}
 func (r *Runtime) SaveRedundancy(ctx context.Context, id string, revision uint64, p domain.RedundancyPolicy) (domain.RedundancyPolicy, error) {
 	r.configMu.Lock()
 	defer r.configMu.Unlock()

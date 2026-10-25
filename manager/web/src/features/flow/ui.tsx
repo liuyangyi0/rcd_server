@@ -9,6 +9,19 @@ export const STATION_GROUPS=[{label:'正常',color:STATION_COLORS[1],states:[1]}
 // Activity lasts about 3 s, so an active card keeps showing its last non-zero count between snapshots.
 export const latestValue=(delta:number,history?:number[])=>delta || [...(history ?? [])].reverse().find((v)=>v>0);
 
+// True for a moment after signature changes, never on first render: fault cues flash only for
+// real changes between snapshots, not when a card mounts on a page, group or view switch.
+export function usePulse(signature: string, ms=1800) {
+  const [on,setOn]=useState(false), last=useRef(signature);
+  useEffect(()=>{
+    if(last.current===signature)return;
+    last.current=signature;setOn(true);
+    const timer=window.setTimeout(()=>setOn(false),ms);
+    return ()=>window.clearTimeout(timer);
+  },[signature,ms]);
+  return on;
+}
+
 // Numbers roll to their new value and glow briefly; they stay still when motion is off.
 export const MotionContext=createContext(false);
 export function Ticker({value,prefix='',bare}:{value:number;prefix?:string;bare?:boolean}) {

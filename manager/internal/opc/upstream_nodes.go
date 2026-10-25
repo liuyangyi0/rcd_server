@@ -669,9 +669,10 @@ func (s *UpstreamServer) addSourceManagementLocked(source domain.Source, topolog
 		{name: "PointCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return uint32(status().PointCount), awu.Good }},
 		{name: "MonitoredPointCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return uint32(status().PointCount), awu.Good }},
 		{name: "SubscriptionCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return uint32(status().SubscriptionCount), awu.Good }},
-		{name: "TotalPointCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return uint32(pointStats().Total), awu.Good }},
-		{name: "GoodPointCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return uint32(pointStats().Good), awu.Good }},
-		{name: "BadPointCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, read: func(string) (any, awu.StatusCode) { return uint32(pointStats().Bad), awu.Good }},
+		// Point statistics scan every node of the source, so sampling is capped like other computed diagnostics.
+		{name: "TotalPointCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, minimumSamplingInterval: 1000, read: func(string) (any, awu.StatusCode) { return uint32(pointStats().Total), awu.Good }},
+		{name: "GoodPointCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, minimumSamplingInterval: 1000, read: func(string) (any, awu.StatusCode) { return uint32(pointStats().Good), awu.Good }},
+		{name: "BadPointCount", dataType: awu.DataTypeIDUInt32, valueRank: awu.ValueRankScalar, minimumSamplingInterval: 1000, read: func(string) (any, awu.StatusCode) { return uint32(pointStats().Bad), awu.Good }},
 	}
 	for _, definition := range definitions {
 		if err := s.addManagementVariableLocked(objectID, "Sources/"+source.ID+"/"+definition.name, definition); err != nil {

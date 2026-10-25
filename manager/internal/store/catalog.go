@@ -180,8 +180,9 @@ func (r *Repository) ListCatalogRecordsFiltered(ctx context.Context, filter Cata
 		filter.Offset = 0
 	}
 	where := ` WHERE (? = '' OR COALESCE(NULLIF(n.group_id,''),s.group_id) = ?) AND (? = '' OR n.source_id = ?)
-		AND (? = '' OR n.identifier LIKE '%' || ? || '%' OR n.browse_name LIKE '%' || ? || '%')`
-	args := []any{filter.GroupID, filter.GroupID, filter.SourceID, filter.SourceID, filter.Query, filter.Query, filter.Query}
+		AND (? = '' OR n.identifier LIKE '%' || ? || '%' ESCAPE '\' OR n.browse_name LIKE '%' || ? || '%' ESCAPE '\')`
+	query := likeLiteral(filter.Query)
+	args := []any{filter.GroupID, filter.GroupID, filter.SourceID, filter.SourceID, query, query, query}
 	var total int
 	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM catalog_nodes n JOIN sources s ON s.id = n.source_id`+where, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count catalog records: %w", err)

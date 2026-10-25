@@ -55,11 +55,12 @@ func (r *Repository) AppendSourceEvent(ctx context.Context, event domain.SourceE
 func (r *Repository) ListSourceEvents(ctx context.Context, filter SourceEventFilter) ([]domain.SourceEvent, int, error) {
 	filter.Limit, filter.Offset = normalizedPage(filter.Limit, filter.Offset)
 	where := ` WHERE (? = '' OR source_id = ?) AND (? = '' OR kind = ?)
-		AND (? = '' OR source_id LIKE '%' || ? || '%' OR kind LIKE '%' || ? || '%' OR message LIKE '%' || ? || '%')
+		AND (? = '' OR source_id LIKE '%' || ? || '%' ESCAPE '\' OR kind LIKE '%' || ? || '%' ESCAPE '\' OR message LIKE '%' || ? || '%' ESCAPE '\')
 		AND (? = '' OR occurred_at >= ?) AND (? = '' OR occurred_at <= ?)`
 	from, to := encodedTimeBounds(filter.From, filter.To)
+	query := likeLiteral(filter.Query)
 	args := []any{filter.SourceID, filter.SourceID, filter.Kind, filter.Kind,
-		filter.Query, filter.Query, filter.Query, filter.Query, from, from, to, to}
+		query, query, query, query, from, from, to, to}
 	var total int
 	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM source_events`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
@@ -171,11 +172,12 @@ func (r *Repository) reconcileAlarmTx(ctx context.Context, tx *sql.Tx, condition
 func (r *Repository) ListAlarms(ctx context.Context, filter AlarmFilter) ([]domain.Alarm, int, error) {
 	filter.Limit, filter.Offset = normalizedPage(filter.Limit, filter.Offset)
 	where := ` WHERE (? = '' OR source_id = ?) AND (? = '' OR state = ?)
-		AND (? = '' OR source_id LIKE '%' || ? || '%' OR kind LIKE '%' || ? || '%' OR message LIKE '%' || ? || '%')
+		AND (? = '' OR source_id LIKE '%' || ? || '%' ESCAPE '\' OR kind LIKE '%' || ? || '%' ESCAPE '\' OR message LIKE '%' || ? || '%' ESCAPE '\')
 		AND (? = '' OR updated_at >= ?) AND (? = '' OR updated_at <= ?)`
 	from, to := encodedTimeBounds(filter.From, filter.To)
+	query := likeLiteral(filter.Query)
 	args := []any{filter.SourceID, filter.SourceID, filter.State, filter.State,
-		filter.Query, filter.Query, filter.Query, filter.Query, from, from, to, to}
+		query, query, query, query, from, from, to, to}
 	var total int
 	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM alarms`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err

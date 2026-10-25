@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, expect, it, vi } from 'vitest';
+import { Drawer } from './Drawer';
 import { Modal } from './Modal';
 
 afterEach(() => { vi.restoreAllMocks(); });
@@ -63,4 +64,19 @@ it('includes textareas and links in keyboard focus wrapping and excludes hidden 
   expect(close).toHaveFocus();
   screen.getByLabelText('配置原文').focus();
   expect(fireEvent.keyDown(document, { key: 'Tab' })).toBe(true);
+});
+
+it('closes only the innermost overlay on Escape', () => {
+  const closeDrawer = vi.fn();
+  const closeDialog = vi.fn();
+  const view = (dialog: boolean) => <Drawer open title="分组详情" onClose={() => closeDrawer()}>{dialog ? <Modal open title="切换来源" onClose={closeDialog}><button type="button">确认</button></Modal> : null}</Drawer>;
+  const { rerender } = render(view(true));
+  // A drawer that re-renders with a new onClose must not move above its dialog.
+  rerender(view(true));
+  fireEvent.keyDown(document, { key: 'Escape' });
+  expect(closeDialog).toHaveBeenCalledOnce();
+  expect(closeDrawer).not.toHaveBeenCalled();
+  rerender(view(false));
+  fireEvent.keyDown(document, { key: 'Escape' });
+  expect(closeDrawer).toHaveBeenCalledOnce();
 });

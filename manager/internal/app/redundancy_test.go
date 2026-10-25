@@ -374,3 +374,30 @@ func TestRedundancyCooldownAndCandidateChangedBeforeCommit(t *testing.T) {
 		t.Fatal("did not switch after cooldown", route)
 	}
 }
+
+func TestOPCRedundancyDiagnosticsDoNotWaitForConfigurationWrites(t *testing.T) {
+	r := redundancyRuntime(t)
+	backend := OPCBackend{Runtime: r}
+	// A configuration write holds configMu across SQLite and audit I/O.
+	r.configMu.Lock()
+	defer r.configMu.Unlock()
+	done := make(chan error, 1)
+	go func() {
+		view, err := backend.GroupRedundancy("line")
+		if err == nil && view.Policy.GroupID != "line" {
+			err = errors.New("policy of another group")
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("OPC redundancy diagnostics waited for the configuration lock")
+	}
+	if _, err := backend.GroupRedundancy("missing"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("missing group err=%v", err)
+	}
+}

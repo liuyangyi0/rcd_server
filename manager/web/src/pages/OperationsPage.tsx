@@ -40,10 +40,12 @@ export default function OperationsPage() {
   const calculation = useCalculationStatus();
   const versions = useDeviceVersions({ page: 1, pageSize: 1 });
   const bounds = useMemo(() => timeBounds(range, customFrom, customTo, relativeNow), [range, customFrom, customTo, relativeNow]);
+  // Before 08:00 the "today from 08:00" window starts in the future; an empty list would read as "nothing happened".
+  const timeError = range === 'today8' && bounds.from && new Date(bounds.from).getTime() > relativeNow ? '今天 08:00 尚未到达，该时间范围暂无记录；请改选最近 1 小时或最近 24 小时。' : '';
   const listParams = { page, pageSize: PAGE_SIZE, query, sourceId, status: state, ...bounds };
-  const alarms = useAlarms(listParams, tab === 'alarms');
-  const events = useSourceEvents(listParams, tab === 'events');
-  const audit = useManagementAudit({ page, pageSize: PAGE_SIZE, query, ...bounds }, tab === 'audit');
+  const alarms = useAlarms(listParams, tab === 'alarms' && !timeError);
+  const events = useSourceEvents(listParams, tab === 'events' && !timeError);
+  const audit = useManagementAudit({ page, pageSize: PAGE_SIZE, query, ...bounds }, tab === 'audit' && !timeError);
   const acknowledge = useAcknowledgeAlarm();
   const silence = useSilenceAlarm();
   const mutationError = acknowledge.error ?? silence.error;
@@ -100,7 +102,7 @@ export default function OperationsPage() {
       </section> : null}
 
       <section className="table-panel content-panel">
-        {activeQuery.isLoading && !activeQuery.data ? <LoadingState /> : activeQuery.isError ? <ErrorState error={activeQuery.error} onRetry={() => void activeQuery.refetch()} /> : tab === 'alarms' ? (
+        {timeError ? <p className="field-error" role="alert">{timeError}</p> : activeQuery.isLoading && !activeQuery.data ? <LoadingState /> : activeQuery.isError ? <ErrorState error={activeQuery.error} onRetry={() => void activeQuery.refetch()} /> : tab === 'alarms' ? (
           (alarms.data?.items.length ?? 0) === 0 ? <EmptyState title="没有匹配的 OPC 链路告警" description={state === 'Open' ? '连接、会话、订阅和目录当前没有未恢复告警；采集、计算及版本异常请查看上方质量关注项。' : '调整筛选条件后重试。'} /> : <>
             <div className="table-scroll"><table className="data-table"><thead><tr><th>状态</th><th>告警</th><th>来源</th><th>信息</th><th>次数</th><th>打开 / 更新</th><th>确认</th><th className="align-right">操作</th></tr></thead><tbody>
               {alarms.data?.items.map((alarm) => {
@@ -127,7 +129,7 @@ export default function OperationsPage() {
           </>
         ) : (
           (audit.data?.items.length ?? 0) === 0 ? <EmptyState title="暂无管理审计" /> : <>
-            <div className="table-scroll"><table className="data-table responsive-table management-audit-table"><thead><tr><th>时间</th><th>操作</th><th>操作者 / 目标</th><th>结果</th><th>摘要</th><th>技术明细</th></tr></thead><tbody>{groupedAudit.map((row) => { const entry = row.completed ?? row.requested ?? row.single; const outcome = auditOutcome(entry); return entry ? <tr key={row.key}><td data-label="时间">{formatDateTime(entry.occurredAt)}</td><td data-label="操作"><strong>{operationLabel(String(entry.details?.action ?? kindLabel(entry.kind)))}</strong><span className="sub-cell">{row.requested && row.completed ? '请求与完成已关联' : kindLabel(entry.kind)}</span></td><td data-label="操作者 / 目标">{entry.actor || '系统'}<span className="sub-cell">{entry.target}</span></td><td data-label="结果"><StatusBadge state={outcome === 'success' ? 'good' : outcome === 'pending' ? 'warning' : 'bad'} label={stateLabel(outcome)} compact /></td><td data-label="摘要" className="message-cell">{auditSummary(entry)}</td><td data-label="技术明细"><details className="audit-details"><summary>查看 JSON</summary><pre>{JSON.stringify({ requested: row.requested?.details, completed: row.completed?.details, single: row.single?.details }, null, 2)}</pre></details></td></tr> : null; })}</tbody></table></div>
+            <div className="table-scroll"><table className="data-table responsive-table management-audit-table"><thead><tr><th>时间</th><th>操作</th><th>操作者 / 目标</th><th>结果</th><th>摘要</th><th>技术明细</th></tr></thead><tbody>{groupedAudit.map((row) => { const entry = row.completed ?? row.requested ?? row.single; const outcome = auditOutcome(entry); return entry ? <tr key={row.key}><td data-label="时间">{formatDateTime(entry.occurredAt)}</td><td data-label="操作"><strong>{operationLabel(String(entry.details?.action ?? kindLabel(entry.kind)))}</strong><span className="sub-cell">{row.requested && row.completed ? '请求与完成已关联' : kindLabel(entry.kind)}</span></td><td data-label="操作者 / 目标">{entry.actor || '系统'}<span className="sub-cell">{entry.target}</span></td><td data-label="结果"><StatusBadge state={outcome === 'success' ? 'good' : outcome === 'pending' || outcome === 'warning' ? 'warning' : outcome === 'unknown' ? 'unknown' : 'bad'} label={stateLabel(outcome)} compact /></td><td data-label="摘要" className="message-cell">{auditSummary(entry)}</td><td data-label="技术明细"><details className="audit-details"><summary>查看 JSON</summary><pre>{JSON.stringify({ requested: row.requested?.details, completed: row.completed?.details, single: row.single?.details }, null, 2)}</pre></details></td></tr> : null; })}</tbody></table></div>
           </>
         )}
         {!activeQuery.isError && activeQuery.data ? <Pagination onPageSizeChange={(size) => update({ size, page: 1 })} page={activeQuery.data.page ?? page} pageSize={PAGE_SIZE} total={activeQuery.data.total} onPageChange={(value) => update({ page: value })} /> : null}

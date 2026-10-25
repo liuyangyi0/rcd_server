@@ -51,12 +51,13 @@ func (r *Repository) ListCommandsFiltered(ctx context.Context, filter CommandFil
 		filter.Offset = 0
 	}
 	where := ` WHERE (? = '' OR group_id = ?) AND (? = '' OR source_id = ?) AND (? = '' OR state = ?)
-		AND (? = '' OR id LIKE '%' || ? || '%' OR session_id LIKE '%' || ? || '%' OR port LIKE '%' || ? || '%' OR kind LIKE '%' || ? || '%' OR node_id LIKE '%' || ? || '%' OR request LIKE '%' || ? || '%' OR response LIKE '%' || ? || '%' OR error LIKE '%' || ? || '%')
+		AND (? = '' OR id LIKE '%' || ? || '%' ESCAPE '\' OR session_id LIKE '%' || ? || '%' ESCAPE '\' OR port LIKE '%' || ? || '%' ESCAPE '\' OR kind LIKE '%' || ? || '%' ESCAPE '\' OR node_id LIKE '%' || ? || '%' ESCAPE '\' OR request LIKE '%' || ? || '%' ESCAPE '\' OR response LIKE '%' || ? || '%' ESCAPE '\' OR error LIKE '%' || ? || '%' ESCAPE '\')
 		AND (? = '' OR started_at >= ?) AND (? = '' OR started_at <= ?)`
 	from, to := encodedTimeBounds(filter.From, filter.To)
+	query := likeLiteral(filter.Query)
 	args := []any{filter.GroupID, filter.GroupID, filter.SourceID, filter.SourceID, filter.Status, filter.Status,
-		filter.Query, filter.Query, filter.Query, filter.Query, filter.Query, filter.Query, filter.Query, filter.Query,
-		filter.Query, from, from, to, to}
+		query, query, query, query, query, query, query, query,
+		query, from, from, to, to}
 	var total int
 	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM command_audit`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
@@ -133,11 +134,12 @@ func (r *Repository) ListAuditFiltered(ctx context.Context, filter AuditFilter) 
 	if offset < 0 {
 		offset = 0
 	}
-	where := ` WHERE (? = '' OR kind = ?) AND (? = '' OR kind LIKE '%' || ? || '%' OR actor LIKE '%' || ? || '%'
-		OR target LIKE '%' || ? || '%' OR details LIKE '%' || ? || '%')
+	where := ` WHERE (? = '' OR kind = ?) AND (? = '' OR kind LIKE '%' || ? || '%' ESCAPE '\' OR actor LIKE '%' || ? || '%' ESCAPE '\'
+		OR target LIKE '%' || ? || '%' ESCAPE '\' OR details LIKE '%' || ? || '%' ESCAPE '\')
 		AND (? = '' OR occurred_at >= ?) AND (? = '' OR occurred_at <= ?)`
 	from, to := encodedTimeBounds(filter.From, filter.To)
-	args := []any{filter.Kind, filter.Kind, filter.Query, filter.Query, filter.Query, filter.Query, filter.Query, from, from, to, to}
+	query := likeLiteral(filter.Query)
+	args := []any{filter.Kind, filter.Kind, query, query, query, query, query, from, from, to, to}
 	var total int
 	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM management_audit`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err

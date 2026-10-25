@@ -14,6 +14,12 @@ import (
 	"rcd_manager/internal/domain"
 )
 
+// likeLiteral makes user search text a literal LIKE operand: with ESCAPE '\' after the
+// pattern, % and _ in the text (common in KKS identifiers) match only themselves.
+func likeLiteral(value string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(value)
+}
+
 type Repository struct {
 	db        *sql.DB
 	protector SecretProtector

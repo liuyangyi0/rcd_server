@@ -4,7 +4,7 @@
 
 程序默认HTTP端口为8080，当前现场使用8087；以下127.0.0.1:8080只表示隔离实例。管理接口要求管理员登录cookie，包括导出、诊断、metrics和SSE；未登录返回401。当前为单管理员模式，没有细分角色权限，HTTP仍不加密，必须依赖隔离内网、防火墙/VLAN和主机访问控制。
 
-登录使用 `POST /api/v1/auth/login`（JSON `username`、`password`），浏览器保存 HttpOnly cookie；`GET /api/v1/auth/session` 返回登录状态；`POST /api/v1/auth/logout` 退出；`POST /api/v1/auth/password` 接收 `current_password` 和 `new_password`，成功后需重新登录。登录/改密过于频繁返回 429。健康探针和 `POST /api/v1/lower-ingest/logs` 不使用浏览器登录，继续沿用各自原有校验。详见 [网页登录说明](../guides/web-login-and-usability.md)。
+登录使用 `POST /api/v1/auth/login`（JSON `username`、`password`），浏览器保存 HttpOnly cookie；`GET /api/v1/auth/session` 返回登录状态；`POST /api/v1/auth/logout` 退出；`POST /api/v1/auth/password` 接收 `current_password` 和 `new_password`，成功后需重新登录。登录/改密过于频繁返回 429。健康探针和 `POST /api/v1/lower-ingest/logs` 不使用浏览器登录；日志接收接口没有发送方认证，只校验来源 ID 和序号连续，风险见[下级集中日志](../guides/central-lower-logs.md)。详见 [网页登录说明](../guides/web-login-and-usability.md)。
 
 JSON 写请求必须满足：
 

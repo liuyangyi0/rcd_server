@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
+import { isTopOverlay, popOverlay, pushOverlay } from './overlayStack';
 
 interface ModalProps {
   open: boolean;
@@ -21,7 +22,9 @@ export function Modal({ open, title, description, onClose, children, footer, wid
   useEffect(() => {
     if (!open) return;
     const previous = document.activeElement as HTMLElement | null;
+    const token = pushOverlay('dialog');
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (!isTopOverlay(token)) return;
       if (event.key === 'Escape') closeRef.current();
       if (event.key !== 'Tab' || !panelRef.current) return;
       const panel = panelRef.current;
@@ -49,6 +52,7 @@ export function Modal({ open, title, description, onClose, children, footer, wid
     return () => {
       window.cancelAnimationFrame(frame);
       document.removeEventListener('keydown', handleKeyDown);
+      popOverlay(token);
       if (previous?.isConnected) previous.focus();
     };
   }, [open]);

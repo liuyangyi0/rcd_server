@@ -181,6 +181,22 @@ func (t *RouteTable) Groups() []Group {
 	return out
 }
 
+// HasGroup and DefaultSource answer single-group questions without copying and
+// sorting every group; per-sample and per-read paths use them.
+func (t *RouteTable) HasGroup(id string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	_, exists := t.groups[id]
+	return exists
+}
+
+func (t *RouteTable) DefaultSource(groupID string) (string, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	group, exists := t.groups[groupID]
+	return group.DefaultSourceID, exists
+}
+
 func (t *RouteTable) Sources() []Source {
 	t.mu.RLock()
 	defer t.mu.RUnlock()

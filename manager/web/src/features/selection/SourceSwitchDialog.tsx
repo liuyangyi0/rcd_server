@@ -117,6 +117,10 @@ function SourceSwitchForm({ mode, group, sources: allSources, sessions, initialS
           const selected = source.id === sourceId;
           const unavailableReason = sourceUnavailableReason(source, group.id);
           const selectable = unavailableReason === undefined;
+          // Link health alone is not data quality: Good only when every point of the source is Good.
+          const allGood = health === 'good' && source.qualityKnown && source.badPoints === 0;
+          const qualityClass = health === 'bad' ? 'text-bad' : !source.qualityKnown ? 'text-muted' : allGood ? 'text-good' : 'text-warning';
+          const qualityNote = source.lastError || (allGood ? 'Good' : source.qualityKnown && source.badPoints > 0 ? `${formatNumber(source.badPoints)} 点非 Good` : '');
           return (
             <label key={source.id} className={`source-option${selected ? ' is-selected' : ''}${selectable ? '' : ' is-disabled'}`}>
               <input type="radio" name="source" value={source.id} checked={selected} disabled={!selectable} onChange={() => { setSourceId(source.id); setConfirmed(false); }} />
@@ -125,8 +129,8 @@ function SourceSwitchForm({ mode, group, sources: allSources, sessions, initialS
                 <span className="source-option-main">
                   <strong>{source.id}</strong>
                   <StatusBadge state={health} label={statusLabel(health)} compact />
-                  <span className={health === 'bad' ? 'text-bad' : source.qualityKnown ? 'text-good' : 'text-muted'}>
-                    来源整体 {source.qualityKnown ? `${formatNumber(source.goodPoints)} / ${formatNumber(source.totalPoints)}` : `${formatNumber(source.totalPoints)} 点`} {selectable ? (source.lastError || (source.qualityKnown && health === 'good' ? 'Good' : '')) : `不可选 · ${unavailableReason}`}
+                  <span className={qualityClass}>
+                    来源整体 {source.qualityKnown ? `${formatNumber(source.goodPoints)} / ${formatNumber(source.totalPoints)}` : `${formatNumber(source.totalPoints)} 点`} {selectable ? qualityNote : `不可选 · ${unavailableReason}`}
                   </span>
                 </span>
                 <span className="source-option-endpoint">{source.endpoint}</span>
