@@ -41,7 +41,7 @@ func (r *Runtime) SystemInfo(ctx context.Context) (api.SystemInfo, error) {
 	dirtyStatusEvents, dirtyStatusAlarms, _ := r.statusHistory.state()
 	r.mu.RLock()
 	metrics := api.RuntimeMetrics{Goroutines: goruntime.NumGoroutine(), AllocatedBytes: memory.Alloc, HeapObjects: memory.HeapObjects,
-		RefreshQueueDepth: len(r.refreshQueue), DirtyCatalogs: dirtyCatalogs, DirtyCommands: dirtyCommands,
+		RefreshQueueDepth: r.refreshes.depth(), DirtyCatalogs: dirtyCatalogs, DirtyCommands: dirtyCommands,
 		DirtyAudits: dirtyAudits, DirtyStatusEvents: dirtyStatusEvents, DirtyStatusAlarms: dirtyStatusAlarms,
 		EventSubscribers: subscribers, DroppedEventNotifications: dropped}
 	r.mu.RUnlock()

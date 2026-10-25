@@ -115,15 +115,14 @@ func TestDeletingSourceRefreshesOnlyAffectedLiveSessionGroups(t *testing.T) {
 	if err := runtime.DeleteSource(ctx, "source-b", 1); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case request := <-runtime.refreshQueue:
-		if request.sessionID != "session" || request.groupID != "line" {
-			t.Fatalf("wrong refresh target: %+v", request)
-		}
-	default:
+	request, ok := runtime.refreshes.take()
+	if !ok {
 		t.Fatal("hot source deletion did not refresh the affected existing Session group")
 	}
-	if len(runtime.refreshQueue) != 0 {
+	if request.sessionID != "session" || request.groupID != "line" {
+		t.Fatalf("wrong refresh target: %+v", request)
+	}
+	if runtime.refreshes.depth() != 0 {
 		t.Fatal("unaffected or duplicate Session groups were refreshed")
 	}
 	after, err := runtime.routes.Route("session", "line")

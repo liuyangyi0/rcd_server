@@ -131,6 +131,22 @@ func (s *redundancyService) view(id string) domain.RedundancyView {
 	return domain.RedundancyView{ComparisonState: "Disabled", Health: []domain.SourceHealth{}, Differences: []domain.PointDifference{}}
 }
 
+// diagnostics returns the policy and public view under one lock, so OPC readers see a
+// consistent pair without the Runtime configuration lock.
+func (s *redundancyService) diagnostics(id string) domain.RedundancyView {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	v := domain.RedundancyView{ComparisonState: "Disabled", Health: []domain.SourceHealth{}, Differences: []domain.PointDifference{}}
+	if state := s.states[id]; state != nil {
+		v = cloneRedundancyView(state.view)
+	}
+	v.Policy = domain.DefaultRedundancyPolicy(id)
+	if p, ok := s.policies[id]; ok {
+		v.Policy = p.Clone()
+	}
+	return v
+}
+
 func (s *redundancyService) hasState(id string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

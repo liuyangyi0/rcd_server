@@ -74,18 +74,48 @@ func TestSourceStatusRefreshTargetsOnlySessionsSelectingThatSource(t *testing.T)
 	defer runtime.running.Store(false)
 
 	runtime.queueSourceRefreshes("source-b")
-	select {
-	case request := <-runtime.refreshQueue:
-		if request.sessionID != "session-b" || request.groupID != "line" {
-			t.Fatalf("targeted source refresh=%#v", request)
-		}
-	default:
+	request, ok := runtime.refreshes.take()
+	if !ok {
 		t.Fatal("selected source refresh was not queued")
 	}
-	select {
-	case request := <-runtime.refreshQueue:
+	if request.sessionID != "session-b" || request.groupID != "line" {
+		t.Fatalf("targeted source refresh=%#v", request)
+	}
+	if request, ok := runtime.refreshes.take(); ok {
 		t.Fatalf("unselected peer Session was also refreshed: %#v", request)
-	default:
+	}
+}
+
+func TestSessionRefreshesCoalesceAndNeverBlock(t *testing.T) {
+	queue := newSessionRefreshQueue()
+	done := make(chan struct{})
+	go func() {
+		// Far more requests than the old 256-entry channel held, from a caller that may hold configMu.
+		for i := 0; i < 2000; i++ {
+			queue.push(sessionRefreshRequest{sessionID: fmt.Sprint("s", i%5), groupID: fmt.Sprint("g", i%7)})
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pushing refreshes blocked without a consumer")
+	}
+	if depth := queue.depth(); depth != 35 {
+		t.Fatalf("pending refreshes = %d, want one per Session and group (35)", depth)
+	}
+	first, _ := queue.take()
+	queue.push(first)
+	if depth := queue.depth(); depth != 35 {
+		t.Fatalf("a refresh taken for running must be queued again by a later change, depth = %d", depth)
+	}
+	for i := 0; i < 35; i++ {
+		if _, ok := queue.take(); !ok {
+			t.Fatalf("missing refresh %d", i)
+		}
+	}
+	if _, ok := queue.take(); ok {
+		t.Fatal("queue should be empty")
 	}
 }
 

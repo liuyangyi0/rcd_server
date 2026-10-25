@@ -52,6 +52,55 @@ type sessionRefreshRequest struct {
 	groupID   string
 }
 
+// sessionRefreshQueue holds at most one pending refresh per Session and group, in request
+// order. Pushing never blocks: some callers hold configMu, and a refresh resamples the route
+// current when it runs, so one pending request covers every change made before it is taken.
+type sessionRefreshQueue struct {
+	mu      sync.Mutex
+	order   []sessionRefreshRequest
+	pending map[sessionRefreshRequest]struct{}
+	wake    chan struct{}
+}
+
+func newSessionRefreshQueue() *sessionRefreshQueue {
+	return &sessionRefreshQueue{pending: make(map[sessionRefreshRequest]struct{}), wake: make(chan struct{}, 1)}
+}
+
+func (q *sessionRefreshQueue) push(request sessionRefreshRequest) {
+	q.mu.Lock()
+	if _, queued := q.pending[request]; !queued {
+		q.pending[request] = struct{}{}
+		q.order = append(q.order, request)
+	}
+	q.mu.Unlock()
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+}
+
+// take removes the oldest request before it runs, so a change during that refresh queues another.
+func (q *sessionRefreshQueue) take() (sessionRefreshRequest, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.order) == 0 {
+		return sessionRefreshRequest{}, false
+	}
+	request := q.order[0]
+	q.order = q.order[1:]
+	if len(q.order) == 0 {
+		q.order = nil
+	}
+	delete(q.pending, request)
+	return request, true
+}
+
+func (q *sessionRefreshQueue) depth() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.order)
+}
+
 // Runtime owns the mutable manager state. Configuration/catalog metadata is
 // persisted, while samples remain exclusively in the sharded in-memory cache.
 type Runtime struct {
@@ -102,7 +151,7 @@ type Runtime struct {
 	runCancel            context.CancelFunc
 	shutdownDone         chan struct{}
 	refreshSession       func(sessionID, groupID string)
-	refreshQueue         chan sessionRefreshRequest
+	refreshes            *sessionRefreshQueue
 	statusPersistWake    chan struct{}
 	refreshCalculations  func([]string)
 	sessionViews         func() map[string]api.SessionView
@@ -332,7 +381,7 @@ func NewRuntime(ctx context.Context, repo *store.Repository, options RuntimeOpti
 		commands:           newCommandExecutionService(routes),
 		ackSequences:       make(map[string]uint64),
 		ackEpochs:          make(map[string]uint64),
-		refreshQueue:       make(chan sessionRefreshRequest, 256),
+		refreshes:          newSessionRefreshQueue(),
 		statusPersistWake:  make(chan struct{}, 1),
 		conflictCount:      conflicts, selectionCount: selectionCount, lastSelectionAt: lastSelectionAt,
 		groupLastSelectedAt: groupLastSelectedAt, startedAt: now,
@@ -558,13 +607,10 @@ func (r *Runtime) queueSessionRefresh(sessionID, groupID string) {
 	handler := r.refreshSession
 	ctx := r.runContext
 	r.mu.RUnlock()
-	if handler == nil || ctx == nil || !r.running.Load() {
+	if handler == nil || ctx == nil || r.refreshes == nil || !r.running.Load() {
 		return
 	}
-	select {
-	case r.refreshQueue <- sessionRefreshRequest{sessionID: sessionID, groupID: groupID}:
-	case <-ctx.Done():
-	}
+	r.refreshes.push(sessionRefreshRequest{sessionID: sessionID, groupID: groupID})
 }
 
 func (r *Runtime) sessionRefreshWorker() {
@@ -576,7 +622,13 @@ func (r *Runtime) sessionRefreshWorker() {
 		select {
 		case <-ctx.Done():
 			return
-		case request := <-r.refreshQueue:
+		case <-r.refreshes.wake:
+		}
+		for ctx.Err() == nil {
+			request, ok := r.refreshes.take()
+			if !ok {
+				break
+			}
 			r.mu.RLock()
 			handler := r.refreshSession
 			r.mu.RUnlock()

@@ -56,7 +56,7 @@ func (b OPCBackend) CommandQueueCounts(groupID string) (uint32, uint32) {
 	return b.Runtime.routes.CommandQueueCounts(groupID)
 }
 func (b OPCBackend) GroupRedundancy(group string) (domain.RedundancyView, error) {
-	return b.Runtime.Redundancy(context.Background(), group)
+	return b.Runtime.redundancyDiagnostics(group)
 }
 func (b OPCBackend) SetSessionAutomatic(session, group string, automatic bool, revision uint64) (domain.GroupRoute, error) {
 	return b.Runtime.SetSessionAutomatic(context.Background(), session, group, automatic, revision)
