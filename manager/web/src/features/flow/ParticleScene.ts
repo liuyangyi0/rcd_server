@@ -1,33 +1,17 @@
 import { portRows, sourceCanFlow, type Activity, type FlowPort, type FlowSession, type FlowSource } from './model';
+import { along, burstSize, clamp, easeOut, fract, hash, INK, partial, RECENT_MS, SCENE_HEIGHT, SCENE_WIDTH, SceneBase, sheet, track, withAlpha, type Point, type SceneCalculation, type SceneFrame, type Tone, type Track, type View } from './sceneKit';
+export { burstSize } from './sceneKit';
 
-export const SCENE_WIDTH = 1680, SCENE_HEIGHT = 750;
 // Scene units. Cards and stage labels in FlowPage.css are placed with the same percentages:
 // source cards end at CARD_RIGHT, the manager frame spans FRAME, client cards start just after EGRESS_X;
 // the result bus runs along BUS_Y under the calculation label.
 const CARD_RIGHT = 319, SLOT_X = 548, SLOT_W = 120, SLOT_H = 28, NODE_X = 1012, NODE_W = 120, NODE_H = 28, EGRESS_X = 1403, BUS_X = 1156;
-const FRAME = { left: 500, top: 150, right: 1180, bottom: 650 }, CALC = { x: 840, y: 575, r: 22 }, BUS_Y = 622, RECENT_MS = 3200, OUTPUT_DELAY = .9, BOOT_S = 2.2;
+const FRAME = { left: 500, top: 150, right: 1180, bottom: 650 }, CALC = { x: 840, y: 575, r: 22 }, BUS_Y = 622, OUTPUT_DELAY = .9, BOOT_S = 2.2;
 // Slots and nodes stack compactly inside the frame; wires fan in from the cards and out to the clients.
 const stackY = (index: number, count: number) => 375 + (index - (count - 1) / 2) * Math.min(80, 320 / Math.max(count - 1, 1));
-// Structure is neutral slate; the accent only appears where real data is moving.
-const INK = { data: '#59c7ff', out: '#8fb4ff', ok: '#3fd6a0', line: '#22324a', rule: '#3a4f68', amber: '#f0b45a', red: '#ff6f6f', off: '#56657a', idle: '#2c3b4f', stale: '#3a4656', text: '#e6edf5', muted: '#7d8ea3', plate: '#0a121c' };
 export const laneY = (index: number, count: number) => 48 + (index + 0.5) * (654 / Math.max(count, 1));
-const fract = (value: number) => value - Math.floor(value);
-const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value));
-const easeOut = (value: number) => 1 - (1 - clamp(value, 0, 1)) ** 3;
-// Deterministic noise: paused and reduced-motion frames must be pixel-stable.
-const hash = (seed: number) => fract(Math.sin(seed * 127.1 + 311.7) * 43758.5453);
-const withAlpha = (hex: string, alpha: number) => hex + Math.round(clamp(alpha, 0, 1) * 255).toString(16).padStart(2, '0');
-// Packets per snapshot follow the logarithm of real updates, so 10 and 10 000 samples both stay readable.
-export const burstSize = (delta: number) => delta > 0 ? Math.min(18, 3 + Math.round(5 * Math.log10(1 + delta))) : 0;
-type Point = [number,number];
-// ok carries data; warn = every station on the port abnormal; idle = no station in normal communication.
-type Tone = 'ok' | 'warn' | 'idle' | 'down' | 'off';
-export interface SceneCalculation { active: boolean; good: number; bad: number; evaluated?: string }
 export interface SceneState { sources: FlowSource[]; sessions: FlowSession[]; activity: Activity; live: boolean; paused: boolean; selected?: string; focus?: string; cacheActive?: boolean; group?: string; defaultSource?: string; calculation?: SceneCalculation; anchors?: Record<string, Point>; maxPorts?: number }
-export interface SceneFrame { width: number; height: number; dt: number; motion: boolean; now: number }
-interface View { sx: number; sy: number; u: number }
 interface Box { x: number; y: number; w: number; h: number }
-interface Track { pts: Point[]; acc: number[]; total: number }
 // alerts counts the port's stations in an abnormal or offline state.
 interface Wire { key: string; track: Track; tone: Tone; alerts: number }
 interface Slot { key: string; id: string; box: Box; wires: Wire[]; link: Tone; ready: boolean; stamp?: number; delta: number; running: boolean; selected: boolean; preferred: boolean }
@@ -35,8 +19,6 @@ interface Node { key: string; label: string; box: Box; route?: string; slot?: Sl
 interface Calc { center: Point; r: number; good: number; bad: number; feed?: Track; bus: Track; joins: Point[] }
 // owner is the source id used for hover focus; via is the distance where an output packet enters its Session node.
 interface Packet { track: Track; key: string; owner?: string; born: number; life: number; lead: boolean; color: string; land: 'slot' | 'client' | 'calc' | 'none'; via: number; passed: boolean }
-interface Wave { start: number; color: string; at: Point }
-interface Spark { x: number; y: number; vx: number; vy: number; born: number; color: string }
 // A real state change between snapshots: a station turning abnormal or recovering, an OPC link breaking or joining.
 interface Shift { key: string; kind: 'warn' | 'recover' | 'break' | 'join'; start: number; landed?: boolean }
 const SHIFT_S = { warn: 1.6, recover: 1.2, break: .8, join: 1 };
@@ -47,34 +29,6 @@ function bezier(a: Point,b: Point,c: Point,d: Point,t: number): Point {
 }
 // Horizontal-tangent S-curve, the shape every link in the scene uses.
 const curve=(a: Point,d: Point,steps=28): Point[]=>{const mid=(a[0]+d[0])/2;return Array.from({length:steps+1},(_,i)=>bezier(a,[mid,a[1]],[mid,d[1]],d,i/steps));};
-function track(pts: Point[]): Track {
-  const acc=[0];
-  for(let i=1;i<pts.length;i++)acc.push(acc[i-1]+Math.hypot(pts[i][0]-pts[i-1][0],pts[i][1]-pts[i-1][1]));
-  return {pts,acc,total:acc[acc.length-1]};
-}
-function along(t: Track, distance: number): Point {
-  const s=clamp(distance,0,t.total);let low=0,high=t.acc.length-1;
-  while(high-low>1){const mid=(low+high)>>1;if(t.acc[mid]<=s)low=mid;else high=mid;}
-  const span=t.acc[high]-t.acc[low]||1,k=(s-t.acc[low])/span,a=t.pts[low],b=t.pts[high];
-  return [a[0]+(b[0]-a[0])*k,a[1]+(b[1]-a[1])*k];
-}
-// The leading part of a track, used while links are drawn in or retract.
-function partial(t: Track, portion: number): Track {
-  if(portion>=1)return t;
-  const end=t.total*Math.max(0,portion),pts: Point[]=[];
-  for(let i=0;i<t.pts.length&&t.acc[i]<end;i++)pts.push(t.pts[i]);
-  pts.push(along(t,end));
-  return track(pts.length>1?pts:[t.pts[0],t.pts[0]]);
-}
-function sheet(width: number, height: number) {
-  const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;
-  return canvas;
-}
-function glowSprite(color: string) {
-  const sprite=sheet(64,64),g=sprite.getContext('2d');
-  if(g){const glow=g.createRadialGradient(32,32,0,32,32,32);glow.addColorStop(0,'#ffffff');glow.addColorStop(.14,withAlpha(color,1));glow.addColorStop(.38,withAlpha(color,.3));glow.addColorStop(1,withAlpha(color,0));g.fillStyle=glow;g.fillRect(0,0,64,64);}
-  return sprite;
-}
 const portTone=(ports: FlowPort[]): Tone=>ports.some((p)=>p.devices.some((d)=>d.state===1))?'ok':ports.some((p)=>p.devices.some((d)=>d.state===2||d.state===3))?'warn':'idle';
 const toneInk=(tone: Tone,out=false)=>tone==='ok'?out?INK.out:INK.data:tone==='warn'?INK.amber:tone==='down'?INK.red:tone==='idle'?INK.idle:INK.off;
 
@@ -118,13 +72,12 @@ function layout(state: SceneState, view: View) {
 // Alarm and link effects follow real changes between snapshots. The opening sequence,
 // frame scan line and matrix guides are decoration. A stale monitor greys out and
 // clears every packet and effect.
-export class FlowScene {
-  private clock=0; private seq=0; private focus?: string; private evaluated?: string; private calcAt=-1e9; private bootClock=0; private booted=false; private reveal=1;
-  private view: View={sx:1,sy:1,u:1};
+export class FlowScene extends SceneBase {
+  private focus?: string; private evaluated?: string; private calcAt=-1e9; private bootClock=0; private booted=false; private reveal=1;
   private slots: Slot[]=[]; private nodes: Node[]=[]; private calc?: Calc; private guides: {owner: string; track: Track}[]=[]; private shown?: SceneState; private shownSize='';
   private levels=new Map<string,number>(); private stamps=new Map<string,number>(); private flashes=new Map<string,number>(); private memory=new Map<string,string>();
-  private packets: Packet[]=[]; private waves: Wave[]=[]; private sparks: Spark[]=[]; private shifts: Shift[]=[];
-  private glows=new Map<string,HTMLCanvasElement>(); private backdrop?: HTMLCanvasElement; private backdropKey='';
+  private packets: Packet[]=[]; private shifts: Shift[]=[];
+  private backdrop?: HTMLCanvasElement; private backdropKey='';
 
   // Packets launched or still travelling.
   get inFlight() { return this.packets.length; }
@@ -261,40 +214,6 @@ export class FlowScene {
     for(let i=0;i<2;i++)this.spawn({track:feed,key:`in:${source}`,owner:source,born:this.clock+i*.25,life:feed.total/(240*this.view.u),lead:i===0,color:INK.data,land:i===0?'calc':'none',via:0});
   }
 
-  private burst([x,y]: Point, color: string, count: number) {
-    const {u}=this.view;
-    for(let i=0;i<count;i++){
-      const seed=++this.seq,angle=hash(seed*3.1)*Math.PI*2,speed=(60+hash(seed*4.7)*110)*u;
-      this.sparks.push({x,y,vx:Math.cos(angle)*speed,vy:Math.sin(angle)*speed,born:this.clock,color});
-    }
-  }
-
-  private stroke(ctx: CanvasRenderingContext2D, t: Track, color: string, alpha: number, width: number, dash?: number[]) {
-    ctx.beginPath();ctx.moveTo(...t.pts[0]);for(let i=1;i<t.pts.length;i++)ctx.lineTo(...t.pts[i]);
-    if(dash)ctx.setLineDash(dash);
-    ctx.strokeStyle=color;ctx.globalAlpha=alpha;ctx.lineWidth=width;ctx.stroke();
-    if(dash)ctx.setLineDash([]);
-  }
-
-  // A soft light segment ending at distance head, used for light-pipe waves and alarm pulses.
-  private comet(ctx: CanvasRenderingContext2D, t: Track, head: number, span: number, color: string, alpha: number, width: number) {
-    ctx.strokeStyle=color;ctx.lineWidth=width;
-    for(let k=0;k<8;k++){
-      const from=head-span*(k+1)/8,to=head-span*k/8;
-      if(to<=0||from>=t.total)continue;
-      ctx.globalAlpha=alpha*(1-k/8)**1.5;ctx.beginPath();ctx.moveTo(...along(t,from));ctx.lineTo(...along(t,to));ctx.stroke();
-    }
-  }
-
-  // A live link glows like a light pipe, with waves running toward the clients.
-  private energise(ctx: CanvasRenderingContext2D, t: Track, color: string, level: number, weight: number) {
-    const {u}=this.view;
-    if(level<.01||t.total<1)return;
-    for(const [width,strength] of [[10,.06],[4,.14],[1.4,.85]])this.stroke(ctx,t,color,strength*level*weight,width*u);
-    const span=Math.min(80*u,t.total*.5),gap=Math.max(t.total/2,240*u);
-    for(let head=fract(this.clock*260*u/gap)*gap;head<t.total+span;head+=gap)this.comet(ctx,t,head,span,'#ffffff',.6*level*weight,2*u);
-  }
-
   // The manager boundary: everything inside is the current OPC manager.
   private frame(ctx: CanvasRenderingContext2D, live: boolean) {
     const {sx,sy,u}=this.view,x0=FRAME.left*sx,y0=FRAME.top*sy,x1=FRAME.right*sx,y1=FRAME.bottom*sy,cut=12*u,accent=live?INK.data:INK.stale,drawn=this.phase(0,.35);
@@ -390,15 +309,6 @@ export class FlowScene {
     ctx.globalAlpha=weight;ctx.fillStyle=level>.01?color:INK.rule;ctx.fillRect(x,y+cut,1.5*u,h-cut*2);
   }
 
-  private text(ctx: CanvasRenderingContext2D, value: string, x: number, y: number, color: string, alpha: number, size: number, max?: number, align: CanvasTextAlign='left') {
-    const {u}=this.view;
-    ctx.globalCompositeOperation='source-over';ctx.font=`500 ${Math.max(9,Math.round(size*u))}px ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace`;ctx.textBaseline='middle';ctx.textAlign=align;
-    let label=value;
-    if(max)while(label.length>1&&ctx.measureText(label).width>max)label=label.slice(0,-1);
-    ctx.globalAlpha=alpha;ctx.fillStyle=color;ctx.fillText(label===value?value:`${label.slice(0,-1)}…`,x,y);
-    ctx.globalCompositeOperation='lighter';
-  }
-
   private boxes(ctx: CanvasRenderingContext2D, live: boolean) {
     const {u}=this.view;
     this.slots.forEach((slot,index)=>{
@@ -458,22 +368,6 @@ export class FlowScene {
     }
   }
 
-  private ripples(ctx: CanvasRenderingContext2D) {
-    const {u}=this.view;
-    for(const spark of this.sparks){
-      const age=this.clock-spark.born,p=age/.7,drag=1-p*.5,x=spark.x+spark.vx*age*drag,y=spark.y+spark.vy*age*drag,size=(5-3*p)*u;
-      ctx.globalAlpha=(1-p)**1.5*.8;ctx.strokeStyle=spark.color;ctx.lineWidth=u;
-      ctx.beginPath();ctx.moveTo(x-spark.vx*.04,y-spark.vy*.04);ctx.lineTo(x,y);ctx.stroke();
-      ctx.drawImage(this.glow(spark.color),x-size/2,y-size/2,size,size);
-    }
-    for(const wave of this.waves){
-      const p=(this.clock-wave.start)/1.2;
-      if(p<0||p>=1)continue;
-      ctx.strokeStyle=wave.color;ctx.globalAlpha=(1-p)**2*.7;ctx.lineWidth=1.4*u*(1-p*.5);
-      ctx.beginPath();ctx.arc(wave.at[0],wave.at[1],(5+p*34)*u,0,Math.PI*2);ctx.stroke();
-    }
-  }
-
   // Static layer: dot grid and ruler ticks inside the manager frame.
   private backdropFor(width: number, height: number) {
     const key=`${width}x${height}`;
@@ -490,11 +384,5 @@ export class FlowScene {
     for(let y=FRAME.top+30;y<FRAME.bottom;y+=15){const long=(y-FRAME.top)%150===0;g.moveTo(FRAME.right*sx,y*sy);g.lineTo(FRAME.right*sx-(long?7:3)*u,y*sy);}
     g.stroke();
     return canvas;
-  }
-
-  private glow(color: string): HTMLCanvasElement {
-    let sprite=this.glows.get(color);
-    if(!sprite){sprite=glowSprite(color);this.glows.set(color,sprite);}
-    return sprite;
   }
 }

@@ -55,6 +55,16 @@ export function advanceActivity(previous: FlowSnapshot | undefined, current: Flo
   return next;
 }
 
+// One trace column per received snapshot: each source's real sample count and link state,
+// plus the notifications all Sessions generated in the same interval.
+export type TraceTone = 'ok' | 'warn' | 'down' | 'off';
+export interface TraceFrame { at: string; notes: number; sources: Record<string, { delta: number; tone: TraceTone }> }
+export function traceFrame(snapshot: FlowSnapshot, activity: Activity): TraceFrame {
+  const tone = (s: FlowSource): TraceTone => !s.enabled ? 'off' : !s.connected ? 'down' : s.catalog_state === 'CatalogConflict' ? 'warn' : 'ok';
+  const notes = Object.values(activity.sessionDeltas).reduce((sum, value) => sum + value, 0);
+  return { at: snapshot.generated_at, notes, sources: Object.fromEntries(snapshot.sources.map((s) => [s.id, { delta: activity.sourceDeltas[s.id] ?? 0, tone: tone(s) }])) };
+}
+
 // kind groups events for the event list; tone says whether the change is a recovery, a fault or neutral.
 export interface FlowEvent { kind: 'source' | 'station' | 'route' | 'session'; tone: 'good' | 'bad' | 'info'; text: string }
 export function visibleEvents(previous: FlowSnapshot | undefined, current: FlowSnapshot): FlowEvent[] {
