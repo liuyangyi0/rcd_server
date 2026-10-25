@@ -11,6 +11,7 @@ import { EmptyState, ErrorState, LoadingState } from '../components/PageState';
 import { PageHeader } from '../components/PageHeader';
 import { Pagination, readPageSize } from '../components/Pagination';
 import { StatusBadge } from '../components/StatusBadge';
+import { downloadCsv } from '../lib/download';
 import { formatDateTime, formatRelativeTime } from '../lib/format';
 import { humanizeTechnicalMessage } from '../lib/labels';
 
@@ -186,21 +187,27 @@ function SourceLoggingControl({ source }: { source?: Source }) {
   const logging = useLoggingStatus(target, supported);
   const mutation = useLoggingLevelMutation(target);
   const [desired, setDesired] = useState<LoggingLevel | ''>('');
+  // The config revision the operator chose a level against; it is the CAS value saved with it.
+  const [baseline, setBaseline] = useState<string>();
   const [notice, setNotice] = useState('');
+  const edited = baseline !== undefined;
+  const changedElsewhere = edited && Boolean(logging.data) && logging.data?.config_revision !== baseline;
 
+  // Follow the saved configuration only until the operator picks a level.
   useEffect(() => {
     const configured = logging.data?.configured_level;
-    setDesired(configured && configured !== 'custom' ? configured : '');
-  }, [logging.data?.configured_level]);
+    if (!edited) setDesired(configured && configured !== 'custom' ? configured : '');
+  }, [logging.data?.configured_level, edited]);
 
-  useEffect(() => setNotice(''), [source?.id]);
+  useEffect(() => { setNotice(''); setBaseline(undefined); }, [source?.id]);
 
   const save = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!logging.data || !desired) return;
     setNotice('');
     try {
-      const result = await mutation.mutateAsync({ revision: logging.data.config_revision, level: desired });
+      const result = await mutation.mutateAsync({ revision: baseline ?? logging.data.config_revision, level: desired });
+      setBaseline(undefined);
       setNotice(result.status === 'Unchanged' ? '日志等级没有变化。' : '日志等级已保存；重启该下级后生效。');
     } catch (error) {
       setNotice(apiErrorMessage(error));
@@ -224,25 +231,19 @@ function SourceLoggingControl({ source }: { source?: Source }) {
                   {logging.data.environment_override ? <InlineNotice tone="warning"><strong>当前存在 RUST_LOG 环境变量覆盖。</strong><p>保存的等级不会接管运行日志，需先清除该环境变量再重启。</p></InlineNotice> : null}
                   {logging.data.restart_required ? <InlineNotice tone="warning"><strong>配置尚未应用。</strong><p>当前运行仍为 {logging.data.active_level.toUpperCase()}；请到 <Link to="/sources">下级 OPC → 运维 → 进程</Link> 明确重启该下级。</p></InlineNotice> : null}
                   <form className="lower-log-level-form" onSubmit={(event) => void save(event)}>
-                    <label className="field"><span>保存的日志等级</span><select aria-label="保存的日志等级" value={desired} disabled={mutation.isPending} onChange={(event) => setDesired(event.target.value as LoggingLevel)}>
+                    <label className="field"><span>保存的日志等级</span><select aria-label="保存的日志等级" value={desired} disabled={mutation.isPending} onChange={(event) => { setDesired(event.target.value as LoggingLevel); setBaseline((old) => old ?? logging.data?.config_revision); }}>
                       {desired === '' ? <option value="">当前为自定义规则</option> : null}
                       {LOG_LEVELS.map((item) => <option key={item.value} value={item.value}>{item.label} · {item.description}</option>)}
                     </select></label>
                     <button className="button button-primary" type="submit" disabled={!desired || mutation.isPending || desired === logging.data.configured_level}>{mutation.isPending ? '正在保存…' : '保存等级'}</button>
                     <span className="operations-muted">DEBUG/TRACE 仅建议短时排障，集中日志和本机文件都会明显增大。</span>
                   </form>
+                  {changedElsewhere ? <InlineNotice tone="warning"><p>选择等级后，该下级配置已被他人修改；按原版本保存会被拒绝。</p><button className="button button-small button-secondary" type="button" onClick={() => { setBaseline(undefined); setNotice(''); }}>放弃选择并按当前配置重新核对</button></InlineNotice> : null}
                   {notice ? <InlineNotice tone={mutation.error ? 'error' : 'info'}><p>{notice}</p></InlineNotice> : null}
                 </> : null}
   </section>;
 }
 
 function exportCurrentPage(sourceName: string, items: Array<{ timestamp: string; level: string; component: string; portId?: string; deviceId?: string; message: string; receivedAt: string }>) {
-  const quote = (value: unknown) => `"${String(value ?? '').replaceAll('"', '""')}"`;
-  const rows = [['发生时间', '等级', '组件', '串口', '站点', '信息', '管理端接收时间'], ...items.map((item) => [item.timestamp, item.level, item.component, item.portId ?? '', item.deviceId ?? '', item.message, item.receivedAt])];
-  const blob = new Blob([`\uFEFF${rows.map((row) => row.map(quote).join(',')).join('\r\n')}`], { type: 'text/csv;charset=utf-8' });
-  const anchor = document.createElement('a');
-  anchor.href = URL.createObjectURL(blob);
-  anchor.download = `${sourceName || 'lower'}-central-logs-${new Date().toISOString().slice(0, 10)}.csv`;
-  anchor.click();
-  URL.revokeObjectURL(anchor.href);
+  downloadCsv(`${sourceName || 'lower'}-central-logs-${new Date().toISOString().slice(0, 10)}.csv`, [['发生时间', '等级', '组件', '串口', '站点', '信息', '管理端接收时间'], ...items.map((item) => [item.timestamp, item.level, item.component, item.portId ?? '', item.deviceId ?? '', item.message, item.receivedAt])]);
 }

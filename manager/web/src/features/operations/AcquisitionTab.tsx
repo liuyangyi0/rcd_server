@@ -11,7 +11,8 @@ import { humanizeTechnicalMessage } from '../../lib/labels';
 import { operationFailure } from './shared';
 
 interface Props { target: OperationsTarget; writable: boolean; stationVersions: boolean; onBusyChange: (busy: boolean) => void; onDialogChange: (open: boolean) => void }
-interface VersionTarget { port: AcquisitionPort; device: AcquisitionDevice; action: 'type' | 'query'; moduleType: ModuleType }
+// stationRevision is the version configuration the operator reviewed when opening the dialog; it is the CAS value sent.
+interface VersionTarget { port: AcquisitionPort; device: AcquisitionDevice; action: 'type' | 'query'; moduleType: ModuleType; stationRevision: string }
 
 export function AcquisitionTab({ target, writable, stationVersions, onBusyChange, onDialogChange }: Props) {
   const [pollUntil, setPollUntil] = useState(0);
@@ -28,7 +29,11 @@ export function AcquisitionTab({ target, writable, stationVersions, onBusyChange
   const staleSource = snapshot ? snapshot.source_revision !== target.revision || snapshot.source_id !== target.id : false;
   const busy = mutation.isPending || versionMutation.isPending;
   const disabled = !writable || staleSource || busy || query.isFetching || Boolean(query.error);
-  const versionQueryBlockReason = versionTarget?.action === 'query' ? acquisitionVersionQueryDisabled(versionTarget.port, versionTarget.device) : undefined;
+  // The query guard follows the live port and station, not the copy taken when the dialog opened.
+  const livePort = versionTarget ? snapshot?.ports.find((port) => port.port_id === versionTarget.port.port_id) : undefined;
+  const liveDevice = versionTarget ? livePort?.devices.find((device) => device.device_id === versionTarget.device.device_id) : undefined;
+  const versionQueryBlockReason = versionTarget?.action === 'query' ? livePort && liveDevice ? acquisitionVersionQueryDisabled(livePort, liveDevice) : '站点已不在当前采集状态中' : undefined;
+  const versionStale = Boolean(versionTarget && versionTarget.stationRevision !== snapshot?.station_revision);
 
   useEffect(() => { onBusyChange(busy); return () => onBusyChange(false); }, [busy, onBusyChange]);
   useEffect(() => { onDialogChange(Boolean(closing || versionTarget)); return () => onDialogChange(false); }, [Boolean(closing || versionTarget), onDialogChange]);
@@ -49,11 +54,11 @@ export function AcquisitionTab({ target, writable, stationVersions, onBusyChange
   };
 
   const applyVersion = () => {
-    if (!versionTarget || !snapshot?.station_revision || (versionTarget.action === 'query' && versionQueryBlockReason)) return;
+    if (!versionTarget || !versionTarget.stationRevision || versionStale || (versionTarget.action === 'query' && versionQueryBlockReason)) return;
     versionMutation.mutate(versionTarget.action === 'query' ? {
-      action: 'query', target, stationRevision: snapshot.station_revision, portId: versionTarget.port.port_id, deviceId: versionTarget.device.device_id,
+      action: 'query', target, stationRevision: versionTarget.stationRevision, portId: versionTarget.port.port_id, deviceId: versionTarget.device.device_id,
     } : {
-      action: 'set_type', target, stationRevision: snapshot.station_revision, portId: versionTarget.port.port_id, deviceId: versionTarget.device.device_id, moduleType: versionTarget.moduleType,
+      action: 'set_type', target, stationRevision: versionTarget.stationRevision, portId: versionTarget.port.port_id, deviceId: versionTarget.device.device_id, moduleType: versionTarget.moduleType,
     }, { onSuccess: (result) => {
       const station = result.ports.find((port) => port.port_id === versionTarget.port.port_id)?.devices.find((device) => device.device_id === versionTarget.device.device_id);
       const versionState = station?.version_state?.toLowerCase() ?? '';
@@ -101,7 +106,7 @@ export function AcquisitionTab({ target, writable, stationVersions, onBusyChange
         {port.devices.length ? <div className="table-scroll"><table className="data-table operations-device-table operations-device-version-table"><thead><tr><th>站点</th><th>期望采集</th><th>已应用</th><th>实际通信</th><th>模块 / 版本</th><th>最近数据</th><th>操作</th></tr></thead><tbody>{port.devices.map((device) => <tr key={device.device_id}>
           <td><strong>{device.name || device.device_id}</strong><span className="sub-cell">{device.device_id}</span></td><td>{device.read_enabled ? '读取' : '停读'}</td><td>{device.applied_read_enabled ? '读取' : '停读'}{device.read_enabled !== device.applied_read_enabled ? <span className="sub-cell">待应用</span> : null}</td>
           <td><StatusBadge state={device.communication_ok ? 'good' : 'unknown'} label={device.communication_ok ? '通信正常' : '通信未确认'} compact /></td><td><StationVersionCell device={device} supported={stationVersions} /></td><td>{formatDateTime(device.last_data_at)}</td>
-          <td><div className="operations-device-actions"><button className={`button button-small ${device.read_enabled ? 'button-danger-outline' : 'button-primary'}`} type="button" disabled={disabled || port.control_pending || (port.pending_commands ?? 0) > 0} aria-label={`${device.read_enabled ? '停读' : '恢复读取'} ${port.port_id} ${device.device_id}`} onClick={() => { mutation.reset(); setMessage(''); apply({ revision: snapshot.revision, portId: port.port_id, deviceId: device.device_id, enabled: !device.read_enabled }); }}>{device.read_enabled ? '停读' : '恢复读取'}</button>{stationVersions ? <><button className="table-action-link" type="button" disabled={disabled || !snapshot.station_revision || port.control_pending || (port.pending_commands ?? 0) > 0} onClick={() => { versionMutation.reset(); setVersionConfirmed(false); setVersionTarget({ port, device, action: 'type', moduleType: device.configured_module_type ?? 'unknown' }); }}>设置类型</button><button className="table-action-link" type="button" disabled={disabled || !snapshot.station_revision || Boolean(acquisitionVersionQueryDisabled(port, device))} title={acquisitionVersionQueryDisabled(port, device)} onClick={() => { versionMutation.reset(); setVersionConfirmed(false); setVersionTarget({ port, device, action: 'query', moduleType: 'domestic' }); }}>查询版本</button></> : null}</div></td>
+          <td><div className="operations-device-actions"><button className={`button button-small ${device.read_enabled ? 'button-danger-outline' : 'button-primary'}`} type="button" disabled={disabled || port.control_pending || (port.pending_commands ?? 0) > 0} aria-label={`${device.read_enabled ? '停读' : '恢复读取'} ${port.port_id} ${device.device_id}`} onClick={() => { mutation.reset(); setMessage(''); apply({ revision: snapshot.revision, portId: port.port_id, deviceId: device.device_id, enabled: !device.read_enabled }); }}>{device.read_enabled ? '停读' : '恢复读取'}</button>{stationVersions ? <><button className="table-action-link" type="button" disabled={disabled || !snapshot.station_revision || port.control_pending || (port.pending_commands ?? 0) > 0} onClick={() => { versionMutation.reset(); setVersionConfirmed(false); setVersionTarget({ port, device, action: 'type', moduleType: device.configured_module_type ?? 'unknown', stationRevision: snapshot.station_revision ?? '' }); }}>设置类型</button><button className="table-action-link" type="button" disabled={disabled || !snapshot.station_revision || Boolean(acquisitionVersionQueryDisabled(port, device))} title={acquisitionVersionQueryDisabled(port, device)} onClick={() => { versionMutation.reset(); setVersionConfirmed(false); setVersionTarget({ port, device, action: 'query', moduleType: 'domestic', stationRevision: snapshot.station_revision ?? '' }); }}>查询版本</button></> : null}</div></td>
         </tr>)}</tbody></table></div> : <p className="operations-muted">此串口没有配置站点。</p>}
       </section>)}
     </> : null}
@@ -111,9 +116,10 @@ export function AcquisitionTab({ target, writable, stationVersions, onBusyChange
       {closing && closing.revision !== snapshot?.revision ? <p className="text-bad">状态版本已变化，请取消后重新核对。</p> : null}
       {mutation.error ? <p className="text-bad" role="alert">{operationFailure(mutation.error)}</p> : null}
     </Modal>
-    <Modal open={Boolean(versionTarget)} title={versionTarget?.action === 'query' ? '查询通信模块版本' : '设置通信模块类型'} description={`${versionTarget?.port.port_name || versionTarget?.port.port_id || ''} · ${versionTarget?.device.name || versionTarget?.device.device_id || ''}`} onClose={() => !versionMutation.isPending && setVersionTarget(undefined)} footer={<><button className="button button-secondary" type="button" disabled={versionMutation.isPending} onClick={() => setVersionTarget(undefined)}>取消</button><button className="button button-primary" type="button" disabled={disabled || !versionTarget || !versionConfirmed || !snapshot?.station_revision || Boolean(versionQueryBlockReason)} onClick={applyVersion}>{versionMutation.isPending ? '正在提交…' : versionTarget?.action === 'query' ? '确认查询' : '确认保存'}</button></>}>
+    <Modal open={Boolean(versionTarget)} title={versionTarget?.action === 'query' ? '查询通信模块版本' : '设置通信模块类型'} description={`${versionTarget?.port.port_name || versionTarget?.port.port_id || ''} · ${versionTarget?.device.name || versionTarget?.device.device_id || ''}`} onClose={() => !versionMutation.isPending && setVersionTarget(undefined)} footer={<><button className="button button-secondary" type="button" disabled={versionMutation.isPending} onClick={() => setVersionTarget(undefined)}>取消</button><button className="button button-primary" type="button" disabled={disabled || !versionTarget || !versionConfirmed || !versionTarget.stationRevision || versionStale || Boolean(versionQueryBlockReason)} onClick={applyVersion}>{versionMutation.isPending ? '正在提交…' : versionTarget?.action === 'query' ? '确认查询' : '确认保存'}</button></>}>
       {versionTarget?.action === 'type' ? <label className="field"><span>模块类型</span><select value={versionTarget.moduleType} disabled={versionMutation.isPending} onChange={(event) => { setVersionConfirmed(false); setVersionTarget((current) => current ? { ...current, moduleType: event.target.value as ModuleType } : current); }}><option value="unknown">未配置（不查询）</option><option value="legacy_russian">俄供原模块（不查询）</option><option value="domestic">国产自研模块</option></select></label> : null}
       <InlineNotice tone="warning">{versionTarget?.action === 'query' || versionTarget?.moduleType === 'domestic' ? '下级将使用现场物理串口发送版本请求，同一串口不会并发。' : '未知和俄供类型不会发送版本查询。'}</InlineNotice>
+      {versionStale ? <p className="text-bad">站点版本配置已变化，请取消后重新核对。</p> : null}
       {versionQueryBlockReason ? <p className="text-bad" role="alert">当前不能查询：{versionQueryBlockReason}</p> : null}
       <label className="operations-check"><input type="checkbox" checked={versionConfirmed} onChange={(event) => setVersionConfirmed(event.target.checked)} />我已核对目标站点和操作</label>
       {versionMutation.error ? <p className="text-bad" role="alert">{operationFailure(versionMutation.error)}</p> : null}

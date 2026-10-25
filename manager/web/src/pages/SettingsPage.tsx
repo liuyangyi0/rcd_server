@@ -140,7 +140,7 @@ export default function SettingsPage() {
               <a className="button button-outline" href="/api/v1/configuration"><Download size={16} />导出配置 JSON</a>
               <button className="button button-secondary" type="button" onClick={() => fileInput.current?.click()}><Upload size={16} />选择配置并预检</button>
               <a className="button button-secondary" href="/api/v1/diagnostics"><PackageOpen size={16} />下载诊断包</a>
-              <input ref={fileInput} className="visually-hidden" type="file" accept="application/json,.json" onChange={(event) => void chooseConfiguration(event.target.files?.[0])} />
+              <input ref={fileInput} className="visually-hidden" type="file" accept="application/json,.json" onChange={(event) => { const file = event.target.files?.[0]; event.currentTarget.value = ''; void chooseConfiguration(file); }} />
             </div>
             {importFileName ? <p className="selected-file">已选择：{importFileName}</p> : null}
             {importMutation.isPending ? <p className="settings-feedback">正在校验配置文件…</p> : null}

@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { request, apiErrorMessage } from '../api/client';
 
@@ -20,13 +20,18 @@ export function AuthGate({ children }: { children: ReactNode }) {
   const [password, setPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirm, setConfirm] = useState('');
-  const clear = () => { client.clear(); window.dispatchEvent(new Event('rcd-auth-cleared')); };
+  // Bumped whenever a login, logout, password change or expiry completes. A periodic check
+  // started before that answers for an older cookie and must not overwrite the newer state.
+  const generation = useRef(0);
+  const clear = () => { generation.current += 1; client.clear(); window.dispatchEvent(new Event('rcd-auth-cleared')); };
   const check = async () => {
+    const started = generation.current;
     try {
       const value = await request('/auth/session') as Session;
+      if (started !== generation.current) return;
       if (!value.authenticated) { clear(); setChanging(false); }
       setSession(value); setError('');
-    } catch (reason) { setError(apiErrorMessage(reason)); }
+    } catch (reason) { if (started === generation.current) setError(apiErrorMessage(reason)); }
   };
   useEffect(() => {
     void check();

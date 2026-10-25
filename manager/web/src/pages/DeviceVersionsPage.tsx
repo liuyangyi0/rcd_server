@@ -12,6 +12,7 @@ import { EmptyState, ErrorState, LoadingState } from '../components/PageState';
 import { Pagination, readPageSize } from '../components/Pagination';
 import { StatusBadge } from '../components/StatusBadge';
 import { api, ApiError, apiErrorMessage } from '../api/client';
+import { downloadCsv } from '../lib/download';
 import { formatDateTime } from '../lib/format';
 import { humanizeTechnicalMessage } from '../lib/labels';
 
@@ -56,7 +57,9 @@ export default function DeviceVersionsPage() {
   const ports = [...new Map([...topologies.flatMap((query) => (query.data?.ports ?? []).map((port) => [port.portId, port.portName || port.portId] as const)), ...rows.map((row) => [row.portId, row.portName || row.portId] as const)]).entries()].sort((a, b) => a[1].localeCompare(b[1]));
 
   useEffect(() => setDraftQuery(queryText), [filterKey, queryText]);
-  useEffect(() => { setSelected(new Map()); }, [filterKey]);
+  // Paging keeps the selection so a batch can span pages; any other filter change clears it.
+  const selectionKey = useMemo(() => { const value = new URLSearchParams(searchParams); value.delete('page'); return value.toString(); }, [searchParams]);
+  useEffect(() => { setSelected(new Map()); }, [selectionKey]);
 
   const updateParams = (next: Record<string, string | number | undefined>) => {
     const updated = new URLSearchParams(searchParams);
@@ -321,19 +324,9 @@ export async function runWithConcurrency(jobs: Array<() => Promise<void>>, concu
 function exportVersionCsv(rows: DeviceVersion[]) {
   const headings = ['下级来源', 'RCD版本', '构建提交', '串口', '站点', '配置类型', '实测类型', '通信模块版本', '通信模块原始值', 'PLC版本', 'PLC原始值', '状态', '最后查询', '最后成功', '错误'];
   const records = rows.map((row) => [row.sourceId, row.rcdSoftwareVersion, row.rcdBuildCommit, row.portId, row.deviceName || row.deviceId, moduleTypeLabel(row.configuredModuleType), moduleTypeLabel(row.detectedModuleType), row.communicationModuleVersion, rawVersion(row.communicationModuleVersionRaw), row.plcVersion, rawVersion(row.plcVersionRaw), row.versionState, row.lastVersionAttemptAt, row.lastVersionSuccessAt, row.lastVersionError]);
-  const csv = `\uFEFF${[headings, ...records].map((record) => record.map(csvCell).join(',')).join('\r\n')}`;
-  const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
-  const anchor = document.createElement('a');
-  anchor.href = url;
-  anchor.download = `rcd-device-versions-${new Date().toISOString().slice(0, 10)}.csv`;
-  anchor.click();
-  URL.revokeObjectURL(url);
+  downloadCsv(`rcd-device-versions-${new Date().toISOString().slice(0, 10)}.csv`, [headings, ...records]);
 }
 
 function rawVersion(value?: number): string {
   return value === undefined ? '' : `0x${value.toString(16).padStart(4, '0').toUpperCase()}`;
-}
-
-function csvCell(value: unknown): string {
-  return `"${String(value ?? '').replaceAll('"', '""')}"`;
 }
