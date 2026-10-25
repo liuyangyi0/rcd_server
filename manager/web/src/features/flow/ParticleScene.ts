@@ -1,12 +1,12 @@
 import { portRows, sourceCanFlow, type Activity, type FlowPort, type FlowSession, type FlowSource } from './model';
-import { along, burstSize, clamp, easeOut, fract, hash, INK, partial, RECENT_MS, SCENE_HEIGHT, SCENE_WIDTH, SceneBase, sheet, track, withAlpha, type Point, type SceneCalculation, type SceneFrame, type Tone, type Track, type View } from './sceneKit';
+import { along, burstSize, easeOut, fract, hash, INK, partial, RECENT_MS, SCENE_HEIGHT, SCENE_WIDTH, SceneBase, sheet, SHIFT_S, track, withAlpha, type Point, type SceneCalculation, type SceneFrame, type Shift, type Tone, type Track, type View } from './sceneKit';
 export { burstSize } from './sceneKit';
 
 // Scene units. Cards and stage labels in FlowPage.css are placed with the same percentages:
 // source cards end at CARD_RIGHT, the manager frame spans FRAME, client cards start just after EGRESS_X;
 // the result bus runs along BUS_Y under the calculation label.
 const CARD_RIGHT = 319, SLOT_X = 548, SLOT_W = 120, SLOT_H = 28, NODE_X = 1012, NODE_W = 120, NODE_H = 28, EGRESS_X = 1403, BUS_X = 1156;
-const FRAME = { left: 500, top: 150, right: 1180, bottom: 650 }, CALC = { x: 840, y: 575, r: 22 }, BUS_Y = 622, OUTPUT_DELAY = .9, BOOT_S = 2.2;
+const FRAME = { left: 500, top: 150, right: 1180, bottom: 650 }, CALC = { x: 840, y: 575, r: 22 }, BUS_Y = 622, OUTPUT_DELAY = .9;
 // Slots and nodes stack compactly inside the frame; wires fan in from the cards and out to the clients.
 const stackY = (index: number, count: number) => 375 + (index - (count - 1) / 2) * Math.min(80, 320 / Math.max(count - 1, 1));
 export const laneY = (index: number, count: number) => 48 + (index + 0.5) * (654 / Math.max(count, 1));
@@ -19,9 +19,6 @@ interface Node { key: string; label: string; box: Box; route?: string; slot?: Sl
 interface Calc { center: Point; r: number; good: number; bad: number; feed?: Track; bus: Track; joins: Point[] }
 // owner is the source id used for hover focus; via is the distance where an output packet enters its Session node.
 interface Packet { track: Track; key: string; owner?: string; born: number; life: number; lead: boolean; color: string; land: 'slot' | 'client' | 'calc' | 'none'; via: number; passed: boolean }
-// A real state change between snapshots: a station turning abnormal or recovering, an OPC link breaking or joining.
-interface Shift { key: string; kind: 'warn' | 'recover' | 'break' | 'join'; start: number; landed?: boolean }
-const SHIFT_S = { warn: 1.6, recover: 1.2, break: .8, join: 1 };
 
 function bezier(a: Point,b: Point,c: Point,d: Point,t: number): Point {
   const u=1-t;
@@ -73,10 +70,9 @@ function layout(state: SceneState, view: View) {
 // frame scan line and matrix guides are decoration. A stale monitor greys out and
 // clears every packet and effect.
 export class FlowScene extends SceneBase {
-  private focus?: string; private evaluated?: string; private calcAt=-1e9; private bootClock=0; private booted=false; private reveal=1;
+  private evaluated?: string; private calcAt=-1e9;
   private slots: Slot[]=[]; private nodes: Node[]=[]; private calc?: Calc; private guides: {owner: string; track: Track}[]=[]; private shown?: SceneState; private shownSize='';
-  private levels=new Map<string,number>(); private stamps=new Map<string,number>(); private flashes=new Map<string,number>(); private memory=new Map<string,string>();
-  private packets: Packet[]=[]; private shifts: Shift[]=[];
+  private packets: Packet[]=[];
   private backdrop?: HTMLCanvasElement; private backdropKey='';
 
   // Packets launched or still travelling.
@@ -105,24 +101,16 @@ export class FlowScene extends SceneBase {
     ctx.setTransform(1,0,0,1,0,0);ctx.globalCompositeOperation='source-over';ctx.globalAlpha=1;
   }
 
-  // Hovering a source or Session keeps its route bright and dims the rest.
-  private weight(id?: string) { return !this.focus||id===this.focus?1:.25; }
-  private level(key: string) { return this.levels.get(key)??0; }
-  // Opening sequence progress between two points of the reveal, eased.
-  private phase(from: number, to: number) { return easeOut((this.reveal-from)/(to-from)); }
-  private shift(key: string) { return this.shifts.find((item)=>item.key===key); }
-
   // Compare link and station states with the previous snapshot and start the matching effect.
   private notice(active: boolean) {
     const seen=new Set<string>();
     const mark=(key: string,value: string,kind: (old: string)=>Shift['kind']|undefined,at?: Point,count=0)=>{
-      seen.add(key);
-      const old=this.memory.get(key);this.memory.set(key,value);
-      const change=active&&old!==undefined&&old!==value?kind(old):undefined;
-      if(!change)return;
-      this.shifts.push({key,kind:change,start:this.clock});
-      // Packets already travelling on a link that just broke would cross the break, so they are dropped.
+      const old=this.changed(key,value,seen),change=old===undefined?undefined:kind(old);
+      // Packets already travelling on a link that just broke would cross the break, so they are dropped,
+      // also while the animation is paused.
       if(change==='break')this.packets=this.packets.filter((packet)=>packet.key!==key);
+      if(!active||!change)return;
+      this.shifts.push({key,kind:change,start:this.clock});
       const color=change==='warn'?INK.amber:change==='break'?INK.red:change==='recover'?INK.ok:INK.data;
       if(at){this.waves.push({start:this.clock,color,at});if(count)this.burst(at,color,count);}
     };
@@ -131,38 +119,23 @@ export class FlowScene extends SceneBase {
       mark(slot.key,slot.link,(old)=>slot.link==='down'&&old!=='down'?'break':old==='down'&&slot.link==='ok'?'join':undefined,stub&&along(stub.track,stub.track.total*.55),slot.link==='down'?8:0);
       for(const wire of slot.wires)mark(wire.key,String(wire.alerts),(old)=>wire.alerts>Number(old)?'warn':wire.alerts<Number(old)?'recover':undefined,wire.track.pts[0]);
     }
-    for(const key of this.memory.keys())if(!seen.has(key))this.memory.delete(key);
+    this.forget(seen);
   }
 
   private advance(state: SceneState, {dt,motion,now}: SceneFrame) {
     // Fades run only while animating; paused or reduced-motion frames show the current state at once.
-    const ease=(rate: number)=>motion&&state.live?1-Math.exp(-dt*rate):1,keys=new Set<string>(['calc']);
-    this.clock+=dt;
-    // The opening sequence plays once; a still frame skips straight to the finished scene.
-    if(!motion)this.booted=true;
-    // It starts with the first snapshot that has something to show.
-    if(this.slots.length||this.nodes.length)this.bootClock+=dt;
-    this.reveal=this.booted?1:clamp(this.bootClock/BOOT_S,0,1);
-    if(this.reveal>=1)this.booted=true;
-    for(const [key,value] of this.flashes)this.flashes.set(key,value*Math.exp(-dt*3.5));
-    const step=(flow: Slot|Node,launch: ()=>void)=>{
-      flow.running=flow.ready&&!!flow.stamp&&now-flow.stamp<RECENT_MS;
-      const old=this.level(flow.key),seen=this.stamps.get(flow.key);
-      this.levels.set(flow.key,old+(Number(flow.running)-old)*ease(3));keys.add(flow.key);
-      if(flow.stamp===undefined)return;
-      this.stamps.set(flow.key,flow.stamp);
-      if(motion&&flow.running&&flow.stamp>(seen??0))launch();
-    };
-    for(const slot of this.slots)step(slot,()=>this.launchInput(slot));
-    for(const node of this.nodes)step(node,()=>this.launchOutput(node));
+    const ease=motion&&state.live?1-Math.exp(-dt*3):1,keys=new Set<string>(['calc']);
+    this.tick(dt,motion,this.slots.length>0||this.nodes.length>0);
+    for(const slot of this.slots)this.follow(slot,now,motion,ease,keys,()=>this.launchInput(slot));
+    for(const node of this.nodes)this.follow(node,now,motion,ease,keys,()=>this.launchOutput(node));
     // A changed evaluation timestamp is the only calculation activity the snapshot reports.
     const evaluated=state.calculation?.active?state.calculation.evaluated:undefined,feeder=this.slots.find((slot)=>slot.preferred);
     if(evaluated&&this.evaluated&&evaluated!==this.evaluated){this.calcAt=now;if(motion&&state.live&&this.calc?.feed&&feeder)this.launchCalc(this.calc.feed,feeder.id);}
     this.evaluated=evaluated;
     const calcLevel=this.level('calc');
-    this.levels.set('calc',calcLevel+(Number(state.live&&!!this.calc&&now-this.calcAt<RECENT_MS)-calcLevel)*ease(3));
-    for(const map of [this.levels,this.stamps])for(const key of map.keys())if(!keys.has(key))map.delete(key);
-    if(!state.live){this.packets=[];this.waves=[];this.sparks=[];this.shifts=[];return;}
+    this.levels.set('calc',calcLevel+(Number(state.live&&!!this.calc&&now-this.calcAt<RECENT_MS)-calcLevel)*ease);
+    this.prune(keys);
+    if(!state.live){this.packets=[];this.clearEffects();return;}
     if(!motion)return;
     const flying: Packet[]=[],spawned: Packet[]=[];
     for(const packet of this.packets){
@@ -178,12 +151,8 @@ export class FlowScene extends SceneBase {
     // A rejoined link flashes its cache slot as the light reaches it.
     for(const shift of this.shifts)if(shift.kind==='join'&&!shift.landed&&this.clock-shift.start>=SHIFT_S.join*.85){shift.landed=true;this.flash(shift.key,1);}
     this.packets=flying.concat(spawned);
-    this.waves=this.waves.filter((wave)=>this.clock-wave.start<1.2).slice(-32);
-    this.sparks=this.sparks.filter((spark)=>this.clock-spark.born<.7).slice(-240);
-    this.shifts=this.shifts.filter((shift)=>this.clock-shift.start<SHIFT_S[shift.kind]).slice(-40);
+    this.settle();
   }
-
-  private flash(key: string, amount: number) { this.flashes.set(key,Math.min(1,(this.flashes.get(key)??0)+amount)); }
 
   private spawn(packet: Omit<Packet,'passed'>) {
     this.packets.push({...packet,passed:false});

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { MatrixScene, MX, mxColX, traceX, TRACE_CELLS, type MatrixState } from './MatrixScene';
+import { MatrixScene, MX, mxColX, traceTicks, traceX, TRACE_CELLS, type MatrixState } from './MatrixScene';
 import { flowFixture } from './fixture';
 import type { TraceFrame } from './model';
 
@@ -73,5 +73,33 @@ describe('flow matrix scene',()=>{
     const sessions=12,last=mxColX(sessions-1,sessions,true),calc=mxColX(sessions,sessions,true);
     expect(calc-last).toBeGreaterThan(60);
     expect(calc).toBeLessThan(MX.gridRight);
+  });
+  it('drops packets of a source that breaks while the animation is paused',()=>{
+    const data=flowFixture(),scene=new MatrixScene(),state: MatrixState={sources:data.sources,sessions:data.sessions,frames,activity:recent,live:true,paused:false,group:'serial-acquisition'};
+    scene.draw(recorder().ctx,state,moving);
+    expect(scene.inFlight).toBeGreaterThan(0);
+    const down=structuredClone(data);down.sources[0].connected=false;
+    scene.draw(recorder().ctx,{...state,paused:true,sources:down.sources},frame);
+    expect(scene.inFlight).toBe(0);
+  });
+  it('shows the selected row at once when paused during a slide',()=>{
+    const data=twoSources(),scene=new MatrixScene(),state: MatrixState={sources:data.sources,sessions:data.sessions,frames,activity:idle,live:true,paused:false,group:'serial-acquisition'};
+    scene.draw(recorder().ctx,state,moving);
+    const moved=structuredClone(data.sessions);moved[0].routes['serial-acquisition']='rcd-58';
+    scene.draw(recorder().ctx,{...state,sessions:moved},moving);
+    expect(scene.switching).toBe(1);
+    const back=structuredClone(data.sessions);
+    scene.draw(recorder().ctx,{...state,paused:true,sessions:back},frame);
+    expect(scene.switching).toBe(0);
+  });
+  it('anchors ruler marks to wall-clock spans so they scroll with the trace',()=>{
+    const at=(second: number): TraceFrame=>({at:`2026-10-24T10:00:${String(second).padStart(2,'0')}Z`,notes:0,sources:{}});
+    expect(traceTicks([at(8),at(9),at(10),at(11),at(29),at(30),at(31)]).map(({index,long})=>[index,long])).toEqual([[2,false],[4,false],[5,true]]);
+  });
+  it('shows no totals peak until samples were really received',()=>{
+    const data=flowFixture(),still: TraceFrame[]=[{at:'2026-10-24T10:00:00Z',notes:0,sources:{'rcd-46':{delta:0,tone:'ok'}}}];
+    const draw=(list: TraceFrame[])=>{const record=recorder();new MatrixScene().draw(record.ctx,{sources:data.sources,sessions:data.sessions,frames:list,activity:idle,live:true,paused:true,group:'serial-acquisition'},frame);return record.calls.join('\n');};
+    expect(draw(still)).not.toContain('峰值');
+    expect(draw(frames)).toContain('峰值 +5');
   });
 });

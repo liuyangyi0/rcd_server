@@ -50,6 +50,14 @@ describe('flow particle scene',()=>{
     scene.draw(recorder().ctx,{...state,sources:down.sources},{...frame,motion:true,dt:.05});
     expect(scene.inFlight).toBe(0);
   });
+  it('drops packets on a link that breaks while the animation is paused',()=>{
+    const data=flowFixture(),scene=new FlowScene(),state: SceneState={sources:data.sources,sessions:[],activity:recent,live:true,paused:false,group:'serial-acquisition'};
+    scene.draw(recorder().ctx,state,{...frame,motion:true,dt:.05});
+    expect(scene.inFlight).toBeGreaterThan(0);
+    const down=structuredClone(data);down.sources[0].connected=false;
+    scene.draw(recorder().ctx,{...state,paused:true,sources:down.sources},frame);
+    expect(scene.inFlight).toBe(0);
+  });
   it('sizes bursts by the logarithm of real updates',()=>{
     expect(burstSize(0)).toBe(0);
     expect(burstSize(1)).toBeLessThan(burstSize(100));

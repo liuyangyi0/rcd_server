@@ -7,8 +7,9 @@ import { flowFixture } from '../features/flow/fixture';
 
 const canvasProps=vi.hoisted(()=>({live:false,paused:false}));
 vi.mock('../features/flow/FlowCanvas',()=>({laneY:(i:number,n:number)=>48+(i+0.5)*(654/Math.max(n,1)),default:(props:{live:boolean;paused:boolean})=>{Object.assign(canvasProps,props);return <canvas data-testid="flow-canvas"/>;}}));
-const matrixProps=vi.hoisted(()=>({live:false,paused:false,sources:[] as unknown[]}));
-vi.mock('../features/flow/MatrixCanvas',()=>({default:(props:{live:boolean;paused:boolean;sources:unknown[]})=>{Object.assign(matrixProps,props);return <canvas data-testid="matrix-canvas"/>;}}));
+const matrixProps=vi.hoisted(()=>({live:false,paused:false,sources:[] as unknown[],frames:[] as {sources:Record<string,{delta:number}>}[]}));
+const resetMatrix=()=>Object.assign(matrixProps,{live:false,paused:false,sources:[],frames:[]});
+vi.mock('../features/flow/MatrixCanvas',()=>({default:(props:typeof matrixProps)=>{Object.assign(matrixProps,props);return <canvas data-testid="matrix-canvas"/>;}}));
 let fetchMock: ReturnType<typeof vi.fn>;
 beforeEach(()=>{
   fetchMock=vi.fn(async(input:RequestInfo|URL)=>new Response(JSON.stringify(String(input).includes('/points?')?{items:[{id:'9CYE91GH201_READY',type:'UInt32',value:1,status:0}],total:1,offset:0}:flowFixture()),{status:200,headers:{'Content-Type':'application/json'}}));
@@ -57,7 +58,7 @@ it('switches to the routing matrix, remembers it and lets the address choose',as
   expect(screen.queryByTestId('flow-canvas')).not.toBeInTheDocument();
   expect(screen.getByText('事件时间线')).toBeInTheDocument();expect(screen.getByText('站点阵列')).toBeInTheDocument();
   expect(window.localStorage.getItem('rcd.flow.view')).toBe('matrix');
-  first.unmount();first.clear();
+  first.unmount();first.clear();resetMatrix();
   const second=mount();await screen.findByText('监视连接正常',{exact:false});
   expect(screen.getByRole('button',{name:'矩阵'})).toHaveAttribute('aria-pressed','true');
   expect(matrixProps.live).toBe(true);expect(matrixProps.sources).toHaveLength(1);
@@ -70,4 +71,16 @@ it('opens source detail from a matrix row',async()=>{
   fireEvent.click(screen.getByRole('button',{name:/采集主机46/}));
   expect(await screen.findByRole('dialog')).toBeInTheDocument();
   expect(await screen.findByText('9CYE91GH201_READY')).toBeInTheDocument();
+});
+it('adds one trace column per new snapshot and ignores a repeated cached one',async()=>{
+  resetMatrix();
+  const client=mount(undefined,'/flow?view=matrix');await screen.findByText('监视连接正常',{exact:false});
+  await act(async()=>{await client.invalidateQueries({queryKey:['public-flow']});});
+  await act(async()=>{await client.invalidateQueries({queryKey:['public-flow']});});
+  expect(matrixProps.frames).toHaveLength(0);
+  const next=flowFixture();next.generated_at='2026-10-24T10:00:01Z';next.sources[0].samples='150';
+  fetchMock.mockImplementation(async()=>new Response(JSON.stringify(next),{status:200,headers:{'Content-Type':'application/json'}}));
+  await act(async()=>{await client.invalidateQueries({queryKey:['public-flow']});});
+  await waitFor(()=>expect(matrixProps.frames).toHaveLength(1));
+  expect(matrixProps.frames[0].sources['rcd-46'].delta).toBe(50);
 });

@@ -1,12 +1,12 @@
 import { sourceCanFlow, type Activity, type FlowSession, type FlowSource, type TraceFrame } from './model';
-import { along, burstSize, clamp, easeOut, fract, hash, INK, partial, RECENT_MS, SCENE_HEIGHT, SCENE_WIDTH, SceneBase, sheet, track, withAlpha, type Point, type SceneCalculation, type SceneFrame, type Tone, type Track, type View } from './sceneKit';
+import { along, burstSize, clamp, easeOut, fract, hash, INK, partial, RECENT_MS, SCENE_HEIGHT, SCENE_WIDTH, SceneBase, sheet, SHIFT_S, track, withAlpha, type Point, type SceneCalculation, type SceneFrame, type Shift, type Tone, type Track, type View } from './sceneKit';
 
 // Scene units, shared with the percentages in FlowMatrix.tsx: row labels end at labelRight, the
 // throughput trace runs traceLeft → traceRight (newest at the right), the manager frame holds the
 // routing matrix, and Session column heads sit above it with their sockets on headY.
 export const MX = { sumTop: 64, sumBottom: 168, labelLeft: 24, labelRight: 250, traceLeft: 276, traceRight: 756, frameLeft: 790, frameRight: 1660, frameTop: 172, frameBottom: 712, gridLeft: 850, gridRight: 1620, headY: 150, busY: 196, rowsTop: 226, rowsBottom: 694, axisY: 730 };
 export const TRACE_CELLS = 90;
-const TRACE_PITCH = (MX.traceRight - MX.traceLeft) / TRACE_CELLS, OUTPUT_DELAY = .4, BOOT_S = 2.2, SLIDE_S = .7, SCROLL_S = .45;
+const TRACE_PITCH = (MX.traceRight - MX.traceLeft) / TRACE_CELLS, OUTPUT_DELAY = .4, SLIDE_S = .7, SCROLL_S = .45;
 export const mxRowPitch = (count: number) => Math.min(124, (MX.rowsBottom - MX.rowsTop) / Math.max(count, 1));
 export const mxRowY = (index: number, count: number) => (MX.rowsTop + MX.rowsBottom) / 2 + (index - (count - 1) / 2) * mxRowPitch(count);
 // The calculation column keeps its own slot at the right; Session columns share the rest.
@@ -15,6 +15,12 @@ export const mxColPitch = (sessions: number, calc: boolean) => Math.min(220, (MX
 export const mxColX = (index: number, sessions: number, calc: boolean) => index >= sessions ? MX.gridRight - CALC_SLOT / 2 : (MX.gridLeft + MX.gridRight - (calc ? CALC_SLOT : 0)) / 2 + (index - (sessions - 1) / 2) * mxColPitch(sessions, calc);
 // Centre of trace cell index (0 = oldest shown) when count cells are shown; the newest sits against the NOW line.
 export const traceX = (index: number, count: number) => MX.traceRight - (count - 1 - index + .5) * TRACE_PITCH;
+// Ruler marks sit on the first snapshot of each 10-second wall-clock span, so they scroll with the
+// trace; long marks start a 30-second span and carry its receive time.
+export function traceTicks(frames: TraceFrame[]) {
+  const span=(at: string,size: number)=>Math.floor(Date.parse(at)/1000/size);
+  return frames.flatMap((frame,index)=>index&&span(frame.at,10)!==span(frames[index-1].at,10)?[{index,at:frame.at,long:span(frame.at,30)!==span(frames[index-1].at,30)}]:[]);
+}
 
 export interface MatrixState { sources: FlowSource[]; sessions: FlowSession[]; frames: TraceFrame[]; activity: Activity; live: boolean; paused: boolean; focus?: string; group?: string; defaultSource?: string; calculation?: SceneCalculation }
 // alerts counts the source's stations in an abnormal or offline state.
@@ -24,10 +30,15 @@ interface Row { key: string; id: string; y: number; link: Tone; alerts: number; 
 interface Column { key: string; x: number; calc: boolean; route?: string; row?: Row; attached: boolean; spine: Track; riser: Track; path: Track; turn: number; ready: boolean; stamp?: number; delta: number; running: boolean }
 // after is the colour once a packet has turned into a Session column.
 interface Packet { track: Track; key: string; owner?: string; born: number; life: number; lead: boolean; color: string; after: string; turn: number; land: 'head' | 'calc' | 'none'; passed: boolean }
-interface Shift { key: string; kind: 'warn' | 'recover' | 'break' | 'join'; start: number }
 // A Session switching source: its crosspoint slides along the column from the old row to the new one.
 interface Slide { key: string; from: number; to: number; start: number }
-const SHIFT_S = { warn: 1.6, recover: 1.2, break: .8, join: 1 };
+// Trace figures that only change with a snapshot: the row scale, the totals and the ruler.
+interface TraceInfo { peak: number; samples: number[]; total: number; notes: number; ticks: { index: number; long: boolean; label?: string }[] }
+function summarize(frames: TraceFrame[], rows: Row[]): TraceInfo {
+  const samples=frames.map((frame)=>Object.values(frame.sources).reduce((sum,cell)=>sum+cell.delta,0));
+  return {peak:Math.max(10,...frames.flatMap((frame)=>rows.map((row)=>frame.sources[row.id]?.delta??0))),samples,total:Math.max(0,...samples),notes:Math.max(0,...frames.map((frame)=>frame.notes)),
+    ticks:traceTicks(frames).map(({index,at,long})=>({index,long,label:long?new Date(at).toLocaleTimeString('zh-CN',{hour12:false}):undefined}))};
+}
 
 // A horizontal run that turns up into a column with a rounded corner.
 function elbow(start: Point, [cx,cy]: Point, top: number, r: number): Point[] {
@@ -63,11 +74,10 @@ function layout(state: MatrixState, view: View) {
 // alarms and link effects follow real changes between snapshots. The opening sequence, lattice and
 // ruler are decoration. A stale monitor greys out, freezes the trace and clears every effect.
 export class MatrixScene extends SceneBase {
-  private focus?: string; private evaluated?: string; private calcAt=-1e9; private bootClock=0; private booted=false; private reveal=1; private motion=false;
-  private rows: Row[]=[]; private columns: Column[]=[]; private bus?: Track; private bottom=0; private frames: TraceFrame[]=[]; private frameKey=''; private arrived=-1e9;
-  private shown?: MatrixState; private shownSize='';
-  private levels=new Map<string,number>(); private stamps=new Map<string,number>(); private flashes=new Map<string,number>(); private memory=new Map<string,string>(); private crossY=new Map<string,number>();
-  private packets: Packet[]=[]; private shifts: Shift[]=[]; private slides: Slide[]=[];
+  private evaluated?: string; private calcAt=-1e9; private motion=false;
+  private rows: Row[]=[]; private columns: Column[]=[]; private bus?: Track; private bottom=0; private frames: TraceFrame[]=[]; private info=summarize([],[]); private frameKey=''; private arrived=-1e9;
+  private shown?: MatrixState; private shownSize=''; private crossY=new Map<string,number>();
+  private packets: Packet[]=[]; private slides: Slide[]=[];
   private backdrop?: HTMLCanvasElement; private backdropKey='';
 
   // Packets launched or still travelling.
@@ -81,7 +91,7 @@ export class MatrixScene extends SceneBase {
       const sx=frame.width/SCENE_WIDTH,sy=frame.height/SCENE_HEIGHT;
       this.view={sx,sy,u:Math.sqrt(sx*sy)};
       ({rows:this.rows,columns:this.columns,bus:this.bus,bottom:this.bottom}=layout(state,this.view));
-      this.frames=state.frames.slice(-TRACE_CELLS);this.shown=state;this.shownSize=size;this.focus=state.focus;
+      this.frames=state.frames.slice(-TRACE_CELLS);this.info=summarize(this.frames,this.rows);this.shown=state;this.shownSize=size;this.focus=state.focus;
       this.notice(state.live&&frame.motion);
     }
     this.advance(state,frame);
@@ -98,24 +108,16 @@ export class MatrixScene extends SceneBase {
     ctx.setTransform(1,0,0,1,0,0);ctx.globalCompositeOperation='source-over';ctx.globalAlpha=1;
   }
 
-  // Hovering a source or Session keeps its row and the columns that selected it bright.
-  private weight(id?: string) { return !this.focus||id===this.focus?1:.25; }
-  private level(key: string) { return this.levels.get(key)??0; }
-  private phase(from: number, to: number) { return easeOut((this.reveal-from)/(to-from)); }
-  private shift(key: string) { return this.shifts.find((item)=>item.key===key); }
-  private flash(key: string, amount: number) { this.flashes.set(key,Math.min(1,(this.flashes.get(key)??0)+amount)); }
-
   // Compare link, station and route states with the previous snapshot and start the matching effect.
   private notice(active: boolean) {
     const seen=new Set<string>();
     const mark=(key: string,owner: string,value: string,kind: (old: string)=>Shift['kind']|undefined,at: Point,count=0)=>{
-      seen.add(key);
-      const old=this.memory.get(key);this.memory.set(key,value);
-      const change=active&&old!==undefined&&old!==value?kind(old):undefined;
-      if(!change)return;
-      this.shifts.push({key,kind:change,start:this.clock});
-      // Packets already travelling on a row that just broke would cross the break, so they are dropped.
+      const old=this.changed(key,value,seen),change=old===undefined?undefined:kind(old);
+      // Packets already travelling on a row that just broke would cross the break, so they are dropped,
+      // also while the animation is paused.
       if(change==='break')this.packets=this.packets.filter((packet)=>packet.owner!==owner);
+      if(!active||!change)return;
+      this.shifts.push({key,kind:change,start:this.clock});
       const color=change==='warn'?INK.amber:change==='break'?INK.red:change==='recover'?INK.ok:INK.data;
       this.waves.push({start:this.clock,color,at});if(count)this.burst(at,color,count);
     };
@@ -124,47 +126,40 @@ export class MatrixScene extends SceneBase {
       mark(row.key,row.id,row.link,(old)=>row.link==='down'&&old!=='down'?'break':old==='down'&&row.link==='ok'?'join':undefined,at,row.link==='down'?8:0);
       mark(`alert:${row.id}`,row.id,String(row.alerts),(old)=>row.alerts>Number(old)?'warn':row.alerts<Number(old)?'recover':undefined,at);
     }
+    const crossY=new Map<string,number>();
     for(const column of this.columns){
-      const key=`route:${column.key}`,value=column.route??'',old=this.memory.get(key),from=this.crossY.get(column.key);
-      seen.add(key);this.memory.set(key,value);
-      if(column.row)this.crossY.set(column.key,column.row.y);else this.crossY.delete(column.key);
-      if(!active||old===undefined||old===value||!column.row)continue;
+      const old=this.changed(`route:${column.key}`,column.route??'',seen),from=this.crossY.get(column.key);
+      if(column.row)crossY.set(column.key,column.row.y);
+      if(old===undefined)continue;
+      // A newer selection replaces any slide still running for the column.
+      this.slides=this.slides.filter((slide)=>slide.key!==column.key);
+      if(!active||!column.row)continue;
       if(from!==undefined)this.slides.push({key:column.key,from,to:column.row.y,start:this.clock});
       else this.waves.push({start:this.clock,color:INK.out,at:[column.x,column.row.y]});
     }
-    for(const key of this.memory.keys())if(!seen.has(key))this.memory.delete(key);
+    this.crossY=crossY;
+    this.forget(seen);
   }
 
   private advance(state: MatrixState, {dt,motion,now}: SceneFrame) {
-    const ease=(rate: number)=>motion&&state.live?1-Math.exp(-dt*rate):1,keys=new Set<string>(['calc']);
-    this.clock+=dt;this.motion=motion;
-    if(!motion)this.booted=true;
-    if(this.rows.length||this.columns.length)this.bootClock+=dt;
-    this.reveal=this.booted?1:clamp(this.bootClock/BOOT_S,0,1);
-    if(this.reveal>=1)this.booted=true;
-    for(const [key,value] of this.flashes)this.flashes.set(key,value*Math.exp(-dt*3.5));
+    const ease=motion&&state.live?1-Math.exp(-dt*3):1,keys=new Set<string>(['calc']);
+    this.motion=motion;
+    this.tick(dt,motion,this.rows.length>0||this.columns.length>0);
     // Each received snapshot adds one trace column, which slides in at the NOW line.
     const last=state.frames[state.frames.length-1],frameKey=`${state.frames.length}:${last?.at??''}`;
     if(frameKey!==this.frameKey){if(this.frameKey&&motion&&state.live&&last)this.arrived=this.clock;this.frameKey=frameKey;}
-    const step=(flow: Row|Column,launch: ()=>void)=>{
-      flow.running=flow.ready&&!!flow.stamp&&now-flow.stamp<RECENT_MS;
-      const old=this.level(flow.key),seen=this.stamps.get(flow.key);
-      this.levels.set(flow.key,old+(Number(flow.running)-old)*ease(3));keys.add(flow.key);
-      if(flow.stamp===undefined)return;
-      this.stamps.set(flow.key,flow.stamp);
-      if(motion&&flow.running&&flow.stamp>(seen??0))launch();
-    };
-    for(const row of this.rows)step(row,()=>this.launchInput(row));
-    for(const column of this.columns)if(!column.calc)step(column,()=>this.launchOutput(column));
+    for(const row of this.rows)this.follow(row,now,motion,ease,keys,()=>this.launchInput(row));
+    for(const column of this.columns)if(!column.calc)this.follow(column,now,motion,ease,keys,()=>this.launchOutput(column));
     // A changed evaluation timestamp is the only calculation activity the snapshot reports.
     const evaluated=state.calculation?.active?state.calculation.evaluated:undefined,feed=this.columns.find((column)=>column.calc);
     if(evaluated&&this.evaluated&&evaluated!==this.evaluated){this.calcAt=now;if(motion&&state.live&&feed?.row)this.launchCalc(feed);}
     this.evaluated=evaluated;
     const calcLevel=this.level('calc');
-    this.levels.set('calc',calcLevel+(Number(state.live&&!!feed&&now-this.calcAt<RECENT_MS)-calcLevel)*ease(3));
-    for(const map of [this.levels,this.stamps])for(const key of map.keys())if(!keys.has(key))map.delete(key);
-    if(!state.live){this.packets=[];this.waves=[];this.sparks=[];this.shifts=[];this.slides=[];return;}
-    if(!motion)return;
+    this.levels.set('calc',calcLevel+(Number(state.live&&!!feed&&now-this.calcAt<RECENT_MS)-calcLevel)*ease);
+    this.prune(keys);
+    if(!state.live){this.packets=[];this.slides=[];this.clearEffects();return;}
+    // A still frame shows every crosspoint on the row actually selected.
+    if(!motion){this.slides=[];return;}
     const flying: Packet[]=[],spawned: Packet[]=[];
     for(const packet of this.packets){
       const age=this.clock-packet.born;
@@ -177,9 +172,7 @@ export class MatrixScene extends SceneBase {
       if(packet.land==='calc'){this.flash('calc',1);if(this.bus)spawned.push({track:this.bus,key:'bus',born:this.clock,life:this.bus.total/(380*this.view.u),lead:true,color:INK.data,after:INK.data,turn:0,land:'none',passed:false});}
     }
     this.packets=flying.concat(spawned);
-    this.waves=this.waves.filter((wave)=>this.clock-wave.start<1.2).slice(-32);
-    this.sparks=this.sparks.filter((spark)=>this.clock-spark.born<.7).slice(-240);
-    this.shifts=this.shifts.filter((shift)=>this.clock-shift.start<SHIFT_S[shift.kind]).slice(-40);
+    this.settle();
     // A finished slide closes the crosspoint on its new row.
     for(const slide of this.slides)if(this.clock-slide.start>=SLIDE_S)this.flash(`x:${slide.key}`,1);
     this.slides=this.slides.filter((slide)=>this.clock-slide.start<SLIDE_S);
@@ -238,8 +231,7 @@ export class MatrixScene extends SceneBase {
     if(shown<=0||!this.rows.length)return;
     const left=MX.traceLeft*sx,right=MX.traceRight*sx,frames=this.frames,count=frames.length,pitch=TRACE_PITCH*sx,width=Math.max(1.2*u,pitch*.56);
     const since=this.clock-this.arrived,slide=this.motion?pitch*(1-easeOut(since/SCROLL_S)):0,fresh=this.motion&&live?clamp(1-since/.9,0,1):0;
-    const peak=Math.max(10,...frames.flatMap((frame)=>this.rows.map((row)=>frame.sources[row.id]?.delta??0)));
-    const band=Math.min(22*sy,mxRowPitch(this.rows.length)*sy*.3),top=this.rows[0].y-band-18*sy,bottom=this.rows[this.rows.length-1].y+band+14*sy;
+    const {peak,ticks}=this.info,band=Math.min(22*sy,mxRowPitch(this.rows.length)*sy*.3),top=this.rows[0].y-band-18*sy,bottom=this.rows[this.rows.length-1].y+band+14*sy;
     // Each label card plugs into its row's baseline.
     for(const row of this.rows){ctx.globalAlpha=.8*this.weight(row.id)*shown;ctx.fillStyle=INK.rule;for(let x=MX.labelRight*sx+4*u;x<left;x+=4*u)ctx.fillRect(x,row.y-.5*u,1.5*u,u);}
     ctx.save();ctx.beginPath();ctx.rect(left,0,right-left,SCENE_HEIGHT*sy);ctx.clip();
@@ -259,18 +251,17 @@ export class MatrixScene extends SceneBase {
         if(index===count-1&&fresh>0){const size=h*3+10*u;ctx.globalAlpha=.5*fresh*weight;ctx.drawImage(this.glow(color),x-size/2,row.y-size/2,size,size);}
       });
     }
-    // Ruler ticks every 10 snapshots, moving with the trace.
     ctx.strokeStyle=INK.rule;ctx.lineWidth=u;ctx.globalAlpha=.8*shown;ctx.beginPath();
-    frames.forEach((_,index)=>{if((count-1-index)%10)return;const x=traceX(index,count)*sx+slide,long=(count-1-index)%30===0;ctx.moveTo(x,bottom);ctx.lineTo(x,bottom+(long?6:3)*u);});
+    for(const {index,long} of ticks){const x=traceX(index,count)*sx+slide;ctx.moveTo(x,bottom);ctx.lineTo(x,bottom+(long?6:3)*u);}
     ctx.stroke();
     ctx.restore();
-    // Receive time every 30 snapshots, and where the history starts when the page has been open for less than the full trace.
-    frames.forEach((frame,index)=>{const x=traceX(index,count)*sx+slide;if((count-1-index)%30||index===count-1||x<left+24*u)return;this.text(ctx,new Date(frame.at).toLocaleTimeString('zh-CN',{hour12:false}),x,bottom+14*u,INK.muted,.75*shown,9,undefined,'center');});
+    for(const {index,label} of ticks){const x=traceX(index,count)*sx+slide;if(label&&x>left+24*u&&x<right-24*u)this.text(ctx,label,x,bottom+14*u,INK.muted,.75*shown,9,undefined,'center');}
     this.totals(ctx,live,slide,shown);
+    // Where the recorded history starts: the page opened or the manager restarted less than a full trace ago.
     if(count&&count<TRACE_CELLS){
       const x=(traceX(0,count)-TRACE_PITCH/2)*sx+slide;
       ctx.globalAlpha=.7*shown;ctx.fillStyle=INK.rule;for(let y=top;y<bottom;y+=6*u)ctx.fillRect(x,y,u,3*u);
-      this.text(ctx,'页面打开',x-5*u,top-8*u,INK.muted,.8*shown,8.5,undefined,'right');
+      this.text(ctx,'记录起点',x-5*u,top-8*u,INK.muted,.8*shown,8.5,undefined,'right');
     }
     // The NOW line: where each snapshot is written, flashing as it arrives.
     ctx.globalAlpha=(.45+.55*fresh)*shown;ctx.fillStyle=live?INK.data:INK.stale;ctx.fillRect(right+2*u,top,1.2*u,bottom-top);
@@ -282,7 +273,7 @@ export class MatrixScene extends SceneBase {
   // each against its own peak on screen.
   private totals(ctx: CanvasRenderingContext2D, live: boolean, slide: number, shown: number) {
     const {sx,sy,u}=this.view,frames=this.frames,count=frames.length,left=MX.traceLeft*sx,right=MX.traceRight*sx,top=MX.sumTop*sy,base=MX.sumBottom*sy,width=Math.max(1.2*u,TRACE_PITCH*sx*.56);
-    const samples=frames.map((frame)=>Object.values(frame.sources).reduce((sum,cell)=>sum+cell.delta,0)),peak=Math.max(1,...samples),notePeak=Math.max(1,...frames.map((frame)=>frame.notes));
+    const {samples,total,notes}=this.info,peak=Math.max(1,total),notePeak=Math.max(1,notes);
     ctx.globalAlpha=.9*shown;ctx.fillStyle=INK.line;ctx.fillRect(left,base,right-left,u);
     for(const k of [1,2])for(let x=left;x<right;x+=5*u){ctx.globalAlpha=.6*shown;ctx.fillRect(x,base-(base-top)*k/3,1.5*u,u);}
     ctx.save();ctx.beginPath();ctx.rect(left,top-10*u,right-left,base-top+12*u);ctx.clip();
@@ -291,12 +282,12 @@ export class MatrixScene extends SceneBase {
       const x=traceX(index,count)*sx+slide,h=Math.max(1.5*u,total/peak*(base-top)),age=.45+.55*(index+1)/count;
       ctx.fillStyle=live?INK.data:INK.stale;ctx.globalAlpha=.32*age*shown;ctx.fillRect(x-width/2,base-h,width,h);ctx.globalAlpha=.9*age*shown;ctx.fillRect(x-width/2,base-h,width,u);
     });
-    if(frames.some((frame)=>frame.notes)){
+    if(notes){
       ctx.beginPath();frames.forEach((frame,index)=>{const x=traceX(index,count)*sx+slide,y=base-frame.notes/notePeak*(base-top)*.92;if(index)ctx.lineTo(x,y);else ctx.moveTo(x,y);});
       ctx.strokeStyle=live?INK.out:INK.stale;ctx.lineWidth=1.3*u;ctx.globalAlpha=.85*shown;ctx.lineJoin='round';ctx.stroke();
     }
     ctx.restore();
-    if(count)this.text(ctx,`峰值 +${peak.toLocaleString()}`,right,top-8*u,INK.muted,.75*shown,8.5,undefined,'right');
+    if(total)this.text(ctx,`峰值 +${total.toLocaleString()}`,right,top-8*u,INK.muted,.75*shown,8.5,undefined,'right');
   }
 
   private links(ctx: CanvasRenderingContext2D, live: boolean) {

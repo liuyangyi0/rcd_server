@@ -1,9 +1,9 @@
 import { useState, type ReactNode } from 'react';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import MatrixCanvas from '../features/flow/MatrixCanvas';
-import { MX, mxColPitch, mxColX, mxRowPitch, mxRowY, TRACE_CELLS, traceX } from '../features/flow/MatrixScene';
+import { MX, mxColPitch, mxColX, mxRowPitch, mxRowY, TRACE_CELLS, traceTicks, traceX } from '../features/flow/MatrixScene';
 import { sourceCanFlow, STATION_COLORS, STATION_LABELS, type Activity, type FlowEvent, type FlowGroup, type FlowSession, type FlowSnapshot, type FlowSource, type TraceFrame } from '../features/flow/model';
-import { clock, EVENT_KIND, latestValue, shortPort, Spark, STATION_GROUPS, stationAlert, Ticker } from '../features/flow/ui';
+import { clock, EVENT_KIND, latestValue, shortPort, Spark, STATION_GROUPS, stationAlert, Ticker, usePulse } from '../features/flow/ui';
 import './FlowMatrix.css';
 
 // DOM labels sit on the matrix scene's 1680×750 units; the timeline shares the trace's x units.
@@ -21,7 +21,7 @@ export default function FlowMatrix({data,group,sources,sessions,activity,frames,
   const rows=sources.slice(rp*maxRows,rp*maxRows+maxRows), columns=sessions.slice(cp*COLUMNS_PER_PAGE,cp*COLUMNS_PER_PAGE+COLUMNS_PER_PAGE);
   const calc=data?.calculation, k=columns.length, computing=!!calc?.active, pitch=mxColPitch(k,computing), dense=pitch<120, compact=mxRowPitch(rows.length)<84;
   const recent=(stamp?:number)=>fresh && !!stamp && now-stamp<3200;
-  const shown=frames.slice(-TRACE_CELLS), last=shown[shown.length-1], peak=Math.max(0,...shown.flatMap((frame)=>Object.values(frame.sources).map((cell)=>cell.delta)));
+  const shown=frames.slice(-TRACE_CELLS), last=shown[shown.length-1], peak=Math.max(0,...shown.flatMap((frame)=>rows.map((source)=>frame.sources[source.id]?.delta ?? 0)));
   return <>
     <section className={`flow-mx-stage${dense?' is-dense':''}`} aria-label="来源吞吐轨迹与会话选源矩阵">
       <MatrixCanvas sources={rows} sessions={columns} frames={frames} activity={activity} live={fresh} paused={paused} focus={focus} group={group?.id} defaultSource={group?.default_source} calculation={calc?{active:calc.active,good:calc.good,bad:calc.bad,evaluated:calc.last_evaluation_at}:undefined}/>
@@ -56,7 +56,8 @@ function MatrixRow({source,index,count,compact,preferred,active,delta,history,se
   const tone=!source.enabled?'off':!source.connected?'down':source.catalog_state==='CatalogConflict'?'warn':active?'live':'idle';
   const status=!source.enabled?'来源停用':!source.connected?'OPC 未连接':source.catalog_state==='CatalogConflict'?'目录冲突':active?'正在收到更新':source.subscribed?'等待数据变化':'订阅未就绪';
   const devices=source.ports.flatMap((port)=>port.devices), alerts=devices.filter((device)=>stationAlert(device.state)).length, shown=latestValue(delta,history);
-  return <button type="button" className={`flow-mx-row is-${tone}${selected?' is-selected':''}${compact?' is-compact':''}`} style={{left:X(MX.labelLeft),width:X(MX.labelRight-MX.labelLeft),top:Y(mxRowY(index,count)),animationDelay:`${index*90}ms`}} onClick={onSelect} onMouseEnter={()=>onHover(source.id)} onMouseLeave={()=>onHover(undefined)} onFocus={()=>onHover(source.id)} onBlur={()=>onHover(undefined)} title="展开串口、站点和只读点位">
+  const pulsing=usePulse(`${tone==='live' || tone==='idle'?'ok':tone}|${alerts}`);
+  return <button type="button" className={`flow-mx-row is-${tone}${selected?' is-selected':''}${compact?' is-compact':''}${pulsing?' is-pulsing':''}`} style={{left:X(MX.labelLeft),width:X(MX.labelRight-MX.labelLeft),top:Y(mxRowY(index,count)),animationDelay:`${index*90}ms`}} onClick={onSelect} onMouseEnter={()=>onHover(source.id)} onMouseLeave={()=>onHover(undefined)} onFocus={()=>onHover(source.id)} onBlur={()=>onHover(undefined)} title="展开串口、站点和只读点位">
     <span className="flow-card-head"><span className="flow-source-heading">{source.name || source.id}</span>{preferred?<span className="flow-mx-default">DEFAULT</span>:<span className="flow-card-tag">{source.ports.length} 串口 · {devices.length}{source.truncated?'+':''} 站</span>}</span>
     <span className="flow-card-meta">{source.id} · {source.address.replace('opc.tcp://','')}{alerts?<em> · {alerts} 站异常</em>:null}</span>
     <span className="flow-card-status"><span><i/>{status}</span><b title="最近一次有更新的快照间隔收到的采集样本">{active && shown?<Ticker value={shown} prefix="+"/>:'—'}</b></span>
@@ -81,11 +82,11 @@ function MatrixHead({session,x,width,dense,index,route,visible,active,delta,hist
 function Timeline({frames,events,pending}:{frames:TraceFrame[];events:TimedEvent[];pending?:number}) {
   const column=new Map(frames.map((frame,index)=>[frame.at,index])), marks=new Map<number,TimedEvent[]>();
   for(const event of events){const index=column.get(event.at);if(index!==undefined)marks.set(index,[...(marks.get(index) ?? []),event]);}
-  const count=frames.length, ticks=frames.map((frame,index)=>({frame,index})).filter(({index})=>(count-1-index)%30===0);
+  const count=frames.length, ticks=traceTicks(frames).filter((tick)=>tick.long);
   return <section className="flow-mx-timeline" style={{width:X(TIMELINE_W)}}>
     <header style={{left:T(MX.labelLeft),width:T(MX.labelRight-MX.labelLeft)}}><small>EVENTS</small><h2>事件时间线</h2><span>自打开页面起 {events.length} 条</span><span>待处理命令 <b>{pending===undefined?'—':<Ticker value={pending} bare/>}</b></span></header>
     <div className="flow-mx-axis" style={{left:T(MX.traceLeft),width:T(MX.traceRight-MX.traceLeft)}}>
-      {ticks.map(({frame,index})=><span key={frame.at} className="flow-mx-axis-tick" style={{left:`${(traceX(index,count)-MX.traceLeft)/(MX.traceRight-MX.traceLeft)*100}%`}}/>)}
+      {ticks.map(({at,index})=><span key={at} className="flow-mx-axis-tick" style={{left:`${(traceX(index,count)-MX.traceLeft)/(MX.traceRight-MX.traceLeft)*100}%`}}/>)}
       {[...marks].map(([index,list])=>{
         const tone=list.some((event)=>event.tone==='bad')?'bad':list.some((event)=>event.tone==='good')?'good':'info';
         return <span key={list[0].id} className={`flow-mx-mark is-${tone}`} style={{left:`${(traceX(index,count)-MX.traceLeft)/(MX.traceRight-MX.traceLeft)*100}%`}} title={list.map((event)=>`${clock(event.at)} ${event.text}`).join('\n')}>{list.length>1?<b>{list.length}</b>:null}</span>;

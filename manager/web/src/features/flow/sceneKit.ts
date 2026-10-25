@@ -19,6 +19,12 @@ export interface View { sx: number; sy: number; u: number }
 export interface Track { pts: Point[]; acc: number[]; total: number }
 export interface Wave { start: number; color: string; at: Point }
 export interface Spark { x: number; y: number; vx: number; vy: number; born: number; color: string }
+// A real state change between snapshots: a station turning abnormal or recovering, an OPC link breaking or joining.
+export interface Shift { key: string; kind: 'warn' | 'recover' | 'break' | 'join'; start: number; landed?: boolean }
+export const SHIFT_S = { warn: 1.6, recover: 1.2, break: .8, join: 1 };
+// A source or Session whose activity follows the real snapshot counters.
+export interface Flow { key: string; ready: boolean; stamp?: number; running: boolean }
+const BOOT_S = 2.2;
 
 export function track(pts: Point[]): Track {
   const acc=[0];
@@ -49,12 +55,62 @@ function glowSprite(color: string) {
   return sprite;
 }
 
-// Clock, glow sprites, sparks and ripple rings, plus the line primitives both scenes draw with.
+// The lifecycle both scenes share (clock, opening sequence, activity levels, flashes, state
+// changes between snapshots and transient effects) plus the line primitives they draw with.
 export abstract class SceneBase {
-  protected clock=0; protected seq=0;
+  protected clock=0; protected seq=0; protected focus?: string; protected reveal=1;
   protected view: View={sx:1,sy:1,u:1};
-  protected waves: Wave[]=[]; protected sparks: Spark[]=[];
+  protected waves: Wave[]=[]; protected sparks: Spark[]=[]; protected shifts: Shift[]=[];
+  protected levels=new Map<string,number>(); protected stamps=new Map<string,number>(); protected flashes=new Map<string,number>();
+  private memory=new Map<string,string>(); private bootClock=0; private booted=false;
   private glows=new Map<string,HTMLCanvasElement>();
+
+  // Hovering a source or Session keeps its route bright and dims the rest.
+  protected weight(id?: string) { return !this.focus||id===this.focus?1:.25; }
+  protected level(key: string) { return this.levels.get(key)??0; }
+  // Opening sequence progress between two points of the reveal, eased.
+  protected phase(from: number, to: number) { return easeOut((this.reveal-from)/(to-from)); }
+  protected shift(key: string) { return this.shifts.find((item)=>item.key===key); }
+  protected flash(key: string, amount: number) { this.flashes.set(key,Math.min(1,(this.flashes.get(key)??0)+amount)); }
+
+  // Advances the clock, the opening sequence and flash decay. The opening sequence plays once and
+  // starts with the first snapshot that has something to show; a still frame skips straight to the end.
+  protected tick(dt: number, motion: boolean, content: boolean) {
+    this.clock+=dt;
+    if(!motion)this.booted=true;
+    if(content)this.bootClock+=dt;
+    this.reveal=this.booted?1:clamp(this.bootClock/BOOT_S,0,1);
+    if(this.reveal>=1)this.booted=true;
+    // Faded flashes are dropped, so sources and Sessions that come and go leave nothing behind.
+    for(const [key,value] of this.flashes){const next=value*Math.exp(-dt*3.5);if(next<.005)this.flashes.delete(key);else this.flashes.set(key,next);}
+  }
+
+  // Remembers a snapshot value; returns the previous one when it changed since the last snapshot.
+  protected changed(key: string, value: string, seen: Set<string>) {
+    seen.add(key);
+    const old=this.memory.get(key);this.memory.set(key,value);
+    return old!==undefined&&old!==value?old:undefined;
+  }
+  protected forget(seen: Set<string>) { for(const key of this.memory.keys())if(!seen.has(key))this.memory.delete(key); }
+
+  // Eases a flow's level toward its running state; launch fires once per new activity stamp while animating.
+  protected follow(flow: Flow, now: number, motion: boolean, ease: number, keys: Set<string>, launch: ()=>void) {
+    flow.running=flow.ready&&!!flow.stamp&&now-flow.stamp<RECENT_MS;
+    const old=this.level(flow.key),seen=this.stamps.get(flow.key);
+    this.levels.set(flow.key,old+(Number(flow.running)-old)*ease);keys.add(flow.key);
+    if(flow.stamp===undefined)return;
+    this.stamps.set(flow.key,flow.stamp);
+    if(motion&&flow.running&&flow.stamp>(seen??0))launch();
+  }
+  // Levels and stamps of flows that left the scene are dropped.
+  protected prune(keys: Set<string>) { for(const map of [this.levels,this.stamps])for(const key of map.keys())if(!keys.has(key))map.delete(key); }
+  protected clearEffects() { this.waves=[];this.sparks=[];this.shifts=[]; }
+  // Drops effects that have played out.
+  protected settle() {
+    this.waves=this.waves.filter((wave)=>this.clock-wave.start<1.2).slice(-32);
+    this.sparks=this.sparks.filter((spark)=>this.clock-spark.born<.7).slice(-240);
+    this.shifts=this.shifts.filter((shift)=>this.clock-shift.start<SHIFT_S[shift.kind]).slice(-40);
+  }
 
   protected burst([x,y]: Point, color: string, count: number) {
     const {u}=this.view;
