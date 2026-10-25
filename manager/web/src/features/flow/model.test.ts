@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { advanceActivity, notificationDelta, sourceDelta, visibleEvents } from './model';
+import { advanceActivity, notificationDelta, sourceDelta, traceFrame, visibleEvents } from './model';
 import { flowFixture } from './fixture';
 describe('real flow activity',()=>{
   it('does not invent activity on first load, no changes, or instance restart',()=>{
@@ -28,5 +28,12 @@ describe('real flow activity',()=>{
     const events=visibleEvents(old,next);expect(events).toHaveLength(2);
     expect(events[0]).toMatchObject({kind:'station',tone:'bad'});expect(events[0].text).toContain('通信异常');
     expect(events[1]).toMatchObject({kind:'route',tone:'info'});expect(events[1].text).toContain('rcd-58');
+  });
+  it('records one trace frame per snapshot from real counts and link state',()=>{
+    const data=flowFixture();data.sources[0].connected=false;
+    const frame=traceFrame(data,{sources:{},sessions:{},updates:7,sourceDeltas:{'rcd-46':7},sessionDeltas:{'public-alias':2,other:3}});
+    expect(frame).toEqual({at:data.generated_at,notes:5,sources:{'rcd-46':{delta:7,tone:'down'}}});
+    data.sources[0].connected=true;data.sources[0].enabled=false;
+    expect(traceFrame(data,{sources:{},sessions:{},updates:0,sourceDeltas:{},sessionDeltas:{}}).sources['rcd-46']).toEqual({delta:0,tone:'off'});
   });
 });

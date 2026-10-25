@@ -1,0 +1,63 @@
+/* Matrix view: positions follow the 1680×750 scene units of MatrixScene.ts; tokens come from FlowPage.css */
+.flow-mx-stage{position:relative;flex:1 0 440px;min-height:440px;overflow:hidden;background:radial-gradient(70% 80% at 64% 52%,#0b1624 0%,#060b12 62%,#04070c 100%)}
+.flow-mx-title{position:absolute;top:10px;display:flex;align-items:baseline;gap:9px;white-space:nowrap;pointer-events:none}.flow-mx-title small{font:600 9px var(--mono);letter-spacing:.24em;color:var(--text-4)}.flow-mx-title b{font-size:13px;font-weight:600;letter-spacing:.08em;color:var(--text)}.flow-mx-title span{font-size:11px;color:var(--text-3)}
+.flow-mx-title::after{content:'';position:absolute;left:0;bottom:-6px;width:28px;height:1px;background:var(--accent)}
+.flow-mx-frame-title{position:absolute;transform:translateY(-50%);display:flex;align-items:baseline;gap:10px;padding:2px 12px;background:#070d15;white-space:nowrap;pointer-events:none}.flow-mx-frame-title small{font:600 9px var(--mono);letter-spacing:.24em;color:var(--accent)}.flow-mx-frame-title b{font-size:12px;font-weight:600;letter-spacing:.1em;color:var(--text)}.flow-mx-frame-title span{font-size:11px;color:var(--text-3)}.flow-mx-frame-title strong{color:var(--accent);font:500 11px var(--mono)}
+
+/* Row labels and column heads share the card language of the pipeline view */
+.flow-page .flow-mx-row,.flow-mx-head{position:absolute;display:block;text-align:left;line-height:1.4;border:1px solid var(--hair-2);border-radius:5px;background:linear-gradient(180deg,var(--surface-2),var(--surface));box-shadow:inset 0 1px #ffffff07,0 14px 34px #00000080;overflow:hidden;--tone:var(--text-4);--spark:var(--text-3);animation:flow-fade-in .8s ease-out backwards;transition:border-color .25s,box-shadow .25s}
+.flow-page .flow-mx-row{transform:translateY(-50%);padding:9px 12px 8px 14px}
+.flow-mx-row.is-live{--tone:var(--accent)}.flow-mx-head.is-live{--tone:var(--accent-2);--spark:var(--accent-2)}.flow-mx-row.is-warn{--tone:var(--warn)}.flow-mx-calc{--tone:var(--accent)}
+.flow-mx-row::before{content:'';position:absolute;left:-1px;top:10px;bottom:10px;width:2px;border-radius:2px;background:var(--tone);transition:background .3s}.flow-mx-row.is-live::before{box-shadow:0 0 10px var(--tone)}
+.flow-mx-row::after,.flow-mx-head::after{content:'';position:absolute;top:0;bottom:0;left:0;width:40%;pointer-events:none;background:linear-gradient(90deg,transparent,#8fd8ff0d,transparent);transform:translateX(-110%)}.flow-mx-row.is-live::after,.flow-mx-head.is-live::after{animation:flow-shimmer 3.2s ease-in-out infinite}
+.flow-page .flow-mx-row:hover,.flow-mx-head:hover{border-color:var(--hair-3)}.flow-page .flow-mx-row.is-selected{border-color:#59c7ff66;box-shadow:inset 0 1px #ffffff07,0 0 0 1px #59c7ff22,0 14px 34px #00000080}
+.flow-mx-row .flow-card-meta em{font-style:normal;color:var(--warn)}.flow-mx-row.is-compact{padding-top:6px;padding-bottom:5px}.flow-mx-row.is-compact .flow-card-meta{display:none}.flow-mx-row.is-compact .flow-card-status{margin-top:3px}
+.flow-mx-default{flex:none;padding:0 6px;border:1px solid #59c7ff55;border-radius:3px;font:600 9px/16px var(--mono);letter-spacing:.14em;color:var(--accent);background:#59c7ff12}
+.flow-mx-row.is-down::before,.flow-mx-row.is-warn::before{animation:flow-alarm .45s ease-in-out 4}
+
+/* Column heads stand on the socket line (MX.headY = 80% from the bottom) */
+.flow-mx-head{bottom:calc(80% + 5px);transform:translateX(-50%);padding:8px 11px 7px}.flow-mx-head h2{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:600;letter-spacing:.04em;color:var(--text)}
+.flow-mx-head::before{content:'';position:absolute;left:50%;bottom:-1px;width:26px;height:2px;margin-left:-13px;border-radius:2px;background:var(--tone);transition:background .3s}.flow-mx-head.is-live::before,.flow-mx-calc::before{box-shadow:0 0 10px var(--tone)}
+.flow-mx-route{display:block;margin-top:3px;font-size:11px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.flow-mx-route strong{color:var(--accent-2);font:500 11px var(--mono)}
+.flow-mx-head .flow-card-status{margin-top:5px}
+/* Dense heads stack the name one upright character per line, so CJK and Latin read the same with any font */
+.flow-mx-head.is-dense{width:24px;height:min(104px,calc(20% - 39px));padding:7px 0}.flow-mx-dense-label{display:flex;flex-direction:column;align-items:center;gap:1px;height:100%;overflow:hidden;-webkit-mask-image:linear-gradient(#000 calc(100% - 9px),transparent);mask-image:linear-gradient(#000 calc(100% - 9px),transparent)}.flow-mx-dense-label b{flex:none;font-size:11px;font-weight:500;line-height:12px;color:var(--text)}.flow-mx-dense-label i{flex:none;width:6px;height:6px;margin-bottom:5px;border-radius:50%;background:var(--tone)}.flow-mx-head.is-dense.is-live .flow-mx-dense-label i{box-shadow:0 0 8px var(--tone);animation:flow-breathe 1.6s ease-in-out infinite}
+.flow-mx-total{position:absolute;display:flex;flex-direction:column;justify-content:flex-end;gap:2px;padding-left:14px;border-left:1px solid var(--hair-2);pointer-events:none}.flow-mx-total small{font:600 9px var(--mono);letter-spacing:.22em;color:var(--text-4);margin-bottom:4px}
+.flow-mx-total p{display:flex;align-items:baseline;gap:8px;font-size:11px;color:var(--text-3);white-space:nowrap}.flow-mx-total b{min-width:0;font:500 20px/1.15 var(--mono);color:var(--accent);font-variant-numeric:tabular-nums}.flow-mx-total .is-notes b{font-size:15px;color:var(--accent-2)}.flow-mx-total em{font-style:normal;font-size:10px;color:var(--text-4)}
+.flow-mx-calc-split{white-space:nowrap;display:flex;justify-content:space-between;gap:10px;margin-top:5px;line-height:18px;font:500 11px var(--mono);font-variant-numeric:tabular-nums}
+.flow-mx-calc-bar{position:absolute;left:0;right:0;bottom:0;display:flex;gap:1px;height:2px;overflow:hidden;background:var(--hair)}.flow-mx-calc::before{display:none}.flow-mx-calc-bar i{display:block;min-width:2px}.flow-mx-calc-bar i:first-child{background:var(--ok)}.flow-mx-calc-bar i:last-child{background:var(--warn)}
+
+.flow-mx-empty-rows{left:2%;top:45%;width:14%;padding:12px}
+.flow-mx-empty-cols{position:absolute;top:42%;text-align:center;font-size:12px;line-height:1.9;color:var(--text-2);pointer-events:none}.flow-mx-empty-cols small{display:block;color:var(--text-4)}
+.flow-mx-row-pages{left:1.5%}.flow-mx-column-pages{right:1.5%;top:8px;bottom:auto}
+
+/* Dock: the event timeline sits under the trace on the same x units; stations fill the rest */
+.flow-mx-dock{position:relative;display:flex;height:17vh;min-height:132px;max-height:176px;border-top:1px solid var(--hair);background:linear-gradient(180deg,#060b12,var(--bg))}
+.flow-mx-timeline{position:relative;flex:none;height:100%;border-right:1px solid var(--hair)}
+.flow-mx-timeline header{position:absolute;top:12px;display:flex;flex-direction:column;gap:2px;min-width:0}.flow-mx-timeline header small{font:600 9px var(--mono);letter-spacing:.22em;color:var(--text-4)}.flow-mx-timeline h2,.flow-mx-stations h2{font-size:13px;font-weight:600;letter-spacing:.08em;color:var(--text)}.flow-mx-timeline header span{font-size:10.5px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.flow-mx-timeline header b{font:500 12px var(--mono);color:var(--text)}
+.flow-mx-axis{position:absolute;top:18px;height:22px;border-bottom:1px solid var(--hair-3)}.flow-mx-axis::after{content:'';position:absolute;right:-1px;bottom:-4px;width:1px;height:26px;background:var(--accent);box-shadow:0 0 8px var(--accent)}
+.flow-mx-now{position:absolute;right:-3px;bottom:-17px;transform:translateX(50%);font:600 8.5px var(--mono);letter-spacing:.14em;color:var(--accent)}
+.flow-mx-axis-tick{position:absolute;bottom:-5px;width:1px;height:5px;background:var(--text-4);transition:left .45s cubic-bezier(.2,.8,.2,1)}
+.flow-mx-mark{position:absolute;bottom:0;width:3px;height:15px;margin-left:-1.5px;border-radius:1px;background:var(--accent-2);color:var(--accent-2);box-shadow:0 0 8px currentColor;transition:left .45s cubic-bezier(.2,.8,.2,1);animation:flow-mark-in .6s ease-out both}.flow-mx-mark.is-bad{background:var(--bad);color:var(--bad)}.flow-mx-mark.is-good{background:var(--ok);color:var(--ok)}
+.flow-mx-mark b{position:absolute;left:50%;top:-13px;transform:translateX(-50%);font:600 9px var(--mono);color:inherit}
+.flow-mx-events{position:absolute;top:52px;right:16px;margin:0;padding:0;list-style:none;overflow:hidden}.flow-mx-events li{display:grid;grid-template-columns:auto auto auto minmax(0,1fr);align-items:center;gap:9px;font-size:11px;line-height:1.85;white-space:nowrap;animation:flow-enter .5s ease-out both}.flow-mx-events li>span{overflow:hidden;text-overflow:ellipsis;color:var(--text-2)}
+.flow-mx-events i{width:3px;height:10px;border-radius:1px;background:var(--accent-2)}.flow-mx-events .is-bad i{background:var(--bad)}.flow-mx-events .is-good i{background:var(--ok)}.flow-mx-events time{font:10.5px var(--mono);color:var(--text-4);font-variant-numeric:tabular-nums}.flow-mx-events li:first-child time{color:var(--text-2)}
+.flow-mx-events b{font-size:10px;font-weight:500;line-height:1.5;padding:0 6px;border-radius:3px;color:var(--text-2);background:#ffffff0a}.flow-mx-events .is-good b{color:var(--ok);background:#3fd6a01a}.flow-mx-events .is-bad b{color:var(--bad);background:#ff6f6f1c}.flow-mx-events li.is-bad{animation:flow-enter .5s ease-out both,flow-bad-flash 1.6s ease-out}
+.flow-mx-events .flow-mx-events-empty{display:flex;color:var(--text-3)}.flow-mx-events-empty i{background:var(--accent);box-shadow:0 0 8px var(--accent);animation:flow-breathe 1.8s ease-in-out infinite}
+.flow-mx-stations{flex:1;min-width:0;display:flex;flex-direction:column;padding:12px 16px 8px 20px}.flow-mx-stations header{display:flex;align-items:baseline;gap:12px;min-width:0;white-space:nowrap}.flow-mx-stations header small{font:600 9px var(--mono);letter-spacing:.22em;color:var(--text-4)}
+.flow-mx-station-total{font-size:11px;color:var(--text-3)}.flow-mx-station-total b{margin-right:1px;font:500 15px var(--mono);color:var(--ok)}.flow-mx-stations .flow-station-legend{margin-left:auto;flex-wrap:nowrap;overflow:hidden}
+.flow-mx-station-grid{display:flex;flex-wrap:wrap;align-content:flex-start;gap:6px 10px;min-height:0;margin-top:9px;overflow:hidden}
+.flow-page .flow-mx-station-source{display:flex;align-items:center;gap:9px;padding:4px 8px;border:1px solid var(--hair);border-radius:4px;background:#ffffff03;transition:opacity .25s,border-color .25s}.flow-page .flow-mx-station-source:hover{border-color:var(--hair-3)}.flow-mx-station-source.is-dim{opacity:.35}
+.flow-mx-station-source em{font:normal 10.5px var(--mono);color:var(--text-2)}
+.flow-mx-port{display:flex;align-items:center;gap:4px}.flow-mx-port small{font:9px var(--mono);color:var(--text-4)}.flow-mx-port>span{display:grid;grid-auto-flow:column;grid-template-rows:repeat(2,8px);gap:2px}
+.flow-mx-port i{width:8px;height:8px;border-radius:1.5px;animation:flow-cell-in .5s ease-out backwards}.flow-mx-port i.is-alert{box-shadow:0 0 6px currentColor;animation:flow-cell-in .5s ease-out backwards,flow-breathe 1.4s ease-in-out .5s infinite}
+.flow-stale .flow-mx-total,.flow-stale .flow-mx-station-grid,.flow-stale .flow-mx-row .flow-card-status,.flow-stale .flow-mx-head .flow-card-status,.flow-stale .flow-mx-route{opacity:.45}
+
+@keyframes flow-mark-in{from{transform:scaleY(0);filter:brightness(2.4)}}
+@keyframes flow-cell-in{from{transform:rotateX(90deg);filter:brightness(2.4)}}
+
+@media(min-width:1900px){.flow-mx-head h2{font-size:14px}.flow-mx-events li{font-size:12px}}
+@media(max-width:1450px){.flow-mx-total em,.flow-mx-head .flow-card-tag,.flow-mx-row .flow-card-tag{display:none}.flow-mx-head .flow-spark{display:none}.flow-mx-title span{display:none}.flow-mx-stations .flow-station-legend{display:none}}
+@media(max-height:860px){.flow-mx-row .flow-card-meta{display:none}.flow-page .flow-mx-row{padding-top:7px;padding-bottom:6px}.flow-mx-row .flow-card-status{margin-top:3px}}
+@media(max-height:800px){.flow-mx-total small{display:none}.flow-mx-total b{font-size:16px}.flow-mx-stage{min-height:400px;flex-basis:400px}.flow-mx-head .flow-card-meta{display:none}.flow-mx-head{padding:6px 10px 5px}.flow-mx-head .flow-card-status{margin-top:3px}.flow-mx-dock{height:116px;min-height:116px}.flow-mx-events{top:48px}.flow-mx-events li:nth-child(3){display:none}.flow-mx-title{top:6px}}
+@media(max-width:1050px){.flow-mx-head .flow-card-status b,.flow-mx-timeline header span:last-child{display:none}}
